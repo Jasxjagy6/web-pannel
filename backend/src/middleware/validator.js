@@ -1,0 +1,160 @@
+const Joi = require('joi');
+const { AppError } = require('../utils/errorHandler');
+
+const validate = (schema, source = 'body') => {
+  return (req, res, next) => {
+    const data = source === 'body' ? req.body : source === 'query' ? req.query : req.params;
+    const { error } = schema.validate(data, { abortEarly: false, stripUnknown: true });
+
+    if (error) {
+      const messages = error.details.map((detail) => detail.message).join(', ');
+      return next(new AppError(messages, 400, 'VALIDATION_ERROR'));
+    }
+
+    next();
+  };
+};
+
+const schemas = {
+  register: Joi.object({
+    email: Joi.string().email().required(),
+    password: Joi.string().min(8).max(128).required(),
+    role: Joi.string().valid('user', 'admin').default('user'),
+  }),
+
+  login: Joi.object({
+    email: Joi.string().email().required(),
+    password: Joi.string().required(),
+  }),
+
+  sessionUpload: Joi.object({
+    apiId: Joi.number().integer().positive(),
+    apiHash: Joi.string().max(100),
+  }),
+
+  scrapeGroup: Joi.object({
+    sessionId: Joi.number().integer().positive().required(),
+    groupId: Joi.string().required(),
+    limit: Joi.number().integer().min(1).max(100000).default(10000),
+    filterBots: Joi.boolean().default(true),
+    includeDetails: Joi.boolean().default(true),
+    saveToList: Joi.boolean().default(false),
+    listName: Joi.string().max(255),
+  }),
+
+  scrapeChannel: Joi.object({
+    sessionId: Joi.number().integer().positive().required(),
+    channelId: Joi.string().required(),
+    limit: Joi.number().integer().min(1).max(100000).default(10000),
+  }),
+
+  sendMessage: Joi.object({
+    sessionId: Joi.number().integer().positive().required(),
+    targetId: Joi.alternatives().try(Joi.string(), Joi.number()).required(),
+    message: Joi.string().max(4096).required(),
+    messageType: Joi.string().valid('text', 'html', 'markdown').default('text'),
+    mediaPath: Joi.string(),
+  }),
+
+  bulkMessage: Joi.object({
+    sessionIds: Joi.array().items(Joi.number().integer().positive()).min(1).required(),
+    targetList: Joi.array().items(
+      Joi.alternatives().try(
+        Joi.string(),
+        Joi.number(),
+        Joi.object({
+          telegram_id: Joi.alternatives().try(Joi.string(), Joi.number()),
+          id: Joi.alternatives().try(Joi.string(), Joi.number()),
+          username: Joi.string().allow(null),
+          first_name: Joi.string().allow(null),
+          last_name: Joi.string().allow(null),
+          phone: Joi.string().allow(null),
+        })
+      )
+    ).min(1).required(),
+    message: Joi.string().max(4096).required(),
+    messageType: Joi.string().valid('text', 'html', 'markdown').default('text'),
+    mediaPath: Joi.string(),
+    delayMin: Joi.number().min(1).max(10).default(1),
+    delayMax: Joi.number().min(1).max(10).default(3),
+    messagesPerSession: Joi.number().integer().min(1).default(50),
+    sourceType: Joi.string().valid('manual', 'list').default('manual'),
+    sourceId: Joi.number().integer().positive().optional(),
+  }),
+
+  addMembersToGroup: Joi.object({
+    // New multi-session mode
+    sessionIds: Joi.array().items(Joi.number().integer().positive()).min(1).optional(),
+    // Old single-session mode (backward compat)
+    sessionId: Joi.number().integer().positive().optional(),
+    // New multi-target mode
+    targetIds: Joi.array().items(Joi.string()).min(1).optional(),
+    // Old single-target mode (backward compat)
+    targetGroupId: Joi.string().optional(),
+    // Target type
+    targetType: Joi.string().valid('group', 'channel').default('group'),
+    // User list (required)
+    userList: Joi.array().items(
+      Joi.alternatives().try(
+        Joi.string(),
+        Joi.number(),
+        Joi.object({
+          telegram_id: Joi.alternatives().try(Joi.string(), Joi.number()),
+          id: Joi.alternatives().try(Joi.string(), Joi.number()),
+          username: Joi.string().allow(null),
+          first_name: Joi.string().allow(null),
+          last_name: Joi.string().allow(null),
+          phone: Joi.string().allow(null),
+        })
+      )
+    ).min(1).required(),
+    // Delay settings
+    delayMin: Joi.number().min(1).max(600).default(30),
+    delayMax: Joi.number().min(1).max(600).default(60),
+    delay: Joi.number().min(1).max(600).optional(),
+    batchSize: Joi.number().integer().min(1).max(100).default(5),
+    // Async mode
+    async: Joi.alternatives().try(Joi.boolean(), Joi.string()).optional(),
+  }).or('sessionIds', 'sessionId').or('targetIds', 'targetGroupId'),
+
+  joinLeaveChannels: Joi.object({
+    sessionIds: Joi.array().items(Joi.number().integer().positive()).min(1).required(),
+    targetIds: Joi.array().items(Joi.string()).min(1).required(),
+    targetType: Joi.string().valid('group', 'channel').default('group'),
+  }),
+
+  twoFACheck: Joi.object({
+    sessionId: Joi.number().integer().positive().required(),
+  }),
+
+  twoFASet: Joi.object({
+    sessionId: Joi.number().integer().positive().required(),
+    password: Joi.string().min(1).max(128).required(),
+    hint: Joi.string().max(255),
+    email: Joi.string().email(),
+  }),
+
+  listImport: Joi.object({
+    listName: Joi.string().max(255).required(),
+    type: Joi.string().valid('users', 'groups', 'channels').required(),
+  }),
+
+  reportGenerate: Joi.object({
+    reportType: Joi.string().valid('channel', 'group', 'user', 'session').required(),
+    targetId: Joi.string().required(),
+    periodStart: Joi.date(),
+    periodEnd: Joi.date(),
+  }),
+
+  pagination: Joi.object({
+    page: Joi.number().integer().min(1).default(1),
+    limit: Joi.number().integer().min(1).max(100).default(20),
+    sort: Joi.string().default('created_at'),
+    order: Joi.string().valid('ASC', 'DESC').default('DESC'),
+  }),
+};
+
+module.exports = {
+  validate,
+  schemas,
+};

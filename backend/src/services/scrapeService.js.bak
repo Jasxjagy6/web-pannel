@@ -1,0 +1,1538 @@
+/**
+ * ScrapeService - Handles scraping group members and channel subscribers
+ * using the Telegram service, with job tracking and progress reporting.
+ *
+ * Manages the full lifecycle of scraping operations including job creation,
+ * real-time progress tracking via Redis, batch database inserts with
+ * transactions, multi-group scraping, cancellation, export, and statistics.
+ */
+
+const { pool } = require('../config/database');
+// telegramService is already exported as a singleton
+const tgService = require('./telegramService');
+const logger = require('../utils/logger');
+const { AppError } = require('../utils/errorHandler');
+const { buildPagination, applyPagination, applySorting } = require('../utils/pagination');
+const { redisClient } = require('../config/redis');
+
+/**
+ * Telegram API batch size for fetching participants.
+ */
+const TELEGRAM_BATCH_SIZE = 200;
+
+/**
+ * Database batch size for inserting scraped users in a single transaction.
+ */
+const DB_BATCH_SIZE = 500;
+
+/**
+ * Delay between Telegram API batches to avoid rate limiting.
+ */
+const BATCH_DELAY_MS = 1000;
+
+/**
+ * Redis TTL for progress keys (24 hours).
+ */
+const REDIS_PROGRESS_TTL = 86400;
+
+/**
+ * Maximum number of groups that can be scraped in a single multiple-groups request.
+ */
+const MAX_MULTIGROUP_COUNT = 20;
+
+/**
+ * Valid job statuses.
+ */
+const VALID_JOB_STATUSES = ['pending', 'running', 'completed', 'cancelled', 'failed'];
+
+/**
+ * Target type constants.
+ */
+const TARGET_TYPE_GROUP = 'group';
+const TARGET_TYPE_CHANNEL = 'channel';
+
+/**
+ * Sleep utility.
+ * @param {number} ms - Milliseconds to sleep
+ * @returns {Promise<void>}
+ */
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Generate a timestamp string for filenames.
+ * @returns {string} Formatted timestamp
+ */
+function timestampForFilename() {
+  const now = new Date();
+  return now.toISOString().replace(/[:.]/g, '-').slice(0, 19);
+}
+
+/**
+ * ScrapeService - Manages all scraping operations.
+ */
+class ScrapeService {
+  constructor() {
+    /**
+     * Lazy-initialized TelegramService instance.
+     * @type {TelegramService|null}
+     * @private
+     */
+    this._telegramService = null;
+
+    /**
+     * Map of active job cancellation tokens.
+     * Key: jobId (number), Value: { cancelled: boolean }
+     * @type {Map<number, { cancelled: boolean }>}
+     * @private
+     */
+    this._cancellationTokens = new Map();
+  }
+
+  // Uses the shared singleton TelegramService instance (tgService)
+  // No need for _getTelegramService - just use tgService directly
+
+  /**
+   * Build the Redis key for a job's progress data.
+   * @param {number} jobId - The scraping job ID
+   * @returns {string} Redis key
+   * @private
+   */
+  _progressKey(jobId) {
+    return `scrape:progress:${jobId}`;
+  }
+
+  /**
+   * Update progress for a job both in the database and in Redis.
+   * @param {number} jobId - The scraping job ID
+   * @param {object} data - Progress data { progress, totalFound, status }
+   * @private
+   */
+  async _updateProgress(jobId, data) {
+    // Update Redis for real-time UI
+    try {
+      await redisClient.set(
+        this._progressKey(jobId),
+        JSON.stringify({
+          progress: data.progress || 0,
+          totalFound: data.totalFound || 0,
+          status: data.status || 'running',
+        }),
+        { EX: REDIS_PROGRESS_TTL }
+      );
+    } catch (redisError) {
+      logger.warn(`Failed to update Redis progress for job ${jobId}`, {
+        error: redisError.message,
+      });
+    }
+
+    // Update database
+    const updates = [];
+    const values = [];
+    let paramIndex = 1;
+
+    if (data.progress !== undefined) {
+      updates.push(`progress = $${paramIndex}`);
+      values.push(data.progress);
+      paramIndex++;
+    }
+    if (data.totalFound !== undefined) {
+      updates.push(`total_found = $${paramIndex}`);
+      values.push(data.totalFound);
+      paramIndex++;
+    }
+    if (data.status !== undefined) {
+      updates.push(`status = $${paramIndex}`);
+      values.push(data.status);
+      paramIndex++;
+    }
+
+    if (updates.length > 0) {
+      values.push(jobId);
+      await pool.query(
+        `UPDATE scraping_jobs SET ${updates.join(', ')} WHERE id = $${paramIndex}`,
+        values
+      );
+    }
+  }
+
+  /**
+   * Validate that a session belongs to the given user and is logged in.
+   * @param {number|string} sessionId - Session database ID
+   * @param {number|string} userId - Owner user ID
+   * @returns {Promise<object>} Session row from database
+   * @throws {AppError} If session not found or not owned by user
+   * @private
+   */
+  async _validateSessionOwnership(sessionId, userId) {
+    const result = await pool.query(
+      `SELECT id, user_id, status, is_logged_in, api_id, api_hash
+       FROM sessions
+       WHERE id = $1 AND user_id = $2`,
+      [sessionId, userId]
+    );
+
+    if (result.rows.length === 0) {
+      throw new AppError(
+        `Session not found or access denied: ${sessionId}`,
+        404,
+        'SESSION_NOT_FOUND'
+      );
+    }
+
+    const session = result.rows[0];
+
+    if (!session.is_logged_in) {
+      throw new AppError(
+        `Session is not logged in. Please login the session before scraping.`,
+        400,
+        'SESSION_NOT_LOGGED_IN'
+      );
+    }
+
+    return session;
+  }
+
+  /**
+   * Check if a job has been cancelled via its cancellation token.
+   * @param {number} jobId - The job ID
+   * @returns {boolean} True if cancelled
+   * @private
+   */
+  _isCancelled(jobId) {
+    const token = this._cancellationTokens.get(jobId);
+    return token ? token.cancelled : false;
+  }
+
+  /**
+   * Create a cancellation token for a job.
+   * @param {number} jobId - The job ID
+   * @returns {{ cancelled: boolean }}
+   * @private
+   */
+  _createCancellationToken(jobId) {
+    const token = { cancelled: false };
+    this._cancellationTokens.set(jobId, token);
+    return token;
+  }
+
+  /**
+   * Remove a cancellation token.
+   * @param {number} jobId - The job ID
+   * @private
+   */
+  _removeCancellationToken(jobId) {
+    this._cancellationTokens.delete(jobId);
+  }
+
+  /**
+   * Insert scraped users into the database in batches using a transaction.
+   * Handles ON CONFLICT to avoid duplicate telegram_id per job.
+   * @param {number} jobId - The scraping job ID
+   * @param {object[]} users - Array of normalized user objects
+   * @returns {Promise<number>} Number of users inserted
+   * @private
+   */
+  async _insertUsersBatch(jobId, users) {
+    if (users.length === 0) return 0;
+
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+
+      let inserted = 0;
+
+      for (let i = 0; i < users.length; i += DB_BATCH_SIZE) {
+        const batch = users.slice(i, i + DB_BATCH_SIZE);
+
+        // Build multi-row insert with ON CONFLICT DO NOTHING
+        const placeholders = [];
+        const values = [];
+        let paramIndex = 1;
+
+        for (const user of batch) {
+          placeholders.push(
+            `($${paramIndex}, $${paramIndex + 1}, $${paramIndex + 2}, $${paramIndex + 3}, $${paramIndex + 4}, $${paramIndex + 5}, $${paramIndex + 6}, $${paramIndex + 7})`
+          );
+          values.push(
+            jobId,
+            user.id,
+            user.username || null,
+            user.firstName || null,
+            user.lastName || null,
+            user.phone || null,
+            user.isBot || false,
+            user.isPremium || false
+          );
+          paramIndex += 8;
+        }
+
+        const insertQuery = `
+          INSERT INTO scraped_users
+            (job_id, telegram_id, username, first_name, last_name, phone, is_bot, is_premium)
+          VALUES ${placeholders.join(', ')}
+          ON CONFLICT (job_id, telegram_id) DO NOTHING
+        `;
+
+        const result = await client.query(insertQuery, values);
+        inserted += result.rowCount;
+      }
+
+      await client.query('COMMIT');
+      return inserted;
+    } catch (error) {
+      await client.query('ROLLBACK');
+      logger.error(`Failed to insert scraped users batch for job ${jobId}`, {
+        error: error.message,
+      });
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
+  /**
+   * Create a list entry from scraped users if saveToList is enabled.
+   * @param {number} userId - The user who owns the list
+   * @param {string} listName - Name for the list
+   * @param {number} jobId - The scraping job ID (source reference)
+   * @param {string} targetTitle - Title of the scraped group/channel
+   * @private
+   */
+  async _createListFromScrapedUsers(userId, listName, jobId, targetTitle) {
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+
+      // Get the count of scraped users for this job
+      const countResult = await client.query(
+        'SELECT COUNT(*) as total FROM scraped_users WHERE job_id = $1',
+        [jobId]
+      );
+      const itemCount = parseInt(countResult.rows[0].total, 10);
+
+      if (itemCount === 0) {
+        logger.info(`No users to save to list for job ${jobId}`, { jobId });
+        await client.query('COMMIT');
+        return null;
+      }
+
+      // Create the list
+      const listResult = await client.query(
+        `INSERT INTO lists (user_id, name, type, items_count, source, created_at)
+         VALUES ($1, $2, $3, $4, $5, NOW())
+         RETURNING id`,
+        [userId, listName, 'scraped', itemCount, `job_${jobId}`]
+      );
+
+      const listId = listResult.rows[0].id;
+
+      // Copy users to list_items
+      await client.query(
+        `INSERT INTO list_items (list_id, telegram_id, username, first_name, last_name, phone, added_at)
+         SELECT $1, telegram_id, username, first_name, last_name, phone, NOW()
+         FROM scraped_users
+         WHERE job_id = $2`,
+        [listId, jobId]
+      );
+
+      await client.query('COMMIT');
+
+      logger.info(`Created list "${listName}" with ${itemCount} users from job ${jobId}`, {
+        listId,
+        userId,
+      });
+
+      return { listId, listName, itemCount };
+    } catch (error) {
+      await client.query('ROLLBACK');
+      logger.error(`Failed to create list from job ${jobId}`, {
+        error: error.message,
+      });
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
+  /**
+   * Resolve the entity title from Telegram for use in job records.
+   * @param {string} sessionId - Telegram session ID (database ID as string)
+   * @param {string} groupId - Group/channel identifier
+   * @returns {Promise<string|null>} Title or null
+   * @private
+   */
+  async _resolveEntityTitle(sessionId, groupId) {
+    try {
+      const tgService = require('./telegramService');
+      const info = await tgService.getGroupInfo(sessionId, groupId);
+      return info && info.title ? info.title : null;
+    } catch (error) {
+      logger.debug(`Could not resolve entity title for ${groupId}`, {
+        error: error.message,
+      });
+      return null;
+    }
+  }
+
+  // =========================================================================
+  // Public Methods
+  // =========================================================================
+
+  /**
+   * Scrape members from a Telegram group.
+   *
+   * Creates a scraping job, fetches members from Telegram in batches,
+   * saves them to the database, updates real-time progress in Redis,
+   * and optionally saves results to a user list.
+   *
+   * @param {number|string} sessionId - Active session database ID
+   * @param {string|number} groupId - Group ID, username, or invite link
+   * @param {object} options - Scraping options
+   * @param {number} options.limit - Maximum members to fetch (default: 10000)
+   * @param {boolean} options.filterBots - Whether to exclude bots (default: true)
+   * @param {boolean} options.saveToList - Save results to a list (default: false)
+   * @param {boolean} options.includeDetails - Include extended user details (default: false)
+   * @param {string} options.listName - Name for the list if saveToList is true
+   * @param {number|string} userId - The user who owns this session
+   * @returns {Promise<{
+   *   jobId: number,
+   *   status: string,
+   *   totalFound: number,
+   *   targetTitle: string|null,
+   *   listCreated: object|null
+   * }>}
+   */
+  async scrapeGroupMembers(sessionId, groupId, options = {}, userId) {
+    const {
+      limit = 10000,
+      filterBots = true,
+      saveToList = false,
+      includeDetails = false,
+      listName = null,
+    } = options;
+
+    logger.info(`Starting group member scrape`, {
+      sessionId,
+      groupId: String(groupId),
+      userId,
+      limit,
+      filterBots,
+      saveToList,
+    });
+
+    // Validate session ownership
+    await this._validateSessionOwnership(sessionId, userId);
+
+    // Resolve entity title for display
+    const targetTitle = await this._resolveEntityTitle(String(sessionId), groupId);
+
+    // Create the scraping job
+    const jobResult = await pool.query(
+      `INSERT INTO scraping_jobs
+        (session_id, target_type, target_id, target_title, status, progress, total_found, options, created_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())
+       RETURNING id`,
+      [
+        sessionId,
+        TARGET_TYPE_GROUP,
+        String(groupId),
+        targetTitle,
+        'pending',
+        0,
+        0,
+        JSON.stringify({ limit, filterBots, saveToList, includeDetails, listName }),
+      ]
+    );
+
+    const jobId = jobResult.rows[0].id;
+
+    // Create cancellation token and initialize progress
+    const cancelToken = this._createCancellationToken(jobId);
+    await this._updateProgress(jobId, { progress: 0, totalFound: 0, status: 'pending' });
+
+    logger.info(`Created scrape job ${jobId} for group ${groupId}`);
+
+    try {
+      // Update status to running
+      await this._updateProgress(jobId, { status: 'running' });
+
+      // Fetch members from Telegram
+      const tgService = require('./telegramService');
+      const scrapeResult = await tgService.getGroupMembers(String(sessionId), groupId, {
+        limit,
+        filterBots,
+      });
+
+      const members = scrapeResult.members || [];
+      const total = members.length;
+
+      logger.info(`Scraped ${total} members from group ${groupId} for job ${jobId}`, {
+        jobId,
+        total,
+      });
+
+      // Check for cancellation before saving
+      if (cancelToken.cancelled) {
+        await this._updateProgress(jobId, { status: 'cancelled', progress: 100 });
+        await pool.query(
+          `UPDATE scraping_jobs SET status = 'cancelled', completed_at = NOW() WHERE id = $1`,
+          [jobId]
+        );
+        this._removeCancellationToken(jobId);
+
+        logger.info(`Job ${jobId} was cancelled before saving results`);
+        return {
+          jobId,
+          status: 'cancelled',
+          totalFound: 0,
+          targetTitle,
+          listCreated: null,
+        };
+      }
+
+      // Save users to database in batches
+      let totalInserted = 0;
+      for (let i = 0; i < members.length; i += DB_BATCH_SIZE) {
+        if (cancelToken.cancelled) {
+          logger.info(`Job ${jobId} cancelled during batch insert at ${i}/${members.length}`);
+          break;
+        }
+
+        const batch = members.slice(i, i + DB_BATCH_SIZE);
+        const inserted = await this._insertUsersBatch(jobId, batch);
+        totalInserted += inserted;
+
+        // Update progress
+        const progress = Math.round(((i + batch.length) / members.length) * 100);
+        await this._updateProgress(jobId, {
+          progress,
+          totalFound: totalInserted,
+          status: 'running',
+        });
+
+        logger.debug(`Inserted batch for job ${jobId}: ${inserted} users, progress ${progress}%`);
+      }
+
+      // Save to list if requested
+      let listCreated = null;
+      if (saveToList && !cancelToken.cancelled) {
+        const effectiveListName = listName || `Scraped from ${targetTitle || groupId} - ${timestampForFilename()}`;
+        try {
+          listCreated = await this._createListFromScrapedUsers(
+            userId,
+            effectiveListName,
+            jobId,
+            targetTitle || String(groupId)
+          );
+        } catch (listError) {
+          logger.error(`Failed to create list for job ${jobId}`, {
+            error: listError.message,
+          });
+          // Don't fail the whole job if list creation fails
+        }
+      }
+
+      // Mark job as completed
+      const finalStatus = cancelToken.cancelled ? 'cancelled' : 'completed';
+      await this._updateProgress(jobId, {
+        progress: 100,
+        totalFound: totalInserted,
+        status: finalStatus,
+      });
+      await pool.query(
+        `UPDATE scraping_jobs SET status = $1, completed_at = NOW() WHERE id = $2`,
+        [finalStatus, jobId]
+      );
+
+      logger.info(`Job ${jobId} completed with ${finalStatus} status, ${totalInserted} users saved`, {
+        jobId,
+        status: finalStatus,
+        totalInserted,
+      });
+
+      return {
+        jobId,
+        status: finalStatus,
+        totalFound: totalInserted,
+        targetTitle,
+        listCreated,
+      };
+    } catch (error) {
+      // Mark job as failed
+      const errorMessage = error.message || 'Unknown scraping error';
+      await this._updateProgress(jobId, { status: 'failed' });
+      await pool.query(
+        `UPDATE scraping_jobs SET status = 'failed', completed_at = NOW(),
+         options = jsonb_set(options, '{error}', $1)
+         WHERE id = $2`,
+        [JSON.stringify(errorMessage), jobId]
+      );
+
+      logger.error(`Scrape job ${jobId} failed for group ${groupId}`, {
+        jobId,
+        error: errorMessage,
+        stack: error.stack,
+      });
+
+      throw new AppError(
+        `Scraping failed: ${errorMessage}`,
+        error.statusCode || 500,
+        error.code || 'SCRAPE_FAILED'
+      );
+    } finally {
+      this._removeCancellationToken(jobId);
+    }
+  }
+
+  /**
+   * Scrape subscribers from a Telegram channel.
+   *
+   * Creates a scraping job, fetches subscribers from Telegram in batches,
+   * saves them to the database, updates real-time progress in Redis,
+   * and optionally saves results to a user list.
+   *
+   * @param {number|string} sessionId - Active session database ID
+   * @param {string|number} channelId - Channel ID or username
+   * @param {object} options - Scraping options
+   * @param {number} options.limit - Maximum subscribers to fetch (default: 10000)
+   * @param {boolean} options.saveToList - Save results to a list (default: false)
+   * @param {boolean} options.includeDetails - Include extended user details (default: false)
+   * @param {string} options.listName - Name for the list if saveToList is true
+   * @param {number|string} userId - The user who owns this session
+   * @returns {Promise<{
+   *   jobId: number,
+   *   status: string,
+   *   totalFound: number,
+   *   targetTitle: string|null,
+   *   listCreated: object|null
+   * }>}
+   */
+  async scrapeChannelSubscribers(sessionId, channelId, options = {}, userId) {
+    const {
+      limit = 10000,
+      saveToList = false,
+      includeDetails = false,
+      listName = null,
+    } = options;
+
+    logger.info(`Starting channel subscriber scrape`, {
+      sessionId,
+      channelId: String(channelId),
+      userId,
+      limit,
+      saveToList,
+    });
+
+    // Validate session ownership
+    await this._validateSessionOwnership(sessionId, userId);
+
+    // Resolve entity title for display
+    const targetTitle = await this._resolveEntityTitle(String(sessionId), channelId);
+
+    // Create the scraping job
+    const jobResult = await pool.query(
+      `INSERT INTO scraping_jobs
+        (session_id, target_type, target_id, target_title, status, progress, total_found, options, created_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())
+       RETURNING id`,
+      [
+        sessionId,
+        TARGET_TYPE_CHANNEL,
+        String(channelId),
+        targetTitle,
+        'pending',
+        0,
+        0,
+        JSON.stringify({ limit, saveToList, includeDetails, listName }),
+      ]
+    );
+
+    const jobId = jobResult.rows[0].id;
+
+    // Create cancellation token and initialize progress
+    const cancelToken = this._createCancellationToken(jobId);
+    await this._updateProgress(jobId, { progress: 0, totalFound: 0, status: 'pending' });
+
+    logger.info(`Created scrape job ${jobId} for channel ${channelId}`);
+
+    try {
+      // Update status to running
+      await this._updateProgress(jobId, { status: 'running' });
+
+      // Fetch subscribers from Telegram
+      const tgService = require('./telegramService');
+      const scrapeResult = await tgService.getChannelSubscribers(String(sessionId), channelId, {
+        limit,
+      });
+
+      const subscribers = scrapeResult.subscribers || [];
+      const total = subscribers.length;
+
+      logger.info(`Scraped ${total} subscribers from channel ${channelId} for job ${jobId}`, {
+        jobId,
+        total,
+      });
+
+      // Check for cancellation before saving
+      if (cancelToken.cancelled) {
+        await this._updateProgress(jobId, { status: 'cancelled', progress: 100 });
+        await pool.query(
+          `UPDATE scraping_jobs SET status = 'cancelled', completed_at = NOW() WHERE id = $1`,
+          [jobId]
+        );
+        this._removeCancellationToken(jobId);
+
+        logger.info(`Job ${jobId} was cancelled before saving results`);
+        return {
+          jobId,
+          status: 'cancelled',
+          totalFound: 0,
+          targetTitle,
+          listCreated: null,
+        };
+      }
+
+      // Save users to database in batches
+      let totalInserted = 0;
+      for (let i = 0; i < subscribers.length; i += DB_BATCH_SIZE) {
+        if (cancelToken.cancelled) {
+          logger.info(`Job ${jobId} cancelled during batch insert at ${i}/${subscribers.length}`);
+          break;
+        }
+
+        const batch = subscribers.slice(i, i + DB_BATCH_SIZE);
+        const inserted = await this._insertUsersBatch(jobId, batch);
+        totalInserted += inserted;
+
+        // Update progress
+        const progress = Math.round(((i + batch.length) / subscribers.length) * 100);
+        await this._updateProgress(jobId, {
+          progress,
+          totalFound: totalInserted,
+          status: 'running',
+        });
+
+        logger.debug(`Inserted batch for job ${jobId}: ${inserted} users, progress ${progress}%`);
+      }
+
+      // Save to list if requested
+      let listCreated = null;
+      if (saveToList && !cancelToken.cancelled) {
+        const effectiveListName = listName || `Scraped from ${targetTitle || channelId} - ${timestampForFilename()}`;
+        try {
+          listCreated = await this._createListFromScrapedUsers(
+            userId,
+            effectiveListName,
+            jobId,
+            targetTitle || String(channelId)
+          );
+        } catch (listError) {
+          logger.error(`Failed to create list for job ${jobId}`, {
+            error: listError.message,
+          });
+        }
+      }
+
+      // Mark job as completed
+      const finalStatus = cancelToken.cancelled ? 'cancelled' : 'completed';
+      await this._updateProgress(jobId, {
+        progress: 100,
+        totalFound: totalInserted,
+        status: finalStatus,
+      });
+      await pool.query(
+        `UPDATE scraping_jobs SET status = $1, completed_at = NOW() WHERE id = $2`,
+        [finalStatus, jobId]
+      );
+
+      logger.info(`Job ${jobId} completed with ${finalStatus} status, ${totalInserted} users saved`, {
+        jobId,
+        status: finalStatus,
+        totalInserted,
+      });
+
+      return {
+        jobId,
+        status: finalStatus,
+        totalFound: totalInserted,
+        targetTitle,
+        listCreated,
+      };
+    } catch (error) {
+      // Mark job as failed
+      const errorMessage = error.message || 'Unknown scraping error';
+      await this._updateProgress(jobId, { status: 'failed' });
+      await pool.query(
+        `UPDATE scraping_jobs SET status = 'failed', completed_at = NOW(),
+         options = jsonb_set(options, '{error}', $1)
+         WHERE id = $2`,
+        [JSON.stringify(errorMessage), jobId]
+      );
+
+      logger.error(`Scrape job ${jobId} failed for channel ${channelId}`, {
+        jobId,
+        error: errorMessage,
+        stack: error.stack,
+      });
+
+      throw new AppError(
+        `Scraping failed: ${errorMessage}`,
+        error.statusCode || 500,
+        error.code || 'SCRAPE_FAILED'
+      );
+    } finally {
+      this._removeCancellationToken(jobId);
+    }
+  }
+
+  /**
+   * Scrape members from multiple groups at once.
+   *
+   * Creates a separate scraping job for each group and starts them
+   * sequentially to avoid overwhelming the Telegram API. Returns
+   * an aggregate summary of all jobs.
+   *
+   * @param {number|string} sessionId - Active session database ID
+   * @param {Array<string|number>} groupIds - Array of group identifiers
+   * @param {object} options - Scraping options applied to each group
+   * @param {number} options.limit - Maximum members per group (default: 10000)
+   * @param {boolean} options.filterBots - Whether to exclude bots (default: true)
+   * @param {boolean} options.saveToList - Save results to a list per group (default: false)
+   * @param {boolean} options.includeDetails - Include extended user details (default: false)
+   * @param {number|string} userId - The user who owns this session
+   * @returns {Promise<{
+   *   totalGroups: number,
+   *   totalUsers: number,
+   *   jobs: Array<{ jobId: number, groupId: string, status: string, totalFound: number }>
+   * }>}
+   */
+  async scrapeMultipleGroups(sessionId, groupIds, options = {}, userId) {
+    if (!groupIds || !Array.isArray(groupIds) || groupIds.length === 0) {
+      throw new AppError('At least one group ID is required', 400, 'NO_GROUP_IDS');
+    }
+
+    if (groupIds.length > MAX_MULTIGROUP_COUNT) {
+      throw new AppError(
+        `Too many groups. Maximum allowed is ${MAX_MULTIGROUP_COUNT}`,
+        400,
+        'TOO_MANY_GROUPS'
+      );
+    }
+
+    logger.info(`Starting multi-group scrape for ${groupIds.length} groups`, {
+      sessionId,
+      userId,
+      groupCount: groupIds.length,
+    });
+
+    // Validate session ownership once
+    await this._validateSessionOwnership(sessionId, userId);
+
+    const results = [];
+    let totalUsers = 0;
+
+    for (const groupId of groupIds) {
+      try {
+        const jobResult = await this.scrapeGroupMembers(sessionId, groupId, options, userId);
+        results.push({
+          jobId: jobResult.jobId,
+          groupId: String(groupId),
+          status: jobResult.status,
+          totalFound: jobResult.totalFound,
+        });
+        totalUsers += jobResult.totalFound;
+      } catch (error) {
+        logger.error(`Failed to scrape group ${groupId} in multi-group operation`, {
+          error: error.message,
+          groupId,
+        });
+        results.push({
+          jobId: null,
+          groupId: String(groupId),
+          status: 'failed',
+          totalFound: 0,
+          error: error.message,
+        });
+      }
+
+      // Small delay between groups to respect rate limits
+      if (groupIds.indexOf(groupId) < groupIds.length - 1) {
+        await sleep(BATCH_DELAY_MS * 2);
+      }
+    }
+
+    const succeeded = results.filter((r) => r.status === 'completed').length;
+    const failed = results.filter((r) => r.status === 'failed').length;
+
+    logger.info(`Multi-group scrape complete: ${succeeded} succeeded, ${failed} failed`, {
+      totalGroups: groupIds.length,
+      totalUsers,
+      succeeded,
+      failed,
+    });
+
+    return {
+      totalGroups: groupIds.length,
+      totalUsers,
+      jobs: results,
+    };
+  }
+
+  /**
+   * Get details of a specific scraping job including result summary.
+   *
+   * Verifies that the job's session belongs to the requesting user.
+   *
+   * @param {number|string} jobId - The scraping job ID
+   * @param {number|string} userId - The requesting user ID
+   * @returns {Promise<{
+   *   id: number,
+   *   sessionId: number,
+   *   targetType: string,
+   *   targetId: string,
+   *   targetTitle: string|null,
+   *   status: string,
+   *   progress: number,
+   *   totalFound: number,
+   *   options: object,
+   *   createdAt: string,
+   *   completedAt: string|null,
+   *   resultSummary: { totalUsers: number, uniqueUsers: number }
+   * }>}
+   */
+  async getJobDetails(jobId, userId) {
+    logger.info(`Fetching scrape job details`, { jobId, userId });
+
+    // Fetch the job and verify ownership through session
+    const jobResult = await pool.query(
+      `SELECT sj.*, s.user_id
+       FROM scraping_jobs sj
+       INNER JOIN sessions s ON sj.session_id = s.id
+       WHERE sj.id = $1 AND s.user_id = $2`,
+      [jobId, userId]
+    );
+
+    if (jobResult.rows.length === 0) {
+      throw new AppError(
+        `Scraping job not found or access denied: ${jobId}`,
+        404,
+        'JOB_NOT_FOUND'
+      );
+    }
+
+    const job = jobResult.rows[0];
+
+    // Get result summary
+    const summaryResult = await pool.query(
+      `SELECT
+         COUNT(*) as total_users,
+         COUNT(DISTINCT telegram_id) as unique_users
+       FROM scraped_users
+       WHERE job_id = $1`,
+      [jobId]
+    );
+
+    const summary = summaryResult.rows[0];
+
+    // Try to get live progress from Redis
+    let redisProgress = null;
+    try {
+      const redisData = await redisClient.get(this._progressKey(jobId));
+      if (redisData) {
+        redisProgress = JSON.parse(redisData);
+      }
+    } catch (redisError) {
+      logger.debug(`Could not fetch Redis progress for job ${jobId}`, {
+        error: redisError.message,
+      });
+    }
+
+    return {
+      id: job.id,
+      sessionId: job.session_id,
+      targetType: job.target_type,
+      targetId: job.target_id,
+      targetTitle: job.target_title,
+      status: job.status,
+      progress: job.progress,
+      totalFound: job.total_found,
+      options: typeof job.options === 'string' ? JSON.parse(job.options) : job.options,
+      createdAt: job.created_at,
+      completedAt: job.completed_at,
+      resultSummary: {
+        totalUsers: parseInt(summary.total_users, 10),
+        uniqueUsers: parseInt(summary.unique_users, 10),
+      },
+      liveProgress: redisProgress,
+    };
+  }
+
+  /**
+   * List scraping jobs for a user with pagination and sorting.
+   *
+   * @param {number|string} userId - The requesting user ID
+   * @param {object} params - Query parameters
+   * @param {number} params.page - Page number (1-based, default: 1)
+   * @param {number} params.limit - Items per page (default: 20, max: 100)
+   * @param {string} params.sort - Sort field (default: 'created_at')
+   * @param {string} params.order - Sort order: ASC or DESC (default: 'DESC')
+   * @param {string} [params.status] - Filter by status (optional)
+   * @param {string} [params.targetType] - Filter by target type (optional)
+   * @returns {Promise<{
+   *   jobs: Array<object>,
+   *   pagination: { currentPage, pageSize, totalPages, total, hasNext, hasPrev }
+   * }>}
+   */
+  async listJobs(userId, { page = 1, limit = 20, sort = 'created_at', order = 'DESC', status, targetType } = {}) {
+    logger.info(`Listing scrape jobs for user ${userId}`, { page, limit, sort, order, status, targetType });
+
+    const validSortFields = ['created_at', 'completed_at', 'total_found', 'progress', 'id', 'status'];
+    const { field: sortField, order: sortOrder } = applySorting(sort, order, validSortFields);
+    const { offset, limit: pageSize } = applyPagination(null, page, limit);
+
+    // Build query conditions
+    const conditions = ['s.user_id = $1'];
+    const values = [userId];
+    let paramIndex = 2;
+
+    if (status && VALID_JOB_STATUSES.includes(status)) {
+      conditions.push(`sj.status = $${paramIndex}`);
+      values.push(status);
+      paramIndex++;
+    }
+
+    if (targetType && [TARGET_TYPE_GROUP, TARGET_TYPE_CHANNEL].includes(targetType)) {
+      conditions.push(`sj.target_type = $${paramIndex}`);
+      values.push(targetType);
+      paramIndex++;
+    }
+
+    const whereClause = conditions.join(' AND ');
+
+    // Get total count
+    const countResult = await pool.query(
+      `SELECT COUNT(*) as total
+       FROM scraping_jobs sj
+       INNER JOIN sessions s ON sj.session_id = s.id
+       WHERE ${whereClause}`,
+      values
+    );
+    const total = parseInt(countResult.rows[0].total, 10);
+
+    // Get paginated results
+    const jobsResult = await pool.query(
+      `SELECT sj.id, sj.session_id, sj.target_type, sj.target_id, sj.target_title,
+              sj.status, sj.progress, sj.total_found, sj.options,
+              sj.created_at, sj.completed_at
+       FROM scraping_jobs sj
+       INNER JOIN sessions s ON sj.session_id = s.id
+       WHERE ${whereClause}
+       ORDER BY sj.${sortField} ${sortOrder}
+       LIMIT $${paramIndex} OFFSET $${paramIndex + 1}`,
+      [...values, pageSize, offset]
+    );
+
+    const jobs = jobsResult.rows.map((row) => ({
+      id: row.id,
+      sessionId: row.session_id,
+      targetType: row.target_type,
+      targetId: row.target_id,
+      targetTitle: row.target_title,
+      status: row.status,
+      progress: row.progress,
+      totalFound: row.total_found,
+      options: typeof row.options === 'string' ? JSON.parse(row.options) : row.options,
+      createdAt: row.created_at,
+      completedAt: row.completed_at,
+    }));
+
+    const pagination = buildPagination(page, limit, total);
+
+    return { jobs, pagination };
+  }
+
+  /**
+   * Cancel a running scraping job.
+   *
+   * Sets the job status to cancelled and signals any in-progress
+   * scraping operation to stop via the cancellation token.
+   *
+   * @param {number|string} jobId - The scraping job ID
+   * @param {number|string} userId - The requesting user ID
+   * @returns {Promise<{ success: boolean, jobId: number, status: string }>}
+   */
+  async cancelJob(jobId, userId) {
+    logger.info(`Cancelling scrape job`, { jobId, userId });
+
+    // Fetch and verify ownership
+    const jobResult = await pool.query(
+      `SELECT sj.id, sj.status, s.user_id
+       FROM scraping_jobs sj
+       INNER JOIN sessions s ON sj.session_id = s.id
+       WHERE sj.id = $1 AND s.user_id = $2`,
+      [jobId, userId]
+    );
+
+    if (jobResult.rows.length === 0) {
+      throw new AppError(
+        `Scraping job not found or access denied: ${jobId}`,
+        404,
+        'JOB_NOT_FOUND'
+      );
+    }
+
+    const job = jobResult.rows[0];
+
+    // Only allow cancellation of pending or running jobs
+    if (job.status !== 'pending' && job.status !== 'running') {
+      throw new AppError(
+        `Cannot cancel job with status: ${job.status}. Only pending or running jobs can be cancelled.`,
+        400,
+        'JOB_NOT_CANCELLABLE'
+      );
+    }
+
+    // Signal cancellation via token
+    const token = this._cancellationTokens.get(jobId);
+    if (token) {
+      token.cancelled = true;
+      logger.info(`Cancellation token set for job ${jobId}`);
+    }
+
+    // Update database status
+    await pool.query(
+      `UPDATE scraping_jobs SET status = 'cancelled', completed_at = NOW() WHERE id = $1`,
+      [jobId]
+    );
+
+    // Update Redis progress
+    await this._updateProgress(jobId, { status: 'cancelled' });
+
+    logger.info(`Job ${jobId} cancelled by user ${userId}`);
+
+    return {
+      success: true,
+      jobId: Number(jobId),
+      status: 'cancelled',
+    };
+  }
+
+  /**
+   * Export scraped users from a job in the specified format.
+   *
+   * Verifies job ownership, fetches all scraped users, and formats
+   * them as CSV, JSON, or TXT.
+   *
+   * Supported formats:
+   *   - csv: Comma-separated with headers (user_id, username, first_name, last_name, phone)
+   *   - json: JSON array of user objects
+   *   - txt: One user per line (username or user_id if no username)
+   *
+   * @param {number|string} jobId - The scraping job ID
+   * @param {string} format - Export format: 'csv', 'json', or 'txt' (default: 'csv')
+   * @param {number|string} userId - The requesting user ID
+   * @returns {Promise<{
+   *   content: string,
+   *   filename: string,
+   *   mimeType: string,
+   *   totalUsers: number
+   * }>}
+   */
+  async exportUsers(jobId, format = 'csv', userId) {
+    const validFormats = ['csv', 'json', 'txt'];
+    const exportFormat = (format || 'csv').toLowerCase();
+
+    if (!validFormats.includes(exportFormat)) {
+      throw new AppError(
+        `Invalid export format: ${format}. Supported: ${validFormats.join(', ')}`,
+        400,
+        'INVALID_EXPORT_FORMAT'
+      );
+    }
+
+    logger.info(`Exporting scraped users`, { jobId, format: exportFormat, userId });
+
+    // Verify job ownership
+    const jobResult = await pool.query(
+      `SELECT sj.id, sj.target_title, sj.target_id, s.user_id
+       FROM scraping_jobs sj
+       INNER JOIN sessions s ON sj.session_id = s.id
+       WHERE sj.id = $1 AND s.user_id = $2`,
+      [jobId, userId]
+    );
+
+    if (jobResult.rows.length === 0) {
+      throw new AppError(
+        `Scraping job not found or access denied: ${jobId}`,
+        404,
+        'JOB_NOT_FOUND'
+      );
+    }
+
+    const job = jobResult.rows[0];
+
+    // Fetch all scraped users for this job
+    const usersResult = await pool.query(
+      `SELECT telegram_id, username, first_name, last_name, phone
+       FROM scraped_users
+       WHERE job_id = $1
+       ORDER BY id ASC`,
+      [jobId]
+    );
+
+    const users = usersResult.rows;
+    const targetIdentifier = job.target_title || job.target_id;
+    const filenameBase = `scraped_${targetIdentifier}_${timestampForFilename()}`;
+
+    let content;
+    let filename;
+    let mimeType;
+
+    switch (exportFormat) {
+      case 'csv':
+        content = this._exportCSV(users);
+        filename = `${filenameBase}.csv`;
+        mimeType = 'text/csv';
+        break;
+
+      case 'json':
+        content = this._exportJSON(users);
+        filename = `${filenameBase}.json`;
+        mimeType = 'application/json';
+        break;
+
+      case 'txt':
+        content = this._exportTXT(users);
+        filename = `${filenameBase}.txt`;
+        mimeType = 'text/plain';
+        break;
+    }
+
+    logger.info(`Exported ${users.length} users from job ${jobId} as ${exportFormat}`, {
+      jobId,
+      format: exportFormat,
+      userCount: users.length,
+    });
+
+    return {
+      content,
+      filename,
+      mimeType,
+      totalUsers: users.length,
+    };
+  }
+
+  /**
+   * Format users as CSV with headers.
+   * @param {object[]} users - Array of user rows from database
+   * @returns {string} CSV string
+   * @private
+   */
+  _exportCSV(users) {
+    const headers = ['user_id', 'username', 'first_name', 'last_name', 'phone'];
+
+    const csvRows = [headers.join(',')];
+
+    for (const user of users) {
+      const row = [
+        this._csvEscape(user.telegram_id),
+        this._csvEscape(user.username),
+        this._csvEscape(user.first_name),
+        this._csvEscape(user.last_name),
+        this._csvEscape(user.phone),
+      ];
+      csvRows.push(row.join(','));
+    }
+
+    return csvRows.join('\r\n');
+  }
+
+  /**
+   * Escape a value for CSV output.
+   * @param {*} value - The value to escape
+   * @returns {string} Esc CSV-safe string
+   * @private
+   */
+  _csvEscape(value) {
+    if (value === null || value === undefined) {
+      return '';
+    }
+    const str = String(value);
+    // If the value contains commas, quotes, or newlines, wrap in quotes
+    if (str.includes(',') || str.includes('"') || str.includes('\n') || str.includes('\r')) {
+      return `"${str.replace(/"/g, '""')}"`;
+    }
+    return str;
+  }
+
+  /**
+   * Format users as JSON array.
+   * @param {object[]} users - Array of user rows from database
+   * @returns {string} JSON string
+   * @private
+   */
+  _exportJSON(users) {
+    const jsonArray = users.map((user) => ({
+      user_id: user.telegram_id,
+      username: user.username || null,
+      first_name: user.first_name || null,
+      last_name: user.last_name || null,
+      phone: user.phone || null,
+    }));
+
+    return JSON.stringify(jsonArray, null, 2);
+  }
+
+  /**
+   * Format users as plain text, one per line.
+   * Uses username if available, otherwise falls back to telegram ID.
+   * @param {object[]} users - Array of user rows from database
+   * @returns {string} TXT string
+   * @private
+   */
+  _exportTXT(users) {
+    const lines = users.map((user) => {
+      return user.username ? `@${user.username}` : String(user.telegram_id);
+    });
+
+    return lines.join('\n');
+  }
+
+  /**
+   * Get scraping statistics for a user.
+   *
+   * Returns aggregated statistics across all scraping jobs owned by the user.
+   *
+   * @param {number|string} userId - The requesting user ID
+   * @returns {Promise<{
+   *   totalJobs: number,
+   *   completedJobs: number,
+   *   failedJobs: number,
+   *   cancelledJobs: number,
+   *   pendingJobs: number,
+   *   runningJobs: number,
+   *   totalUsersScraped: number,
+   *   successRate: number,
+   *   averageUsersPerJob: number,
+   *   lastJobDate: string|null,
+   *   jobsByType: { group: number, channel: number },
+   *   recentJobs: Array<{ id: number, targetType: string, targetTitle: string|null, status: string, totalFound: number, createdAt: string }>
+   * }>}
+   */
+  async getScrapeStats(userId) {
+    logger.info(`Fetching scrape stats for user ${userId}`);
+
+    // Overall job counts by status
+    const statusResult = await pool.query(
+      `SELECT
+         COUNT(*) as total_jobs,
+         COUNT(*) FILTER (WHERE sj.status = 'completed') as completed_jobs,
+         COUNT(*) FILTER (WHERE sj.status = 'failed') as failed_jobs,
+         COUNT(*) FILTER (WHERE sj.status = 'cancelled') as cancelled_jobs,
+         COUNT(*) FILTER (WHERE sj.status = 'pending') as pending_jobs,
+         COUNT(*) FILTER (WHERE sj.status = 'running') as running_jobs
+       FROM scraping_jobs sj
+       INNER JOIN sessions s ON sj.session_id = s.id
+       WHERE s.user_id = $1`,
+      [userId]
+    );
+
+    const statusRow = statusResult.rows[0];
+    const totalJobs = parseInt(statusRow.total_jobs, 10);
+    const completedJobs = parseInt(statusRow.completed_jobs, 10);
+    const failedJobs = parseInt(statusRow.failed_jobs, 10);
+    const cancelledJobs = parseInt(statusRow.cancelled_jobs, 10);
+    const pendingJobs = parseInt(statusRow.pending_jobs, 10);
+    const runningJobs = parseInt(statusRow.running_jobs, 10);
+
+    // Total users scraped
+    const usersResult = await pool.query(
+      `SELECT COUNT(*) as total_users
+       FROM scraped_users su
+       INNER JOIN scraping_jobs sj ON su.job_id = sj.id
+       INNER JOIN sessions s ON sj.session_id = s.id
+       WHERE s.user_id = $1`,
+      [userId]
+    );
+    const totalUsersScraped = parseInt(usersResult.rows[0].total_users, 10);
+
+    // Jobs by target type
+    const typeResult = await pool.query(
+      `SELECT
+         COUNT(*) FILTER (WHERE sj.target_type = 'group') as group_jobs,
+         COUNT(*) FILTER (WHERE sj.target_type = 'channel') as channel_jobs
+       FROM scraping_jobs sj
+       INNER JOIN sessions s ON sj.session_id = s.id
+       WHERE s.user_id = $1`,
+      [userId]
+    );
+    const typeRow = typeResult.rows[0];
+
+    // Success rate (completed / (completed + failed))
+    const successRate = (completedJobs + failedJobs) > 0
+      ? Math.round((completedJobs / (completedJobs + failedJobs)) * 100)
+      : 0;
+
+    // Average users per completed job
+    const averageUsersPerJob = completedJobs > 0
+      ? Math.round(totalUsersScraped / completedJobs)
+      : 0;
+
+    // Last job date
+    const lastJobResult = await pool.query(
+      `SELECT MAX(sj.created_at) as last_job_date
+       FROM scraping_jobs sj
+       INNER JOIN sessions s ON sj.session_id = s.id
+       WHERE s.user_id = $1`,
+      [userId]
+    );
+    const lastJobDate = lastJobResult.rows[0].last_job_date;
+
+    // Recent 5 jobs
+    const recentResult = await pool.query(
+      `SELECT sj.id, sj.target_type, sj.target_title, sj.status, sj.total_found, sj.created_at
+       FROM scraping_jobs sj
+       INNER JOIN sessions s ON sj.session_id = s.id
+       WHERE s.user_id = $1
+       ORDER BY sj.created_at DESC
+       LIMIT 5`,
+      [userId]
+    );
+
+    const recentJobs = recentResult.rows.map((row) => ({
+      id: row.id,
+      targetType: row.target_type,
+      targetTitle: row.target_title,
+      status: row.status,
+      totalFound: row.total_found,
+      createdAt: row.created_at,
+    }));
+
+    return {
+      totalJobs,
+      completedJobs,
+      failedJobs,
+      cancelledJobs,
+      pendingJobs,
+      runningJobs,
+      totalUsersScraped,
+      successRate,
+      averageUsersPerJob,
+      lastJobDate,
+      jobsByType: {
+        group: parseInt(typeRow.group_jobs, 10),
+        channel: parseInt(typeRow.channel_jobs, 10),
+      },
+      recentJobs,
+    };
+  }
+
+  /**
+   * Get the live progress of a scraping job from Redis.
+   *
+   * Falls back to database values if Redis is unavailable.
+   *
+   * @param {number|string} jobId - The scraping job ID
+   * @param {number|string} userId - The requesting user ID
+   * @returns {Promise<{
+   *   jobId: number,
+   *   progress: number,
+   *   totalFound: number,
+   *   status: string,
+   *   source: 'redis' | 'database'
+   * }>}
+   */
+  async getLiveProgress(jobId, userId) {
+    logger.debug(`Fetching live progress for job ${jobId}`, { userId });
+
+    // Verify ownership
+    const jobResult = await pool.query(
+      `SELECT sj.id, sj.progress, sj.total_found, sj.status, s.user_id
+       FROM scraping_jobs sj
+       INNER JOIN sessions s ON sj.session_id = s.id
+       WHERE sj.id = $1 AND s.user_id = $2`,
+      [jobId, userId]
+    );
+
+    if (jobResult.rows.length === 0) {
+      throw new AppError(
+        `Scraping job not found or access denied: ${jobId}`,
+        404,
+        'JOB_NOT_FOUND'
+      );
+    }
+
+    // Try Redis first
+    try {
+      const redisData = await redisClient.get(this._progressKey(jobId));
+      if (redisData) {
+        const parsed = JSON.parse(redisData);
+        return {
+          jobId: Number(jobId),
+          progress: parsed.progress || 0,
+          totalFound: parsed.totalFound || 0,
+          status: parsed.status || 'unknown',
+          source: 'redis',
+        };
+      }
+    } catch (redisError) {
+      logger.debug(`Redis unavailable for job ${jobId} progress, falling back to DB`, {
+        error: redisError.message,
+      });
+    }
+
+    // Fallback to database
+    const job = jobResult.rows[0];
+    return {
+      jobId: Number(jobId),
+      progress: job.progress,
+      totalFound: job.total_found,
+      status: job.status,
+      source: 'database',
+    };
+  }
+
+  /**
+   * Clean up expired Redis progress entries.
+   * This is a maintenance method that can be called periodically.
+   *
+   * @param {number} maxAgeHours - Maximum age in hours before cleanup (default: 48)
+   * @returns {Promise<{ cleanedJobs: number }>}
+   */
+  async cleanupExpiredProgress(maxAgeHours = 48) {
+    logger.info(`Cleaning up expired Redis progress entries older than ${maxAgeHours}h`);
+
+    // Find completed/failed/cancelled jobs older than maxAgeHours
+    const oldJobsResult = await pool.query(
+      `SELECT id FROM scraping_jobs
+       WHERE status IN ('completed', 'failed', 'cancelled')
+       AND completed_at IS NOT NULL
+       AND completed_at < NOW() - INTERVAL '${maxAgeHours} hours'`
+    );
+
+    let cleanedCount = 0;
+
+    for (const row of oldJobsResult.rows) {
+      const key = this._progressKey(row.id);
+      try {
+        const exists = await redisClient.exists(key);
+        if (exists) {
+          await redisClient.del(key);
+          cleanedCount++;
+        }
+      } catch (redisError) {
+        logger.debug(`Could not clean Redis key for job ${row.id}`, {
+          error: redisError.message,
+        });
+      }
+    }
+
+    logger.info(`Cleaned up ${cleanedCount} expired Redis progress entries`);
+
+    return { cleanedJobs: cleanedCount };
+  }
+}
+
+module.exports = new ScrapeService();

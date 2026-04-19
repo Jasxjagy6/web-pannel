@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" type="image/svg+xml" href="/vite.svg" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Telegram Panel</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+  </head>
+  <body>
+    <div id="root"></div>
+    <div id="error-overlay" style="display:none;position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.9);z-index:99999;padding:20px;overflow:auto;">
+      <div style="background:#1e293b;border:2px solid #ef4444;border-radius:12px;padding:24px;max-width:800px;margin:40px auto;">
+        <h2 style="color:#ef4444;margin:0 0 16px 0;">JavaScript Error Detected</h2>
+        <pre id="error-message" style="color:#f8fafc;background:#0f172a;padding:16px;border-radius:8px;overflow-x:auto;white-space:pre-wrap;font-size:14px;"></pre>
+        <button onclick="window.location.reload()" style="background:#3b82f6;color:white;border:none;padding:12px 24px;border-radius:8px;cursor:pointer;margin-top:16px;font-size:14px;">Reload Page</button>
+      </div>
+    </div>
+    <script>
+      window.addEventListener('error', function(e) {
+        var errorOverlay = document.getElementById('error-overlay');
+        var errorMessage = document.getElementById('error-message');
+        var errorMsg = e.message || 'Unknown error';
+        var file = e.filename || '';
+        var line = e.lineno || '';
+        var col = e.colno || '';
+        var stack = e.error && e.error.stack ? e.error.stack : 'No stack trace';
+        errorMessage.textContent = errorMsg + '\n' + file + ':' + line + ':' + col + '\n\nStack:\n' + stack;
+        errorOverlay.style.display = 'block';
+      });
+      window.addEventListener('unhandledrejection', function(e) {
+        var errorOverlay = document.getElementById('error-overlay');
+        var errorMessage = document.getElementById('error-message');
+        var reason = e.reason || 'Unknown rejection';
+        var msg = reason.message || reason.toString();
+        var stack = reason.stack || 'No stack trace';
+        errorMessage.textContent = 'Promise Rejection: ' + msg + '\n\nStack:\n' + stack;
+        errorOverlay.style.display = 'block';
+      });
+    </script>
+    <script type="module" src="/src/main.jsx"></script>
+  </body>
+</html>

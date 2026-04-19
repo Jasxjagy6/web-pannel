@@ -1,0 +1,996 @@
+import { useState, useEffect, useCallback, useRef } from 'react';
+import { useWebSocket } from '../hooks/useWebSocket';
+import { listSessions } from '../api/sessions';
+import {
+  scrapeGroup,
+  scrapeChannel,
+  getJobs,
+  getJob,
+  cancelJob,
+  exportJob,
+} from '../api/scrape';
+import { parseApiError, formatRelativeTime, formatNumber, exportToFile } from '../utils/formatters';
+import { useToast } from '../components/common/Toast';
+import { Modal } from '../components/common/Modal';
+import StatusBadge from '../components/common/StatusBadge';
+import {
+  MagnifyingGlassIcon,
+  BoltIcon,
+  SignalIcon,
+  UserGroupIcon,
+  ArrowPathIcon,
+  ArrowDownTrayIcon,
+  XMarkIcon,
+  FunnelIcon,
+  ListBulletIcon,
+  ShieldExclamationIcon,
+} from '@heroicons/react/24/outline';
+import {
+  Loader2,
+  Play,
+  X,
+  FileDown,
+  Eye,
+  StopCircle,
+  Link,
+  Hash,
+  Users,
+  Settings,
+  Radio,
+  ListFilter,
+  Download,
+  Check,
+  AlertTriangle,
+  Search,
+  ChevronLeft,
+  ChevronRight,
+} from 'lucide-react';
+
+// --- Scrape Form ---
+function ScrapeForm({ sessions, onSubmit, submitting }) {
+  const [sessionId, setSessionId] = useState('');
+  const [targetInput, setTargetInput] = useState('');
+  const [scrapeType, setScrapeType] = useState('group');
+  const [limit, setLimit] = useState(1000);
+  const [filterBots, setFilterBots] = useState(true);
+  const [saveToList, setSaveToList] = useState(false);
+  const [listName, setListName] = useState('');
+  const [errors, setErrors] = useState({});
+
+  const validate = () => {
+    const newErrors = {};
+    if (!sessionId) newErrors.session = 'Please select a session.';
+    if (!targetInput.trim()) newErrors.target = 'Please enter a group/channel link or ID.';
+    if (limit < 1 || limit > 100000) newErrors.limit = 'Limit must be between 1 and 100,000.';
+    if (saveToList && !listName.trim()) newErrors.listName = 'Please enter a list name.';
+    setErrors(newErrors);
+    return Object.keys(newErrors).length === 0;
+  };
+
+  const handleSubmit = (e) => {
+    e.preventDefault();
+    if (!validate()) return;
+    onSubmit({
+      sessionId,
+      target: targetInput.trim(),
+      type: scrapeType,
+      limit: Number(limit),
+      filterBots,
+      saveToList: saveToList ? listName.trim() : null,
+    });
+    // Reset form
+    setTargetInput('');
+    setLimit(1000);
+    setSaveToList(false);
+    setListName('');
+    setErrors({});
+  };
+
+  const inputBase = 'w-full rounded-lg border bg-dark-900 py-2.5 px-3 text-sm text-white placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-primary-500/50 focus:border-primary-500 transition';
+  const inputError = 'border-red-500/50';
+  const inputNormal = 'border-white/10';
+  const labelClass = 'mb-1.5 block text-sm font-medium text-gray-300';
+
+  return (
+    <form onSubmit={handleSubmit} className="space-y-5">
+      {/* Select Session */}
+      <div>
+        <label className={labelClass}>
+          <span className="flex items-center gap-1.5">
+            <Users className="w-3.5 h-3.5 text-gray-500" />
+            Session
+          </span>
+        </label>
+        <select
+          value={sessionId}
+          onChange={(e) => setSessionId(e.target.value)}
+          className={`${inputBase} ${errors.session ? inputError : inputNormal}`}
+        >
+          <option value="">Select a session...</option>
+          {sessions
+            .filter((s) => s.status?.toLowerCase() === 'active')
+            .map((s) => (
+              <option key={s.id} value={s.id}>
+                {s.phone} {s.username ? `(@${s.username})` : ''}
+              </option>
+            ))}
+        </select>
+        {sessions.filter((s) => s.status?.toLowerCase() === 'active').length === 0 && (
+          <p className="mt-1 text-xs text-amber-400">
+            No active sessions available. Please login a session first.
+          </p>
+        )}
+        {errors.session && (
+          <p className="mt-1 text-xs text-red-400">{errors.session}</p>
+        )}
+      </div>
+
+      {/* Target Input */}
+      <div>
+        <label className={labelClass}>
+          <span className="flex items-center gap-1.5">
+            <Link className="w-3.5 h-3.5 text-gray-500" />
+            Group / Channel Link or ID
+          </span>
+        </label>
+        <div className="relative">
+          <input
+            type="text"
+            value={targetInput}
+            onChange={(e) => setTargetInput(e.target.value)}
+            placeholder="https://t.me/example_group or -1001234567890"
+            className={`${inputBase} ${errors.target ? inputError : inputNormal}`}
+          />
+        </div>
+        {errors.target && (
+          <p className="mt-1 text-xs text-red-400">{errors.target}</p>
+        )}
+      </div>
+
+      {/* Scrape Type Radio */}
+      <div>
+        <label className={labelClass}>
+          <span className="flex items-center gap-1.5">
+            <Radio className="w-3.5 h-3.5 text-gray-500" />
+            Type
+          </span>
+        </label>
+        <div className="flex gap-3">
+          <label
+            className={`flex-1 flex items-center gap-2 rounded-lg border px-4 py-2.5 cursor-pointer transition ${
+              scrapeType === 'group'
+                ? 'border-primary-500/50 bg-primary-500/10 text-primary-400'
+                : 'border-white/10 bg-dark-900 text-gray-400 hover:border-white/20'
+            }`}
+          >
+            <input
+              type="radio"
+              name="scrapeType"
+              value="group"
+              checked={scrapeType === 'group'}
+              onChange={() => setScrapeType('group')}
+              className="sr-only"
+            />
+            <UserGroupIcon className="w-4 h-4" />
+            <span className="text-sm font-medium">Group</span>
+          </label>
+          <label
+            className={`flex-1 flex items-center gap-2 rounded-lg border px-4 py-2.5 cursor-pointer transition ${
+              scrapeType === 'channel'
+                ? 'border-primary-500/50 bg-primary-500/10 text-primary-400'
+                : 'border-white/10 bg-dark-900 text-gray-400 hover:border-white/20'
+            }`}
+          >
+            <input
+              type="radio"
+              name="scrapeType"
+              value="channel"
+              checked={scrapeType === 'channel'}
+              onChange={() => setScrapeType('channel')}
+              className="sr-only"
+            />
+            <SignalIcon className="w-4 h-4" />
+            <span className="text-sm font-medium">Channel</span>
+          </label>
+        </div>
+      </div>
+
+      {/* Options */}
+      <div>
+        <label className={labelClass}>
+          <span className="flex items-center gap-1.5">
+            <Settings className="w-3.5 h-3.5 text-gray-500" />
+            Options
+          </span>
+        </label>
+        <div className="space-y-3 rounded-lg border border-white/5 bg-dark-900 p-4">
+          {/* Limit */}
+          <div>
+            <label className="text-xs text-gray-400 mb-1 block">User Limit</label>
+            <input
+              type="number"
+              min={1}
+              max={100000}
+              value={limit}
+              onChange={(e) => setLimit(Number(e.target.value))}
+              className={`${inputBase} ${errors.limit ? inputError : inputNormal}`}
+            />
+            {errors.limit && (
+              <p className="mt-1 text-xs text-red-400">{errors.limit}</p>
+            )}
+          </div>
+
+          {/* Filter Bots */}
+          <label className="flex items-center gap-2 cursor-pointer">
+            <input
+              type="checkbox"
+              checked={filterBots}
+              onChange={(e) => setFilterBots(e.target.checked)}
+              className="rounded border-white/20 bg-dark-900 text-primary-600 focus:ring-primary-500/50 focus:ring-offset-0"
+            />
+            <ShieldExclamationIcon className="w-4 h-4 text-gray-400" />
+            <span className="text-sm text-gray-300">Filter out bot accounts</span>
+          </label>
+
+          {/* Save to List */}
+          <div>
+            <label className="flex items-center gap-2 cursor-pointer mb-2">
+              <input
+                type="checkbox"
+                checked={saveToList}
+                onChange={(e) => setSaveToList(e.target.checked)}
+                className="rounded border-white/20 bg-dark-900 text-primary-600 focus:ring-primary-500/50 focus:ring-offset-0"
+              />
+              <ListBulletIcon className="w-4 h-4 text-gray-400" />
+              <span className="text-sm text-gray-300">Save users to a list</span>
+            </label>
+            {saveToList && (
+              <input
+                type="text"
+                value={listName}
+                onChange={(e) => setListName(e.target.value)}
+                placeholder="Enter list name..."
+                className={`${inputBase} ${errors.listName ? inputError : inputNormal}`}
+              />
+            )}
+            {errors.listName && (
+              <p className="mt-1 text-xs text-red-400">{errors.listName}</p>
+            )}
+          </div>
+        </div>
+      </div>
+
+      {/* Submit Button */}
+      <button
+        type="submit"
+        disabled={submitting}
+        className="w-full flex items-center justify-center gap-2 rounded-xl bg-gradient-to-r from-primary-600 to-blue-600 px-4 py-2.5 text-sm font-semibold text-white shadow-lg shadow-primary-600/25 transition-all duration-200 hover:from-primary-500 hover:to-blue-500 hover:shadow-primary-500/30 focus:outline-none focus:ring-2 focus:ring-primary-500/40 focus:ring-offset-2 focus:ring-offset-dark-800 disabled:cursor-not-allowed disabled:opacity-60"
+      >
+        {submitting ? (
+          <>
+            <Loader2 className="h-4 w-4 animate-spin" />
+            Starting Scrape...
+          </>
+        ) : (
+          <>
+            <Play className="h-4 w-4" />
+            Start Scrape
+          </>
+        )}
+      </button>
+    </form>
+  );
+}
+
+// --- Active Scrape Progress Panel ---
+function ActiveScrapePanel({ activeJobs, onCancel }) {
+  if (activeJobs.length === 0) {
+    return (
+      <div className="rounded-xl border border-white/5 bg-dark-800 p-6 flex flex-col items-center justify-center min-h-[200px]">
+        <ArrowPathIcon className="w-10 h-10 text-gray-600 mb-3" />
+        <p className="text-gray-400 font-medium">No active scrapes</p>
+        <p className="text-gray-500 text-sm mt-1">Start a scrape task to see progress here</p>
+      </div>
+    );
+  }
+
+  return (
+    <div className="rounded-xl border border-white/5 bg-dark-800 p-5">
+      <h3 className="mb-4 text-sm font-semibold text-white flex items-center gap-2">
+        <BoltIcon className="w-4 h-4 text-primary-500" />
+        Active Scrapes ({activeJobs.length})
+      </h3>
+      <div className="space-y-4">
+        {activeJobs.map((job) => {
+          const progress = job.progress || 0;
+          const variant =
+            job.status === 'error' || job.status === 'failed'
+              ? 'error'
+              : job.status === 'completed'
+              ? 'success'
+              : 'default';
+
+          return (
+            <div
+              key={job.id}
+              className="rounded-lg border border-white/5 bg-dark-900 p-4 space-y-3"
+            >
+              {/* Job Header */}
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-2">
+                  <StatusBadge status={job.status || 'running'} size="sm" />
+                  <span className="text-sm text-gray-300 truncate max-w-[200px]">
+                    {job.target || 'Unknown Target'}
+                  </span>
+                </div>
+                {(job.status === 'running' || job.status === 'queued' || job.status === 'pending') && (
+                  <button
+                    onClick={() => onCancel(job.id)}
+                    className="flex items-center gap-1 rounded-lg bg-red-500/10 border border-red-500/20 px-2.5 py-1 text-xs font-medium text-red-400 hover:bg-red-500/20 transition"
+                  >
+                    <StopCircle className="w-3 h-3" />
+                    Cancel
+                  </button>
+                )}
+              </div>
+
+              {/* Progress Bar */}
+              <div>
+                <div className="flex items-center justify-between mb-1.5">
+                  <span className="text-xs text-gray-400">Progress</span>
+                  <span className="text-xs font-medium text-white">
+                    {Math.round(progress)}%
+                  </span>
+                </div>
+                <div className="w-full bg-dark-800 rounded-full h-2 overflow-hidden">
+                  <div
+                    className={`h-2 rounded-full transition-all duration-500 ease-out ${
+                      variant === 'error'
+                        ? 'bg-red-500'
+                        : variant === 'success'
+                        ? 'bg-green-500'
+                        : 'bg-primary-600'
+                    }`}
+                    style={{ width: `${Math.min(100, Math.max(0, progress))}%` }}
+                  />
+                </div>
+              </div>
+
+              {/* Stats Row */}
+              <div className="flex items-center justify-between text-xs text-gray-400">
+                <span className="flex items-center gap-1">
+                  <Users className="w-3 h-3" />
+                  {formatNumber(job.users_found ?? 0)} users found
+                </span>
+                {job.limit && (
+                  <span>of {formatNumber(job.limit)} target</span>
+                )}
+              </div>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+// --- Export Modal ---
+function ExportModal({ job, isOpen, onClose, onExport }) {
+  const [format, setFormat] = useState('csv');
+  const [exporting, setExporting] = useState(false);
+
+  const handleExport = async () => {
+    setExporting(true);
+    try {
+      await onExport(job.id, format);
+      onClose();
+    } catch (err) {
+      // Error handled by caller
+    } finally {
+      setExporting(false);
+    }
+  };
+
+  const formats = [
+    { value: 'csv', label: 'CSV', description: 'Comma-separated values, openable in Excel' },
+    { value: 'json', label: 'JSON', description: 'Structured JSON array for programmatic use' },
+    { value: 'txt', label: 'TXT', description: 'Plain text, one user per line' },
+  ];
+
+  return (
+    <Modal isOpen={isOpen} onClose={onClose} title="Export Results" size="sm">
+      <div className="space-y-4">
+        <p className="text-sm text-gray-400">
+          Export scraped users from <span className="text-white font-medium">{job?.target || 'this job'}</span>
+        </p>
+
+        <div className="space-y-2">
+          {formats.map((f) => (
+            <label
+              key={f.value}
+              className={`flex items-start gap-3 rounded-lg border px-4 py-3 cursor-pointer transition ${
+                format === f.value
+                  ? 'border-primary-500/50 bg-primary-500/10'
+                  : 'border-white/10 bg-dark-900 hover:border-white/20'
+              }`}
+            >
+              <input
+                type="radio"
+                name="exportFormat"
+                value={f.value}
+                checked={format === f.value}
+                onChange={() => setFormat(f.value)}
+                className="mt-0.5 rounded-full border-white/20 bg-dark-900 text-primary-600 focus:ring-primary-500/50"
+              />
+              <div>
+                <p className="text-sm font-medium text-white">{f.label}</p>
+                <p className="text-xs text-gray-500">{f.description}</p>
+              </div>
+            </label>
+          ))}
+        </div>
+
+        <div className="flex gap-3 pt-2">
+          <button
+            onClick={onClose}
+            className="flex-1 rounded-lg border border-white/10 bg-dark-900 px-4 py-2.5 text-sm font-medium text-gray-300 hover:text-white hover:border-white/20 transition"
+          >
+            Cancel
+          </button>
+          <button
+            onClick={handleExport}
+            disabled={exporting}
+            className="flex-1 flex items-center justify-center gap-2 rounded-lg bg-primary-600 px-4 py-2.5 text-sm font-medium text-white hover:bg-primary-500 transition disabled:opacity-50 disabled:cursor-not-allowed"
+          >
+            {exporting ? (
+              <>
+                <Loader2 className="h-4 w-4 animate-spin" />
+                Exporting...
+              </>
+            ) : (
+              <>
+                <Download className="h-4 w-4" />
+                Export as {format.toUpperCase()}
+              </>
+            )}
+          </button>
+        </div>
+      </div>
+    </Modal>
+  );
+}
+
+// --- Main Scrape Page ---
+export default function Scrape() {
+  const { success: showSuccess, error: showError, info: showInfo } = useToast();
+  const { connect, on, off, connected } = useWebSocket();
+
+  const [sessions, setSessions] = useState([]);
+  const [jobs, setJobs] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [submitting, setSubmitting] = useState(false);
+  const [exportJobData, setExportJobData] = useState(null);
+  const [exportOpen, setExportOpen] = useState(false);
+  const [searchTerm, setSearchTerm] = useState('');
+  const [statusFilter, setStatusFilter] = useState('all');
+  const [currentPage, setCurrentPage] = useState(1);
+
+  const pageSize = 10;
+
+  // Fetch sessions for dropdown
+  const fetchSessions = useCallback(async () => {
+    try {
+      const response = await listSessions({ limit: 100 });
+      setSessions(response.data.data?.sessions || []);
+    } catch (err) {
+      console.warn('Failed to fetch sessions:', parseApiError(err));
+    }
+  }, []);
+
+  // Fetch scrape jobs
+  const fetchJobs = useCallback(async () => {
+    try {
+      const response = await getJobs({
+        page: currentPage,
+        limit: pageSize,
+        search: searchTerm || undefined,
+        status: statusFilter !== 'all' ? statusFilter : undefined,
+      });
+      setJobs(response.data.data?.jobs || []);
+    } catch (err) {
+      console.warn('Failed to fetch jobs:', parseApiError(err));
+    } finally {
+      setLoading(false);
+    }
+  }, [currentPage, searchTerm, statusFilter]);
+
+  useEffect(() => {
+    fetchSessions();
+    fetchJobs();
+  }, [fetchSessions, fetchJobs]);
+
+  // WebSocket connection for live progress
+  useEffect(() => {
+    const token = localStorage.getItem('token');
+    if (token) {
+      connect(token);
+    }
+    // Note: Event listeners are registered in the next useEffect
+    // Cleanup is handled there as well
+  }, [connect]);
+
+  // Listen for WebSocket scrape events
+  useEffect(() => {
+    const handleProgress = (data) => {
+      setJobs((prev) =>
+        prev.map((job) =>
+          job.id === data.job_id
+            ? { ...job, progress: data.progress, users_found: data.users_found, status: data.status }
+            : job
+        )
+      );
+    };
+
+    const handleCompleted = (data) => {
+      setJobs((prev) =>
+        prev.map((job) =>
+          job.id === data.job_id
+            ? { ...job, progress: 100, status: 'completed', users_found: data.users_found }
+            : job
+        )
+      );
+      showSuccess(`Scrape job ${data.job_id} completed with ${data.users_found} users.`, 'Scrape Complete');
+    };
+
+    const handleError = (data) => {
+      setJobs((prev) =>
+        prev.map((job) =>
+          job.id === data.job_id ? { ...job, status: 'error' } : job
+        )
+      );
+      showError(`Scrape job ${data.job_id} failed: ${data.error || 'Unknown error'}`, 'Scrape Error');
+    };
+
+    on('scrape_progress', handleProgress);
+    on('scrape_completed', handleCompleted);
+    on('scrape_error', handleError);
+
+    return () => {
+      off('scrape_progress', handleProgress);
+      off('scrape_completed', handleCompleted);
+      off('scrape_error', handleError);
+    };
+  }, [on, off, showSuccess, showError]);
+
+  // --- Actions ---
+  const handleScrape = async (data) => {
+    setSubmitting(true);
+    try {
+      const apiCall = data.type === 'group' ? scrapeGroup : scrapeChannel;
+      const payload = {
+        sessionId: data.sessionId,
+        limit: data.limit,
+        filterBots: data.filterBots,
+        saveToList: !!data.saveToList,
+      };
+
+      if (data.type === 'group') {
+        payload.groupId = data.target;
+      } else {
+        payload.channelId = data.target;
+      }
+
+      // If saveToList is a string (custom list name), use it as listName
+      if (typeof data.saveToList === 'string' && data.saveToList.trim()) {
+        payload.saveToList = true;
+        payload.listName = data.saveToList.trim();
+      }
+
+      const response = await apiCall(payload);
+      showSuccess(`Scrape started for ${data.type}: ${data.target}`, 'Scrape');
+      await fetchJobs();
+    } catch (err) {
+      showError(parseApiError(err), 'Scrape Failed');
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  const handleCancel = async (jobId) => {
+    try {
+      await cancelJob(jobId);
+      showSuccess(`Job ${jobId} cancelled.`, 'Cancelled');
+      setJobs((prev) =>
+        prev.map((job) =>
+          job.id === jobId ? { ...job, status: 'cancelled' } : job
+        )
+      );
+    } catch (err) {
+      showError(parseApiError(err), 'Cancel Failed');
+    }
+  };
+
+  const handleExport = async (jobId, format) => {
+    try {
+      const response = await exportJob(jobId, format);
+      const content = response.data;
+      const mimeTypes = {
+        csv: 'text/csv',
+        json: 'application/json',
+        txt: 'text/plain',
+      };
+      const extensions = {
+        csv: 'csv',
+        json: 'json',
+        txt: 'txt',
+      };
+      exportToFile(
+        typeof content === 'string' ? content : JSON.stringify(content, null, 2),
+        `scrape-${jobId}.${extensions[format]}`,
+        mimeTypes[format]
+      );
+      showSuccess(`Exported as ${format.toUpperCase()}.`, 'Export');
+    } catch (err) {
+      showError(parseApiError(err), 'Export Failed');
+      throw err;
+    }
+  };
+
+  // --- Filtered & paginated jobs ---
+  const activeJobs = jobs.filter(
+    (j) =>
+      j.status === 'running' ||
+      j.status === 'queued' ||
+      j.status === 'pending' ||
+      j.status === 'processing'
+  );
+
+  const filteredJobs = jobs.filter((j) => {
+    const matchesSearch =
+      !searchTerm ||
+      (j.target && j.target.toLowerCase().includes(searchTerm.toLowerCase())) ||
+      (j.id && String(j.id).toLowerCase().includes(searchTerm.toLowerCase()));
+    const matchesStatus =
+      statusFilter === 'all' ||
+      j.status?.toLowerCase() === statusFilter;
+    return matchesSearch && matchesStatus;
+  });
+
+  const totalPages = Math.ceil(filteredJobs.length / pageSize);
+  const paginatedJobs = filteredJobs.slice(
+    (currentPage - 1) * pageSize,
+    currentPage * pageSize
+  );
+
+  const getPageNumbers = () => {
+    const pages = [];
+    const maxVisible = 5;
+    if (totalPages <= maxVisible + 2) {
+      for (let i = 1; i <= totalPages; i++) pages.push(i);
+    } else {
+      pages.push(1);
+      if (currentPage > 3) pages.push('...');
+      const start = Math.max(2, currentPage - 1);
+      const end = Math.min(totalPages - 1, currentPage + 1);
+      for (let i = start; i <= end; i++) pages.push(i);
+      if (currentPage < totalPages - 2) pages.push('...');
+      pages.push(totalPages);
+    }
+    return pages;
+  };
+
+  return (
+    <div className="space-y-6">
+      {/* Page Header */}
+      <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
+        <div>
+          <h1 className="text-2xl font-bold tracking-tight text-white">Scrape</h1>
+          <p className="mt-1 text-sm text-gray-400">
+            Scrape users from Telegram groups and channels
+          </p>
+        </div>
+        {connected && (
+          <div className="flex items-center gap-1.5 text-xs text-green-400">
+            <span className="w-2 h-2 rounded-full bg-green-400 animate-pulse" />
+            Live updates connected
+          </div>
+        )}
+      </div>
+
+      {/* Main Content: Form + Active Progress */}
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+        {/* Left: Scrape Form */}
+        <div className="rounded-xl border border-white/5 bg-dark-800 p-5">
+          <h3 className="mb-4 text-sm font-semibold text-white flex items-center gap-2">
+            <FunnelIcon className="w-4 h-4 text-primary-500" />
+            New Scrape Task
+          </h3>
+          <ScrapeForm
+            sessions={sessions}
+            onSubmit={handleScrape}
+            submitting={submitting}
+          />
+        </div>
+
+        {/* Right: Active Progress */}
+        <ActiveScrapePanel activeJobs={activeJobs} onCancel={handleCancel} />
+      </div>
+
+      {/* Scrape History */}
+      <div>
+        <div className="flex flex-col sm:flex-row items-stretch sm:items-center justify-between gap-3 mb-4">
+          <h3 className="text-lg font-semibold text-white flex items-center gap-2">
+            <ArrowPathIcon className="w-5 h-5 text-primary-500" />
+            Scrape History
+          </h3>
+          <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-3">
+            <div className="relative">
+              <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-gray-500" />
+              <input
+                type="text"
+                value={searchTerm}
+                onChange={(e) => {
+                  setSearchTerm(e.target.value);
+                  setCurrentPage(1);
+                }}
+                placeholder="Search history..."
+                className="w-full sm:w-64 pl-10 pr-4 py-2 bg-dark-900 border border-white/10 rounded-lg text-sm text-white placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-primary-500/50 focus:border-primary-500 transition"
+              />
+            </div>
+            <div className="flex items-center gap-2">
+              {['all', 'running', 'completed', 'error', 'cancelled'].map((status) => (
+                <button
+                  key={status}
+                  onClick={() => {
+                    setStatusFilter(status);
+                    setCurrentPage(1);
+                  }}
+                  className={`px-3 py-1.5 rounded-lg text-xs font-medium border transition ${
+                    statusFilter === status
+                      ? 'bg-primary-500/15 border-primary-500/30 text-primary-400'
+                      : 'bg-dark-900 border-white/10 text-gray-400 hover:text-white hover:border-white/20'
+                  }`}
+                >
+                  {status.charAt(0).toUpperCase() + status.slice(1)}
+                </button>
+              ))}
+            </div>
+          </div>
+        </div>
+
+        {/* History Table */}
+        <div className="rounded-xl border border-white/5 bg-dark-800 overflow-hidden">
+          <div className="overflow-x-auto">
+            <table className="w-full">
+              <thead>
+                <tr className="border-b border-white/5">
+                  <th className="px-4 py-3 text-left text-xs font-semibold text-gray-400 uppercase tracking-wider">
+                    ID
+                  </th>
+                  <th className="px-4 py-3 text-left text-xs font-semibold text-gray-400 uppercase tracking-wider">
+                    Type
+                  </th>
+                  <th className="px-4 py-3 text-left text-xs font-semibold text-gray-400 uppercase tracking-wider">
+                    Target
+                  </th>
+                  <th className="px-4 py-3 text-left text-xs font-semibold text-gray-400 uppercase tracking-wider">
+                    Status
+                  </th>
+                  <th className="px-4 py-3 text-left text-xs font-semibold text-gray-400 uppercase tracking-wider">
+                    Progress
+                  </th>
+                  <th className="px-4 py-3 text-left text-xs font-semibold text-gray-400 uppercase tracking-wider">
+                    Found
+                  </th>
+                  <th className="px-4 py-3 text-right text-xs font-semibold text-gray-400 uppercase tracking-wider">
+                    Actions
+                  </th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-white/5">
+                {loading ? (
+                  <tr>
+                    <td colSpan={7} className="px-4 py-16">
+                      <div className="flex flex-col items-center justify-center">
+                        <Loader2 className="w-8 h-8 text-primary-500 animate-spin mb-3" />
+                        <p className="text-gray-400 text-sm">Loading scrape history...</p>
+                      </div>
+                    </td>
+                  </tr>
+                ) : paginatedJobs.length === 0 ? (
+                  <tr>
+                    <td colSpan={7} className="px-4 py-16">
+                      <div className="flex flex-col items-center justify-center">
+                        <div className="w-12 h-12 rounded-full bg-dark-900 flex items-center justify-center mb-3">
+                          <ArrowPathIcon className="w-5 h-5 text-gray-600" />
+                        </div>
+                        <p className="text-gray-400 font-medium">No scrape jobs found</p>
+                        <p className="text-gray-500 text-sm mt-1">
+                          Start a scrape task to see it here
+                        </p>
+                      </div>
+                    </td>
+                  </tr>
+                ) : (
+                  paginatedJobs.map((job) => {
+                    const progress = job.progress || 0;
+                    const isActive =
+                      job.status === 'running' ||
+                      job.status === 'queued' ||
+                      job.status === 'pending' ||
+                      job.status === 'processing';
+                    const isCompleted = job.status === 'completed';
+
+                    return (
+                      <tr key={job.id} className="transition-colors hover:bg-white/[0.02]">
+                        <td className="px-4 py-3">
+                          <span className="text-sm font-mono text-gray-400">
+                            #{job.id}
+                          </span>
+                        </td>
+                        <td className="px-4 py-3">
+                          <span
+                            className={`inline-flex items-center gap-1 text-xs font-medium px-2 py-0.5 rounded-full ${
+                              job.type === 'group'
+                                ? 'bg-blue-500/15 text-blue-400'
+                                : 'bg-purple-500/15 text-purple-400'
+                            }`}
+                          >
+                            {job.type === 'group' ? (
+                              <UserGroupIcon className="w-3 h-3" />
+                            ) : (
+                              <SignalIcon className="w-3 h-3" />
+                            )}
+                            {job.type ? job.type.charAt(0).toUpperCase() + job.type.slice(1) : 'N/A'}
+                          </span>
+                        </td>
+                        <td className="px-4 py-3">
+                          <span className="text-sm text-white truncate max-w-[200px] block">
+                            {job.target || 'N/A'}
+                          </span>
+                        </td>
+                        <td className="px-4 py-3">
+                          <StatusBadge status={job.status || 'pending'} size="sm" />
+                        </td>
+                        <td className="px-4 py-3">
+                          <div className="flex items-center gap-2 min-w-[120px]">
+                            <div className="flex-1 bg-dark-900 rounded-full h-1.5 overflow-hidden">
+                              <div
+                                className={`h-1.5 rounded-full transition-all duration-500 ${
+                                  job.status === 'error' || job.status === 'failed'
+                                    ? 'bg-red-500'
+                                    : job.status === 'completed'
+                                    ? 'bg-green-500'
+                                    : 'bg-primary-600'
+                                }`}
+                                style={{
+                                  width: `${Math.min(100, Math.max(0, progress))}%`,
+                                }}
+                              />
+                            </div>
+                            <span className="text-xs text-gray-400 w-10 text-right">
+                              {Math.round(progress)}%
+                            </span>
+                          </div>
+                        </td>
+                        <td className="px-4 py-3">
+                          <span className="text-sm font-medium text-white">
+                            {formatNumber(job.users_found ?? 0)}
+                          </span>
+                        </td>
+                        <td className="px-4 py-3 text-right">
+                          <div className="inline-flex items-center gap-1">
+                            {/* View */}
+                            <button
+                              className="p-1.5 rounded-lg text-gray-400 hover:text-primary-400 hover:bg-primary-500/10 transition"
+                              title="View Details"
+                            >
+                              <Eye className="w-4 h-4" />
+                            </button>
+                            {/* Cancel (active jobs) */}
+                            {isActive && (
+                              <button
+                                onClick={() => handleCancel(job.id)}
+                                className="p-1.5 rounded-lg text-gray-400 hover:text-red-400 hover:bg-red-500/10 transition"
+                                title="Cancel"
+                              >
+                                <StopCircle className="w-4 h-4" />
+                              </button>
+                            )}
+                            {/* Export (completed jobs) */}
+                            {isCompleted && (
+                              <button
+                                onClick={() => {
+                                  setExportJobData(job);
+                                  setExportOpen(true);
+                                }}
+                                className="p-1.5 rounded-lg text-gray-400 hover:text-green-400 hover:bg-green-500/10 transition"
+                                title="Export"
+                              >
+                                <Download className="w-4 h-4" />
+                              </button>
+                            )}
+                          </div>
+                        </td>
+                      </tr>
+                    );
+                  })
+                )}
+              </tbody>
+            </table>
+          </div>
+
+          {/* Pagination Footer */}
+          {!loading && totalPages > 1 && (
+            <div className="px-4 py-3 border-t border-white/5 flex flex-col sm:flex-row items-center justify-between gap-3">
+              <p className="text-sm text-gray-400">
+                Showing{' '}
+                <span className="text-gray-200 font-medium">
+                  {(currentPage - 1) * pageSize + 1}
+                </span>{' '}
+                to{' '}
+                <span className="text-gray-200 font-medium">
+                  {Math.min(currentPage * pageSize, filteredJobs.length)}
+                </span>{' '}
+                of{' '}
+                <span className="text-gray-200 font-medium">
+                  {filteredJobs.length}
+                </span>{' '}
+                results
+              </p>
+              <nav className="flex items-center gap-1" aria-label="Pagination">
+                <button
+                  onClick={() => setCurrentPage((p) => Math.max(1, p - 1))}
+                  disabled={currentPage === 1}
+                  className="p-2 rounded-lg text-gray-400 hover:text-white hover:bg-white/5 disabled:opacity-30 disabled:cursor-not-allowed transition"
+                  aria-label="Previous page"
+                >
+                  <ChevronLeft className="w-4 h-4" />
+                </button>
+                {getPageNumbers().map((page, i) =>
+                  typeof page === 'number' ? (
+                    <button
+                      key={i}
+                      onClick={() => setCurrentPage(page)}
+                      className={`min-w-[2rem] h-8 rounded-lg text-sm font-medium transition ${
+                        page === currentPage
+                          ? 'bg-primary-600 text-white'
+                          : 'text-gray-400 hover:text-white hover:bg-white/5'
+                      }`}
+                      aria-current={page === currentPage ? 'page' : undefined}
+                    >
+                      {page}
+                    </button>
+                  ) : (
+                    <span key={i} className="px-1 text-gray-500 text-sm">
+                      ...
+                    </span>
+                  )
+                )}
+                <button
+                  onClick={() => setCurrentPage((p) => Math.min(totalPages, p + 1))}
+                  disabled={currentPage === totalPages}
+                  className="p-2 rounded-lg text-gray-400 hover:text-white hover:bg-white/5 disabled:opacity-30 disabled:cursor-not-allowed transition"
+                  aria-label="Next page"
+                >
+                  <ChevronRight className="w-4 h-4" />
+                </button>
+              </nav>
+            </div>
+          )}
+        </div>
+      </div>
+
+      {/* Export Modal */}
+      <ExportModal
+        job={exportJobData}
+        isOpen={exportOpen}
+        onClose={() => {
+          setExportOpen(false);
+          setExportJobData(null);
+        }}
+        onExport={handleExport}
+      />
+    </div>
+  );
+}

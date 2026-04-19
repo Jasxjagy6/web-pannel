@@ -1,0 +1,2288 @@
+/**
+ * MessageService - Handles single messages, bulk messaging, and smart
+ * distribution of messages across multiple Telegram sessions.
+ *
+ * Includes a DistributionEngine for round-robin target splitting,
+ * real-time progress tracking via Redis, retry logic, rate limiting,
+ * and comprehensive message logging.
+ */
+
+const { pool } = require('../config/database');
+const telegramService = require('./telegramService');
+const logger = require('../utils/logger');
+const { AppError } = require('../utils/errorHandler');
+const { buildPagination, applyPagination, applySorting } = require('../utils/pagination');
+const { redisClient } = require('../config/redis');
+
+// =========================================================================
+// Constants
+// =========================================================================
+
+/**
+ * Maximum batch size for database transaction inserts.
+ */
+const LOG_BATCH_SIZE = 200;
+
+/**
+ * Maximum number of retries when a message fails with a non-fatal error.
+ */
+const MAX_RETRIES = 2;
+
+/**
+ * Redis TTL for progress keys (24 hours in seconds).
+ */
+const PROGRESS_TTL = 86400;
+
+/**
+ * Default minimum delay between messages (ms).
+ */
+const DEFAULT_DELAY_MIN = 1000;
+
+/**
+ * Default maximum delay between messages (ms).
+ */
+const DEFAULT_DELAY_MAX = 3000;
+
+/**
+ * Default maximum targets per session when not specified.
+ */
+const DEFAULT_MESSAGES_PER_SESSION = 500;
+
+/**
+ * Valid job status values.
+ */
+const VALID_JOB_STATUSES = ['pending', 'running', 'completed', 'cancelled', 'failed'];
+
+/**
+ * Valid message log status values.
+ */
+const VALID_LOG_STATUSES = ['sent', 'failed', 'skipped'];
+
+// =========================================================================
+// Utility Helpers
+// =========================================================================
+
+/**
+ * Sleep for the specified number of milliseconds.
+ * @param {number} ms - Milliseconds to sleep
+ * @returns {Promise<void>}
+ */
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Generate a random integer between min and max (inclusive).
+ * @param {number} min - Minimum value
+ * @param {number} max - Maximum value
+ * @returns {number}
+ */
+function randomInt(min, max) {
+  return Math.floor(Math.random() * (max - min + 1)) + min;
+}
+
+/**
+ * Parse a JSON field, returning null on failure.
+ * @param {*} value - The value to parse
+ * @returns {object|null}
+ */
+function parseJson(value) {
+  if (value === null || value === undefined) return null;
+  if (typeof value === 'object') return value;
+  if (typeof value === 'string') {
+    try {
+      return JSON.parse(value);
+    } catch {
+      return null;
+    }
+  }
+  return null;
+}
+
+/**
+ * Extract a user_id from a target object that may be a plain value or
+ * an object with various id field names.
+ * @param {string|number|object} target - The target identifier
+ * @returns {string|null} Normalized target ID string
+ */
+function normalizeTargetId(target) {
+  if (target === null || target === undefined) return null;
+  if (typeof target === 'object') {
+    return String(
+      target.telegram_id || target.id || target.userId || target.target_id || ''
+    );
+  }
+  return String(target);
+}
+
+/**
+ * Check if a Telegram error is retryable.
+ * @param {string} errorMessage - The error message
+ * @returns {boolean}
+ */
+function isRetryableError(errorMessage) {
+  if (!errorMessage) return false;
+  const nonRetryablePatterns = [
+    'SESSION_EXPIRED',
+    'SESSION_REVOKED',
+    'AUTH_KEY_UNREGISTERED',
+    'USER_BANNED_IN_CHANNEL',
+    'CHAT_WRITE_FORBIDDEN',
+    'CHAT_ID_INVALID',
+    'USER_ID_INVALID',
+    'INPUT_USER_DEACTIVATED',
+    'PEER_FLOOD',
+  ];
+  for (const pattern of nonRetryablePatterns) {
+    if (errorMessage.includes(pattern)) return false;
+  }
+  return true;
+}
+
+/**
+ * Check if an error indicates a fatal session problem that should
+ * halt the entire job.
+ * @param {string} errorMessage - The error message
+ * @returns {boolean}
+ */
+function isFatalSessionError(errorMessage) {
+  if (!errorMessage) return false;
+  const fatalPatterns = [
+    'SESSION_EXPIRED',
+    'SESSION_REVOKED',
+    'AUTH_KEY_UNREGISTERED',
+  ];
+  return fatalPatterns.some((p) => errorMessage.includes(p));
+}
+
+// =========================================================================
+// Distribution Engine
+// =========================================================================
+
+class DistributionEngine {
+  constructor() {
+    /**
+     * Per-session message counts for rate limiting tracking.
+     * @type {Map<string, number>}
+     */
+    this._sessionCounts = new Map();
+  }
+
+  /**
+   * Distribute a list of targets across available sessions using
+   * round-robin assignment, optionally capped by messagesPerSession.
+   *
+   * @param {Array<string|number|object>} targetList - Array of targets to distribute
+   * @param {Array<string|number>} availableSessions - Array of session IDs
+   * @param {object} options - Distribution options
+   * @param {number} options.messagesPerSession - Max targets per session (default: 500)
+   * @returns {Map<string, Array<string>>} Map of sessionId -> array of target IDs
+   */
+  async distributeTargets(targetList, availableSessions, options = {}) {
+    const { messagesPerSession = DEFAULT_MESSAGES_PER_SESSION } = options;
+
+    if (!targetList || targetList.length === 0) {
+      return new Map();
+    }
+
+    if (!availableSessions || availableSessions.length === 0) {
+      throw new AppError('No available sessions for message distribution', 400, 'NO_SESSIONS');
+    }
+
+    const distribution = new Map();
+
+    // Initialize empty arrays for each session
+    for (const sessionId of availableSessions) {
+      distribution.set(String(sessionId), []);
+    }
+
+    const sessionIds = availableSessions.map((s) => String(s));
+    let sessionIndex = 0;
+    let distributedCount = 0;
+
+    // Round-robin distribution with per-session cap
+    for (const target of targetList) {
+      const targetId = normalizeTargetId(target);
+      if (!targetId) continue;
+
+      // Find the next session that hasn't hit its cap
+      let assigned = false;
+      let attempts = 0;
+
+      while (attempts < sessionIds.length) {
+        const currentSession = sessionIds[sessionIndex % sessionIds.length];
+        const currentChunk = distribution.get(currentSession);
+
+        if (currentChunk.length < messagesPerSession) {
+          currentChunk.push(targetId);
+          assigned = true;
+          sessionIndex = (sessionIndex + 1) % sessionIds.length;
+          distributedCount++;
+          break;
+        }
+
+        sessionIndex = (sessionIndex + 1) % sessionIds.length;
+        attempts++;
+      }
+
+      if (!assigned) {
+        // All sessions are at capacity; assign to the least-loaded session
+        let minSession = sessionIds[0];
+        let minCount = Infinity;
+        for (const sid of sessionIds) {
+          const chunk = distribution.get(sid);
+          if (chunk.length < minCount) {
+            minCount = chunk.length;
+            minSession = sid;
+          }
+        }
+        distribution.get(minSession).push(targetId);
+        distributedCount++;
+      }
+    }
+
+    // Remove sessions that received no targets
+    for (const [sessionId, chunk] of distribution) {
+      if (chunk.length === 0) {
+        distribution.delete(sessionId);
+      }
+    }
+
+    logger.info(`Distributed ${distributedCount} targets across ${distribution.size} sessions`, {
+      sessionCounts: Object.fromEntries(
+        [...distribution].map(([sid, chunk]) => [sid, chunk.length])
+      ),
+    });
+
+    return distribution;
+  }
+
+  /**
+   * Execute a distributed messaging job, processing each session's chunk
+   * sequentially with progress tracking, retries, and cancellation support.
+   *
+   * @param {object} job - The messaging job record from the database
+   * @param {Map<string, string[]>} sessionMap - Map of sessionId -> target IDs
+   * @param {object} options - Execution options
+   * @param {number} options.delayMin - Min delay between messages (ms)
+   * @param {number} options.delayMax - Max delay between messages (ms)
+   * @param {string} options.messageType - Type of message (text, media, etc.)
+   * @param {string} options.mediaPath - Path to media file (if applicable)
+   * @param {object} options.messageOptions - Additional send options
+   * @returns {Promise<{ sent: number, failed: number, skipped: number }>}
+   */
+  async executeDistributedJob(job, sessionMap, options = {}) {
+    const {
+      delayMin = DEFAULT_DELAY_MIN,
+      delayMax = DEFAULT_DELAY_MAX,
+      messageType = 'text',
+      mediaPath = null,
+      messageOptions = {},
+    } = options;
+
+    const jobId = job.id;
+    const messageContent = job.message_content;
+    const totalTargets = job.total_count;
+
+    let totalSent = 0;
+    let totalFailed = 0;
+    let totalSkipped = 0;
+
+    // Buffer for batch logging
+    let logBuffer = [];
+
+    /**
+     * Flush the log buffer to the database in a transaction.
+     */
+    const flushLogBuffer = async () => {
+      if (logBuffer.length === 0) return;
+
+      const client = await pool.connect();
+      try {
+        await client.query('BEGIN');
+
+        for (const log of logBuffer) {
+          await client.query(
+            `INSERT INTO message_logs (job_id, session_id, target_id, status, error_message, sent_at)
+             VALUES ($1, $2, $3, $4, $5, NOW())`,
+            [jobId, log.sessionId, log.targetId, log.status, log.errorMessage || null]
+          );
+        }
+
+        await client.query('COMMIT');
+      } catch (error) {
+        await client.query('ROLLBACK');
+        logger.error(`Failed to flush message log buffer for job ${jobId}`, {
+          error: error.message,
+          bufferSize: logBuffer.length,
+        });
+      } finally {
+        client.release();
+      }
+
+      logBuffer = [];
+    };
+
+    /**
+     * Add a log entry to the buffer, flushing if full.
+     */
+    const addLog = async (sessionId, targetId, status, errorMessage = null) => {
+      logBuffer.push({ sessionId, targetId, status, errorMessage });
+
+      if (logBuffer.length >= LOG_BATCH_SIZE) {
+        await flushLogBuffer();
+      }
+    };
+
+    /**
+     * Update the progress in Redis for real-time UI updates.
+     */
+    const updateProgress = async (status) => {
+      const progressData = {
+        progress: totalTargets > 0 ? Math.round(((totalSent + totalFailed + totalSkipped) / totalTargets) * 100) : 0,
+        sent: totalSent,
+        failed: totalFailed,
+        skipped: totalSkipped,
+        status,
+        total: totalTargets,
+        updatedAt: new Date().toISOString(),
+      };
+
+      try {
+        if (redisClient && redisClient.isReady) {
+          await redisClient.set(
+            `message:progress:${jobId}`,
+            JSON.stringify(progressData),
+            { EX: PROGRESS_TTL }
+          );
+        }
+      } catch (redisError) {
+        logger.warn(`Failed to update Redis progress for job ${jobId}`, {
+          error: redisError.message,
+        });
+      }
+    };
+
+    /**
+     * Check if the job has been cancelled.
+     * @returns {Promise<boolean>}
+     */
+    const isCancelled = async () => {
+      try {
+        if (redisClient && redisClient.isReady) {
+          const cancelKey = `message:cancel:${jobId}`;
+          const val = await redisClient.get(cancelKey);
+          if (val === '1') return true;
+        }
+
+        // Also check the database as a fallback
+        const result = await pool.query(
+          'SELECT status FROM messaging_jobs WHERE id = $1',
+          [jobId]
+        );
+        if (result.rows.length > 0 && result.rows[0].status === 'cancelled') {
+          return true;
+        }
+      } catch {
+        // If we can't check, assume not cancelled
+      }
+      return false;
+    };
+
+    // Process each session's chunk
+    const sessions = [...sessionMap.entries()];
+
+    for (const [sessionId, targets] of sessions) {
+      // Check cancellation before starting each session
+      if (await isCancelled()) {
+        // Skip remaining targets
+        totalSkipped += targets.length;
+        for (const targetId of targets) {
+          await addLog(sessionId, targetId, 'skipped', 'Job was cancelled');
+        }
+        await updateProgress('cancelled');
+        break;
+      }
+
+      let sessionSent = 0;
+      let sessionFailed = 0;
+      let sessionSkipped = 0;
+
+      for (const targetId of targets) {
+        // Check cancellation between each message
+        if (await isCancelled()) {
+          totalSkipped += 1 + targets.slice(targets.indexOf(targetId) + 1).length;
+          await addLog(sessionId, targetId, 'skipped', 'Job was cancelled');
+          for (const remainingTarget of targets.slice(targets.indexOf(targetId) + 1)) {
+            await addLog(sessionId, remainingTarget, 'skipped', 'Job was cancelled');
+          }
+          await updateProgress('cancelled');
+          break;
+        }
+
+        // Attempt to send with retries
+        let success = false;
+        let lastError = null;
+        let usedSessionId = sessionId;
+
+        for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+          try {
+            // On retry, try a different session if available
+            if (attempt > 0) {
+              const otherSessions = [...sessionMap.keys()].filter(
+                (s) => s !== usedSessionId
+              );
+              if (otherSessions.length > 0) {
+                usedSessionId = otherSessions[
+                  Math.floor(Math.random() * otherSessions.length)
+                ];
+                logger.info(`Retry ${attempt}: switching to session ${usedSessionId} for target ${targetId}`);
+              }
+            }
+
+            if (messageType === 'text' || messageType === 'markdown') {
+              await telegramService.sendMessage(
+                usedSessionId,
+                targetId,
+                messageContent,
+                messageOptions
+              );
+            } else if (messageType === 'forward') {
+              const forwardOpts = parseJson(messageContent);
+              const sourceId = forwardOpts?.sourceId || forwardOpts?.source_id || '';
+              const msgId = forwardOpts?.messageId || forwardOpts?.message_id || 0;
+              await telegramService.forwardMessage(
+                usedSessionId,
+                targetId,
+                parseInt(msgId, 10),
+                sourceId
+              );
+            } else {
+              // Generic send for other types
+              await telegramService.sendMessage(
+                usedSessionId,
+                targetId,
+                messageContent,
+                messageOptions
+              );
+            }
+
+            success = true;
+            break;
+          } catch (sendError) {
+            lastError = sendError.message || String(sendError);
+
+            // If it's a fatal session error, don't retry
+            if (isFatalSessionError(lastError)) {
+              logger.error(`Fatal error on session ${usedSessionId}: ${lastError}`);
+              break;
+            }
+
+            // If not retryable, stop retrying
+            if (!isRetryableError(lastError)) {
+              break;
+            }
+
+            // Wait before retry (exponential backoff with jitter)
+            if (attempt < MAX_RETRIES) {
+              const backoffMs = Math.min(
+                delayMin * Math.pow(2, attempt) + randomInt(0, 500),
+                30000
+              );
+              logger.warn(
+                `Retry ${attempt + 1}/${MAX_RETRIES} for target ${targetId} after ${backoffMs}ms: ${lastError}`
+              );
+              await sleep(backoffMs);
+            }
+          }
+        }
+
+        if (success) {
+          totalSent++;
+          sessionSent++;
+          await addLog(usedSessionId, targetId, 'sent');
+        } else {
+          totalFailed++;
+          sessionFailed++;
+          await addLog(sessionId, targetId, 'failed', lastError);
+        }
+
+        // Update progress periodically
+        if ((totalSent + totalFailed + totalSkipped) % 50 === 0) {
+          await updateProgress('running');
+        }
+
+        // Rate limiting delay (only if successful, to avoid wasting time on failures)
+        if (success) {
+          const delay = randomInt(delayMin, delayMax);
+          await sleep(delay);
+        }
+      }
+
+      logger.info(`Session ${sessionId} chunk complete: ${sessionSent} sent, ${sessionFailed} failed, ${sessionSkipped} skipped`);
+    }
+
+    // Flush any remaining logs
+    await flushLogBuffer();
+
+    // Final progress update
+    await updateProgress('completed');
+
+    // Update the job record in the database
+    await pool.query(
+      `UPDATE messaging_jobs SET
+         status = $1,
+         sent_count = $2,
+         failed_count = $3,
+         skipped_count = $4,
+         completed_at = NOW()
+       WHERE id = $5`,
+      ['completed', totalSent, totalFailed, totalSkipped, jobId]
+    );
+
+    logger.info(`Distributed job ${jobId} completed: ${totalSent} sent, ${totalFailed} failed, ${totalSkipped} skipped`);
+
+    return { sent: totalSent, failed: totalFailed, skipped: totalSkipped };
+  }
+
+  /**
+   * Rate limiter: enforce a random delay between delayMin and delayMax
+   * to prevent account bans. Also tracks per-session message counts.
+   *
+   * @param {string} sessionId - The session identifier
+   * @param {number} delayMin - Minimum delay in milliseconds (default: 1000)
+   * @param {number} delayMax - Maximum delay in milliseconds (default: 3000)
+   * @returns {Promise<{ delay: number, sessionCount: number }>}
+   */
+  async rateLimiter(sessionId, delayMin = DEFAULT_DELAY_MIN, delayMax = DEFAULT_DELAY_MAX) {
+    const currentCount = this._sessionCounts.get(sessionId) || 0;
+    const newCount = currentCount + 1;
+    this._sessionCounts.set(sessionId, newCount);
+
+    // Calculate delay with adaptive scaling:
+    // As session message count increases, increase the delay range slightly
+    // to provide natural-looking behavior
+    const scaleFactor = Math.min(1 + Math.floor(newCount / 50) * 0.2, 3);
+    const adjustedMin = Math.round(delayMin * scaleFactor);
+    const adjustedMax = Math.round(delayMax * scaleFactor);
+
+    const delay = randomInt(adjustedMin, adjustedMax);
+    await sleep(delay);
+
+    return { delay, sessionCount: newCount };
+  }
+
+  /**
+   * Reset the session count tracker for a given session.
+   * @param {string} sessionId
+   */
+  resetSessionCount(sessionId) {
+    this._sessionCounts.delete(sessionId);
+  }
+
+  /**
+   * Get the current message count for a session.
+   * @param {string} sessionId
+   * @returns {number}
+   */
+  getSessionCount(sessionId) {
+    return this._sessionCounts.get(sessionId) || 0;
+  }
+}
+
+// =========================================================================
+// Message Service
+// =========================================================================
+
+class MessageService {
+  constructor() {
+    /**
+     * The distribution engine for splitting and executing bulk jobs.
+     * @type {DistributionEngine}
+     */
+    this.distributionEngine = new DistributionEngine();
+  }
+
+  // =========================================================================
+  // Single Message Operations
+  // =========================================================================
+
+  /**
+   * Send a single message to a target and log the result.
+   *
+   * @param {string|number} sessionId - Session database ID
+   * @param {string|number} targetId - Target user/group/channel ID
+   * @param {string} message - Message content
+   * @param {object} options - Send options (silent, noWebpage, replyTo, etc.)
+   * @param {number|string} userId - User ID for authorization
+   * @returns {Promise<{ success: boolean, messageId: number|null, targetId: string, date: string }>}
+   */
+  async sendMessage(sessionId, targetId, message, options = {}, userId) {
+    logger.info(`Sending single message`, { sessionId, targetId, userId });
+
+    // Verify the session belongs to the user
+    const session = await this._verifySessionOwnership(sessionId, userId);
+
+    try {
+      const result = await telegramService.sendMessage(
+        String(sessionId),
+        String(targetId),
+        message,
+        options
+      );
+
+      // Log the successful send
+      await pool.query(
+        `INSERT INTO message_logs (job_id, session_id, target_id, status, error_message, sent_at)
+         VALUES (NULL, $1, $2, $3, NULL, NOW())`,
+        [sessionId, String(targetId), 'sent']
+      );
+
+      return {
+        success: true,
+        messageId: result.messageId,
+        targetId: String(targetId),
+        date: result.date,
+      };
+    } catch (error) {
+      const errorMessage = error.message || String(error);
+
+      // Log the failure
+      await pool.query(
+        `INSERT INTO message_logs (job_id, session_id, target_id, status, error_message, sent_at)
+         VALUES (NULL, $1, $2, $3, $4, NOW())`,
+        [sessionId, String(targetId), 'failed', errorMessage]
+      );
+
+      logger.error(`Failed to send message to ${targetId}`, {
+        sessionId,
+        error: errorMessage,
+      });
+
+      return {
+        success: false,
+        messageId: null,
+        targetId: String(targetId),
+        error: errorMessage,
+      };
+    }
+  }
+
+  // =========================================================================
+  // Bulk Message Operations
+  // =========================================================================
+
+  /**
+   * Send bulk messages using the distribution engine to split targets
+   * across multiple sessions.
+   *
+   * @param {object} params - Bulk messaging parameters
+   * @param {Array<number|string>} params.sessionIds - Session IDs to use
+   * @param {Array<string|number|object>} params.targetList - Targets to message
+   * @param {string} params.message - Message content
+   * @param {string} params.messageType - Type: text, markdown, forward
+   * @param {string} params.mediaPath - Path to media file (optional)
+   * @param {number} params.delayMin - Minimum delay between messages (ms)
+   * @param {number} params.delayMax - Maximum delay between messages (ms)
+   * @param {number} params.messagesPerSession - Max targets per session
+   * @param {object} params.messageOptions - Additional send options
+   * @param {number|string} userId - User ID for authorization
+   * @returns {Promise<{
+   *   jobId: number,
+   *   status: string,
+   *   totalTargets: number,
+   *   sessionCount: number,
+   *   distribution: object
+   * }>}
+   */
+  async sendBulkMessage(params, userId) {
+    const {
+      sessionIds,
+      targetList,
+      message,
+      messageType = 'text',
+      mediaPath = null,
+      delayMin = DEFAULT_DELAY_MIN,
+      delayMax = DEFAULT_DELAY_MAX,
+      messagesPerSession = DEFAULT_MESSAGES_PER_SESSION,
+      messageOptions = {},
+      sourceType = 'manual',
+      sourceId = null,
+    } = params;
+
+    logger.info(`Starting bulk message job for user ${userId}`, {
+      sessionCount: sessionIds ? sessionIds.length : 0,
+      targetCount: targetList ? targetList.length : 0,
+      messageType,
+    });
+
+    // Validate inputs
+    if (!sessionIds || sessionIds.length === 0) {
+      throw new AppError('At least one session ID is required', 400, 'NO_SESSIONS');
+    }
+
+    if (!targetList || targetList.length === 0) {
+      throw new AppError('Target list cannot be empty', 400, 'EMPTY_TARGET_LIST');
+    }
+
+    if (!message || message.trim().length === 0) {
+      throw new AppError('Message content is required', 400, 'EMPTY_MESSAGE');
+    }
+
+    // Verify all sessions belong to the user
+    const verifiedSessions = await this._verifyMultipleSessionsOwnership(sessionIds, userId);
+    const verifiedSessionIds = verifiedSessions.map((s) => s.id);
+
+    if (verifiedSessionIds.length === 0) {
+      throw new AppError('No valid sessions found for this user', 404, 'NO_VALID_SESSIONS');
+    }
+
+    // Normalize target list to simple IDs
+    const normalizedTargets = targetList.map((t) => normalizeTargetId(t)).filter(Boolean);
+
+    if (normalizedTargets.length === 0) {
+      throw new AppError('No valid targets in the target list', 400, 'NO_VALID_TARGETS');
+    }
+
+    // Create the messaging job record
+    const jobResult = await pool.query(
+      `INSERT INTO messaging_jobs (
+         session_id,
+         job_type,
+         target_list,
+         message_content,
+         message_type,
+         media_path,
+         status,
+         total_count,
+         sent_count,
+         failed_count,
+         skipped_count,
+         options,
+         created_at
+       ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, NOW())
+       RETURNING id`,
+      [
+        verifiedSessionIds[0], // primary session (actual sessions in options)
+        'bulk',
+        JSON.stringify(normalizedTargets),
+        message,
+        messageType,
+        mediaPath,
+        'pending',
+        normalizedTargets.length,
+        0,
+        0,
+        0,
+        JSON.stringify({
+          sessionIds: verifiedSessionIds,
+          delayMin,
+          delayMax,
+          messagesPerSession,
+          messageOptions,
+          sourceType,
+          sourceId,
+        }),
+      ]
+    );
+
+    const jobId = jobResult.rows[0].id;
+
+    // Distribute targets across sessions
+    const sessionMap = await this.distributionEngine.distributeTargets(
+      normalizedTargets,
+      verifiedSessionIds,
+      { messagesPerSession }
+    );
+
+    const distributionObj = {};
+    for (const [sid, chunk] of sessionMap) {
+      distributionObj[sid] = chunk;
+    }
+
+    // Update job with running status
+    await pool.query(
+      "UPDATE messaging_jobs SET status = 'running' WHERE id = $1",
+      [jobId]
+    );
+
+    // Initialize Redis progress
+    try {
+      if (redisClient && redisClient.isReady) {
+        await redisClient.set(
+          `message:progress:${jobId}`,
+          JSON.stringify({
+            progress: 0,
+            sent: 0,
+            failed: 0,
+            skipped: 0,
+            status: 'running',
+            total: normalizedTargets.length,
+            updatedAt: new Date().toISOString(),
+          }),
+          { EX: PROGRESS_TTL }
+        );
+      }
+    } catch (redisError) {
+      logger.warn(`Failed to initialize Redis progress for job ${jobId}`, {
+        error: redisError.message,
+      });
+    }
+
+    // Execute the distributed job (non-blocking for large jobs)
+    // We run it in the foreground so the caller gets the final result,
+    // but for very large jobs the caller should use the job API to check status.
+    try {
+      const result = await this.distributionEngine.executeDistributedJob(
+        {
+          id: jobId,
+          message_content: message,
+          total_count: normalizedTargets.length,
+        },
+        sessionMap,
+        {
+          delayMin,
+          delayMax,
+          messageType,
+          mediaPath,
+          messageOptions,
+        }
+      );
+
+      logger.info(`Bulk message job ${jobId} completed`, {
+        sent: result.sent,
+        failed: result.failed,
+        skipped: result.skipped,
+      });
+
+      return {
+        jobId,
+        status: 'completed',
+        totalTargets: normalizedTargets.length,
+        sessionCount: sessionMap.size,
+        distribution: distributionObj,
+        results: result,
+      };
+    } catch (executionError) {
+      // Mark job as failed
+      await pool.query(
+        `UPDATE messaging_jobs SET status = 'failed', completed_at = NOW() WHERE id = $1`,
+        [jobId]
+      );
+
+      logger.error(`Bulk message job ${jobId} failed`, {
+        error: executionError.message,
+      });
+
+      throw new AppError(
+        `Bulk messaging job failed: ${executionError.message}`,
+        500,
+        'BULK_JOB_FAILED'
+      );
+    }
+  }
+
+  // =========================================================================
+  // Group Messaging
+  // =========================================================================
+
+  /**
+   * Send a message to a group or channel.
+   *
+   * @param {string|number} sessionId - Session database ID
+   * @param {string|number} groupId - Group/channel identifier
+   * @param {string} message - Message content
+   * @param {number|string} userId - User ID for authorization
+   * @returns {Promise<{ success: boolean, messageId: number|null, groupId: string }>}
+   */
+  async sendMessageToGroup(sessionId, groupId, message, userId) {
+    logger.info(`Sending message to group`, { sessionId, groupId, userId });
+
+    await this._verifySessionOwnership(sessionId, userId);
+
+    try {
+      const result = await telegramService.sendMessageToGroup(
+        String(sessionId),
+        String(groupId),
+        message
+      );
+
+      // Log the successful send
+      await pool.query(
+        `INSERT INTO message_logs (job_id, session_id, target_id, status, error_message, sent_at)
+         VALUES (NULL, $1, $2, $3, NULL, NOW())`,
+        [sessionId, String(groupId), 'sent']
+      );
+
+      return {
+        success: true,
+        messageId: result.messageId,
+        groupId: String(groupId),
+        date: result.date,
+      };
+    } catch (error) {
+      const errorMessage = error.message || String(error);
+
+      await pool.query(
+        `INSERT INTO message_logs (job_id, session_id, target_id, status, error_message, sent_at)
+         VALUES (NULL, $1, $2, $3, $4, NOW())`,
+        [sessionId, String(groupId), 'failed', errorMessage]
+      );
+
+      logger.error(`Failed to send message to group ${groupId}`, {
+        sessionId,
+        error: errorMessage,
+      });
+
+      return {
+        success: false,
+        messageId: null,
+        groupId: String(groupId),
+        error: errorMessage,
+      };
+    }
+  }
+
+  // =========================================================================
+  // Forwarding
+  // =========================================================================
+
+  /**
+   * Forward a message from one chat to another.
+   *
+   * @param {string|number} sessionId - Session database ID
+   * @param {string|number} targetId - Destination chat ID
+   * @param {number} messageId - Message ID to forward
+   * @param {string|number} sourceId - Source chat ID
+   * @param {number|string} userId - User ID for authorization
+   * @returns {Promise<{ success: boolean, messageId: number|null, sourceId: string, targetId: string }>}
+   */
+  async forwardMessage(sessionId, targetId, messageId, sourceId, userId) {
+    logger.info(`Forwarding message`, { sessionId, targetId, messageId, sourceId, userId });
+
+    await this._verifySessionOwnership(sessionId, userId);
+
+    try {
+      const result = await telegramService.forwardMessage(
+        String(sessionId),
+        String(targetId),
+        parseInt(messageId, 10),
+        String(sourceId)
+      );
+
+      // Log the successful forward
+      await pool.query(
+        `INSERT INTO message_logs (job_id, session_id, target_id, status, error_message, sent_at)
+         VALUES (NULL, $1, $2, $3, NULL, NOW())`,
+        [sessionId, String(targetId), 'sent']
+      );
+
+      return {
+        success: true,
+        messageId: result.messageId,
+        sourceId: String(sourceId),
+        targetId: String(targetId),
+        date: result.date,
+      };
+    } catch (error) {
+      const errorMessage = error.message || String(error);
+
+      await pool.query(
+        `INSERT INTO message_logs (job_id, session_id, target_id, status, error_message, sent_at)
+         VALUES (NULL, $1, $2, $3, $4, NOW())`,
+        [sessionId, String(targetId), 'failed', errorMessage]
+      );
+
+      logger.error(`Failed to forward message ${messageId}`, {
+        sessionId,
+        error: errorMessage,
+      });
+
+      return {
+        success: false,
+        messageId: null,
+        sourceId: String(sourceId),
+        targetId: String(targetId),
+        error: errorMessage,
+      };
+    }
+  }
+
+  // =========================================================================
+  // Job Management
+  // =========================================================================
+
+  /**
+   * Get detailed information about a messaging job including its logs.
+   *
+   * @param {number|string} jobId - Job database ID
+   * @param {number|string} userId - User ID for authorization
+   * @returns {Promise<{
+   *   job: object,
+   *   logs: Array<object>,
+   *   logCount: number,
+   *   progress: object|null
+   * }>}
+   */
+  async getJobDetails(jobId, userId) {
+    logger.info(`Fetching job details`, { jobId, userId });
+
+    // Fetch the job and verify ownership
+    const jobResult = await pool.query(
+      `SELECT mj.*, s.user_id
+       FROM messaging_jobs mj
+       JOIN sessions s ON mj.session_id = s.id
+       WHERE mj.id = $1 AND s.user_id = $2`,
+      [jobId, userId]
+    );
+
+    if (jobResult.rows.length === 0) {
+      throw new AppError('Messaging job not found or access denied', 404, 'JOB_NOT_FOUND');
+    }
+
+    const job = jobResult.rows[0];
+
+    // Fetch message logs for this job
+    const logsResult = await pool.query(
+      `SELECT id, job_id, session_id, target_id, status, error_message, sent_at
+       FROM message_logs
+       WHERE job_id = $1
+       ORDER BY sent_at DESC
+       LIMIT 1000`,
+      [jobId]
+    );
+
+    const logs = logsResult.rows.map((row) => ({
+      id: row.id,
+      jobId: row.job_id,
+      sessionId: row.session_id,
+      targetId: String(row.target_id),
+      status: row.status,
+      errorMessage: row.error_message,
+      sentAt: row.sent_at,
+    }));
+
+    // Get progress from Redis if available
+    let progress = null;
+    try {
+      if (redisClient && redisClient.isReady) {
+        const progressData = await redisClient.get(`message:progress:${jobId}`);
+        if (progressData) {
+          progress = JSON.parse(progressData);
+        }
+      }
+    } catch {
+      // Redis unavailable, progress will be null
+    }
+
+    // Compute summary stats from logs
+    const logStats = {
+      total: logs.length,
+      sent: logs.filter((l) => l.status === 'sent').length,
+      failed: logs.filter((l) => l.status === 'failed').length,
+      skipped: logs.filter((l) => l.status === 'skipped').length,
+    };
+
+    return {
+      job: {
+        id: job.id,
+        sessionId: job.session_id,
+        jobType: job.job_type,
+        targetList: parseJson(job.target_list),
+        messageContent: job.message_content,
+        messageType: job.message_type,
+        mediaPath: job.media_path,
+        status: job.status,
+        totalCount: job.total_count,
+        sentCount: job.sent_count,
+        failedCount: job.failed_count,
+        skippedCount: job.skipped_count,
+        options: parseJson(job.options),
+        createdAt: job.created_at,
+        completedAt: job.completed_at,
+      },
+      logs,
+      logStats,
+      progress,
+    };
+  }
+
+  /**
+   * List messaging jobs for a user with pagination, sorting, and filtering.
+   *
+   * @param {number|string} userId - User ID
+   * @param {object} params - Query parameters
+   * @param {number} params.page - Page number (default: 1)
+   * @param {number} params.limit - Items per page (default: 20)
+   * @param {string} params.sort - Sort field (default: 'created_at')
+   * @param {string} params.order - Sort order: ASC or DESC (default: 'DESC')
+   * @param {string} params.status - Filter by job status
+   * @returns {Promise<{ jobs: Array<object>, pagination: object }>}
+   */
+  async listJobs(userId, { page = 1, limit = 20, sort = 'created_at', order = 'DESC', status } = {}) {
+    logger.info(`Listing messaging jobs for user ${userId}`, { page, limit, sort, order, status });
+
+    const { offset, limit: pageSize } = applyPagination(null, page, limit);
+    const validSortFields = ['created_at', 'completed_at', 'total_count', 'sent_count', 'failed_count', 'id'];
+    const { field: sortField, order: sortOrder } = applySorting(sort, order, validSortFields);
+
+    const queryConditions = ['s.user_id = $1'];
+    const queryParams = [userId];
+    let paramIndex = 2;
+
+    if (status && VALID_JOB_STATUSES.includes(status)) {
+      queryConditions.push(`mj.status = $${paramIndex}`);
+      queryParams.push(status);
+      paramIndex++;
+    }
+
+    const whereClause = queryConditions.join(' AND ');
+
+    // Get total count
+    const countResult = await pool.query(
+      `SELECT COUNT(*) as total
+       FROM messaging_jobs mj
+       JOIN sessions s ON mj.session_id = s.id
+       WHERE ${whereClause}`,
+      queryParams
+    );
+    const total = parseInt(countResult.rows[0].total, 10);
+
+    // Get paginated results
+    const jobsResult = await pool.query(
+      `SELECT mj.id, mj.session_id, mj.job_type, mj.message_type,
+              mj.message_content, mj.media_path, mj.status,
+              mj.total_count, mj.sent_count, mj.failed_count, mj.skipped_count,
+              mj.options, mj.created_at, mj.completed_at,
+              s.phone as session_phone
+       FROM messaging_jobs mj
+       JOIN sessions s ON mj.session_id = s.id
+       WHERE ${whereClause}
+       ORDER BY mj.${sortField} ${sortOrder}
+       LIMIT $${paramIndex} OFFSET $${paramIndex + 1}`,
+      [...queryParams, pageSize, offset]
+    );
+
+    const jobs = jobsResult.rows.map((row) => ({
+      id: row.id,
+      sessionId: row.session_id,
+      sessionPhone: row.session_phone,
+      jobType: row.job_type,
+      messageType: row.message_type,
+      messageContent: row.message_content
+        ? (row.message_content.length > 100
+            ? row.message_content.substring(0, 100) + '...'
+            : row.message_content)
+        : null,
+      mediaPath: row.media_path,
+      status: row.status,
+      totalCount: row.total_count,
+      sentCount: row.sent_count,
+      failedCount: row.failed_count,
+      skippedCount: row.skipped_count,
+      options: parseJson(row.options),
+      createdAt: row.created_at,
+      completedAt: row.completed_at,
+    }));
+
+    const pagination = buildPagination(page, limit, total);
+
+    return { jobs, pagination };
+  }
+
+  /**
+   * Cancel a running messaging job.
+   *
+   * Sets the cancellation token in Redis and updates the job status.
+   *
+   * @param {number|string} jobId - Job database ID
+   * @param {number|string} userId - User ID for authorization
+   * @returns {Promise<{ success: boolean, jobId: number, previousStatus: string }>}
+   */
+  async cancelJob(jobId, userId) {
+    logger.info(`Cancelling messaging job`, { jobId, userId });
+
+    // Verify job ownership
+    const jobResult = await pool.query(
+      `SELECT mj.id, mj.status, s.user_id
+       FROM messaging_jobs mj
+       JOIN sessions s ON mj.session_id = s.id
+       WHERE mj.id = $1 AND s.user_id = $2`,
+      [jobId, userId]
+    );
+
+    if (jobResult.rows.length === 0) {
+      throw new AppError('Messaging job not found or access denied', 404, 'JOB_NOT_FOUND');
+    }
+
+    const job = jobResult.rows[0];
+    const previousStatus = job.status;
+
+    // Cannot cancel already finished jobs
+    if (['completed', 'cancelled', 'failed'].includes(job.status)) {
+      throw new AppError(
+        `Cannot cancel job in '${job.status}' status`,
+        400,
+        'JOB_NOT_CANCELABLE'
+      );
+    }
+
+    // Set cancellation token in Redis for fast detection by the execution engine
+    try {
+      if (redisClient && redisClient.isReady) {
+        await redisClient.set(`message:cancel:${jobId}`, '1', { EX: PROGRESS_TTL });
+      }
+    } catch (redisError) {
+      logger.warn(`Failed to set Redis cancellation token for job ${jobId}`, {
+        error: redisError.message,
+      });
+    }
+
+    // Update job status in the database
+    await pool.query(
+      `UPDATE messaging_jobs SET status = 'cancelled', completed_at = NOW() WHERE id = $1`,
+      [jobId]
+    );
+
+    // Update progress in Redis
+    try {
+      if (redisClient && redisClient.isReady) {
+        const progressData = await redisClient.get(`message:progress:${jobId}`);
+        if (progressData) {
+          const progress = JSON.parse(progressData);
+          progress.status = 'cancelled';
+          progress.updatedAt = new Date().toISOString();
+          await redisClient.set(
+            `message:progress:${jobId}`,
+            JSON.stringify(progress),
+            { EX: PROGRESS_TTL }
+          );
+        }
+      }
+    } catch {
+      // Non-critical
+    }
+
+    logger.info(`Job ${jobId} cancelled (was: ${previousStatus})`);
+
+    return {
+      success: true,
+      jobId: Number(jobId),
+      previousStatus,
+    };
+  }
+
+  // =========================================================================
+  // Message History
+  // =========================================================================
+
+  /**
+   * Get message history with filtering and pagination.
+   *
+   * @param {number|string} userId - User ID
+   * @param {object} params - Query parameters
+   * @param {number} params.page - Page number (default: 1)
+   * @param {number} params.limit - Items per page (default: 20)
+   * @param {string} params.status - Filter by log status (sent/failed/skipped)
+   * @param {number} params.sessionId - Filter by session ID
+   * @param {string} params.dateFrom - Start date filter (ISO string)
+   * @param {string} params.dateTo - End date filter (ISO string)
+   * @returns {Promise<{ logs: Array<object>, pagination: object, exportUrl: string }>}
+   */
+  async getMessageHistory(userId, { page = 1, limit = 20, status, sessionId, dateFrom, dateTo } = {}) {
+    logger.info(`Fetching message history for user ${userId}`, { page, limit, status, sessionId });
+
+    const { offset, limit: pageSize } = applyPagination(null, page, limit);
+
+    const queryConditions = ['s.user_id = $1'];
+    const queryParams = [userId];
+    let paramIndex = 2;
+
+    if (status && VALID_LOG_STATUSES.includes(status)) {
+      queryConditions.push(`ml.status = $${paramIndex}`);
+      queryParams.push(status);
+      paramIndex++;
+    }
+
+    if (sessionId) {
+      queryConditions.push(`ml.session_id = $${paramIndex}`);
+      queryParams.push(sessionId);
+      paramIndex++;
+    }
+
+    if (dateFrom) {
+      queryConditions.push(`ml.sent_at >= $${paramIndex}`);
+      queryParams.push(dateFrom);
+      paramIndex++;
+    }
+
+    if (dateTo) {
+      queryConditions.push(`ml.sent_at <= $${paramIndex}`);
+      queryParams.push(dateTo);
+      paramIndex++;
+    }
+
+    const whereClause = queryConditions.join(' AND ');
+
+    // Get total count
+    const countResult = await pool.query(
+      `SELECT COUNT(*) as total
+       FROM message_logs ml
+       JOIN sessions s ON ml.session_id = s.id
+       WHERE ${whereClause}`,
+      queryParams
+    );
+    const total = parseInt(countResult.rows[0].total, 10);
+
+    // Get paginated results
+    const logsResult = await pool.query(
+      `SELECT ml.id, ml.job_id, ml.session_id, ml.target_id,
+              ml.status, ml.error_message, ml.sent_at,
+              mj.job_type, mj.message_type,
+              s.phone as session_phone
+       FROM message_logs ml
+       JOIN sessions s ON ml.session_id = s.id
+       LEFT JOIN messaging_jobs mj ON ml.job_id = mj.id
+       WHERE ${whereClause}
+       ORDER BY ml.sent_at DESC
+       LIMIT $${paramIndex} OFFSET $${paramIndex + 1}`,
+      [...queryParams, pageSize, offset]
+    );
+
+    const logs = logsResult.rows.map((row) => ({
+      id: row.id,
+      jobId: row.job_id,
+      sessionId: row.session_id,
+      sessionPhone: row.session_phone,
+      targetId: String(row.target_id),
+      status: row.status,
+      errorMessage: row.error_message,
+      jobType: row.job_type,
+      messageType: row.message_type,
+      sentAt: row.sent_at,
+    }));
+
+    const pagination = buildPagination(page, limit, total);
+
+    return {
+      logs,
+      pagination,
+      exportUrl: `/api/messages/history/export?page=${page}&limit=${limit}&status=${status || ''}&sessionId=${sessionId || ''}&dateFrom=${dateFrom || ''}&dateTo=${dateTo || ''}`,
+    };
+  }
+
+  /**
+   * Export message history as JSON.
+   *
+   * @param {number|string} userId - User ID
+   * @param {object} params - Same filters as getMessageHistory
+   * @returns {Promise<{ export: Array<object>, total: number, exportedAt: string }>}
+   */
+  async exportMessageHistory(userId, { status, sessionId, dateFrom, dateTo } = {}) {
+    logger.info(`Exporting message history for user ${userId}`);
+
+    const queryConditions = ['s.user_id = $1'];
+    const queryParams = [userId];
+    let paramIndex = 2;
+
+    if (status && VALID_LOG_STATUSES.includes(status)) {
+      queryConditions.push(`ml.status = $${paramIndex}`);
+      queryParams.push(status);
+      paramIndex++;
+    }
+
+    if (sessionId) {
+      queryConditions.push(`ml.session_id = $${paramIndex}`);
+      queryParams.push(sessionId);
+      paramIndex++;
+    }
+
+    if (dateFrom) {
+      queryConditions.push(`ml.sent_at >= $${paramIndex}`);
+      queryParams.push(dateFrom);
+      paramIndex++;
+    }
+
+    if (dateTo) {
+      queryConditions.push(`ml.sent_at <= $${paramIndex}`);
+      queryParams.push(dateTo);
+      paramIndex++;
+    }
+
+    const whereClause = queryConditions.join(' AND ');
+
+    const exportResult = await pool.query(
+      `SELECT ml.id, ml.job_id, ml.session_id, ml.target_id,
+              ml.status, ml.error_message, ml.sent_at,
+              mj.job_type, mj.message_type, mj.message_content,
+              s.phone as session_phone
+       FROM message_logs ml
+       JOIN sessions s ON ml.session_id = s.id
+       LEFT JOIN messaging_jobs mj ON ml.job_id = mj.id
+       WHERE ${whereClause}
+       ORDER BY ml.sent_at DESC`,
+      queryParams
+    );
+
+    const exportData = exportResult.rows.map((row) => ({
+      id: row.id,
+      jobId: row.job_id,
+      sessionId: row.session_id,
+      sessionPhone: row.session_phone,
+      targetId: String(row.target_id),
+      status: row.status,
+      errorMessage: row.error_message,
+      jobType: row.job_type,
+      messageType: row.message_type,
+      messageContent: row.message_content,
+      sentAt: row.sent_at,
+    }));
+
+    return {
+      export: exportData,
+      total: exportData.length,
+      exportedAt: new Date().toISOString(),
+      format: 'json',
+    };
+  }
+
+  // =========================================================================
+  // Messaging Statistics
+  // =========================================================================
+
+  /**
+   * Get comprehensive messaging statistics for a user.
+   *
+   * @param {number|string} userId - User ID
+   * @returns {Promise<{
+   *   totalJobs: number,
+   *   totalMessages: number,
+   *   totalSent: number,
+   *   totalFailed: number,
+   *   totalSkipped: number,
+   *   successRate: number,
+   *   jobsByStatus: object,
+   *   messagesByStatus: object,
+   *   recentActivity: Array<object>,
+   *   topSessions: Array<object>,
+   *   dailyStats: Array<object>
+   * }>}
+   */
+  async getMessagingStats(userId) {
+    logger.info(`Fetching messaging stats for user ${userId}`);
+
+    // Total jobs
+    const totalJobsResult = await pool.query(
+      `SELECT COUNT(*) as total FROM messaging_jobs mj
+       JOIN sessions s ON mj.session_id = s.id
+       WHERE s.user_id = $1`,
+      [userId]
+    );
+    const totalJobs = parseInt(totalJobsResult.rows[0].total, 10);
+
+    // Aggregate counts from jobs
+    const jobCountsResult = await pool.query(
+      `SELECT
+         COALESCE(SUM(mj.total_count), 0) as total_messages,
+         COALESCE(SUM(mj.sent_count), 0) as total_sent,
+         COALESCE(SUM(mj.failed_count), 0) as total_failed,
+         COALESCE(SUM(mj.skipped_count), 0) as total_skipped
+       FROM messaging_jobs mj
+       JOIN sessions s ON mj.session_id = s.id
+       WHERE s.user_id = $1`,
+      [userId]
+    );
+
+    const jobCounts = jobCountsResult.rows[0];
+    const totalMessages = parseInt(jobCounts.total_messages, 10);
+    const totalSent = parseInt(jobCounts.total_sent, 10);
+    const totalFailed = parseInt(jobCounts.total_failed, 10);
+    const totalSkipped = parseInt(jobCounts.total_skipped, 10);
+    const successRate = totalMessages > 0
+      ? Math.round((totalSent / totalMessages) * 10000) / 100
+      : 0;
+
+    // Jobs by status
+    const jobsByStatusResult = await pool.query(
+      `SELECT mj.status, COUNT(*) as count
+       FROM messaging_jobs mj
+       JOIN sessions s ON mj.session_id = s.id
+       WHERE s.user_id = $1
+       GROUP BY mj.status`,
+      [userId]
+    );
+
+    const jobsByStatus = {};
+    for (const row of jobsByStatusResult.rows) {
+      jobsByStatus[row.status] = parseInt(row.count, 10);
+    }
+
+    // Message logs by status (including single messages not tied to jobs)
+    const messagesByStatusResult = await pool.query(
+      `SELECT ml.status, COUNT(*) as count
+       FROM message_logs ml
+       JOIN sessions s ON ml.session_id = s.id
+       WHERE s.user_id = $1
+       GROUP BY ml.status`,
+      [userId]
+    );
+
+    const messagesByStatus = {};
+    for (const row of messagesByStatusResult.rows) {
+      messagesByStatus[row.status] = parseInt(row.count, 10);
+    }
+
+    // Recent activity (last 10 messages)
+    const recentResult = await pool.query(
+      `SELECT ml.id, ml.target_id, ml.status, ml.error_message, ml.sent_at,
+              mj.job_type, s.phone as session_phone
+       FROM message_logs ml
+       JOIN sessions s ON ml.session_id = s.id
+       LEFT JOIN messaging_jobs mj ON ml.job_id = mj.id
+       WHERE s.user_id = $1
+       ORDER BY ml.sent_at DESC
+       LIMIT 10`,
+      [userId]
+    );
+
+    const recentActivity = recentResult.rows.map((row) => ({
+      id: row.id,
+      targetId: String(row.target_id),
+      status: row.status,
+      errorMessage: row.error_message,
+      jobType: row.job_type,
+      sessionPhone: row.session_phone,
+      sentAt: row.sent_at,
+    }));
+
+    // Top sessions by message count
+    const topSessionsResult = await pool.query(
+      `SELECT s.id, s.phone, COUNT(ml.id) as message_count,
+              COUNT(*) FILTER (WHERE ml.status = 'sent') as sent_count,
+              COUNT(*) FILTER (WHERE ml.status = 'failed') as failed_count
+       FROM message_logs ml
+       JOIN sessions s ON ml.session_id = s.id
+       WHERE s.user_id = $1
+       GROUP BY s.id, s.phone
+       ORDER BY message_count DESC
+       LIMIT 5`,
+      [userId]
+    );
+
+    const topSessions = topSessionsResult.rows.map((row) => ({
+      sessionId: row.id,
+      phone: row.phone,
+      messageCount: parseInt(row.message_count, 10),
+      sentCount: parseInt(row.sent_count, 10),
+      failedCount: parseInt(row.failed_count, 10),
+    }));
+
+    // Daily stats for the last 7 days
+    const dailyStatsResult = await pool.query(
+      `SELECT
+         DATE(ml.sent_at) as date,
+         COUNT(*) as total,
+         COUNT(*) FILTER (WHERE ml.status = 'sent') as sent,
+         COUNT(*) FILTER (WHERE ml.status = 'failed') as failed,
+         COUNT(*) FILTER (WHERE ml.status = 'skipped') as skipped
+       FROM message_logs ml
+       JOIN sessions s ON ml.session_id = s.id
+       WHERE s.user_id = $1
+         AND ml.sent_at >= NOW() - INTERVAL '7 days'
+       GROUP BY DATE(ml.sent_at)
+       ORDER BY date DESC`,
+      [userId]
+    );
+
+    const dailyStats = dailyStatsResult.rows.map((row) => ({
+      date: row.date,
+      total: parseInt(row.total, 10),
+      sent: parseInt(row.sent, 10),
+      failed: parseInt(row.failed, 10),
+      skipped: parseInt(row.skipped, 10),
+    }));
+
+    return {
+      totalJobs,
+      totalMessages,
+      totalSent,
+      totalFailed,
+      totalSkipped,
+      successRate,
+      jobsByStatus,
+      messagesByStatus,
+      recentActivity,
+      topSessions,
+      dailyStats,
+    };
+  }
+
+  // =========================================================================
+  // Preview / Test
+  // =========================================================================
+
+  /**
+   * Send a test/preview message to verify formatting and delivery.
+   * This is essentially a single message send with logging.
+   *
+   * @param {string|number} sessionId - Session database ID
+   * @param {string|number} targetId - Target to send the test message to
+   * @param {string} message - Message content to preview
+   * @param {number|string} userId - User ID for authorization
+   * @returns {Promise<{ success: boolean, messageId: number|null, targetId: string, date: string, error?: string }>}
+   */
+  async previewMessage(sessionId, targetId, message, userId) {
+    logger.info(`Previewing message`, { sessionId, targetId, userId });
+
+    await this._verifySessionOwnership(sessionId, userId);
+
+    if (!message || message.trim().length === 0) {
+      throw new AppError('Message content is required for preview', 400, 'EMPTY_MESSAGE');
+    }
+
+    try {
+      const result = await telegramService.sendMessage(
+        String(sessionId),
+        String(targetId),
+        message,
+        { silent: true }
+      );
+
+      // Log the preview
+      await pool.query(
+        `INSERT INTO message_logs (job_id, session_id, target_id, status, error_message, sent_at)
+         VALUES (NULL, $1, $2, $3, NULL, NOW())`,
+        [sessionId, String(targetId), 'sent']
+      );
+
+      return {
+        success: true,
+        messageId: result.messageId,
+        targetId: String(targetId),
+        date: result.date,
+        preview: true,
+      };
+    } catch (error) {
+      const errorMessage = error.message || String(error);
+
+      await pool.query(
+        `INSERT INTO message_logs (job_id, session_id, target_id, status, error_message, sent_at)
+         VALUES (NULL, $1, $2, $3, $4, NOW())`,
+        [sessionId, String(targetId), 'failed', errorMessage]
+      );
+
+      logger.error(`Preview message failed`, {
+        sessionId,
+        targetId,
+        error: errorMessage,
+      });
+
+      return {
+        success: false,
+        messageId: null,
+        targetId: String(targetId),
+        error: errorMessage,
+        preview: true,
+      };
+    }
+  }
+
+  // =========================================================================
+  // Real-time Progress Query
+  // =========================================================================
+
+  /**
+   * Get real-time progress for a job from Redis.
+   *
+   * @param {number|string} jobId - Job database ID
+   * @param {number|string} userId - User ID for authorization
+   * @returns {Promise<{ progress: number, sent: number, failed: number, skipped: number, status: string, total: number, updatedAt: string }>}
+   */
+  async getJobProgress(jobId, userId) {
+    // Verify job ownership first
+    const jobResult = await pool.query(
+      `SELECT mj.id, s.user_id
+       FROM messaging_jobs mj
+       JOIN sessions s ON mj.session_id = s.id
+       WHERE mj.id = $1 AND s.user_id = $2`,
+      [jobId, userId]
+    );
+
+    if (jobResult.rows.length === 0) {
+      throw new AppError('Messaging job not found or access denied', 404, 'JOB_NOT_FOUND');
+    }
+
+    // Try Redis first
+    try {
+      if (redisClient && redisClient.isReady) {
+        const progressData = await redisClient.get(`message:progress:${jobId}`);
+        if (progressData) {
+          return JSON.parse(progressData);
+        }
+      }
+    } catch {
+      // Redis unavailable, fall back to database
+    }
+
+    // Fallback to database
+    const job = jobResult.rows[0];
+    const dbResult = await pool.query(
+      'SELECT total_count, sent_count, failed_count, skipped_count, status FROM messaging_jobs WHERE id = $1',
+      [jobId]
+    );
+
+    if (dbResult.rows.length === 0) {
+      return { progress: 0, sent: 0, failed: 0, skipped: 0, status: 'unknown', total: 0 };
+    }
+
+    const row = dbResult.rows[0];
+    const total = parseInt(row.total_count, 10);
+    const sent = parseInt(row.sent_count, 10);
+    const failed = parseInt(row.failed_count, 10);
+    const skipped = parseInt(row.skipped_count, 10);
+    const completed = sent + failed + skipped;
+
+    return {
+      progress: total > 0 ? Math.round((completed / total) * 100) : 0,
+      sent,
+      failed,
+      skipped,
+      status: row.status,
+      total,
+      updatedAt: new Date().toISOString(),
+    };
+  }
+
+  // =========================================================================
+  // Queue-Based Bulk Messaging to Groups
+  // =========================================================================
+
+  /**
+   * Send messages to multiple groups with queue-based rate limiting.
+   * 
+   * Strategy:
+   * - Distribute groups across sessions in round-robin fashion
+   * - Each session sends to N groups, then waits for delay
+   * - Prevents hitting Telegram rate limits
+   * - Continues on failure (skips failed groups)
+   * 
+   * @param {object} params
+   * @param {number[]} params.sessionIds - Array of session IDs
+   * @param {string[]} params.groupIds - Array of group/channel IDs
+   * @param {string} params.message - Message content
+   * @param {string} params.messageType - 'text', 'html', or 'markdown'
+   * @param {number} params.delayBetweenRounds - Delay in seconds between rounds (default: 20)
+   * @param {number} userId - User ID
+   * @returns {Promise<{jobId, status, total, sent, failed, skipped}>}
+   */
+  async sendBulkToGroups(params, userId) {
+    const {
+      sessionIds,
+      groupIds,
+      message,
+      messageType = 'text',
+      delayBetweenRounds = 20,
+    } = params;
+
+    if (!userId) {
+      throw new AppError('User ID is required', 400, 'MISSING_USER_ID');
+    }
+
+    if (!sessionIds || sessionIds.length === 0) {
+      throw new AppError('At least one session is required', 400, 'NO_SESSIONS');
+    }
+
+    if (!groupIds || groupIds.length === 0) {
+      throw new AppError('At least one group is required', 400, 'NO_GROUPS');
+    }
+
+    if (!message || message.trim().length === 0) {
+      throw new AppError('Message is required', 400, 'EMPTY_MESSAGE');
+    }
+
+    // Verify session ownership
+    const verifiedSessions = await this._verifyMultipleSessionsOwnership(sessionIds, userId);
+    if (verifiedSessions.length === 0) {
+      throw new AppError('No valid sessions found', 404, 'NO_VALID_SESSIONS');
+    }
+
+    const numSessions = verifiedSessions.length;
+    const numGroups = groupIds.length;
+
+    logger.info(`Starting bulk group messaging: ${numGroups} groups, ${numSessions} sessions`, {
+      userId, numSessions, numGroups,
+    });
+
+    // Create job record
+    const jobResult = await pool.query(
+      `INSERT INTO messaging_jobs (
+        user_id, session_ids, job_type, status, total_count, message, message_type,
+        options, created_at
+      ) VALUES ($1, $2, 'bulk_groups', 'pending', $3, $4, $5, $6, NOW())
+      RETURNING id`,
+      [
+        userId,
+        JSON.stringify(sessionIds),
+        groupIds.length,
+        message,
+        messageType,
+        JSON.stringify({ delayBetweenRounds, groupIds }),
+      ]
+    );
+
+    const jobId = jobResult.rows[0].id;
+
+    // Start async processing
+    this._processBulkGroups(jobId, verifiedSessions, groupIds, message, messageType, delayBetweenRounds, userId)
+      .catch(err => {
+        logger.error(`Bulk groups job ${jobId} failed with error: ${err.message}`);
+      });
+
+    return {
+      jobId,
+      status: 'pending',
+      total: numGroups,
+      message: 'Job queued and will process in background',
+    };
+  }
+
+  /**
+   * Internal method to process bulk group messaging with rate limiting.
+   */
+  async _processBulkGroups(jobId, sessions, groupIds, message, messageType, delayBetweenRounds, userId) {
+    const numSessions = sessions.length;
+    const sentCount = { value: 0 };
+    const failedCount = { value: 0 };
+    const skippedCount = { value: 0 };
+    const results = [];
+
+    // Update job to running
+    await pool.query(
+      `UPDATE messaging_jobs SET status = 'running', started_at = NOW() WHERE id = $1`,
+      [jobId]
+    );
+
+    // Notify progress
+    await this._notifyProgress(jobId, {
+      job_id: jobId,
+      status: 'running',
+      total: groupIds.length * sessions.length,
+      sent: 0,
+      failed: 0,
+      skipped: 0,
+    });
+
+    try {
+      // Strategy: EACH session sends to EACH group
+      // Process in rounds to avoid rate limits
+      // Round 1: All sessions send to group 1
+      // Round 2: All sessions send to group 2
+      // etc.
+      
+      for (let g = 0; g < groupIds.length; g++) {
+        const groupId = groupIds[g];
+        
+        // Check if job was cancelled
+        const jobStatus = await pool.query('SELECT status FROM messaging_jobs WHERE id = $1', [jobId]);
+        if (jobStatus.rows[0]?.status === 'cancelled') {
+          logger.info(`Bulk groups job ${jobId} cancelled at group ${g}`);
+          await this._finalizeJob(jobId, 'cancelled', sentCount.value, failedCount.value, skippedCount.value, results);
+          return;
+        }
+
+        // Wait between groups (except first)
+        if (g > 0) {
+          const delayMs = delayBetweenRounds * 1000;
+          logger.info(`Waiting ${delayBetweenRounds}s before next group`, { jobId, group: g });
+          await sleep(delayMs);
+        }
+
+        // All sessions send to this group
+        for (const session of sessions) {
+          const result = { sessionId: session.id, groupId, success: false };
+
+          try {
+            // Send message to group
+            const sendResult = await telegramService.sendMessageToGroup(
+              String(session.id),
+              String(groupId),
+              message
+            );
+
+            result.success = true;
+            result.messageId = sendResult.messageId;
+            sentCount.value++;
+
+            // Log success - only if target_id is numeric
+            const targetIdNumeric = String(groupId).match(/^\d+$/) ? BigInt(String(groupId).replace(/^[^\d]*/, '')) : null;
+            if (targetIdNumeric) {
+              await pool.query(
+                `INSERT INTO message_logs (job_id, session_id, target_id, status, sent_at)
+                 VALUES ($1, $2, $3, 'sent', NOW())`,
+                [jobId, session.id, targetIdNumeric]
+              );
+            }
+
+          } catch (err) {
+            result.error = err.message;
+            failedCount.value++;
+
+            // Log failure
+            await pool.query(
+              `INSERT INTO message_logs (job_id, session_id, target_id, status, error_message, sent_at)
+               VALUES ($1, $2, $3, 'failed', $4, NOW())`,
+              [jobId, session.id, String(groupId), err.message]
+            );
+
+            logger.warn(`Failed to send message to group ${groupId} from session ${session.id}: ${err.message}`);
+          }
+
+          results.push(result);
+
+          // Update progress in Redis
+          await this._notifyProgress(jobId, {
+            job_id: jobId,
+            status: 'running',
+            total: groupIds.length * sessions.length,
+            sent: sentCount.value,
+            failed: failedCount.value,
+            skipped: skippedCount.value,
+            session_id: session.id,
+            group_id: groupId,
+          });
+        }
+      }
+
+      // Job completed
+      const finalStatus = 'completed';
+      await this._finalizeJob(jobId, finalStatus, sentCount.value, failedCount.value, skippedCount.value, results);
+
+      logger.info(`Bulk groups job ${jobId} completed: ${sentCount.value} sent, ${failedCount.value} failed`, {
+        jobId,
+      });
+
+    } catch (outerErr) {
+      logger.error(`Bulk groups job ${jobId} failed: ${outerErr.message}`);
+      await this._finalizeJob(jobId, 'failed', sentCount.value, failedCount.value, skippedCount.value, results);
+    }
+  }
+
+  // =========================================================================
+  // Queue-Based Bulk Messaging to Users (from scraped lists)
+  // =========================================================================
+
+  /**
+   * Send messages to multiple users with queue-based rate limiting.
+   * 
+   * Strategy:
+   * - Users are distributed across sessions
+   * - Each session sends to N users, then all sessions wait
+   * - Prevents hitting Telegram rate limits
+   * - Continues on failure (skips failed users)
+   * 
+   * @param {object} params
+   * @param {number[]} params.sessionIds - Array of session IDs
+   * @param {Array} params.users - Array of user objects with telegram_id
+   * @param {string} params.message - Message content
+   * @param {string} params.messageType - 'text', 'html', or 'markdown'
+   * @param {number} params.usersPerRound - Users per session per round (default: 5)
+   * @param {number} params.delayBetweenRounds - Delay in seconds between rounds (default: 60)
+   * @param {number} userId - User ID
+   * @returns {Promise<{jobId, status, total}>}
+   */
+  async sendBulkToUsers(params, userId) {
+    const {
+      sessionIds,
+      users,
+      message,
+      messageType = 'text',
+      usersPerRound = 5,
+      delayBetweenRounds = 60,
+    } = params;
+
+    if (!userId) {
+      throw new AppError('User ID is required', 400, 'MISSING_USER_ID');
+    }
+
+    if (!sessionIds || sessionIds.length === 0) {
+      throw new AppError('At least one session is required', 400, 'NO_SESSIONS');
+    }
+
+    if (!users || users.length === 0) {
+      throw new AppError('At least one user is required', 400, 'NO_USERS');
+    }
+
+    if (!message || message.trim().length === 0) {
+      throw new AppError('Message is required', 400, 'EMPTY_MESSAGE');
+    }
+
+    // Verify session ownership
+    const verifiedSessions = await this._verifyMultipleSessionsOwnership(sessionIds, userId);
+    if (verifiedSessions.length === 0) {
+      throw new AppError('No valid sessions found', 404, 'NO_VALID_SESSIONS');
+    }
+
+    const numSessions = verifiedSessions.length;
+    const numUsers = users.length;
+
+    logger.info(`Starting bulk user messaging: ${numUsers} users, ${numSessions} sessions`, {
+      userId, numSessions, numUsers,
+    });
+
+    // Create job record
+    const jobResult = await pool.query(
+      `INSERT INTO messaging_jobs (
+        user_id, session_ids, job_type, status, total_count, message, message_type,
+        options, created_at
+      ) VALUES ($1, $2, 'bulk_users', 'pending', $3, $4, $5, $6, NOW())
+      RETURNING id`,
+      [
+        userId,
+        JSON.stringify(sessionIds),
+        users.length,
+        message,
+        messageType,
+        JSON.stringify({ delayBetweenRounds, usersPerRound, userCount: users.length }),
+      ]
+    );
+
+    const jobId = jobResult.rows[0].id;
+
+    // Start async processing
+    this._processBulkUsers(jobId, verifiedSessions, users, message, messageType, usersPerRound, delayBetweenRounds, userId)
+      .catch(err => {
+        logger.error(`Bulk users job ${jobId} failed with error: ${err.message}`);
+      });
+
+    return {
+      jobId,
+      status: 'pending',
+      total: numUsers,
+      message: 'Job queued and will process in background',
+    };
+  }
+
+  /**
+   * Internal method to process bulk user messaging with rate limiting.
+   */
+  async _processBulkUsers(jobId, sessions, users, message, messageType, usersPerRound, delayBetweenRounds, userId) {
+    const numSessions = sessions.length;
+    const sentCount = { value: 0 };
+    const failedCount = { value: 0 };
+    const skippedCount = { value: 0 };
+    const results = [];
+
+    // Update job to running
+    await pool.query(
+      `UPDATE messaging_jobs SET status = 'running', started_at = NOW() WHERE id = $1`,
+      [jobId]
+    );
+
+    // Notify progress
+    await this._notifyProgress(jobId, {
+      job_id: jobId,
+      status: 'running',
+      total: users.length,
+      sent: 0,
+      failed: 0,
+      skipped: 0,
+    });
+
+    try {
+      // Distribute users across sessions in round-robin
+      // But process in batches: each session handles usersPerRound users, then wait
+      const sessionUsers = {}; // sessionId -> [user1, user2, ...]
+      
+      for (let i = 0; i < sessions.length; i++) {
+        sessionUsers[sessions[i].id] = [];
+      }
+
+      // Round-robin distribution
+      for (let i = 0; i < users.length; i++) {
+        const sessionIdx = i % numSessions;
+        sessionUsers[sessions[sessionIdx].id].push(users[i]);
+      }
+
+      // Process in rounds
+      let maxUsersPerSession = Math.max(...Object.values(sessionUsers).map(u => u.length));
+
+      for (let r = 0; r < maxUsersPerSession; r += usersPerRound) {
+        // Check if job was cancelled
+        const jobStatus = await pool.query('SELECT status FROM messaging_jobs WHERE id = $1', [jobId]);
+        if (jobStatus.rows[0]?.status === 'cancelled') {
+          logger.info(`Bulk users job ${jobId} cancelled at round ${r}`);
+          await this._finalizeJob(jobId, 'cancelled', sentCount.value, failedCount.value, skippedCount.value, results);
+          return;
+        }
+
+        // If not first round, wait for delay
+        if (r > 0) {
+          const delayMs = delayBetweenRounds * 1000;
+          logger.info(`Waiting ${delayBetweenRounds}s before next round`, { jobId, round: r });
+          await sleep(delayMs);
+        }
+
+        // Each session sends to usersPerRound users in this round
+        for (const session of sessions) {
+          const usersForSession = sessionUsers[session.id];
+          const batchEnd = Math.min(r + usersPerRound, usersForSession.length);
+
+          for (let u = r; u < batchEnd; u++) {
+            const user = usersForSession[u];
+            const userId_target = user.telegram_id || user.id;
+            const result = { sessionId: session.id, userId: userId_target, success: false };
+
+            try {
+              // Send message to user
+              const sendResult = await telegramService.sendMessage(
+                String(session.id),
+                String(userId_target),
+                message
+              );
+
+              result.success = true;
+              result.messageId = sendResult.messageId;
+              sentCount.value++;
+
+              // Log success
+              await pool.query(
+                `INSERT INTO message_logs (job_id, session_id, target_id, status, sent_at)
+                 VALUES ($1, $2, $3, 'sent', NOW())`,
+                [jobId, session.id, String(userId_target)]
+              );
+
+            } catch (err) {
+              result.error = err.message;
+              failedCount.value++;
+
+              // Log failure
+              await pool.query(
+                `INSERT INTO message_logs (job_id, session_id, target_id, status, error_message, sent_at)
+                 VALUES ($1, $2, $3, 'failed', $4, NOW())`,
+                [jobId, session.id, String(userId_target), err.message]
+              );
+
+              logger.warn(`Failed to send message to user ${userId_target} from session ${session.id}: ${err.message}`);
+            }
+
+            results.push(result);
+
+            // Update progress in Redis
+            await this._notifyProgress(jobId, {
+              job_id: jobId,
+              status: 'running',
+              total: users.length,
+              sent: sentCount.value,
+              failed: failedCount.value,
+              skipped: skippedCount.value,
+              session_id: session.id,
+              user_id: userId_target,
+            });
+          }
+        }
+      }
+
+      // Job completed
+      const finalStatus = 'completed';
+      await this._finalizeJob(jobId, finalStatus, sentCount.value, failedCount.value, skippedCount.value, results);
+
+      logger.info(`Bulk users job ${jobId} completed: ${sentCount.value} sent, ${failedCount.value} failed`, {
+        jobId,
+      });
+
+    } catch (outerErr) {
+      logger.error(`Bulk users job ${jobId} failed: ${outerErr.message}`);
+      await this._finalizeJob(jobId, 'failed', sentCount.value, failedCount.value, skippedCount.value, results);
+    }
+  }
+
+  // =========================================================================
+  // Internal Helpers
+  // =========================================================================
+
+  /**
+   * Verify that a session belongs to the specified user.
+   *
+   * @param {string|number} sessionId - Session database ID
+   * @param {number|string} userId - User ID
+   * @returns {Promise<{ id: number, user_id: number, status: string }>}
+   * @private
+   */
+  async _verifySessionOwnership(sessionId, userId) {
+    const result = await pool.query(
+      'SELECT id, user_id, status FROM sessions WHERE id = $1 AND user_id = $2',
+      [sessionId, userId]
+    );
+
+    if (result.rows.length === 0) {
+      throw new AppError('Session not found or access denied', 404, 'SESSION_NOT_FOUND');
+    }
+
+    return result.rows[0];
+  }
+
+  /**
+   * Verify that multiple sessions belong to the specified user.
+   *
+   * @param {Array<string|number>} sessionIds - Array of session IDs
+   * @param {number|string} userId - User ID
+   * @returns {Promise<Array<{ id: number, user_id: number, status: string }>>}
+   * @private
+   */
+  async _verifyMultipleSessionsOwnership(sessionIds, userId) {
+    if (!sessionIds || sessionIds.length === 0) return [];
+
+    const result = await pool.query(
+      'SELECT id, user_id, status FROM sessions WHERE id = ANY($1::int[]) AND user_id = $2',
+      [sessionIds.map((s) => parseInt(s, 10)), userId]
+    );
+
+    return result.rows;
+  }
+
+  /**
+   * Send progress notification via Redis for WebSocket broadcast.
+   */
+  async _notifyProgress(jobId, data) {
+    try {
+      if (redisClient.isReady) {
+        const key = `message:progress:${jobId}`;
+        await redisClient.set(key, JSON.stringify(data), { EX: PROGRESS_TTL });
+      }
+    } catch (err) {
+      logger.error(`Failed to notify progress for job ${jobId}`, { error: err.message });
+    }
+  }
+
+  /**
+   * Finalize a messaging job with final status and counts.
+   */
+  async _finalizeJob(jobId, status, sentCount, failedCount, skippedCount, results) {
+    try {
+      await pool.query(
+        `UPDATE messaging_jobs 
+         SET status = $1, sent_count = $2, failed_count = $3, skipped_count = $4,
+             completed_at = NOW(), results = $5
+         WHERE id = $6`,
+        [status, sentCount, failedCount, skippedCount, JSON.stringify(results.slice(-500)), jobId]
+      );
+
+      // Notify completion via Redis
+      await this._notifyProgress(jobId, {
+        job_id: jobId,
+        status,
+        sent: sentCount,
+        failed: failedCount,
+        skipped: skippedCount,
+      });
+    } catch (err) {
+      logger.error(`Failed to finalize job ${jobId}`, { error: err.message });
+    }
+  }
+}
+
+// =========================================================================
+// Export
+// =========================================================================
+
+module.exports = new MessageService();

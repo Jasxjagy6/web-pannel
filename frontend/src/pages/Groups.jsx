@@ -1,0 +1,1079 @@
+import { useState, useEffect, useCallback } from 'react';
+import { useWebSocket } from '../hooks/useWebSocket';
+import { listSessions } from '../api/sessions';
+import { groupsAPI } from '../api/groups';
+import { listsAPI } from '../api/lists';
+import { parseApiError, formatNumber, formatRelativeTime, formatDateTime } from '../utils/formatters';
+import { useToast } from '../components/common/Toast';
+import { Modal } from '../components/common/Modal';
+import StatusBadge from '../components/common/StatusBadge';
+import {
+  Loader2,
+  X,
+  Eye,
+  StopCircle,
+  Users,
+  Settings,
+  ChevronLeft,
+  ChevronRight,
+  AlertTriangle,
+  CheckCircle,
+  Clock,
+  UserPlus,
+  Search,
+  Link,
+  Hash,
+  ListFilter,
+  AlertCircle,
+  Info,
+  Group,
+  Radio,
+  Check,
+  LogIn,
+  LogOut,
+} from 'lucide-react';
+import {
+  UserGroupIcon,
+  PaperClipIcon,
+  ExclamationTriangleIcon,
+} from '@heroicons/react/24/outline';
+
+// ============================================================
+// Join/Leave Form Sub-Component
+// ============================================================
+
+function JoinLeaveForm({ sessions, onSubmit, submitting }) {
+  const [mode, setMode] = useState('join'); // 'join' or 'leave'
+  const [targetIds, setTargetIds] = useState('');
+  const [selectedSessionIds, setSelectedSessionIds] = useState([]);
+  const [errors, setErrors] = useState({});
+  const [showAllSessions, setShowAllSessions] = useState(false);
+
+  const validate = () => {
+    const newErrors = {};
+    if (!targetIds.trim()) newErrors.targetIds = 'Please enter at least one group/channel.';
+    if (selectedSessionIds.length === 0) newErrors.session = 'Please select at least one session.';
+    setErrors(newErrors);
+    return Object.keys(newErrors).length === 0;
+  };
+
+  const handleSubmit = (e) => {
+    e.preventDefault();
+    if (!validate()) return;
+
+    const targets = targetIds
+      .split('\n')
+      .map(t => t.trim())
+      .filter(t => t.length > 0);
+
+    onSubmit({
+      mode,
+      targetIds: targets,
+      sessionIds: selectedSessionIds,
+    });
+
+    // Reset
+    setTargetIds('');
+    setSelectedSessionIds([]);
+    setErrors({});
+  };
+
+  const toggleSession = (sessionId) => {
+    setSelectedSessionIds(prev =>
+      prev.includes(sessionId)
+        ? prev.filter(id => id !== sessionId)
+        : [...prev, sessionId]
+    );
+  };
+
+  const selectAllSessions = () => {
+    const activeIds = activeSessions.map(s => s.id);
+    setSelectedSessionIds(activeIds);
+  };
+
+  const deselectAllSessions = () => {
+    setSelectedSessionIds([]);
+  };
+
+  const inputBase = 'w-full rounded-lg border bg-dark-900 py-2.5 px-3 text-sm text-white placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-primary-500/50 focus:border-primary-500 transition';
+  const inputError = 'border-red-500/50';
+  const inputNormal = 'border-white/10';
+  const labelClass = 'mb-1.5 block text-sm font-medium text-gray-300';
+
+  const activeSessions = sessions.filter((s) => s.status?.toLowerCase() === 'active' || s.is_logged_in);
+  const displayedSessions = showAllSessions ? sessions : activeSessions;
+
+  return (
+    <form onSubmit={handleSubmit} className="space-y-5">
+      {/* Mode Toggle */}
+      <div>
+        <label className={labelClass}>
+          <span className="flex items-center gap-1.5">
+            <Radio className="w-3.5 h-3.5 text-gray-500" />
+            Action
+          </span>
+        </label>
+        <div className="flex gap-2">
+          <button
+            type="button"
+            onClick={() => setMode('join')}
+            className={`flex-1 rounded-lg border px-4 py-2.5 text-sm font-medium transition flex items-center justify-center gap-2 ${
+              mode === 'join'
+                ? 'border-green-500/50 bg-green-500/10 text-green-400'
+                : 'border-white/10 bg-dark-900 text-gray-400 hover:text-white'
+            }`}
+          >
+            <LogIn className="w-4 h-4" />
+            Join
+          </button>
+          <button
+            type="button"
+            onClick={() => setMode('leave')}
+            className={`flex-1 rounded-lg border px-4 py-2.5 text-sm font-medium transition flex items-center justify-center gap-2 ${
+              mode === 'leave'
+                ? 'border-red-500/50 bg-red-500/10 text-red-400'
+                : 'border-white/10 bg-dark-900 text-gray-400 hover:text-white'
+            }`}
+          >
+            <LogOut className="w-4 h-4" />
+            Leave
+          </button>
+        </div>
+      </div>
+
+      {/* Target IDs */}
+      <div>
+        <label className={labelClass}>
+          <span className="flex items-center gap-1.5">
+            <Link className="w-3.5 h-3.5 text-gray-500" />
+            Groups/Channels (one per line)
+          </span>
+        </label>
+        <textarea
+          value={targetIds}
+          onChange={(e) => setTargetIds(e.target.value)}
+          placeholder="https://t.me/example_group
+or @example_channel
+or -1001234567890
+(one per line, multiple supported)"
+          rows={4}
+          className={`${inputBase} ${errors.targetIds ? inputError : inputNormal} resize-none`}
+        />
+        {errors.targetIds && <p className="mt-1 text-xs text-red-400">{errors.targetIds}</p>}
+        <p className="mt-1 text-xs text-gray-500">
+          Enter one group/channel link or ID per line. You can join/leave multiple at once.
+        </p>
+      </div>
+
+      {/* Session Selection (Multi-Select) */}
+      <div>
+        <label className={labelClass}>
+          <span className="flex items-center gap-1.5">
+            <Users className="w-3.5 h-3.5 text-gray-500" />
+            Sessions ({selectedSessionIds.length} selected)
+          </span>
+        </label>
+
+        <div className="flex gap-2 mb-2">
+          <button type="button" onClick={selectAllSessions} className="text-xs text-primary-400 hover:text-primary-300">
+            Select All Active
+          </button>
+          <span className="text-xs text-gray-600">|</span>
+          <button type="button" onClick={deselectAllSessions} className="text-xs text-gray-400 hover:text-gray-300">
+            Deselect All
+          </button>
+        </div>
+
+        <div className="max-h-36 overflow-y-auto rounded-lg border border-white/10 bg-dark-900 p-2 space-y-1">
+          {displayedSessions.map((s) => {
+            const isSelected = selectedSessionIds.includes(s.id);
+            const isActive = s.status?.toLowerCase() === 'active' || s.is_logged_in;
+            return (
+              <button
+                key={s.id}
+                type="button"
+                onClick={() => toggleSession(s.id)}
+                className={`w-full flex items-center gap-2 px-3 py-2 rounded-md text-sm transition ${
+                  isSelected
+                    ? 'bg-primary-500/20 text-primary-300 border border-primary-500/30'
+                    : 'hover:bg-white/5 text-gray-300 border border-transparent'
+                } ${!isActive ? 'opacity-50' : ''}`}
+                disabled={!isActive}
+              >
+                <div className={`w-4 h-4 rounded border flex items-center justify-center flex-shrink-0 ${
+                  isSelected ? 'border-primary-500 bg-primary-500/30' : 'border-gray-600'
+                }`}>
+                  {isSelected && <Check className="w-3 h-3 text-primary-400" />}
+                </div>
+                <span className="truncate">{s.phone || s.id}</span>
+                {s.username && <span className="text-gray-500 text-xs">@{s.username}</span>}
+              </button>
+            );
+          })}
+        </div>
+        {errors.session && <p className="mt-1 text-xs text-red-400">{errors.session}</p>}
+        {activeSessions.length === 0 && (
+          <p className="mt-1 text-xs text-amber-400">No active sessions. Please login first.</p>
+        )}
+      </div>
+
+      {/* Submit Button */}
+      <button
+        type="submit"
+        disabled={submitting}
+        className={`w-full flex items-center justify-center gap-2 rounded-xl px-4 py-2.5 text-sm font-semibold text-white shadow-lg transition-all duration-200 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-offset-dark-800 disabled:cursor-not-allowed disabled:opacity-60 ${
+          mode === 'join'
+            ? 'bg-gradient-to-r from-green-600 to-emerald-600 shadow-green-600/25 hover:from-green-500 hover:to-emerald-500 hover:shadow-green-500/30 focus:ring-green-500'
+            : 'bg-gradient-to-r from-red-600 to-rose-600 shadow-red-600/25 hover:from-red-500 hover:to-rose-500 hover:shadow-red-500/30 focus:ring-red-500'
+        }`}
+      >
+        {submitting ? (
+          <>
+            <Loader2 className="h-4 w-4 animate-spin" />
+            Processing...
+          </>
+        ) : (
+          <>
+            {mode === 'join' ? <LogIn className="h-4 w-4" /> : <LogOut className="h-4 w-4" />}
+            {mode === 'join' ? 'Join All' : 'Leave All'}
+          </>
+        )}
+      </button>
+    </form>
+  );
+}
+
+// ============================================================
+// Add Members Form Sub-Component
+// ============================================================
+
+function AddMembersForm({ sessions, targetLists, onSubmit, submitting }) {
+  const [sourceList, setSourceList] = useState('');
+  const [targetType, setTargetType] = useState('group'); // 'group' or 'channel'
+  const [targetIds, setTargetIds] = useState('');
+  const [selectedSessionIds, setSelectedSessionIds] = useState([]);
+  const [delayMin, setDelayMin] = useState(30);
+  const [delayMax, setDelayMax] = useState(60);
+  const [batchSize, setBatchSize] = useState(5);
+  const [errors, setErrors] = useState({});
+  const [showAllSessions, setShowAllSessions] = useState(false);
+
+  const validate = () => {
+    const newErrors = {};
+    if (!sourceList) newErrors.sourceList = 'Please select a source list.';
+    if (!targetIds.trim()) newErrors.targetIds = 'Please enter at least one target.';
+    if (selectedSessionIds.length === 0) newErrors.session = 'Please select at least one session.';
+    if (delayMin < 1 || delayMin > 600) newErrors.delayMin = 'Min delay must be between 1 and 600.';
+    if (delayMax < 1 || delayMax > 600) newErrors.delayMax = 'Max delay must be between 1 and 600.';
+    if (delayMin > delayMax) newErrors.delayMin = 'Min delay cannot exceed max delay.';
+    if (batchSize < 1 || batchSize > 100) newErrors.batchSize = 'Batch size must be between 1 and 100.';
+    setErrors(newErrors);
+    return Object.keys(newErrors).length === 0;
+  };
+
+  const handleSubmit = (e) => {
+    e.preventDefault();
+    if (!validate()) return;
+
+    const targets = targetIds
+      .split('\n')
+      .map(t => t.trim())
+      .filter(t => t.length > 0);
+
+    onSubmit({
+      sourceList,
+      targetIds: targets,
+      targetType,
+      sessionIds: selectedSessionIds,
+      delayMin: Number(delayMin),
+      delayMax: Number(delayMax),
+      batchSize: Number(batchSize),
+    });
+
+    // Reset
+    setSourceList('');
+    setTargetIds('');
+    setSelectedSessionIds([]);
+    setDelayMin(30);
+    setDelayMax(60);
+    setBatchSize(5);
+    setErrors({});
+  };
+
+  const toggleSession = (sessionId) => {
+    setSelectedSessionIds(prev =>
+      prev.includes(sessionId)
+        ? prev.filter(id => id !== sessionId)
+        : [...prev, sessionId]
+    );
+  };
+
+  const selectAllSessions = () => {
+    const activeIds = activeSessions.map(s => s.id);
+    setSelectedSessionIds(activeIds);
+  };
+
+  const deselectAllSessions = () => {
+    setSelectedSessionIds([]);
+  };
+
+  const inputBase = 'w-full rounded-lg border bg-dark-900 py-2.5 px-3 text-sm text-white placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-primary-500/50 focus:border-primary-500 transition';
+  const inputError = 'border-red-500/50';
+  const inputNormal = 'border-white/10';
+  const labelClass = 'mb-1.5 block text-sm font-medium text-gray-300';
+
+  const activeSessions = sessions.filter((s) => s.status?.toLowerCase() === 'active' || s.is_logged_in);
+  const displayedSessions = showAllSessions ? sessions : activeSessions;
+
+  return (
+    <form onSubmit={handleSubmit} className="space-y-5">
+      {/* Source List */}
+      <div>
+        <label className={labelClass}>
+          <span className="flex items-center gap-1.5">
+            <ListFilter className="w-3.5 h-3.5 text-gray-500" />
+            Source List
+          </span>
+        </label>
+        <select
+          value={sourceList}
+          onChange={(e) => setSourceList(e.target.value)}
+          className={`${inputBase} ${errors.sourceList ? inputError : inputNormal}`}
+        >
+          <option value="">Select a source list...</option>
+          {targetLists.map((list) => (
+            <option key={list.id} value={list.id}>
+              {list.name} ({formatNumber(list.itemsCount || list.count || 0)} users)
+            </option>
+          ))}
+        </select>
+        {errors.sourceList && <p className="mt-1 text-xs text-red-400">{errors.sourceList}</p>}
+        {targetLists.length === 0 && (
+          <p className="mt-1 text-xs text-amber-400">No lists available. Import or scrape users first.</p>
+        )}
+      </div>
+
+      {/* Target Type */}
+      <div>
+        <label className={labelClass}>
+          <span className="flex items-center gap-1.5">
+            <Radio className="w-3.5 h-3.5 text-gray-500" />
+            Target Type
+          </span>
+        </label>
+        <div className="flex gap-2">
+          <button
+            type="button"
+            onClick={() => setTargetType('group')}
+            className={`flex-1 rounded-lg border px-4 py-2.5 text-sm font-medium transition flex items-center justify-center gap-2 ${
+              targetType === 'group'
+                ? 'border-primary-500/50 bg-primary-500/10 text-primary-400'
+                : 'border-white/10 bg-dark-900 text-gray-400 hover:text-white'
+            }`}
+          >
+            <Group className="w-4 h-4" />
+            Group(s)
+          </button>
+          <button
+            type="button"
+            onClick={() => setTargetType('channel')}
+            className={`flex-1 rounded-lg border px-4 py-2.5 text-sm font-medium transition flex items-center justify-center gap-2 ${
+              targetType === 'channel'
+                ? 'border-primary-500/50 bg-primary-500/10 text-primary-400'
+                : 'border-white/10 bg-dark-900 text-gray-400 hover:text-white'
+            }`}
+          >
+            <Hash className="w-4 h-4" />
+            Channel(s)
+          </button>
+        </div>
+      </div>
+
+      {/* Target IDs */}
+      <div>
+        <label className={labelClass}>
+          <span className="flex items-center gap-1.5">
+            <Link className="w-3.5 h-3.5 text-gray-500" />
+            Target {targetType === 'group' ? 'Groups' : 'Channels'} (one per line)
+          </span>
+        </label>
+        <textarea
+          value={targetIds}
+          onChange={(e) => setTargetIds(e.target.value)}
+          placeholder={`https://t.me/example_${targetType}\nor -1001234567890\n(one per line, multiple supported)`}
+          rows={3}
+          className={`${inputBase} ${errors.targetIds ? inputError : inputNormal} resize-none`}
+        />
+        {errors.targetIds && <p className="mt-1 text-xs text-red-400">{errors.targetIds}</p>}
+        <p className="mt-1 text-xs text-gray-500">
+          Enter one {targetType} link or ID per line. You can add to multiple {targetType}s at once.
+        </p>
+      </div>
+
+      {/* Session Selection (Multi-Select) */}
+      <div>
+        <label className={labelClass}>
+          <span className="flex items-center gap-1.5">
+            <Users className="w-3.5 h-3.5 text-gray-500" />
+            Sessions ({selectedSessionIds.length} selected)
+          </span>
+        </label>
+
+        <div className="flex gap-2 mb-2">
+          <button type="button" onClick={selectAllSessions} className="text-xs text-primary-400 hover:text-primary-300">
+            Select All Active
+          </button>
+          <span className="text-xs text-gray-600">|</span>
+          <button type="button" onClick={deselectAllSessions} className="text-xs text-gray-400 hover:text-gray-300">
+            Deselect All
+          </button>
+        </div>
+
+        <div className="max-h-36 overflow-y-auto rounded-lg border border-white/10 bg-dark-900 p-2 space-y-1">
+          {displayedSessions.map((s) => {
+            const isSelected = selectedSessionIds.includes(s.id);
+            const isActive = s.status?.toLowerCase() === 'active' || s.is_logged_in;
+            return (
+              <button
+                key={s.id}
+                type="button"
+                onClick={() => toggleSession(s.id)}
+                className={`w-full flex items-center gap-2 px-3 py-2 rounded-md text-sm transition ${
+                  isSelected
+                    ? 'bg-primary-500/20 text-primary-300 border border-primary-500/30'
+                    : 'hover:bg-white/5 text-gray-300 border border-transparent'
+                } ${!isActive ? 'opacity-50' : ''}`}
+                disabled={!isActive}
+              >
+                <div className={`w-4 h-4 rounded border flex items-center justify-center flex-shrink-0 ${
+                  isSelected ? 'border-primary-500 bg-primary-500/30' : 'border-gray-600'
+                }`}>
+                  {isSelected && <Check className="w-3 h-3 text-primary-400" />}
+                </div>
+                <span className="truncate">{s.phone || s.id}</span>
+                {s.username && <span className="text-gray-500 text-xs">@{s.username}</span>}
+              </button>
+            );
+          })}
+        </div>
+        {errors.session && <p className="mt-1 text-xs text-red-400">{errors.session}</p>}
+        {activeSessions.length === 0 && (
+          <p className="mt-1 text-xs text-amber-400">No active sessions. Please login first.</p>
+        )}
+      </div>
+
+      {/* Options */}
+      <div>
+        <label className={labelClass}>
+          <span className="flex items-center gap-1.5">
+            <Settings className="w-3.5 h-3.5 text-gray-500" />
+            Options
+          </span>
+        </label>
+        <div className="space-y-4 rounded-lg border border-white/5 bg-dark-900 p-4">
+          {/* Delays */}
+          <div className="grid grid-cols-2 gap-3">
+            <div>
+              <label className="text-xs text-gray-400 mb-1 block">Min Delay (seconds)</label>
+              <input
+                type="number"
+                min={1}
+                max={600}
+                value={delayMin}
+                onChange={(e) => {
+                  const val = Math.min(600, Math.max(1, Number(e.target.value)));
+                  setDelayMin(val);
+                  if (val > delayMax) setDelayMax(val);
+                }}
+                className={`${inputBase} ${errors.delayMin ? inputError : inputNormal}`}
+              />
+              {errors.delayMin && <p className="mt-1 text-xs text-red-400">{errors.delayMin}</p>}
+            </div>
+            <div>
+              <label className="text-xs text-gray-400 mb-1 block">Max Delay (seconds)</label>
+              <input
+                type="number"
+                min={1}
+                max={600}
+                value={delayMax}
+                onChange={(e) => {
+                  const val = Math.min(600, Math.max(1, Number(e.target.value)));
+                  setDelayMax(val);
+                  if (val < delayMin) setDelayMin(val);
+                }}
+                className={`${inputBase} ${errors.delayMax ? inputError : inputNormal}`}
+              />
+              {errors.delayMax && <p className="mt-1 text-xs text-red-400">{errors.delayMax}</p>}
+            </div>
+          </div>
+
+          {/* Batch Size */}
+          <div>
+            <label className="text-xs text-gray-400 mb-1 block">Users per Session per Batch</label>
+            <input
+              type="number"
+              min={1}
+              max={100}
+              value={batchSize}
+              onChange={(e) => setBatchSize(Math.min(100, Math.max(1, Number(e.target.value))))}
+              className={`${inputBase} ${errors.batchSize ? inputError : inputNormal}`}
+            />
+            {errors.batchSize && <p className="mt-1 text-xs text-red-400">{errors.batchSize}</p>}
+            <p className="mt-1 text-xs text-gray-500">
+              Users added per session before waiting for the delay. Lower = safer from bans.
+            </p>
+          </div>
+        </div>
+      </div>
+
+      {/* Submit Button */}
+      <button
+        type="submit"
+        disabled={submitting}
+        className="w-full flex items-center justify-center gap-2 rounded-xl bg-gradient-to-r from-primary-600 to-blue-600 px-4 py-2.5 text-sm font-semibold text-white shadow-lg shadow-primary-600/25 transition-all duration-200 hover:from-primary-500 hover:to-blue-500 hover:shadow-primary-500/30 focus:outline-none focus:ring-2 focus:ring-primary-500/40 focus:ring-offset-2 focus:ring-offset-dark-800 disabled:cursor-not-allowed disabled:opacity-60"
+      >
+        {submitting ? (
+          <>
+            <Loader2 className="h-4 w-4 animate-spin" />
+            Starting...
+          </>
+        ) : (
+          <>
+            <UserPlus className="h-4 w-4" />
+            Start Adding
+          </>
+        )}
+      </button>
+    </form>
+  );
+}
+
+// ============================================================
+// Active Operations Panel
+// ============================================================
+
+function ActiveOperationsPanel({ operations, onCancel }) {
+  if (operations.length === 0) {
+    return (
+      <div className="rounded-xl border border-white/5 bg-dark-800 p-6 flex flex-col items-center justify-center min-h-[200px]">
+        <UserPlus className="w-10 h-10 text-gray-600 mb-3" />
+        <p className="text-gray-400 font-medium">No active operations</p>
+        <p className="text-gray-500 text-sm mt-1">Start an add operation to see progress here</p>
+      </div>
+    );
+  }
+
+  return (
+    <div className="rounded-xl border border-white/5 bg-dark-800 p-5">
+      <h3 className="mb-4 text-sm font-semibold text-white flex items-center gap-2">
+        <UserPlus className="w-4 h-4 text-primary-500" />
+        Active Operations ({operations.length})
+      </h3>
+      <div className="space-y-4">
+        {operations.map((op) => {
+          const total = op.totalUsers || op.total_count || 0;
+          const added = op.successCount || 0;
+          const failed = op.failedCount || 0;
+          const progress = total > 0 ? ((added + failed) / total) * 100 : 0;
+
+          return (
+            <div key={op.id} className="rounded-lg border border-white/5 bg-dark-900 p-4 space-y-3">
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-2">
+                  <StatusBadge status={op.status || 'running'} size="sm" />
+                  <span className="text-sm text-white font-mono">#{op.id}</span>
+                </div>
+                {(op.status === 'running' || op.status === 'queued' || op.status === 'pending') && (
+                  <button
+                    onClick={() => onCancel(op.id)}
+                    className="flex items-center gap-1 rounded-lg bg-red-500/10 border border-red-500/20 px-2.5 py-1 text-xs font-medium text-red-400 hover:bg-red-500/20 transition"
+                  >
+                    <StopCircle className="w-3 h-3" />
+                    Cancel
+                  </button>
+                )}
+              </div>
+
+              <div>
+                <div className="flex items-center justify-between mb-1.5">
+                  <span className="text-xs text-gray-400">Progress</span>
+                  <span className="text-xs font-medium text-white">{formatNumber(added)} / {formatNumber(total)}</span>
+                </div>
+                <div className="w-full bg-dark-800 rounded-full h-2 overflow-hidden">
+                  <div
+                    className={`h-2 rounded-full transition-all duration-500 ${
+                      op.status === 'failed' ? 'bg-red-500' : op.status === 'completed' ? 'bg-green-500' : 'bg-primary-600'
+                    }`}
+                    style={{ width: `${Math.min(100, Math.max(0, progress))}%` }}
+                  />
+                </div>
+              </div>
+
+              <div className="flex items-center gap-4 text-xs text-gray-400">
+                <span className="flex items-center gap-1 text-green-400">
+                  <CheckCircle className="w-3 h-3" />
+                  {formatNumber(added)} added
+                </span>
+                <span className="flex items-center gap-1 text-red-400">
+                  <AlertTriangle className="w-3 h-3" />
+                  {formatNumber(failed)} failed
+                </span>
+              </div>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+// ============================================================
+// Main Groups Page
+// ============================================================
+
+export default function Groups() {
+  const { showSuccess, showError } = useToast();
+  const { connect, on, off, connected } = useWebSocket();
+
+  const [activeTab, setActiveTab] = useState('add-members'); // 'add-members' or 'join-leave'
+  const [submitting, setSubmitting] = useState(false);
+  const [sessions, setSessions] = useState([]);
+  const [targetLists, setTargetLists] = useState([]);
+  const [operations, setOperations] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [currentPage, setCurrentPage] = useState(1);
+  const [selectedOpErrors, setSelectedOpErrors] = useState(null);
+  const [selectedOpId, setSelectedOpId] = useState(null);
+
+  const pageSize = 10;
+
+  const fetchSessions = useCallback(async () => {
+    try {
+      const response = await listSessions({ limit: 100 });
+      setSessions(response.data.data?.sessions || []);
+    } catch (err) {
+      console.warn('Failed to fetch sessions:', parseApiError(err));
+    }
+  }, []);
+
+  const fetchLists = useCallback(async () => {
+    try {
+      const response = await listsAPI.list({ limit: 50 });
+      setTargetLists(response.data.data?.lists || []);
+    } catch (err) {
+      console.warn('Failed to fetch lists:', parseApiError(err));
+    }
+  }, []);
+
+  const fetchOperations = useCallback(async () => {
+    try {
+      const response = await groupsAPI.listOperations({ limit: 50 });
+      const data = response.data.data?.operations || [];
+      setOperations(data);
+    } catch (err) {
+      console.warn('Failed to fetch operations:', parseApiError(err));
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    fetchSessions();
+    fetchLists();
+    fetchOperations();
+  }, [fetchSessions, fetchLists, fetchOperations]);
+
+  useEffect(() => {
+    const token = localStorage.getItem('token');
+    if (token) connect(token);
+  }, [connect]);
+
+  // WebSocket event handlers
+  useEffect(() => {
+    const handleProgress = (data) => {
+      setOperations((prev) =>
+        prev.map((op) =>
+          op.id === data.operation_id ? { ...op, ...data, status: data.status || op.status } : op
+        )
+      );
+    };
+
+    const handleCompleted = (data) => {
+      setOperations((prev) =>
+        prev.map((op) =>
+          op.id === data.operation_id ? { ...op, ...data, status: 'completed' } : op
+        )
+      );
+      showSuccess(
+        `Add operation ${data.operation_id} completed. ${data.added || data.addedCount || 0} added, ${data.failed || 0} failed, ${data.skipped || 0} skipped.`,
+        'Operation Complete'
+      );
+      fetchOperations();
+    };
+
+    const handleError = (data) => {
+      setOperations((prev) =>
+        prev.map((op) => (op.id === data.operation_id ? { ...op, status: 'failed' } : op))
+      );
+      showError(`Add operation ${data.operation_id} failed: ${data.error || 'Unknown error'}`, 'Operation Error');
+    };
+
+    on('add_progress', handleProgress);
+    on('add_completed', handleCompleted);
+    on('add_error', handleError);
+
+    return () => {
+      off('add_progress', handleProgress);
+      off('add_completed', handleCompleted);
+      off('add_error', handleError);
+    };
+  }, [on, off, showSuccess, showError, fetchOperations]);
+
+  const handleStartAdding = async (data) => {
+    setSubmitting(true);
+    const minLoadingTime = 3000;
+    const startTime = Date.now();
+
+    try {
+      // Fetch items from selected list
+      const listResponse = await listsAPI.getItems(data.sourceList, { limit: 10000 });
+      const users = (listResponse.data.data?.items || []).map((item) => ({
+        telegram_id: item.telegram_id || item.telegramId,
+        username: item.username,
+        first_name: item.first_name || item.firstName,
+        last_name: item.last_name || item.lastName,
+        phone: item.phone,
+      }));
+
+      if (users.length === 0) {
+        showError('The selected list has no users. Please import or scrape users first.', 'Empty List');
+        return;
+      }
+
+      const response = await groupsAPI.addMembers({
+        sessionIds: data.sessionIds.map(id => parseInt(id)),
+        targetIds: data.targetIds,
+        targetType: data.targetType,
+        userList: users,
+        delayMin: data.delayMin,
+        delayMax: data.delayMax,
+        batchSize: data.batchSize,
+        async: false,
+      });
+
+      const elapsed = Date.now() - startTime;
+      const remaining = Math.max(0, minLoadingTime - elapsed);
+      await new Promise(resolve => setTimeout(resolve, remaining));
+
+      const result = response.data.data;
+      const added = result.added || 0;
+      const failed = result.failed || 0;
+      const skipped = result.skipped || 0;
+      const total = result.total || 0;
+
+      if (failed === 0 && skipped === 0) {
+        showSuccess(`All ${added} user(s) added successfully to ${data.targetIds.length} target(s).`, 'Complete');
+      } else if (added > 0) {
+        showSuccess(`${added} added, ${failed} failed, ${skipped} skipped out of ${total} user(s).`, 'Partial Success');
+      } else {
+        showError(`All ${failed} user(s) failed. Check logs for details.`, 'Failed');
+      }
+
+      fetchOperations();
+    } catch (err) {
+      const elapsed = Date.now() - startTime;
+      const remaining = Math.max(0, minLoadingTime - elapsed);
+      await new Promise(resolve => setTimeout(resolve, remaining));
+      showError(parseApiError(err), 'Start Failed');
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  const handleJoinLeave = async (data) => {
+    setSubmitting(true);
+    const minLoadingTime = 3000;
+    const startTime = Date.now();
+
+    try {
+      const apiCall = data.mode === 'join' ? groupsAPI.joinChannels : groupsAPI.leaveChannels;
+
+      const response = await apiCall({
+        sessionIds: data.sessionIds.map(id => parseInt(id)),
+        targetIds: data.targetIds,
+      });
+
+      const elapsed = Date.now() - startTime;
+      const remaining = Math.max(0, minLoadingTime - elapsed);
+      await new Promise(resolve => setTimeout(resolve, remaining));
+
+      const result = response.data.data;
+      const successCount = data.mode === 'join' ? result.joined : result.left;
+      const failed = result.failed || 0;
+      const skipped = result.skipped || 0;
+      const total = result.total || 0;
+
+      const actionWord = data.mode === 'join' ? 'joined' : 'left';
+      const failWord = data.mode === 'join' ? 'join' : 'leave';
+
+      if (failed === 0 && skipped === 0) {
+        showSuccess(`All ${successCount} session(s) ${actionWord} successfully to ${data.targetIds.length} target(s).`, 'Complete');
+      } else if (successCount > 0) {
+        showSuccess(`${successCount} ${actionWord}, ${failed} failed, ${skipped} skipped out of ${total} operation(s).`, 'Partial Success');
+      } else {
+        showError(`All ${failed} operation(s) failed. Check logs for details.`, 'Failed');
+      }
+
+      fetchOperations();
+    } catch (err) {
+      const elapsed = Date.now() - startTime;
+      const remaining = Math.max(0, minLoadingTime - elapsed);
+      await new Promise(resolve => setTimeout(resolve, remaining));
+      showError(parseApiError(err), `${data.mode === 'join' ? 'Join' : 'Leave'} Failed`);
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  const handleCancelOperation = async (operationId) => {
+    try {
+      await groupsAPI.cancelOperation(operationId);
+      showSuccess(`Operation ${operationId} cancelled.`, 'Cancelled');
+      setOperations((prev) => prev.map((op) => (op.id === operationId ? { ...op, status: 'cancelled' } : op)));
+    } catch (err) {
+      showError(parseApiError(err), 'Cancel Failed');
+    }
+  };
+
+  const handleViewErrors = async (operationId) => {
+    try {
+      const response = await groupsAPI.getOperation(operationId);
+      const opData = response.data.data;
+      const operation = opData?.operation || opData;
+      setSelectedOpErrors(operation?.errors || operation?.failed_users || []);
+      setSelectedOpId(operationId);
+    } catch (err) {
+      showError(parseApiError(err), 'Failed to load errors');
+    }
+  };
+
+  const activeOperations = operations.filter((op) =>
+    ['running', 'queued', 'pending'].includes(op.status)
+  );
+
+  const totalPages = Math.ceil(operations.length / pageSize);
+  const paginatedOperations = operations.slice((currentPage - 1) * pageSize, currentPage * pageSize);
+
+  return (
+    <div className="space-y-6">
+      {/* Page Header */}
+      <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
+        <div>
+          <h1 className="text-2xl font-bold tracking-tight text-white">Groups & Channels</h1>
+          <p className="mt-1 text-sm text-gray-400">
+            Add members from scraped lists to groups or channels using multiple sessions
+          </p>
+        </div>
+        {connected && (
+          <div className="flex items-center gap-1.5 text-xs text-green-400">
+            <span className="w-2 h-2 rounded-full bg-green-400 animate-pulse" />
+            Live updates connected
+          </div>
+        )}
+      </div>
+
+      {/* Add Members Form + Active Operations */}
+      <div className="rounded-xl border border-white/5 bg-dark-800 overflow-hidden">
+        {/* Tab Navigation */}
+        <div className="flex border-b border-white/5">
+          <button
+            onClick={() => setActiveTab('add-members')}
+            className={`flex-1 px-5 py-3 text-sm font-medium transition flex items-center justify-center gap-2 ${
+              activeTab === 'add-members'
+                ? 'border-b-2 border-primary-500 text-primary-400 bg-primary-500/5'
+                : 'text-gray-400 hover:text-white hover:bg-white/5'
+            }`}
+          >
+            <UserPlus className="w-4 h-4" />
+            Add Members
+          </button>
+          <button
+            onClick={() => setActiveTab('join-leave')}
+            className={`flex-1 px-5 py-3 text-sm font-medium transition flex items-center justify-center gap-2 ${
+              activeTab === 'join-leave'
+                ? 'border-b-2 border-primary-500 text-primary-400 bg-primary-500/5'
+                : 'text-gray-400 hover:text-white hover:bg-white/5'
+            }`}
+          >
+            <LogIn className="w-4 h-4" />
+            Join/Leave
+          </button>
+        </div>
+
+        {/* Tab Content */}
+        <div className="p-5">
+          {activeTab === 'add-members' ? (
+            <AddMembersForm
+              sessions={sessions}
+              targetLists={targetLists}
+              onSubmit={handleStartAdding}
+              submitting={submitting}
+            />
+          ) : (
+            <JoinLeaveForm
+              sessions={sessions}
+              onSubmit={handleJoinLeave}
+              submitting={submitting}
+            />
+          )}
+        </div>
+      </div>
+
+      {/* Active Operations Panel */}
+      <div className="rounded-xl border border-white/5 bg-dark-800 p-5">
+        <ActiveOperationsPanel operations={activeOperations} onCancel={handleCancelOperation} />
+      </div>
+
+      {/* Operations History */}
+      <div className="rounded-xl border border-white/5 bg-dark-800 overflow-hidden">
+        <div className="px-5 py-4 border-b border-white/5">
+          <h3 className="text-sm font-semibold text-white flex items-center gap-2">
+            <Clock className="w-4 h-4 text-gray-400" />
+            Operation History
+          </h3>
+        </div>
+
+        {loading ? (
+          <div className="p-8 text-center">
+            <Loader2 className="w-8 h-8 animate-spin mx-auto text-primary-500 mb-3" />
+            <p className="text-gray-400 text-sm">Loading operations...</p>
+          </div>
+        ) : operations.length === 0 ? (
+          <div className="p-8 text-center text-gray-500">
+            <Clock className="w-12 h-12 mx-auto mb-3 opacity-50" />
+            <p>No operations yet</p>
+          </div>
+        ) : (
+          <div className="overflow-x-auto">
+            <table className="w-full text-sm">
+              <thead>
+                <tr className="border-b border-white/5">
+                  <th className="text-left py-3 px-4 text-xs font-medium text-gray-400">ID</th>
+                  <th className="text-left py-3 px-4 text-xs font-medium text-gray-400">Target</th>
+                  <th className="text-left py-3 px-4 text-xs font-medium text-gray-400">Status</th>
+                  <th className="text-left py-3 px-4 text-xs font-medium text-gray-400">Added / Failed / Total</th>
+                  <th className="text-left py-3 px-4 text-xs font-medium text-gray-400">Date</th>
+                  <th className="text-right py-3 px-4 text-xs font-medium text-gray-400">Actions</th>
+                </tr>
+              </thead>
+              <tbody>
+                {paginatedOperations.map((op) => (
+                  <tr key={op.id} className="border-b border-white/5 hover:bg-white/5">
+                    <td className="py-3 px-4 text-gray-300">#{op.id}</td>
+                    <td className="py-3 px-4">
+                      <p className="text-white truncate max-w-40" title={op.groupId || 'N/A'}>
+                        {op.groupId || 'N/A'}
+                      </p>
+                      <p className="text-xs text-gray-500">{op.operationType || 'add_members'}</p>
+                    </td>
+                    <td className="py-3 px-4">
+                      <StatusBadge status={op.status} />
+                    </td>
+                    <td className="py-3 px-4">
+                      <span className="text-green-400">{op.successCount || 0}</span>
+                      <span className="text-gray-600 mx-1">/</span>
+                      <span className="text-red-400">{op.failedCount || 0}</span>
+                      <span className="text-gray-600 mx-1">/</span>
+                      <span className="text-gray-400">{op.totalUsers || 0}</span>
+                    </td>
+                    <td className="py-3 px-4 text-gray-400 text-xs">
+                      {op.createdAt ? formatDateTime(op.createdAt) : 'N/A'}
+                    </td>
+                    <td className="py-3 px-4 text-right">
+                      <div className="flex justify-end gap-1">
+                        {(op.failedCount > 0 || op.status === 'failed') && (
+                          <button
+                            onClick={() => handleViewErrors(op.id)}
+                            className="p-1.5 rounded hover:bg-red-500/20 text-red-400"
+                            title="View Errors"
+                          >
+                            <AlertTriangle className="w-3.5 h-3.5" />
+                          </button>
+                        )}
+                        {(op.status === 'running' || op.status === 'queued') && (
+                          <button
+                            onClick={() => handleCancelOperation(op.id)}
+                            className="p-1.5 rounded hover:bg-red-500/20 text-red-400"
+                            title="Cancel"
+                          >
+                            <StopCircle className="w-3.5 h-3.5" />
+                          </button>
+                        )}
+                      </div>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+
+        {/* Pagination */}
+        {totalPages > 1 && (
+          <div className="px-4 py-3 border-t border-white/5 flex items-center justify-between">
+            <p className="text-sm text-gray-400">
+              Showing {(currentPage - 1) * pageSize + 1} to {Math.min(currentPage * pageSize, operations.length)} of {operations.length}
+            </p>
+            <div className="flex gap-1">
+              <button
+                onClick={() => setCurrentPage(p => Math.max(1, p - 1))}
+                disabled={currentPage === 1}
+                className="p-2 rounded-lg text-gray-400 hover:text-white hover:bg-white/5 disabled:opacity-30 disabled:cursor-not-allowed transition"
+              >
+                <ChevronLeft className="w-4 h-4" />
+              </button>
+              <button
+                onClick={() => setCurrentPage(p => Math.min(totalPages, p + 1))}
+                disabled={currentPage === totalPages}
+                className="p-2 rounded-lg text-gray-400 hover:text-white hover:bg-white/5 disabled:opacity-30 disabled:cursor-not-allowed transition"
+              >
+                <ChevronRight className="w-4 h-4" />
+              </button>
+            </div>
+          </div>
+        )}
+      </div>
+
+      {/* Error Detail Modal */}
+      {selectedOpErrors && (
+        <Modal
+          isOpen={!!selectedOpErrors}
+          onClose={() => { setSelectedOpErrors(null); setSelectedOpId(null); }}
+          title={`Failed Users #${selectedOpId}`}
+          size="xl"
+        >
+          <div className="max-h-96 overflow-y-auto">
+            <table className="w-full text-sm">
+              <thead className="sticky top-0 bg-dark-800">
+                <tr className="border-b border-white/5">
+                  <th className="text-left py-2 px-3 text-xs font-medium text-gray-400">User ID</th>
+                  <th className="text-left py-2 px-3 text-xs font-medium text-gray-400">Target</th>
+                  <th className="text-left py-2 px-3 text-xs font-medium text-gray-400">Error</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-white/5">
+                {selectedOpErrors.map((err, idx) => (
+                  <tr key={idx} className="hover:bg-white/5">
+                    <td className="py-2 px-3 text-gray-300 font-mono">{err.userId || err.user_id || 'N/A'}</td>
+                    <td className="py-2 px-3 text-gray-400">{err.targetId || 'N/A'}</td>
+                    <td className="py-2 px-3 text-red-400 text-xs">{err.error || 'Unknown error'}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </Modal>
+      )}
+    </div>
+  );
+}

@@ -1,0 +1,893 @@
+import { useState, useEffect, useCallback, useRef } from 'react';
+import { useWebSocket } from '../hooks/useWebSocket';
+import { listSessions } from '../api/sessions';
+import {
+  scrapeGroup,
+  scrapeChannel,
+  listScrapeJobs,
+  getScrapeProgress,
+  cancelScrapeJob,
+  exportScrapeJob,
+  deleteScrapeJob,
+  getScrapeStats,
+} from '../api/scrape';
+import { listsAPI } from '../api/lists';
+import { parseApiError, formatNumber } from '../utils/formatters';
+import { useToast } from '../components/common/Toast';
+import { Modal } from '../components/common/Modal';
+import StatusBadge from '../components/common/StatusBadge';
+import {
+  Users, Link, Settings, Radio, Download, Check, AlertTriangle,
+  Search, ChevronLeft, ChevronRight, ChevronDown, Trash2, CheckSquare, Square,
+  Plus, X, Clock, TrendingUp, BarChart3, XCircle, Loader2, Play,
+  StopCircle, ListFilter, FileDown, Eye, List,
+} from 'lucide-react';
+
+// ============================================================================
+// MAIN SCRAPE PAGE
+// ============================================================================
+
+export default function Scrape() {
+  const [sessions, setSessions] = useState([]);
+  const [jobs, setJobs] = useState([]);
+  const [stats, setStats] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [submitting, setSubmitting] = useState(false);
+  const [activeTab, setActiveTab] = useState('scrape'); // 'scrape' | 'history' | 'stats'
+  
+  // Scrape form state
+  const [selectedSessions, setSelectedSessions] = useState([]);
+  const [targets, setTargets] = useState('');
+  const [scrapeType, setScrapeType] = useState('group');
+  const [limit, setLimit] = useState(1000);
+  const [showBotFilters, setShowBotFilters] = useState(false);
+  const [botFilterOptions, setBotFilterOptions] = useState({
+    enabled: true,
+    threshold: 0.6,
+    requireUsername: false,
+    requirePhone: false,
+    requirePhoto: false,
+    minAccountAge: 0,
+  });
+  const [saveToList, setSaveToList] = useState(false);
+  const [listName, setListName] = useState('');
+  
+  // History state
+  const [historyPage, setHistoryPage] = useState(1);
+  const [historyPagination, setHistoryPagination] = useState({ total: 0, pages: 0 });
+  const [historyFilter, setHistoryFilter] = useState('');
+  const [statusFilter, setStatusFilter] = useState('all');
+  const [exportModal, setExportModal] = useState(null);
+  const [createListModal, setCreateListModal] = useState(null);
+  const [createListName, setCreateListName] = useState('');
+  const [creatingList, setCreatingList] = useState(false);
+
+  const { showSuccess, showError } = useToast();
+  const ws = useWebSocket();
+
+  // Fetch sessions
+  const fetchSessions = useCallback(async () => {
+    try {
+      const response = await listSessions({ page: 1, limit: 100 });
+      setSessions(response.data.data?.sessions || []);
+    } catch (err) {
+      console.error('Failed to fetch sessions:', err);
+    }
+  }, []);
+
+  // Fetch jobs
+  const fetchJobs = useCallback(async () => {
+    try {
+      const params = {
+        page: historyPage,
+        limit: 20,
+        sort: 'created_at',
+        order: 'DESC',
+      };
+      if (historyFilter) params.filter = historyFilter;
+      if (statusFilter !== 'all') params.status = statusFilter;
+      
+      const response = await listScrapeJobs(params);
+      setJobs(response.data.data?.jobs || []);
+      setHistoryPagination(response.data.data?.pagination || { total: 0, pages: 0 });
+    } catch (err) {
+      console.error('Failed to fetch jobs:', err);
+    } finally {
+      setLoading(false);
+    }
+  }, [historyPage, historyFilter, statusFilter]);
+
+  // Fetch stats
+  const fetchStats = useCallback(async () => {
+    try {
+      const response = await getScrapeStats();
+      setStats(response.data.data);
+    } catch (err) {
+      console.error('Failed to fetch stats:', err);
+    }
+  }, []);
+
+  useEffect(() => {
+    fetchSessions();
+    fetchJobs();
+    fetchStats();
+  }, [fetchSessions, fetchJobs, fetchStats]);
+
+  // WebSocket for progress updates
+  useEffect(() => {
+    if (!ws) return;
+    
+    ws.on('scrape_progress', (data) => {
+      setJobs(prev => {
+        const jobIndex = prev.findIndex(job => job.id === data.jobId);
+        if (jobIndex === -1) return prev;
+        
+        const updatedJobs = [...prev];
+        updatedJobs[jobIndex] = { ...updatedJobs[jobIndex], ...data };
+        return updatedJobs;
+      });
+    });
+  }, [ws]);
+
+  // Handle session multi-select
+  const toggleSession = (sessionId) => {
+    setSelectedSessions(prev => 
+      prev.includes(sessionId)
+        ? prev.filter(id => id !== sessionId)
+        : [...prev, sessionId]
+    );
+  };
+
+  const selectAllSessions = () => {
+    const activeIds = sessions.filter(s => s.status === 'active').map(s => s.id);
+    setSelectedSessions(activeIds);
+  };
+
+  // Handle scrape submission
+  const handleScrape = async (e) => {
+    e.preventDefault();
+    
+    if (selectedSessions.length === 0) {
+      showError('Please select at least one session', 'Validation Error');
+      return;
+    }
+
+    const targetList = targets.split('\n')
+      .map(t => t.trim())
+      .filter(t => t.length > 0);
+
+    if (targetList.length === 0) {
+      showError('Please enter at least one group/channel ID or link', 'Validation Error');
+      return;
+    }
+
+    setSubmitting(true);
+    
+    // Show loading for at least 3 seconds
+    const minLoadingTime = 3000;
+    const startTime = Date.now();
+    
+    try {
+      const apiCall = scrapeType === 'group' ? scrapeGroup : scrapeChannel;
+      const response = await apiCall({
+        sessionIds: selectedSessions,
+        targetIds: targetList,
+        limit,
+        filterBots: botFilterOptions.enabled,
+        botFilterOptions: botFilterOptions.enabled ? botFilterOptions : undefined,
+        saveToList,
+        listName: saveToList ? listName.trim() : undefined,
+        async: true,
+      });
+
+      const jobId = response.data.data?.jobId;
+      const elapsed = Date.now() - startTime;
+      const remaining = Math.max(0, minLoadingTime - elapsed);
+      
+      // Wait for minimum loading time
+      await new Promise(resolve => setTimeout(resolve, remaining));
+      
+      const targetCount = targetList.length;
+      const sessionCount = selectedSessions.length;
+      
+      showSuccess(
+        `Scrape job started: ${targetCount} target(s), ${sessionCount} session(s). Job #${jobId}`,
+        'Scrape Started'
+      );
+      
+      // Reset form
+      setTargets('');
+      setSelectedSessions([]);
+      setHistoryPage(1);
+      
+      // Fetch updated jobs immediately
+      await fetchJobs();
+      await fetchStats();
+    } catch (err) {
+      const elapsed = Date.now() - startTime;
+      const remaining = Math.max(0, minLoadingTime - elapsed);
+      await new Promise(resolve => setTimeout(resolve, remaining));
+      showError(parseApiError(err), 'Scrape Error');
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  // Cancel job
+  const handleCancel = async (jobId) => {
+    try {
+      await cancelScrapeJob(jobId);
+      showSuccess('Job cancelled', 'Cancelled');
+      fetchJobs();
+    } catch (err) {
+      showError(parseApiError(err), 'Cancel Error');
+    }
+  };
+
+  // Delete job
+  const handleDelete = async (jobId) => {
+    if (!confirm('Delete this scrape job and all its data?')) return;
+    try {
+      await deleteScrapeJob(jobId);
+      showSuccess('Job deleted', 'Deleted');
+      
+      // Update history dynamically without refresh
+      setJobs(prev => prev.filter(job => job.id !== jobId));
+      await fetchStats();
+    } catch (err) {
+      showError(parseApiError(err), 'Delete Error');
+    }
+  };
+
+  // Export job
+  const handleExport = async (jobId, format = 'csv', filters = {}) => {
+    try {
+      const response = await exportScrapeJob(jobId, { format, ...filters });
+      const blob = new Blob([response.data], {
+        type: format === 'json' ? 'application/json' : format === 'csv' ? 'text/csv' : 'text/plain',
+      });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `scrape_${jobId}.${format}`;
+      a.click();
+      URL.revokeObjectURL(url);
+      showSuccess('Export downloaded', 'Export');
+    } catch (err) {
+      showError(parseApiError(err), 'Export Error');
+    }
+  };
+
+  // Create list from scrape job
+  const handleCreateList = async () => {
+    if (!createListName.trim()) {
+      showError('Please enter a list name', 'Validation Error');
+      return;
+    }
+    setCreatingList(true);
+    try {
+      await listsAPI.createFromScrape({
+        scrapeJobId: createListModal.id,
+        listName: createListName.trim(),
+      });
+      showSuccess(`List "${createListName.trim()}" created with ${createListModal.total_found || 0} users`, 'List Created');
+      setCreateListModal(null);
+      setCreateListName('');
+    } catch (err) {
+      showError(parseApiError(err), 'Create List Error');
+    } finally {
+      setCreatingList(false);
+    }
+  };
+
+  // UI Styles
+  const cardClass = 'rounded-xl border border-white/5 bg-dark-900/50 p-5 backdrop-blur-sm';
+  const inputBase = 'w-full rounded-lg border border-white/10 bg-dark-900 px-3 py-2 text-sm text-white placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-primary-500/50 focus:border-primary-500 transition';
+  const btnPrimary = 'rounded-lg bg-gradient-to-r from-primary-600 to-primary-700 px-4 py-2 text-sm font-medium text-white shadow-lg hover:shadow-primary-500/20 hover:from-primary-500 hover:to-primary-600 transition-all duration-200 disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-2';
+  const btnSecondary = 'rounded-lg border border-white/10 bg-dark-800 px-3 py-2 text-sm font-medium text-gray-300 hover:bg-dark-700 hover:border-white/20 transition flex items-center justify-center gap-2';
+  const labelClass = 'block text-sm font-medium text-gray-300 mb-2';
+
+  const activeSessions = sessions.filter(s => s.status === 'active');
+
+  // Helper to render per-target results
+  const renderTargetResults = (job) => {
+    const targetResults = job.stats?.targetResults || job.targetResults;
+    if (!targetResults || targetResults.length === 0) return null;
+    
+    const successCount = targetResults.filter(r => r.status === 'success').length;
+    const failCount = targetResults.filter(r => r.status === 'failed').length;
+    
+    return (
+      <div className="mt-2 space-y-1">
+        <div className="flex items-center gap-2 text-xs">
+          <Check className="w-3 h-3 text-green-400" />
+          <span className="text-green-400">{successCount} succeeded</span>
+          {failCount > 0 && (
+            <>
+              <XCircle className="w-3 h-3 text-red-400" />
+              <span className="text-red-400">{failCount} failed</span>
+            </>
+          )}
+        </div>
+        {targetResults.map((result, idx) => (
+          <div key={idx} className="flex items-center gap-2 text-xs">
+            {result.status === 'success' ? (
+              <Check className="w-3 h-3 text-green-400 flex-shrink-0" />
+            ) : (
+              <XCircle className="w-3 h-3 text-red-400 flex-shrink-0" />
+            )}
+            <span className="text-gray-300 truncate max-w-32">{result.target}</span>
+            <span className="text-gray-500">
+              {result.status === 'success' 
+                ? `${result.usersFound || 0} users` 
+                : result.error?.substring(0, 30) + '...'}
+            </span>
+          </div>
+        ))}
+      </div>
+    );
+  };
+
+  return (
+    <div className="space-y-6">
+      {/* Header */}
+      <div>
+        <h1 className="text-2xl font-bold text-white">Scrape Users</h1>
+        <p className="text-gray-400 text-sm mt-1">
+          Extract users from Telegram groups and channels with advanced bot filtering
+        </p>
+      </div>
+
+      {/* Tabs */}
+      <div className="flex gap-1 bg-dark-900/50 p-1 rounded-lg w-fit">
+        {[
+          { id: 'scrape', label: 'Scrape', icon: Radio },
+          { id: 'history', label: 'History', icon: Clock },
+          { id: 'stats', label: 'Statistics', icon: BarChart3 },
+        ].map(tab => (
+          <button
+            key={tab.id}
+            onClick={() => setActiveTab(tab.id)}
+            className={`flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-medium transition ${
+              activeTab === tab.id
+                ? 'bg-primary-600 text-white'
+                : 'text-gray-400 hover:text-white'
+            }`}
+          >
+            <tab.icon className="w-4 h-4" />
+            {tab.label}
+          </button>
+        ))}
+      </div>
+
+      {/* SCRAPE TAB */}
+      {activeTab === 'scrape' && (
+        <form onSubmit={handleScrape} className="space-y-6">
+          {/* Session Selection */}
+          <div className={cardClass}>
+            <div className="flex justify-between items-center mb-3">
+              <label className={labelClass}>
+                <Users className="w-4 h-4 inline mr-2" />
+                Sessions ({selectedSessions.length} selected)
+              </label>
+              <button
+                type="button"
+                onClick={selectAllSessions}
+                className="text-xs text-primary-400 hover:text-primary-300"
+              >
+                Select All Active
+              </button>
+            </div>
+            
+            {activeSessions.length === 0 ? (
+              <div className="p-8 text-center text-gray-500 border border-dashed border-white/10 rounded-lg">
+                <Users className="w-12 h-12 mx-auto mb-3 opacity-50" />
+                <p className="text-sm">No active sessions available</p>
+                <p className="text-xs mt-1">Login a session first to use scraping</p>
+              </div>
+            ) : (
+              <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-2 max-h-60 overflow-y-auto">
+                {activeSessions.map(session => (
+                  <button
+                    key={session.id}
+                    type="button"
+                    onClick={() => toggleSession(session.id)}
+                    className={`flex items-center gap-2 p-2 rounded-lg border transition ${
+                      selectedSessions.includes(session.id)
+                        ? 'border-primary-500 bg-primary-500/10'
+                        : 'border-white/5 hover:border-white/10'
+                    }`}
+                  >
+                    {selectedSessions.includes(session.id) ? (
+                      <CheckSquare className="w-4 h-4 text-primary-400" />
+                    ) : (
+                      <Square className="w-4 h-4 text-gray-600" />
+                    )}
+                    <div className="flex-1 text-left">
+                      <p className="text-sm text-white truncate">
+                        {session.phone || session.username || `Session ${session.id}`}
+                      </p>
+                      <p className="text-xs text-gray-500">
+                        ID: {session.id}
+                      </p>
+                    </div>
+                  </button>
+                ))}
+              </div>
+            )}
+          </div>
+
+          {/* Target Input */}
+          <div className={cardClass}>
+            <label className={labelClass}>
+              <Link className="w-4 h-4 inline mr-2" />
+              Target Groups/Channels (one per line)
+            </label>
+            <textarea
+              value={targets}
+              onChange={e => setTargets(e.target.value)}
+              placeholder={`Enter group/channel usernames or IDs:\n@mygroup\nhttps://t.me/mychannel\n-1001234567890`}
+              className={`${inputBase} h-32 resize-y font-mono text-xs`}
+            />
+            <p className="text-xs text-gray-500 mt-1">
+              Enter one target per line. Supports: usernames, links, or numeric IDs
+            </p>
+          </div>
+
+          {/* Settings Row */}
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+            <div className={cardClass}>
+              <label className={labelClass}>
+                <Radio className="w-4 h-4 inline mr-2" />
+                Target Type
+              </label>
+              <div className="flex gap-2">
+                <button
+                  type="button"
+                  onClick={() => setScrapeType('group')}
+                  className={`flex-1 py-2 px-3 rounded-lg text-sm transition ${
+                    scrapeType === 'group'
+                      ? 'bg-primary-600 text-white'
+                      : 'bg-dark-800 text-gray-400 hover:bg-dark-700'
+                  }`}
+                >
+                  Groups
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setScrapeType('channel')}
+                  className={`flex-1 py-2 px-3 rounded-lg text-sm transition ${
+                    scrapeType === 'channel'
+                      ? 'bg-primary-600 text-white'
+                      : 'bg-dark-800 text-gray-400 hover:bg-dark-700'
+                  }`}
+                >
+                  Channels
+                </button>
+              </div>
+            </div>
+
+            <div className={cardClass}>
+              <label className={labelClass}>
+                <TrendingUp className="w-4 h-4 inline mr-2" />
+                Limit per Target
+              </label>
+              <input
+                type="number"
+                value={limit}
+                onChange={e => setLimit(parseInt(e.target.value) || 1000)}
+                min="1"
+                max="100000"
+                className={inputBase}
+              />
+            </div>
+
+            <div className={cardClass}>
+              <label className={labelClass}>
+                <Download className="w-4 h-4 inline mr-2" />
+                Save to List
+              </label>
+              <div className="flex items-center gap-2">
+                <input
+                  type="checkbox"
+                  checked={saveToList}
+                  onChange={e => setSaveToList(e.target.checked)}
+                  className="rounded border-white/20 bg-dark-900 text-primary-600 focus:ring-primary-500"
+                />
+                {saveToList && (
+                  <input
+                    type="text"
+                    value={listName}
+                    onChange={e => setListName(e.target.value)}
+                    placeholder="List name..."
+                    className={`${inputBase} flex-1`}
+                  />
+                )}
+              </div>
+            </div>
+          </div>
+
+          {/* Bot Filter Toggle */}
+          <div className={cardClass}>
+            <button
+              type="button"
+              onClick={() => setShowBotFilters(!showBotFilters)}
+              className="flex justify-between items-center w-full"
+            >
+              <span className="flex items-center gap-2 text-sm font-medium text-gray-300">
+                <ListFilter className="w-4 h-4" />
+                Bot Filtering
+                <span className={`px-2 py-0.5 rounded text-xs ${
+                  botFilterOptions.enabled
+                    ? 'bg-green-500/20 text-green-400'
+                    : 'bg-gray-700 text-gray-400'
+                }`}>
+                  {botFilterOptions.enabled ? 'Enabled' : 'Disabled'}
+                </span>
+              </span>
+              <ChevronDown className={`w-4 h-4 text-gray-500 transition ${showBotFilters ? 'rotate-180' : ''}`} />
+            </button>
+
+            {showBotFilters && (
+              <div className="mt-4 space-y-4 border-t border-white/5 pt-4">
+                <div className="flex items-center gap-2">
+                  <input
+                    type="checkbox"
+                    checked={botFilterOptions.enabled}
+                    onChange={e => setBotFilterOptions(prev => ({ ...prev, enabled: e.target.checked }))}
+                    className="rounded border-white/20 bg-dark-900 text-primary-600"
+                  />
+                  <span className="text-sm text-gray-300">Enable bot filtering</span>
+                </div>
+
+                {botFilterOptions.enabled && (
+                  <>
+                    <div>
+                      <label className={labelClass}>
+                        Detection Threshold: {Math.round(botFilterOptions.threshold * 100)}%
+                      </label>
+                      <input
+                        type="range"
+                        min="0.3"
+                        max="0.9"
+                        step="0.05"
+                        value={botFilterOptions.threshold}
+                        onChange={e => setBotFilterOptions(prev => ({ ...prev, threshold: parseFloat(e.target.value) }))}
+                        className="w-full"
+                      />
+                      <div className="flex justify-between text-xs text-gray-500">
+                        <span>Lenient</span>
+                        <span>Strict</span>
+                      </div>
+                    </div>
+
+                    <div className="grid grid-cols-2 md:grid-cols-3 gap-3">
+                      {[
+                        { key: 'requireUsername', label: 'Require Username' },
+                        { key: 'requirePhone', label: 'Require Phone' },
+                        { key: 'requirePhoto', label: 'Require Photo' },
+                      ].map(opt => (
+                        <div key={opt.key} className="flex items-center gap-2">
+                          <input
+                            type="checkbox"
+                            checked={botFilterOptions[opt.key]}
+                            onChange={e => setBotFilterOptions(prev => ({ ...prev, [opt.key]: e.target.checked }))}
+                            className="rounded border-white/20 bg-dark-900 text-primary-600"
+                          />
+                          <span className="text-sm text-gray-400">{opt.label}</span>
+                        </div>
+                      ))}
+                    </div>
+
+                    <div>
+                      <label className={labelClass}>Minimum Account Age (days)</label>
+                      <input
+                        type="number"
+                        value={botFilterOptions.minAccountAge}
+                        onChange={e => setBotFilterOptions(prev => ({ ...prev, minAccountAge: parseInt(e.target.value) || 0 }))}
+                        min="0"
+                        max="3650"
+                        className={inputBase}
+                      />
+                    </div>
+                  </>
+                )}
+              </div>
+            )}
+          </div>
+
+          {/* Submit Button */}
+          <button
+            type="submit"
+            disabled={submitting || selectedSessions.length === 0 || !targets.trim()}
+            className={`${btnPrimary} w-full py-3 text-base`}
+          >
+            {submitting ? (
+              <>
+                <Loader2 className="w-4 h-4 animate-spin" />
+                Starting Scrape...
+              </>
+            ) : (
+              <>
+                <Play className="w-4 h-4" />
+                Start Scraping ({selectedSessions.length} sessions, {targets.split('\n').filter(t => t.trim()).length} targets)
+              </>
+            )}
+          </button>
+        </form>
+      )}
+
+      {/* HISTORY TAB */}
+      {activeTab === 'history' && (
+        <div className="space-y-4">
+          {/* Filters */}
+          <div className="flex gap-3 flex-wrap">
+            <div className="relative flex-1 min-w-64">
+              <Search className="absolute left-3 top-2.5 w-4 h-4 text-gray-500" />
+              <input
+                type="text"
+                value={historyFilter}
+                onChange={e => { setHistoryFilter(e.target.value); setHistoryPage(1); }}
+                placeholder="Search jobs..."
+                className={`${inputBase} pl-9`}
+              />
+            </div>
+            <div className="flex gap-1 bg-dark-900/50 p-1 rounded-lg">
+              {['all', 'running', 'completed', 'failed', 'cancelled'].map(status => (
+                <button
+                  key={status}
+                  onClick={() => { setStatusFilter(status); setHistoryPage(1); }}
+                  className={`px-3 py-1.5 rounded text-xs font-medium transition ${
+                    statusFilter === status
+                      ? 'bg-primary-600 text-white'
+                      : 'text-gray-400 hover:text-white'
+                  }`}
+                >
+                  {status.charAt(0).toUpperCase() + status.slice(1)}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          {/* Jobs Table */}
+          <div className={cardClass}>
+            {loading ? (
+              <div className="p-8 text-center">
+                <Loader2 className="w-8 h-8 animate-spin mx-auto text-primary-500" />
+              </div>
+            ) : jobs.length === 0 ? (
+              <div className="p-8 text-center text-gray-500">
+                <Clock className="w-12 h-12 mx-auto mb-3 opacity-50" />
+                <p>No scrape jobs found</p>
+              </div>
+            ) : (
+              <div className="overflow-x-auto">
+                <table className="w-full text-sm">
+                  <thead>
+                    <tr className="border-b border-white/5">
+                      <th className="text-left py-3 px-3 text-xs font-medium text-gray-400">ID</th>
+                      <th className="text-left py-3 px-3 text-xs font-medium text-gray-400">Target</th>
+                      <th className="text-left py-3 px-3 text-xs font-medium text-gray-400">Sessions</th>
+                      <th className="text-left py-3 px-3 text-xs font-medium text-gray-400">Status</th>
+                      <th className="text-left py-3 px-3 text-xs font-medium text-gray-400">Progress</th>
+                      <th className="text-left py-3 px-3 text-xs font-medium text-gray-400">Users</th>
+                      <th className="text-left py-3 px-3 text-xs font-medium text-gray-400">Created</th>
+                      <th className="text-right py-3 px-3 text-xs font-medium text-gray-400">Actions</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {jobs.map(job => (
+                      <tr key={job.id} className="border-b border-white/5 hover:bg-white/5">
+                        <td className="py-3 px-3 text-gray-300">#{job.id}</td>
+                        <td className="py-3 px-3">
+                          <p className="text-white truncate max-w-40" title={job.target_id}>
+                            {job.target_id}
+                          </p>
+                          <p className="text-xs text-gray-500">{job.target_type}</p>
+                          {renderTargetResults(job)}
+                        </td>
+                        <td className="py-3 px-3 text-gray-300">
+                          {job.job_mode === 'single' ? '1' : `${job.session_ids?.length || 1}`}
+                        </td>
+                        <td className="py-3 px-3">
+                          <StatusBadge 
+                            status={job.status === 'completed_with_errors' ? 'completed' : job.status} 
+                          />
+                          {job.status === 'completed_with_errors' && (
+                            <span className="text-xs text-yellow-400 ml-1">(partial)</span>
+                          )}
+                        </td>
+                        <td className="py-3 px-3">
+                          <div className="w-24 bg-dark-800 rounded-full h-1.5">
+                            <div
+                              className="bg-primary-500 h-1.5 rounded-full transition-all"
+                              style={{ width: `${job.progress || 0}%` }}
+                            />
+                          </div>
+                          <span className="text-xs text-gray-500 mt-1">{job.progress || 0}%</span>
+                        </td>
+                        <td className="py-3 px-3 text-gray-300">
+                          {formatNumber(job.total_found || 0)}
+                        </td>
+                        <td className="py-3 px-3 text-gray-400 text-xs">
+                          {new Date(job.created_at).toLocaleString()}
+                        </td>
+                        <td className="py-3 px-3 text-right">
+                          <div className="flex justify-end gap-1">
+                            {job.status === 'running' && (
+                              <button
+                                onClick={() => handleCancel(job.id)}
+                                className="p-1.5 rounded hover:bg-red-500/20 text-red-400"
+                                title="Cancel"
+                              >
+                                <StopCircle className="w-3.5 h-3.5" />
+                              </button>
+                            )}
+                            {job.status === 'completed' && (
+                              <button
+                                onClick={() => setExportModal(job)}
+                                className="p-1.5 rounded hover:bg-green-500/20 text-green-400"
+                                title="Export"
+                              >
+                                <FileDown className="w-3.5 h-3.5" />
+                              </button>
+                            )}
+                            {(job.status === 'completed' || job.status === 'completed_with_errors') && (
+                              <button
+                                onClick={() => {
+                                  setCreateListModal(job);
+                                  setCreateListName(`Scraped from ${job.target_id || 'job #'}${job.id}`);
+                                }}
+                                className="p-1.5 rounded hover:bg-blue-500/20 text-blue-400"
+                                title="Create List for Messaging"
+                              >
+                                <List className="w-3.5 h-3.5" />
+                              </button>
+                            )}
+                            <button
+                              onClick={() => handleDelete(job.id)}
+                              className="p-1.5 rounded hover:bg-red-500/20 text-red-400"
+                              title="Delete"
+                            >
+                              <Trash2 className="w-3.5 h-3.5" />
+                            </button>
+                          </div>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+
+            {/* Pagination */}
+            {historyPagination.pages > 1 && (
+              <div className="flex justify-between items-center pt-4 border-t border-white/5">
+                <p className="text-xs text-gray-500">
+                  Showing {((historyPage - 1) * 20) + 1}-{Math.min(historyPage * 20, historyPagination.total)} of {historyPagination.total}
+                </p>
+                <div className="flex gap-2">
+                  <button
+                    onClick={() => setHistoryPage(p => Math.max(1, p - 1))}
+                    disabled={historyPage === 1}
+                    className={btnSecondary}
+                  >
+                    <ChevronLeft className="w-4 h-4" />
+                  </button>
+                  <button
+                    onClick={() => setHistoryPage(p => Math.min(historyPagination.pages, p + 1))}
+                    disabled={historyPage === historyPagination.pages}
+                    className={btnSecondary}
+                  >
+                    <ChevronRight className="w-4 h-4" />
+                  </button>
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* STATS TAB */}
+      {activeTab === 'stats' && stats && (
+        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
+          {[
+            { label: 'Total Jobs', value: stats.total_jobs, icon: Clock, color: 'blue' },
+            { label: 'Completed', value: stats.completed, icon: Check, color: 'green' },
+            { label: 'Running', value: stats.running, icon: Play, color: 'yellow' },
+            { label: 'Failed', value: stats.failed, icon: XCircle, color: 'red' },
+            { label: 'Total Users Scraped', value: formatNumber(stats.total_users_scraped), icon: Users, color: 'purple' },
+            { label: 'Bots Filtered', value: formatNumber(stats.total_bots_filtered), icon: ListFilter, color: 'orange' },
+          ].map(stat => (
+            <div key={stat.label} className={`${cardClass} flex items-center gap-4`}>
+              <div className={`p-3 rounded-lg bg-${stat.color}-500/20`}>
+                <stat.icon className={`w-6 h-6 text-${stat.color}-400`} />
+              </div>
+              <div>
+                <p className="text-2xl font-bold text-white">{stat.value}</p>
+                <p className="text-xs text-gray-500">{stat.label}</p>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {/* Export Modal */}
+      {exportModal && (
+        <Modal isOpen={true} onClose={() => setExportModal(null)} title="Export Scraped Users">
+          <div className="space-y-4">
+            <p className="text-sm text-gray-400">
+              Export {formatNumber(exportModal.total_found || 0)} users from job #{exportModal.id}
+            </p>
+            <div className="flex gap-2">
+              {['csv', 'json', 'txt'].map(format => (
+                <button
+                  key={format}
+                  onClick={() => {
+                    handleExport(exportModal.id, format, { excludeBots: true });
+                    setExportModal(null);
+                  }}
+                  className={btnPrimary}
+                >
+                  <Download className="w-4 h-4" />
+                  {format.toUpperCase()}
+                </button>
+              ))}
+            </div>
+          </div>
+        </Modal>
+      )}
+
+      {/* Create List Modal */}
+      {createListModal && (
+        <Modal isOpen={true} onClose={() => { setCreateListModal(null); setCreateListName(''); }} title="Create List for Messaging">
+          <div className="space-y-4">
+            <p className="text-sm text-gray-400">
+              Create a contact list with {formatNumber(createListModal.total_found || 0)} users from job #{createListModal.id}.
+              This list will be available in the Messaging tab for bulk sending.
+            </p>
+            <div>
+              <label className="block text-sm font-medium text-gray-300 mb-1.5">List Name</label>
+              <input
+                type="text"
+                value={createListName}
+                onChange={(e) => setCreateListName(e.target.value)}
+                placeholder="Enter list name..."
+                className={inputBase}
+                autoFocus
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter') handleCreateList();
+                }}
+              />
+            </div>
+            <div className="flex gap-2">
+              <button
+                onClick={() => { setCreateListModal(null); setCreateListName(''); }}
+                className={btnSecondary}
+              >
+                Cancel
+              </button>
+              <button
+                onClick={handleCreateList}
+                disabled={creatingList || !createListName.trim()}
+                className={btnPrimary}
+              >
+                {creatingList ? (
+                  <>
+                    <Loader2 className="w-4 h-4 animate-spin" />
+                    Creating...
+                  </>
+                ) : (
+                  <>
+                    <List className="w-4 h-4" />
+                    Create List
+                  </>
+                )}
+              </button>
+            </div>
+          </div>
+        </Modal>
+      )}
+    </div>
+  );
+}

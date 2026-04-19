@@ -1,0 +1,410 @@
+const scrapeService = require('../services/scrapeService');
+const reportService = require('../services/reportService');
+const scrapeQueue = require('../queues/scrapeQueue');
+const { AppError, asyncHandler } = require('../utils/errorHandler');
+const logger = require('../utils/logger');
+
+const scrapeController = {
+  /**
+   * Create a scrape job for group members.
+   *
+   * Expects req.body: { sessionId, groupId, limit?, filterBots?, saveToList?, includeDetails?, listName? }
+   * For multi-group: { sessionId, groupIds: [string], ...same options }
+   * If async=true, the job is added to BullMQ queue instead of running inline.
+   */
+  scrapeGroup: asyncHandler(async (req, res) => {
+    const userId = req.user.id;
+    const { sessionId, groupId, groupIds, limit, filterBots, saveToList, includeDetails, listName, async } = req.body;
+
+    if (!sessionId) {
+      throw new AppError('sessionId is required', 400, 'MISSING_SESSION_ID');
+    }
+
+    // Multi-group scrape
+    if (groupIds && Array.isArray(groupIds)) {
+      if (groupIds.length === 0) {
+        throw new AppError('groupIds array must not be empty', 400, 'NO_GROUP_IDS');
+      }
+
+      const options = {
+        limit: limit ? parseInt(limit, 10) : undefined,
+        filterBots: filterBots === 'true' || filterBots === true || filterBots === undefined,
+        saveToList: saveToList === 'true' || saveToList === true,
+        includeDetails: includeDetails === 'true' || includeDetails === true,
+        listName: listName || undefined,
+      };
+
+      const result = await scrapeService.scrapeMultipleGroups(sessionId, groupIds, options, userId);
+
+      await reportService.logActivity(
+        userId,
+        'scrape_start',
+        'scrape_job',
+        null,
+        {
+          type: 'multi_group',
+          groupCount: groupIds.length,
+          sessionId,
+          ...options,
+        }
+      );
+
+      logger.info(`Multi-group scrape started by user ${userId}`, {
+        groupCount: groupIds.length,
+        sessionId,
+      });
+
+      return res.status(200).json({
+        success: true,
+        data: {
+          type: 'multi_group',
+          totalGroups: result.totalGroups,
+          totalUsers: result.totalUsers,
+          jobs: result.jobs,
+        },
+      });
+    }
+
+    // Single group scrape
+    if (!groupId) {
+      throw new AppError('groupId is required', 400, 'MISSING_GROUP_ID');
+    }
+
+    const options = {
+      limit: limit ? parseInt(limit, 10) : undefined,
+      filterBots: filterBots === 'true' || filterBots === true || filterBots === undefined,
+      saveToList: saveToList === 'true' || saveToList === true,
+      includeDetails: includeDetails === 'true' || includeDetails === true,
+      listName: listName || undefined,
+    };
+
+    // Async mode: add to BullMQ queue
+    if (async === 'true' || async === true) {
+      const queueJob = await scrapeQueue.addJob({
+        type: 'group',
+        sessionId,
+        targetId: groupId,
+        options,
+        userId,
+      });
+
+      await reportService.logActivity(
+        userId,
+        'scrape_start',
+        'scrape_job',
+        null,
+        {
+          type: 'group',
+          groupId: String(groupId),
+          sessionId,
+          queueJobId: queueJob.id,
+          ...options,
+        }
+      );
+
+      logger.info(`Group scrape job queued by user ${userId}`, {
+        queueJobId: queueJob.id,
+        groupId,
+        sessionId,
+      });
+
+      return res.status(202).json({
+        success: true,
+        data: {
+          queueJobId: queueJob.id,
+          status: 'queued',
+          type: 'group',
+          targetId: String(groupId),
+        },
+      });
+    }
+
+    // Sync mode: run inline
+    const result = await scrapeService.scrapeGroupMembers(sessionId, groupId, options, userId);
+
+    await reportService.logActivity(
+      userId,
+      result.status === 'completed' ? 'scrape_complete' : 'scrape_fail',
+      'scrape_job',
+      result.jobId,
+      {
+        type: 'group',
+        groupId: String(groupId),
+        sessionId,
+        totalFound: result.totalFound,
+        status: result.status,
+      }
+    );
+
+    logger.info(`Group scrape completed by user ${userId}`, {
+      jobId: result.jobId,
+      groupId,
+      status: result.status,
+      totalFound: result.totalFound,
+    });
+
+    return res.status(200).json({
+      success: true,
+      data: {
+        jobId: result.jobId,
+        status: result.status,
+        totalFound: result.totalFound,
+        targetTitle: result.targetTitle,
+        listCreated: result.listCreated,
+      },
+    });
+  }),
+
+  /**
+   * Create a scrape job for channel subscribers.
+   *
+   * Expects req.body: { sessionId, channelId, limit?, saveToList?, includeDetails?, listName? }
+   * If async=true, the job is added to BullMQ queue.
+   */
+  scrapeChannel: asyncHandler(async (req, res) => {
+    const userId = req.user.id;
+    const { sessionId, channelId, limit, saveToList, includeDetails, listName, async } = req.body;
+
+    if (!sessionId) {
+      throw new AppError('sessionId is required', 400, 'MISSING_SESSION_ID');
+    }
+
+    if (!channelId) {
+      throw new AppError('channelId is required', 400, 'MISSING_CHANNEL_ID');
+    }
+
+    const options = {
+      limit: limit ? parseInt(limit, 10) : undefined,
+      saveToList: saveToList === 'true' || saveToList === true,
+      includeDetails: includeDetails === 'true' || includeDetails === true,
+      listName: listName || undefined,
+    };
+
+    // Async mode: add to BullMQ queue
+    if (async === 'true' || async === true) {
+      const queueJob = await scrapeQueue.addJob({
+        type: 'channel',
+        sessionId,
+        targetId: channelId,
+        options,
+        userId,
+      });
+
+      await reportService.logActivity(
+        userId,
+        'scrape_start',
+        'scrape_job',
+        null,
+        {
+          type: 'channel',
+          channelId: String(channelId),
+          sessionId,
+          queueJobId: queueJob.id,
+          ...options,
+        }
+      );
+
+      logger.info(`Channel scrape job queued by user ${userId}`, {
+        queueJobId: queueJob.id,
+        channelId,
+        sessionId,
+      });
+
+      return res.status(202).json({
+        success: true,
+        data: {
+          queueJobId: queueJob.id,
+          status: 'queued',
+          type: 'channel',
+          targetId: String(channelId),
+        },
+      });
+    }
+
+    // Sync mode: run inline
+    const result = await scrapeService.scrapeChannelSubscribers(sessionId, channelId, options, userId);
+
+    await reportService.logActivity(
+      userId,
+      result.status === 'completed' ? 'scrape_complete' : 'scrape_fail',
+      'scrape_job',
+      result.jobId,
+      {
+        type: 'channel',
+        channelId: String(channelId),
+        sessionId,
+        totalFound: result.totalFound,
+        status: result.status,
+      }
+    );
+
+    logger.info(`Channel scrape completed by user ${userId}`, {
+      jobId: result.jobId,
+      channelId,
+      status: result.status,
+      totalFound: result.totalFound,
+    });
+
+    return res.status(200).json({
+      success: true,
+      data: {
+        jobId: result.jobId,
+        status: result.status,
+        totalFound: result.totalFound,
+        targetTitle: result.targetTitle,
+        listCreated: result.listCreated,
+      },
+    });
+  }),
+
+  /**
+   * List all scrape jobs with pagination and optional filters.
+   *
+   * Query params: page, limit, sort, order, status, targetType
+   */
+  getJobs: asyncHandler(async (req, res) => {
+    const userId = req.user.id;
+
+    const page = req.query.page ? parseInt(req.query.page, 10) : 1;
+    const limit = req.query.limit ? parseInt(req.query.limit, 10) : 20;
+    const sort = req.query.sort || 'created_at';
+    const order = req.query.order || 'DESC';
+    const status = req.query.status || undefined;
+    const targetType = req.query.targetType || undefined;
+
+    const { jobs, pagination } = await scrapeService.listJobs(userId, {
+      page,
+      limit,
+      sort,
+      order,
+      status,
+      targetType,
+    });
+
+    return res.status(200).json({
+      success: true,
+      data: {
+        jobs,
+        pagination,
+      },
+    });
+  }),
+
+  /**
+   * Get single scrape job details.
+   *
+   * Job ID comes from req.params.id.
+   */
+  getJob: asyncHandler(async (req, res) => {
+    const userId = req.user.id;
+    const jobId = req.params.id;
+
+    if (!jobId) {
+      throw new AppError('Job ID is required', 400, 'MISSING_JOB_ID');
+    }
+
+    const job = await scrapeService.getJobDetails(jobId, userId);
+
+    return res.status(200).json({
+      success: true,
+      data: {
+        job,
+      },
+    });
+  }),
+
+  /**
+   * Cancel a running scrape job.
+   *
+   * Job ID comes from req.params.id.
+   */
+  cancelJob: asyncHandler(async (req, res) => {
+    const userId = req.user.id;
+    const jobId = req.params.id;
+
+    if (!jobId) {
+      throw new AppError('Job ID is required', 400, 'MISSING_JOB_ID');
+    }
+
+    // Cancel via the service (sets cancellation token and updates DB)
+    const result = await scrapeService.cancelJob(jobId, userId);
+
+    // Also try to cancel in BullMQ queue if the job is queued
+    try {
+      await scrapeQueue.cancelJob(jobId);
+    } catch (queueError) {
+      logger.debug(`Job ${jobId} not found in BullMQ queue or already processed`, {
+        error: queueError.message,
+      });
+    }
+
+    await reportService.logActivity(
+      userId,
+      'scrape_cancel',
+      'scrape_job',
+      jobId,
+      { previousStatus: 'running' }
+    );
+
+    logger.info(`Scrape job ${jobId} cancelled by user ${userId}`);
+
+    return res.status(200).json({
+      success: true,
+      data: result,
+    });
+  }),
+
+  /**
+   * Export scraped users from a job in the specified format.
+   *
+   * Query params: format (csv|json|txt, default: csv)
+   * Job ID comes from req.params.id.
+   */
+  exportJob: asyncHandler(async (req, res) => {
+    const userId = req.user.id;
+    const jobId = req.params.id;
+    const format = req.query.format || 'csv';
+
+    if (!jobId) {
+      throw new AppError('Job ID is required', 400, 'MISSING_JOB_ID');
+    }
+
+    const { content, filename, mimeType, totalUsers } = await scrapeService.exportUsers(jobId, format, userId);
+
+    await reportService.logActivity(
+      userId,
+      'list_export',
+      'scrape_job',
+      jobId,
+      { format, totalUsers }
+    );
+
+    logger.info(`Scrape job ${jobId} exported as ${format} by user ${userId}`, {
+      totalUsers,
+      format,
+    });
+
+    // Set appropriate headers for file download
+    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+    res.setHeader('Content-Type', mimeType);
+    res.setHeader('Content-Length', Buffer.byteLength(content));
+
+    return res.status(200).send(content);
+  }),
+
+  /**
+   * Get scraping statistics for the authenticated user.
+   */
+  getScrapeStats: asyncHandler(async (req, res) => {
+    const userId = req.user.id;
+
+    const stats = await scrapeService.getScrapeStats(userId);
+
+    return res.status(200).json({
+      success: true,
+      data: stats,
+    });
+  }),
+};
+
+module.exports = scrapeController;
