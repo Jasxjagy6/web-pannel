@@ -21,3 +21,35 @@ export const bulkDeleteSessions = (ids) =>
 export const checkSessionStatus = (id) => api.get(`/sessions/${id}/status`);
 
 export const getSessionStats = () => api.get('/sessions/stats');
+
+// Upgrade 5 — interactive session creation flow.
+export const createSessionStart = (payload) =>
+  api.post('/sessions/create/start', payload);
+export const createSessionVerify = (payload) =>
+  api.post('/sessions/create/verify', payload);
+export const createSessionPassword = (payload) =>
+  api.post('/sessions/create/password', payload);
+export const createSessionResend = (payload) =>
+  api.post('/sessions/create/resend', payload);
+export const createSessionCancel = (payload) =>
+  api.post('/sessions/create/cancel', payload);
+
+/**
+ * Trigger a download of the encrypted session JSON for a given session id.
+ * Uses the configured axios instance (so the JWT is attached) and synthesises
+ * a temporary <a> tag to invoke the browser's download flow.
+ */
+export const downloadSession = async (id, suggestedName = 'session.json') => {
+  const response = await api.get(`/sessions/${id}/download`, {
+    responseType: 'blob',
+  });
+  const blob = response.data;
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = suggestedName;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+};

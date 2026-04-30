@@ -1428,12 +1428,35 @@ class SessionService {
       // Create and connect the telegram client with timeout
       const tgSessionId = String(sessionId);
 
+      // Allocate a proxy for this session (Upgrade 4 — IP rotation, max 4
+      // accounts per IP, VPS direct first then free / manual proxies).
+      // We commit the outer transaction's row lock first because the
+      // assignment itself inserts into session_proxy_assignments which has
+      // an FK to sessions.id, and the FK validation would deadlock-wait on
+      // our own SELECT ... FOR UPDATE.
+      let assignedProxy = null;
+      await client.query('COMMIT');
+      try {
+        const proxyService = require('./proxyService');
+        const row = await proxyService.assignProxyForSession(sessionId);
+        assignedProxy = proxyService.buildGramJSProxy(row);
+      } catch (proxyErr) {
+        logger.warn(`Proxy assignment failed for session ${sessionId}: ${proxyErr.message}`);
+      }
+      await client.query('BEGIN');
+      // Re-acquire our row lock for the rest of the login flow.
+      await client.query(
+        `SELECT id FROM sessions WHERE id = $1 AND user_id = $2 FOR UPDATE`,
+        [sessionId, userId]
+      );
+
       // Add timeout to prevent indefinite hanging
       const loginPromise = tgService.createSession(
         tgSessionId,
         fileData.session,
         session.api_id || undefined,
-        session.api_hash || undefined
+        session.api_hash || undefined,
+        { proxy: assignedProxy }
       );
       const timeoutPromise = new Promise((_, reject) =>
         setTimeout(() => reject(new Error('Login timeout exceeded (30s)')), LOGIN_TIMEOUT_MS)
@@ -1933,6 +1956,149 @@ class SessionService {
     } catch {
       return false;
     }
+  }
+
+  // =========================================================================
+  // Persistent session keep-alive (Upgrade 1)
+  // =========================================================================
+
+  /**
+   * Restore Telegram clients for every session marked as logged-in in the
+   * database. Called once on backend startup so that previously-uploaded
+   * sessions remain authenticated until the user explicitly logs them out.
+   *
+   * Failures on individual sessions are logged and do NOT mark the session
+   * as logged-out — Upgrade 1 explicitly requires that logout only happen
+   * via an explicit user action.
+   */
+  async restoreAllLoggedInSessions() {
+    logger.info('Restoring persisted logged-in sessions');
+    let total = 0;
+    let restored = 0;
+    let failed = 0;
+    try {
+      const result = await pool.query(
+        `SELECT id FROM sessions
+         WHERE is_logged_in = TRUE AND COALESCE(keep_alive, TRUE) = TRUE
+         ORDER BY id ASC`
+      );
+      total = result.rows.length;
+      for (const row of result.rows) {
+        const sessionId = row.id;
+        try {
+          // Try to (re)assign a proxy and load the client.
+          let proxyConf = null;
+          try {
+            const proxyService = require('./proxyService');
+            const proxyRow = await proxyService.assignProxyForSession(sessionId);
+            proxyConf = proxyService.buildGramJSProxy(proxyRow);
+          } catch (proxyErr) {
+            logger.debug(`Proxy assign failed during restore for ${sessionId}: ${proxyErr.message}`);
+          }
+
+          if (tgService.isSessionActive(String(sessionId))) {
+            restored++;
+            continue;
+          }
+          // Use the lower-level loader and then reset proxy via _ensureConnected.
+          await tgService._loadSessionFromDB(sessionId);
+          // If a proxy is configured, replace the client with one bound to that proxy.
+          if (proxyConf) {
+            const sFile = await this._readSessionFile(sessionId);
+            if (sFile) {
+              await tgService.disconnectSession(String(sessionId)).catch(() => {});
+              await tgService.createSession(
+                String(sessionId),
+                sFile.encryptedSession,
+                sFile.apiId,
+                sFile.apiHash,
+                { proxy: proxyConf }
+              );
+            }
+          }
+          await pool.query(`UPDATE sessions SET last_heartbeat = NOW() WHERE id = $1`, [sessionId]);
+          restored++;
+        } catch (err) {
+          failed++;
+          logger.warn(`Failed to restore session ${sessionId}: ${err.message}`);
+          // Per Upgrade 1: do NOT flip is_logged_in to false on failure;
+          // the heartbeat loop will retry on the next tick.
+        }
+      }
+    } catch (err) {
+      logger.error('restoreAllLoggedInSessions failed', { error: err.message });
+    }
+    logger.info(`Session restore: total=${total} restored=${restored} failed=${failed}`);
+    return { total, restored, failed };
+  }
+
+  /**
+   * Read the encrypted session payload + api credentials from disk for a
+   * given session row. Returns null if the file is missing.
+   * @private
+   */
+  async _readSessionFile(sessionId) {
+    try {
+      const r = await pool.query(
+        `SELECT session_file_path, api_id, api_hash FROM sessions WHERE id = $1`,
+        [sessionId]
+      );
+      const row = r.rows[0];
+      if (!row || !row.session_file_path) return null;
+      const fullPath = path.join(uploadDir, row.session_file_path);
+      if (!await fs.pathExists(fullPath)) return null;
+      const data = JSON.parse(await fs.readFile(fullPath, 'utf8'));
+      if (!data.session) return null;
+      return {
+        encryptedSession: data.session,
+        apiId: row.api_id || undefined,
+        apiHash: row.api_hash || undefined,
+      };
+    } catch (err) {
+      logger.debug(`_readSessionFile error: ${err.message}`);
+      return null;
+    }
+  }
+
+  /**
+   * Run a heartbeat sweep over every session marked logged-in: ensure the
+   * underlying Telegram client is connected, and update last_heartbeat on
+   * success. Keeps clients alive for the duration of the container.
+   */
+  async heartbeatLoggedInSessions() {
+    let pinged = 0;
+    let revived = 0;
+    let failed = 0;
+    try {
+      const result = await pool.query(
+        `SELECT id FROM sessions WHERE is_logged_in = TRUE AND COALESCE(keep_alive, TRUE) = TRUE`
+      );
+      for (const row of result.rows) {
+        const sid = String(row.id);
+        try {
+          const wasActive = tgService.isSessionActive(sid);
+          await tgService._ensureConnected(sid);
+          if (!wasActive) revived++;
+          // Lightweight ping that exercises the connection.
+          try {
+            await tgService.getMe(sid);
+          } catch (pingErr) {
+            logger.debug(`heartbeat getMe failed for ${sid}: ${pingErr.message}`);
+          }
+          await pool.query(`UPDATE sessions SET last_heartbeat = NOW() WHERE id = $1`, [row.id]);
+          pinged++;
+        } catch (err) {
+          failed++;
+          logger.debug(`heartbeat failed for session ${sid}: ${err.message}`);
+        }
+      }
+    } catch (err) {
+      logger.warn(`heartbeatLoggedInSessions sweep failed: ${err.message}`);
+    }
+    if (pinged || revived || failed) {
+      logger.debug(`Heartbeat: pinged=${pinged} revived=${revived} failed=${failed}`);
+    }
+    return { pinged, revived, failed };
   }
 }
 

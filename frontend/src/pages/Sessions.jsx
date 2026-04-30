@@ -7,6 +7,7 @@ import {
   logoutSession,
   deleteSession,
   bulkDeleteSessions,
+  downloadSession,
 } from '../api/sessions';
 import { parseApiError, formatRelativeTime, formatNumber } from '../utils/formatters';
 import { useToast } from '../components/common/Toast';
@@ -44,6 +45,7 @@ import {
   X,
   FileText,
   AlertTriangle,
+  Download,
 } from 'lucide-react';
 
 // --- Helper: format file size ---
@@ -805,6 +807,20 @@ export default function Sessions() {
                             title="View Details"
                           >
                             <Eye className="w-4 h-4" />
+                          </button>
+                          <button
+                            onClick={async () => {
+                              try {
+                                const phone = session.phone ? `${session.phone.replace(/^\+/, '+')}.json` : `session-${session.id}.json`;
+                                await downloadSession(session.id, phone);
+                              } catch (err) {
+                                showError(parseApiError(err));
+                              }
+                            }}
+                            className="p-1.5 rounded-lg text-gray-400 hover:text-blue-400 hover:bg-blue-500/10 transition"
+                            title="Download session file"
+                          >
+                            <Download className="w-4 h-4" />
                           </button>
                           {session.status?.toLowerCase() === 'active' ? (
                             <button
