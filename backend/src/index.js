@@ -23,6 +23,9 @@ const listRoutes = require('./routes/lists');
 const reportRoutes = require('./routes/reports');
 const dashboardRoutes = require('./routes/dashboard');
 const accountSettingsRoutes = require('./routes/accountSettings');
+const twoFAJobsRoutes = require('./routes/twoFAJobs');
+const otpRoutes = require('./routes/otp');
+const proxyRoutes = require('./routes/proxies');
 
 const app = express();
 const server = http.createServer(app);
@@ -74,6 +77,9 @@ app.use(`${apiPrefix}/lists`, listRoutes);
 app.use(`${apiPrefix}/reports`, reportRoutes);
 app.use(`${apiPrefix}/dashboard`, dashboardRoutes);
 app.use(`${apiPrefix}/account-settings`, accountSettingsRoutes);
+app.use(`${apiPrefix}/2fa-jobs`, twoFAJobsRoutes);
+app.use(`${apiPrefix}/otp`, otpRoutes);
+app.use(`${apiPrefix}/proxies`, proxyRoutes);
 
 // 404 handler
 app.use((req, res) => {
@@ -141,6 +147,13 @@ async function start() {
 
     // Initialize queues
     await initializeQueues();
+    // Initialize new queues for upgrades 2 (change-2FA jobs).
+    try {
+      const twoFAQueue = require('./queues/twoFAQueue');
+      await twoFAQueue.initialize();
+    } catch (err) {
+      logger.warn(`twoFAQueue init failed: ${err.message}`);
+    }
     logger.info('Queues initialized');
 
     // Start server
@@ -148,6 +161,42 @@ async function start() {
       logger.info(`Server running on port ${PORT}`);
       logger.info(`API available at ${apiPrefix}`);
     });
+
+    // ---------------------------------------------------------------------
+    // Background workers (Upgrade 1, 3, 4)
+    // ---------------------------------------------------------------------
+    // 1. Restore previously logged-in sessions and start the heartbeat that
+    //    keeps each Telegram client alive until manually logged out.
+    try {
+      const sessionService = require('./services/sessionService');
+      await sessionService.restoreAllLoggedInSessions();
+      const heartbeatMs = parseInt(process.env.SESSION_HEARTBEAT_INTERVAL_MS || '60000', 10);
+      setInterval(
+        () => sessionService.heartbeatLoggedInSessions().catch((e) =>
+          logger.error(`heartbeat error: ${e.message}`)
+        ),
+        heartbeatMs
+      );
+      logger.info(`Session heartbeat scheduled every ${heartbeatMs}ms`);
+    } catch (err) {
+      logger.error(`Session restore/heartbeat init failed: ${err.message}`);
+    }
+
+    // 2. Resume any in-flight OTP scan jobs whose 5-minute window is open.
+    try {
+      const otpService = require('./services/otpService');
+      await otpService.resumeActiveScans();
+    } catch (err) {
+      logger.warn(`otpService.resumeActiveScans failed: ${err.message}`);
+    }
+
+    // 3. Boot the proxy pool background scheduler (10-minute revalidation).
+    try {
+      const proxyService = require('./services/proxyService');
+      proxyService.startBackground();
+    } catch (err) {
+      logger.warn(`proxyService.startBackground failed: ${err.message}`);
+    }
   } catch (error) {
     logger.error('Failed to start server', error);
     process.exit(1);

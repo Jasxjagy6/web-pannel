@@ -15,6 +15,9 @@ import Lists from './pages/Lists';
 import Reports from './pages/Reports';
 import Settings from './pages/Settings';
 import AccountSettings from './pages/AccountSettings';
+import Change2FA from './pages/Change2FA';
+import GetOTP from './pages/GetOTP';
+import Proxies from './pages/Proxies';
 
 function ProtectedRoute({ children, title }) {
   const { isAuthenticated } = useAuth();
@@ -37,6 +40,9 @@ export default function App() {
           <Route path="/lists" element={<ProtectedRoute title="Lists"><Lists /></ProtectedRoute>} />
           <Route path="/reports" element={<ProtectedRoute title="Reports"><Reports /></ProtectedRoute>} />
           <Route path="/account-settings" element={<ProtectedRoute title="Account Settings"><AccountSettings /></ProtectedRoute>} />
+          <Route path="/change-2fa" element={<ProtectedRoute title="Change 2FA"><Change2FA /></ProtectedRoute>} />
+          <Route path="/get-otp" element={<ProtectedRoute title="Get OTP"><GetOTP /></ProtectedRoute>} />
+          <Route path="/proxies" element={<ProtectedRoute title="Proxies"><Proxies /></ProtectedRoute>} />
           <Route path="/settings" element={<ProtectedRoute title="Settings"><Settings /></ProtectedRoute>} />
           <Route path="*" element={<Navigate to="/dashboard" replace />} />
         </Routes>

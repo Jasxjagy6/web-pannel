@@ -21,12 +21,30 @@ const initDB = async () => {
   try {
     const fs = require('fs');
     const path = require('path');
+
+    // Apply base schema first.
     const schemaPath = path.join(__dirname, 'schema.sql');
-    
     if (fs.existsSync(schemaPath)) {
       const schema = fs.readFileSync(schemaPath, 'utf8');
       await pool.query(schema);
       console.log('Database schema initialized successfully');
+    }
+
+    // Apply additive migrations in order. Each migration is idempotent.
+    const migrations = [
+      'migration_scraping_upgrade.sql',
+      'migration_v2_upgrades.sql',
+    ];
+    for (const m of migrations) {
+      const mPath = path.join(__dirname, m);
+      if (!fs.existsSync(mPath)) continue;
+      try {
+        const sql = fs.readFileSync(mPath, 'utf8');
+        await pool.query(sql);
+        console.log(`Applied migration: ${m}`);
+      } catch (err) {
+        console.error(`Failed migration ${m}:`, err.message);
+      }
     }
   } catch (error) {
     console.error('Error initializing database schema:', error.message);

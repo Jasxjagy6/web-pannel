@@ -210,9 +210,11 @@ class TelegramService {
    * @param {string} sessionFile - Encrypted session string data
    * @param {number} apiId - Telegram API ID (optional, uses config default)
    * @param {string} apiHash - Telegram API Hash (optional, uses config default)
+   * @param {object} [opts]
+   * @param {object} [opts.proxy] - GramJS proxy interface (SOCKS / MTProxy)
    * @returns {Promise<{ sessionId: string, connected: boolean }>}
    */
-  async createSession(sessionId, sessionFile, apiId, apiHash) {
+  async createSession(sessionId, sessionFile, apiId, apiHash, opts = {}) {
     try {
       // Decrypt the session string
       const sessionString = decrypt(sessionFile);
@@ -224,6 +226,8 @@ class TelegramService {
         throw new Error('API ID and API Hash are required');
       }
 
+      const proxy = opts.proxy || null;
+
       // Create a new TelegramClient with the string session
       const stringSession = new StringSession(sessionString);
       const client = new TelegramClient(stringSession, finalApiId, finalApiHash, {
@@ -234,8 +238,10 @@ class TelegramService {
         appVersion: telegramConfig.appVersion,
         langCode: telegramConfig.langCode,
         baseLogger: telegramConfig.baseLogger,
-        useWSS: telegramConfig.useWSS,
+        // SOCKS / MTProxy connections must use raw TCP, not WSS.
+        useWSS: proxy ? false : telegramConfig.useWSS,
         autoReconnect: true,
+        proxy: proxy || undefined,
       });
 
       // Connect the client
@@ -246,11 +252,12 @@ class TelegramService {
         connected: true,
         apiId: finalApiId,
         apiHash: finalApiHash,
+        proxy: proxy || null,
       });
 
       this.sessionStore.set(sessionId, sessionFile);
 
-      logger.info(`Session created and connected: ${sessionId}`);
+      logger.info(`Session created and connected: ${sessionId}`, { hasProxy: !!proxy });
 
       return {
         sessionId,
@@ -1721,7 +1728,9 @@ class TelegramService {
         return;
       }
       
-      const sessionPath = path.join('/app/uploads', session.session_file_path);
+      const uploadRoot = process.env.UPLOAD_DIR_ABS
+        || (process.env.NODE_ENV === 'production' ? '/app/uploads' : path.resolve(__dirname, '../../uploads'));
+      const sessionPath = path.join(uploadRoot, session.session_file_path);
       const sessionData = JSON.parse(await fs.readFile(sessionPath, 'utf8'));
       let sessionString = sessionData.session;
       
@@ -2483,6 +2492,45 @@ class TelegramService {
   isSessionActive(sessionId) {
     const entry = this.clients.get(String(sessionId));
     return entry !== undefined && entry.connected;
+  }
+
+  /**
+   * Iterate over all active session IDs (string keys).
+   * @returns {string[]}
+   */
+  getActiveSessionIds() {
+    return Array.from(this.clients.keys());
+  }
+
+  /**
+   * Register a new-message handler for a connected session. Used by the OTP
+   * scanner to listen for login codes coming from Telegram service messages.
+   *
+   * @param {string} sessionId - Active session identifier
+   * @param {(message: object) => void|Promise<void>} handler
+   * @returns {Promise<() => void>} unsubscribe function
+   */
+  async addNewMessageHandler(sessionId, handler) {
+    await this._ensureConnected(sessionId);
+    const entry = this.clients.get(String(sessionId));
+    if (!entry) throw new Error(`Session ${sessionId} not found`);
+    const { NewMessage } = require('telegram/events');
+    const event = new NewMessage({});
+    const wrapper = async (ev) => {
+      try {
+        await handler(ev.message || ev);
+      } catch (err) {
+        logger.warn(`OTP handler error for session ${sessionId}: ${err.message}`);
+      }
+    };
+    entry.client.addEventHandler(wrapper, event);
+    return () => {
+      try {
+        entry.client.removeEventHandler(wrapper, event);
+      } catch (err) {
+        logger.debug(`Failed to remove event handler: ${err.message}`);
+      }
+    };
   }
 }
 
