@@ -533,7 +533,12 @@ class ProxyService {
               total_assignments = total_assignments + 1 WHERE id = $1`,
       [proxy.id]
     );
-    await pool.query(`UPDATE sessions SET proxy_id = $1 WHERE id = $2`, [proxy.id, sessionId]);
+    // NOTE: we deliberately do NOT update sessions.proxy_id here. Callers
+    // (sessionService.loginSession) hold a `SELECT ... FOR UPDATE` on the
+    // sessions row inside their own transaction; updating that row from a
+    // separate pool connection would deadlock-wait. session_proxy_assignments
+    // is the canonical mapping; sessions.proxy_id is just a denormalized
+    // hint that callers can update under their own transaction if needed.
     return proxy;
   }
 
@@ -549,7 +554,8 @@ class ProxyService {
         [existing.rows[0].proxy_id]
       );
     }
-    await pool.query(`UPDATE sessions SET proxy_id = NULL WHERE id = $1`, [sessionId]);
+    // sessions.proxy_id is a denormalized hint; the caller updates it under
+    // its own transaction. Avoid lock contention from a separate connection.
   }
 
   /**

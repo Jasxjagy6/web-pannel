@@ -1,4 +1,9 @@
+const path = require('path');
+const fs = require('fs-extra');
+const { pool } = require('../config/database');
+const { uploadDir } = require('../middleware/upload');
 const sessionService = require('../services/sessionService');
+const sessionCreationService = require('../services/sessionCreationService');
 const telegramService = require('../services/telegramService');
 const reportService = require('../services/reportService');
 const { AppError, asyncHandler } = require('../utils/errorHandler');
@@ -317,6 +322,95 @@ const sessionController = {
       success: true,
       data: stats,
     });
+  }),
+
+  // =========================================================================
+  // Upgrade 5 — Create Session via panel (interactive sendCode → signIn flow)
+  // =========================================================================
+
+  createSessionStart: asyncHandler(async (req, res) => {
+    const userId = req.user.id;
+    const { phone, apiId, apiHash } = req.body || {};
+    const result = await sessionCreationService.start({
+      userId,
+      phone,
+      apiId,
+      apiHash,
+    });
+    return res.status(200).json({ success: true, data: result });
+  }),
+
+  createSessionVerify: asyncHandler(async (req, res) => {
+    const userId = req.user.id;
+    const { tempId, code } = req.body || {};
+    const result = await sessionCreationService.verify({ userId, tempId, code });
+    return res.status(200).json({ success: true, data: result });
+  }),
+
+  createSessionPassword: asyncHandler(async (req, res) => {
+    const userId = req.user.id;
+    const { tempId, password } = req.body || {};
+    const result = await sessionCreationService.password({
+      userId,
+      tempId,
+      password,
+    });
+    return res.status(200).json({ success: true, data: result });
+  }),
+
+  createSessionResend: asyncHandler(async (req, res) => {
+    const userId = req.user.id;
+    const { tempId } = req.body || {};
+    const result = await sessionCreationService.resend({ userId, tempId });
+    return res.status(200).json({ success: true, data: result });
+  }),
+
+  createSessionCancel: asyncHandler(async (req, res) => {
+    const userId = req.user.id;
+    const { tempId } = req.body || {};
+    const result = await sessionCreationService.cancel({ userId, tempId });
+    return res.status(200).json({ success: true, data: result });
+  }),
+
+  /**
+   * Download the on-disk session file for a session the user owns.
+   * The downloaded JSON contains the encrypted GramJS string session — i.e.
+   * the same format the panel accepts via /upload, so it round-trips.
+   */
+  downloadSession: asyncHandler(async (req, res) => {
+    const userId = req.user.id;
+    const sessionId = req.params.id;
+    if (!sessionId) {
+      throw new AppError('Session ID is required', 400, 'MISSING_SESSION_ID');
+    }
+
+    const r = await pool.query(
+      `SELECT id, phone, session_file_path, account_info
+         FROM sessions
+        WHERE id = $1 AND user_id = $2`,
+      [sessionId, userId]
+    );
+    const row = r.rows[0];
+    if (!row) {
+      throw new AppError('Session not found', 404, 'SESSION_NOT_FOUND');
+    }
+    if (!row.session_file_path) {
+      throw new AppError('Session has no file on disk', 404, 'SESSION_FILE_MISSING');
+    }
+    const fullPath = path.join(uploadDir, row.session_file_path);
+    if (!(await fs.pathExists(fullPath))) {
+      throw new AppError('Session file is missing on disk', 404, 'SESSION_FILE_MISSING');
+    }
+
+    const ext = path.extname(row.session_file_path) || '.json';
+    const safePhone = (row.phone || `session-${row.id}`).replace(/[^A-Za-z0-9+_-]/g, '');
+    const downloadName = `${safePhone}${ext}`;
+    res.setHeader('Content-Type', 'application/octet-stream');
+    res.setHeader(
+      'Content-Disposition',
+      `attachment; filename="${downloadName}"`
+    );
+    return res.sendFile(fullPath);
   }),
 };
 

@@ -18,6 +18,7 @@ import AccountSettings from './pages/AccountSettings';
 import Change2FA from './pages/Change2FA';
 import GetOTP from './pages/GetOTP';
 import Proxies from './pages/Proxies';
+import CreateSession from './pages/CreateSession';
 
 function ProtectedRoute({ children, title }) {
   const { isAuthenticated } = useAuth();
@@ -34,6 +35,7 @@ export default function App() {
           <Route path="/login" element={<Login />} />
           <Route path="/dashboard" element={<ProtectedRoute title="Dashboard"><Dashboard /></ProtectedRoute>} />
           <Route path="/sessions" element={<ProtectedRoute title="Sessions"><Sessions /></ProtectedRoute>} />
+          <Route path="/create-session" element={<ProtectedRoute title="Create Session"><CreateSession /></ProtectedRoute>} />
           <Route path="/scrape" element={<ProtectedRoute title="Scrape"><Scrape /></ProtectedRoute>} />
           <Route path="/messaging" element={<ProtectedRoute title="Messaging"><Messaging /></ProtectedRoute>} />
           <Route path="/groups" element={<ProtectedRoute title="Groups"><Groups /></ProtectedRoute>} />

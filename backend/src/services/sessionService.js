@@ -1430,7 +1430,12 @@ class SessionService {
 
       // Allocate a proxy for this session (Upgrade 4 — IP rotation, max 4
       // accounts per IP, VPS direct first then free / manual proxies).
+      // We commit the outer transaction's row lock first because the
+      // assignment itself inserts into session_proxy_assignments which has
+      // an FK to sessions.id, and the FK validation would deadlock-wait on
+      // our own SELECT ... FOR UPDATE.
       let assignedProxy = null;
+      await client.query('COMMIT');
       try {
         const proxyService = require('./proxyService');
         const row = await proxyService.assignProxyForSession(sessionId);
@@ -1438,6 +1443,12 @@ class SessionService {
       } catch (proxyErr) {
         logger.warn(`Proxy assignment failed for session ${sessionId}: ${proxyErr.message}`);
       }
+      await client.query('BEGIN');
+      // Re-acquire our row lock for the rest of the login flow.
+      await client.query(
+        `SELECT id FROM sessions WHERE id = $1 AND user_id = $2 FOR UPDATE`,
+        [sessionId, userId]
+      );
 
       // Add timeout to prevent indefinite hanging
       const loginPromise = tgService.createSession(

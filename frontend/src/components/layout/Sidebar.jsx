@@ -1,13 +1,14 @@
 import React, { useState } from 'react';
 import { Link, useLocation } from 'react-router-dom';
 import { 
-  LayoutDashboard, Users, Search, MessageSquare, UsersRound, List, BarChart3, Settings, LogOut, ChevronLeft, ChevronRight, UserCog, ShieldCheck, KeyRound, Network
+  LayoutDashboard, Users, Search, MessageSquare, UsersRound, List, BarChart3, Settings, LogOut, ChevronLeft, ChevronRight, UserCog, ShieldCheck, KeyRound, Network, UserPlus
 } from 'lucide-react';
 import { useAuth } from '@/hooks/useAuth';
 
 const navItems = [
   { path: '/dashboard', label: 'Dashboard', icon: LayoutDashboard },
   { path: '/sessions', label: 'Sessions', icon: Users },
+  { path: '/create-session', label: 'Create Session', icon: UserPlus },
   { path: '/scrape', label: 'Scrape', icon: Search },
   { path: '/messaging', label: 'Messaging', icon: MessageSquare },
   { path: '/groups', label: 'Groups', icon: UsersRound },

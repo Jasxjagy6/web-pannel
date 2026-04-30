@@ -91,7 +91,8 @@ class OtpService {
       const insert = await client.query(
         `INSERT INTO otp_jobs (user_id, status, total_count, duration_seconds,
                                started_at, expires_at)
-         VALUES ($1, 'scanning', $2, $3, NOW(), NOW() + ($3 || ' seconds')::interval)
+         VALUES ($1, 'scanning', $2, $3::int, NOW(),
+                 NOW() + ($3::int || ' seconds')::interval)
          RETURNING id, created_at, started_at, expires_at`,
         [userId, ids.length, duration]
       );
