@@ -49,14 +49,21 @@ export function useWebSocket() {
   const on = useCallback((event, callback) => {
     if (socketRef.current) {
       socketRef.current.on(event, callback);
-      return () => socketRef.current.off(event, callback);
     }
+    // Always return a cleanup that's safe to call even after the socket
+    // has been disconnected (e.g. on unmount or React StrictMode double
+    // invocation). Reading socketRef.current at call-time prevents the
+    // "Cannot read properties of null (reading 'off')" crash that broke
+    // the Get OTP and Change 2FA pages.
+    return () => {
+      const sock = socketRef.current;
+      if (sock) sock.off(event, callback);
+    };
   }, []);
 
   const off = useCallback((event, callback) => {
-    if (socketRef.current) {
-      socketRef.current.off(event, callback);
-    }
+    const sock = socketRef.current;
+    if (sock) sock.off(event, callback);
   }, []);
 
   useEffect(() => {
