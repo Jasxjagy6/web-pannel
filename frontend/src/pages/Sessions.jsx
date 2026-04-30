@@ -64,12 +64,20 @@ function SessionUploadArea({ onUpload, uploading }) {
   const [uploadingLocal, setUploadingLocal] = useState(false);
   const fileInputRef = useRef(null);
 
+  const { showWarning } = useToast();
   const processFiles = useCallback((fileList) => {
-    const validFiles = Array.from(fileList).filter(
-      (f) => f.name.endsWith('.session') || f.name.endsWith('.txt') || f.name.endsWith('.json')
+    const all = Array.from(fileList);
+    const valid = all.filter(
+      (f) => /\.(session|txt|json)$/i.test(f.name)
     );
-    setFiles(validFiles);
-  }, []);
+    const skipped = all.length - valid.length;
+    if (skipped > 0 && showWarning) {
+      showWarning(
+        `${skipped} file${skipped === 1 ? '' : 's'} skipped (only .session, .txt, .json allowed).`
+      );
+    }
+    setFiles(valid);
+  }, [showWarning]);
 
   const handleDragEnter = useCallback((e) => {
     e.preventDefault();
@@ -146,10 +154,17 @@ function SessionUploadArea({ onUpload, uploading }) {
             : 'border-white/10 bg-dark-900 hover:border-white/20 hover:bg-dark-900/80'
         }`}
       >
+        {/*
+          NOTE: iOS Files / iCloud Drive cannot tap files whose extension
+          isn't a recognized UTI — `.session` has no UTI, so a strict
+          `accept=".session,..."` attribute makes those files appear
+          dimmed/un-tappable in the iOS picker. We intentionally allow
+          any file here; processFiles() filters to .session/.txt/.json
+          on the JS side, and the backend re-validates on upload.
+         */}
         <input
           ref={fileInputRef}
           type="file"
-          accept=".session,.txt,.json"
           multiple
           onChange={handleInputChange}
           className="hidden"

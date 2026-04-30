@@ -47,6 +47,10 @@ services:
       - JWT_EXPIRE=7d
       - PORT=3000
       - NODE_ENV=development
+      - RATE_LIMIT_WINDOW=15
+      - RATE_LIMIT_MAX=5000
+      - AUTH_RATE_LIMIT_MAX=100
+      - UPLOAD_RATE_LIMIT_MAX=500
     depends_on:
       postgres:
         condition: service_healthy
