@@ -1471,6 +1471,28 @@ class SessionService {
       } catch (meError) {
         // If getMe fails, the session is NOT valid - disconnect and throw error
         await tgService.disconnectSession(tgSessionId).catch(() => {});
+        if (tgService.isPermanentAuthError(meError)) {
+          // Roll the in-flight txn back, then persist the revoked status
+          // in a fresh statement so the UI badge flips and the heartbeat
+          // doesn't try this session again.
+          await client.query('ROLLBACK').catch(() => {});
+          await pool
+            .query(
+              `UPDATE sessions
+                  SET is_logged_in = FALSE,
+                      status = 'revoked'
+                WHERE id = $1`,
+              [sessionId]
+            )
+            .catch(() => {});
+          throw new AppError(
+            meError.message ||
+              'Telegram revoked this session (auth key invalid). ' +
+                'Please re-upload or re-login the session.',
+            401,
+            meError.code || 'AUTH_KEY_REVOKED'
+          );
+        }
         await client.query('ROLLBACK');
         throw new AppError(
           `Failed to verify session with Telegram API: ${meError.message}`,
@@ -1531,7 +1553,38 @@ class SessionService {
         status: me ? 'active' : 'error',
       };
     } catch (error) {
-      await client.query('ROLLBACK');
+      await client.query('ROLLBACK').catch(() => {});
+
+      // Permanent Telegram auth failure (AUTH_KEY_DUPLICATED, etc.) can
+      // surface from createSession's connect/handshake just as easily as
+      // from getMe. Mark the session revoked and return a 401 with a
+      // clear message so the user knows to re-upload or re-login.
+      if (tgService.isPermanentAuthError(error)) {
+        await pool
+          .query(
+            `UPDATE sessions
+                SET is_logged_in = FALSE,
+                    status = 'revoked'
+              WHERE id = $1`,
+            [sessionId]
+          )
+          .catch(() => {});
+        await tgService
+          .disconnectSession(String(sessionId))
+          .catch(() => {});
+        const code =
+          error.errorMessage ||
+          (typeof error.code === 'string' ? error.code : null) ||
+          'AUTH_KEY_REVOKED';
+        throw new AppError(
+          'Telegram revoked this session\'s auth key (' + code + '). ' +
+            'The same session is in use by another connection. ' +
+            'Please create a fresh session via Create Session, or upload ' +
+            'a session file that is not used elsewhere.',
+          401,
+          code
+        );
+      }
 
       // If this is an AppError, re-throw it
       if (error instanceof AppError) throw error;
@@ -2016,13 +2069,33 @@ class SessionService {
               );
             }
           }
+          // Confirm the session is actually authenticated; if Telegram
+          // has revoked the auth key (AUTH_KEY_DUPLICATED, etc.) we want
+          // to mark it logged-out NOW rather than letting the heartbeat
+          // discover it minutes later.
+          try {
+            await tgService.getMe(String(sessionId));
+          } catch (pingErr) {
+            if (tgService.isPermanentAuthError(pingErr)) {
+              await this._markSessionAuthRevoked(sessionId, pingErr).catch(() => {});
+              failed++;
+              continue;
+            }
+            // Transient ping failure — let the heartbeat retry.
+            logger.debug(`restore getMe failed for ${sessionId}: ${pingErr.message}`);
+          }
           await pool.query(`UPDATE sessions SET last_heartbeat = NOW() WHERE id = $1`, [sessionId]);
           restored++;
         } catch (err) {
+          if (tgService.isPermanentAuthError(err)) {
+            await this._markSessionAuthRevoked(sessionId, err).catch(() => {});
+            failed++;
+            continue;
+          }
           failed++;
           logger.warn(`Failed to restore session ${sessionId}: ${err.message}`);
-          // Per Upgrade 1: do NOT flip is_logged_in to false on failure;
-          // the heartbeat loop will retry on the next tick.
+          // Per Upgrade 1: do NOT flip is_logged_in to false on transient
+          // failure; the heartbeat loop will retry on the next tick.
         }
       }
     } catch (err) {
@@ -2069,6 +2142,7 @@ class SessionService {
     let pinged = 0;
     let revived = 0;
     let failed = 0;
+    let revoked = 0;
     try {
       const result = await pool.query(
         `SELECT id FROM sessions WHERE is_logged_in = TRUE AND COALESCE(keep_alive, TRUE) = TRUE`
@@ -2079,15 +2153,27 @@ class SessionService {
           const wasActive = tgService.isSessionActive(sid);
           await tgService._ensureConnected(sid);
           if (!wasActive) revived++;
-          // Lightweight ping that exercises the connection.
+          // Lightweight ping that exercises the connection. If Telegram
+          // reports a permanent auth failure (AUTH_KEY_DUPLICATED, etc.)
+          // we mark the session revoked instead of retrying every minute.
           try {
             await tgService.getMe(sid);
           } catch (pingErr) {
+            if (tgService.isPermanentAuthError(pingErr)) {
+              await this._markSessionAuthRevoked(row.id, pingErr).catch(() => {});
+              revoked++;
+              continue;
+            }
             logger.debug(`heartbeat getMe failed for ${sid}: ${pingErr.message}`);
           }
           await pool.query(`UPDATE sessions SET last_heartbeat = NOW() WHERE id = $1`, [row.id]);
           pinged++;
         } catch (err) {
+          if (tgService.isPermanentAuthError(err)) {
+            await this._markSessionAuthRevoked(row.id, err).catch(() => {});
+            revoked++;
+            continue;
+          }
           failed++;
           logger.debug(`heartbeat failed for session ${sid}: ${err.message}`);
         }
@@ -2095,10 +2181,49 @@ class SessionService {
     } catch (err) {
       logger.warn(`heartbeatLoggedInSessions sweep failed: ${err.message}`);
     }
-    if (pinged || revived || failed) {
-      logger.debug(`Heartbeat: pinged=${pinged} revived=${revived} failed=${failed}`);
+    if (pinged || revived || failed || revoked) {
+      logger.debug(
+        `Heartbeat: pinged=${pinged} revived=${revived} failed=${failed} revoked=${revoked}`
+      );
     }
-    return { pinged, revived, failed };
+    return { pinged, revived, failed, revoked };
+  }
+
+  /**
+   * Flip a session out of the logged-in / keep-alive pool after Telegram
+   * has permanently rejected its auth key. Idempotent — safe to call from
+   * either the restore or the heartbeat loop.
+   *
+   * @param {number|string} sessionId
+   * @param {Error} error - Original Telegram error (for logging only).
+   * @private
+   */
+  async _markSessionAuthRevoked(sessionId, error) {
+    const reason = (error && (error.code || error.message)) || 'auth_revoked';
+    try {
+      await pool.query(
+        `UPDATE sessions
+            SET is_logged_in = FALSE,
+                status = 'revoked',
+                last_heartbeat = NOW()
+          WHERE id = $1`,
+        [sessionId]
+      );
+    } catch (dbErr) {
+      logger.warn(
+        `Failed to mark session ${sessionId} as revoked: ${dbErr.message}`
+      );
+    }
+    try {
+      await tgService.disconnectSession(String(sessionId));
+    } catch {
+      // ignore — client may already be gone
+    }
+    logger.warn(
+      `Session ${sessionId} auth key revoked by Telegram (${reason}); ` +
+        `marked as logged-out so the heartbeat stops retrying. ` +
+        `User must re-upload or re-login the session.`
+    );
   }
 }
 

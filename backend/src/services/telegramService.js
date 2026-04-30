@@ -2074,6 +2074,22 @@ class TelegramService {
         retryable: false,
         statusCode: 401,
       },
+      AUTH_KEY_DUPLICATED: {
+        pattern: /AUTH_KEY_DUPLICATED/i,
+        message:
+          'The session authorization key is in use by another connection ' +
+          'and has been revoked by Telegram. Please re-upload or re-login the session.',
+        code: 'AUTH_KEY_DUPLICATED',
+        retryable: false,
+        statusCode: 401,
+      },
+      USER_DEACTIVATED: {
+        pattern: /USER_DEACTIVATED(_BAN)?/i,
+        message: 'The Telegram account associated with this session is deactivated.',
+        code: 'USER_DEACTIVATED',
+        retryable: false,
+        statusCode: 401,
+      },
       USER_BANNED_IN_CHANNEL: {
         pattern: /USER_BANNED_IN_CHANNEL/i,
         message: 'You are banned from this channel or group.',
@@ -2481,6 +2497,38 @@ class TelegramService {
    */
   get activeSessionCount() {
     return this.clients.size;
+  }
+
+  /**
+   * Detect whether an error from a Telegram call indicates that the
+   * session's auth key has been permanently invalidated and re-trying is
+   * pointless. Used by the heartbeat / restore loops to stop hammering
+   * Telegram with a dead auth key.
+   *
+   * @param {Error|object} error - Error thrown by a Telegram call.
+   * @returns {boolean}
+   */
+  isPermanentAuthError(error) {
+    if (!error) return false;
+    // GramJS RPC errors carry the symbolic code in `errorMessage`, the
+    // numeric HTTP-style code in `code`, and the human message in
+    // `message`. Concatenate and uppercase whatever we have so the
+    // detection works no matter where the symbol shows up.
+    const parts = [
+      error.errorMessage,
+      error.message,
+      typeof error.code === 'string' ? error.code : null,
+    ].filter(Boolean);
+    if (parts.length === 0) parts.push(String(error));
+    const haystack = parts.join(' ').toUpperCase();
+    return (
+      haystack.includes('AUTH_KEY_DUPLICATED') ||
+      haystack.includes('AUTH_KEY_UNREGISTERED') ||
+      haystack.includes('AUTH_KEY_INVALID') ||
+      haystack.includes('SESSION_REVOKED') ||
+      haystack.includes('SESSION_EXPIRED') ||
+      haystack.includes('USER_DEACTIVATED')
+    );
   }
 
   /**
