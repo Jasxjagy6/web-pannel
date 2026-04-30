@@ -46,6 +46,28 @@ const initDB = async () => {
         console.error(`Failed migration ${m}:`, err.message);
       }
     }
+
+    // Ensure the single admin user (id=1) exists so that foreign-key
+    // references from sessions / activity_logs / lists / reports stay valid.
+    // The auth controller signs JWTs with userId=1; without a matching row
+    // every insert that references user_id would fail with a FK violation
+    // (the cause of the 500s seen on /api/dashboard/stats and
+    // /api/sessions/upload in production).
+    const adminEmail = process.env.ADMIN_EMAIL || 'admin@example.com';
+    await pool.query(
+      `INSERT INTO users (id, email, password_hash, role, created_at)
+       VALUES (1, $1, '__env_managed__', 'admin', NOW())
+       ON CONFLICT (id) DO UPDATE SET email = EXCLUDED.email`,
+      [adminEmail]
+    );
+    // Bump the SERIAL sequence so future inserts (if any) start at id=2.
+    await pool.query(
+      `SELECT setval(
+         pg_get_serial_sequence('users', 'id'),
+         GREATEST((SELECT COALESCE(MAX(id), 1) FROM users), 1)
+       )`
+    );
+    console.log('Admin user ensured (id=1)');
   } catch (error) {
     console.error('Error initializing database schema:', error.message);
   }
