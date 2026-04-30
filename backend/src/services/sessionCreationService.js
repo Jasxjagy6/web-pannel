@@ -200,6 +200,23 @@ class SessionCreationService {
       throw new AppError('OTP code is required', 400, 'CODE_REQUIRED');
     }
     const trimmedCode = String(code).replace(/\s+/g, '');
+
+    // Idempotency: if the client is already authorized (i.e. a previous
+    // verify call succeeded the SignIn step but failed during persistence,
+    // e.g. because of a transient DB error), don't call SignIn again — that
+    // would either fail with PHONE_CODE_EXPIRED or charge the user for a
+    // re-send. Just retry the persistence step.
+    let alreadyAuthorized = false;
+    try {
+      alreadyAuthorized = await entry.client.isUserAuthorized();
+    } catch (_) {
+      alreadyAuthorized = false;
+    }
+    if (alreadyAuthorized) {
+      logger.info(`Session creation ${tempId}: client already authorized, retrying persist`);
+      return await this._persistAndFinish(userId, tempId, entry.awaitingPassword);
+    }
+
     try {
       await entry.client.invoke(
         new Api.auth.SignIn({
@@ -355,7 +372,7 @@ class SessionCreationService {
       `INSERT INTO sessions (
          user_id, phone, session_file_path, api_id, api_hash,
          status, is_2fa_enabled, is_logged_in, keep_alive, account_info,
-         last_heartbeat, created_at, updated_at
+         last_heartbeat, last_active, created_at
        ) VALUES ($1, $2, $3, $4, $5, 'active', $6, TRUE, TRUE, $7, NOW(), NOW(), NOW())
        RETURNING id`,
       [
