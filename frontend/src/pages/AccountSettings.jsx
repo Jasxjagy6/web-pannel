@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback } from 'react';
+import { Link } from 'react-router-dom';
 import {
   Users,
   User,
@@ -11,6 +12,7 @@ import {
   X,
   Eye,
   AlertTriangle,
+  Shield,
 } from 'lucide-react';
 import { useToast } from '../components/common/Toast';
 import { listSessions } from '../api/sessions';
@@ -190,6 +192,31 @@ export default function AccountSettings() {
           Update name, username, bio, and profile picture for multiple sessions at once
         </p>
       </div>
+
+      {/* Sub-menu link card: Privacy */}
+      <Link
+        to="/privacy"
+        className="block rounded-xl border border-white/5 bg-gradient-to-br from-primary-500/10 via-dark-800 to-dark-800 p-5 hover:border-primary-500/40 transition group"
+      >
+        <div className="flex items-center justify-between gap-4">
+          <div className="flex items-center gap-4">
+            <div className="rounded-xl bg-primary-500/15 p-3 text-primary-300">
+              <Shield className="w-5 h-5" />
+            </div>
+            <div>
+              <h3 className="text-sm font-semibold text-white">Privacy</h3>
+              <p className="text-xs text-gray-400 max-w-xl">
+                Bulk-set who can see your phone, last seen, profile picture,
+                bio, gifts, birthday, forwards, calls, messages and group invites
+                across many accounts at once.
+              </p>
+            </div>
+          </div>
+          <span className="text-xs text-primary-300 group-hover:translate-x-0.5 transition">
+            Open  &rarr;
+          </span>
+        </div>
+      </Link>
 
       <form onSubmit={handleSubmit}>
         <div className="grid grid-cols-1 xl:grid-cols-2 gap-6">

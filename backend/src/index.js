@@ -27,6 +27,7 @@ const twoFAJobsRoutes = require('./routes/twoFAJobs');
 const otpRoutes = require('./routes/otp');
 const proxyRoutes = require('./routes/proxies');
 const antiDetectRoutes = require('./routes/antiDetect');
+const privacyRoutes = require('./routes/privacy');
 
 const app = express();
 const server = http.createServer(app);
@@ -82,6 +83,7 @@ app.use(`${apiPrefix}/2fa-jobs`, twoFAJobsRoutes);
 app.use(`${apiPrefix}/otp`, otpRoutes);
 app.use(`${apiPrefix}/proxies`, proxyRoutes);
 app.use(`${apiPrefix}/anti-detect`, antiDetectRoutes);
+app.use(`${apiPrefix}/privacy`, privacyRoutes);
 
 // 404 handler
 app.use((req, res) => {
@@ -214,6 +216,16 @@ async function start() {
       }
     } catch (err) {
       logger.warn(`behaviorService.start failed: ${err.message}`);
+    }
+
+    // 5. Boot the Privacy job worker. Drains queued privacy_jobs and
+    //    applies account.SetPrivacy across the chosen sessions in
+    //    bounded-concurrency batches with jittered cooldown.
+    try {
+      const privacyJobWorker = require('./services/privacyJobWorker');
+      privacyJobWorker.startPrivacyJobWorker();
+    } catch (err) {
+      logger.warn(`privacyJobWorker.start failed: ${err.message}`);
     }
   } catch (error) {
     logger.error('Failed to start server', error);
