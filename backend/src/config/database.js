@@ -34,6 +34,7 @@ const initDB = async () => {
     const migrations = [
       'migration_scraping_upgrade.sql',
       'migration_v2_upgrades.sql',
+      'migration_group_operations_ownership.sql',
     ];
     for (const m of migrations) {
       const mPath = path.join(__dirname, m);
@@ -46,6 +47,8 @@ const initDB = async () => {
         console.error(`Failed migration ${m}:`, err.message);
       }
     }
+
+    await ensureGroupOperationsSchema();
 
     // Ensure the single admin user (id=1) exists so that foreign-key
     // references from sessions / activity_logs / lists / reports stay valid.
@@ -71,6 +74,46 @@ const initDB = async () => {
   } catch (error) {
     console.error('Error initializing database schema:', error.message);
   }
+};
+
+const ensureGroupOperationsSchema = async () => {
+  await pool.query(`
+    ALTER TABLE group_operations
+      ADD COLUMN IF NOT EXISTS user_id INTEGER REFERENCES users(id),
+      ADD COLUMN IF NOT EXISTS operation_type VARCHAR(50),
+      ADD COLUMN IF NOT EXISTS total_users INTEGER,
+      ADD COLUMN IF NOT EXISTS options JSONB
+  `);
+
+  await pool.query(`
+    UPDATE group_operations go
+    SET user_id = s.user_id
+    FROM sessions s
+    WHERE go.user_id IS NULL
+      AND go.session_id = s.id
+  `);
+
+  await pool.query(`
+    UPDATE group_operations
+    SET operation_type = operation
+    WHERE operation_type IS NULL
+      AND operation IS NOT NULL
+  `);
+
+  await pool.query(`
+    UPDATE group_operations
+    SET total_users = total_count
+    WHERE total_users IS NULL
+      AND total_count IS NOT NULL
+  `);
+
+  await pool.query(
+    'CREATE INDEX IF NOT EXISTS idx_group_operations_user_id ON group_operations(user_id)'
+  );
+
+  await pool.query(
+    'CREATE INDEX IF NOT EXISTS idx_group_operations_user_created ON group_operations(user_id, created_at DESC)'
+  );
 };
 
 module.exports = {

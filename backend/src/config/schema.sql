@@ -87,14 +87,18 @@ CREATE TABLE IF NOT EXISTS message_logs (
 -- Group operations table
 CREATE TABLE IF NOT EXISTS group_operations (
   id SERIAL PRIMARY KEY,
+  user_id INTEGER REFERENCES users(id),
   session_id INTEGER REFERENCES sessions(id),
   target_group_id VARCHAR(50),
   operation VARCHAR(20),
+  operation_type VARCHAR(50),
   user_list JSONB,
   status VARCHAR(20) DEFAULT 'pending',
   total_count INTEGER,
+  total_users INTEGER,
   success_count INTEGER DEFAULT 0,
   failed_count INTEGER DEFAULT 0,
+  options JSONB,
   created_at TIMESTAMP DEFAULT NOW(),
   completed_at TIMESTAMP
 );
@@ -166,6 +170,7 @@ CREATE INDEX IF NOT EXISTS idx_scraped_users_job_id ON scraped_users(job_id);
 CREATE INDEX IF NOT EXISTS idx_messaging_jobs_session_id ON messaging_jobs(session_id);
 CREATE INDEX IF NOT EXISTS idx_messaging_jobs_status ON messaging_jobs(status);
 CREATE INDEX IF NOT EXISTS idx_message_logs_job_id ON message_logs(job_id);
+CREATE INDEX IF NOT EXISTS idx_group_operations_user_id ON group_operations(user_id);
 CREATE INDEX IF NOT EXISTS idx_group_operations_session_id ON group_operations(session_id);
 CREATE INDEX IF NOT EXISTS idx_lists_user_id ON lists(user_id);
 CREATE INDEX IF NOT EXISTS idx_list_items_list_id ON list_items(list_id);
