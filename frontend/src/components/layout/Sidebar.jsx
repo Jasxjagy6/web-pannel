@@ -1,7 +1,7 @@
 import React, { useState } from 'react';
 import { Link, useLocation } from 'react-router-dom';
 import { 
-  LayoutDashboard, Users, Search, MessageSquare, UsersRound, List, BarChart3, Settings, LogOut, ChevronLeft, ChevronRight, UserCog, ShieldCheck, KeyRound, Network, UserPlus, Fingerprint
+  LayoutDashboard, Users, Search, MessageSquare, UsersRound, List, BarChart3, Settings, LogOut, ChevronLeft, ChevronRight, UserCog, ShieldCheck, KeyRound, Network, UserPlus, Fingerprint, Shield
 } from 'lucide-react';
 import { useAuth } from '@/hooks/useAuth';
 
@@ -19,6 +19,7 @@ const navItems = [
   { path: '/anti-detect', label: 'Anti-Detect', icon: Fingerprint },
   { path: '/reports', label: 'Reports', icon: BarChart3 },
   { path: '/account-settings', label: 'Account Settings', icon: UserCog },
+  { path: '/privacy', label: 'Privacy', icon: Shield },
   { path: '/settings', label: 'Settings', icon: Settings },
 ];
 
