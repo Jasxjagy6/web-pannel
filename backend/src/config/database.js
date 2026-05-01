@@ -36,6 +36,7 @@ const initDB = async () => {
       'migration_v2_upgrades.sql',
       'migration_group_operations_ownership.sql',
       'migration_v3_antidetect.sql',
+      'migration_v4_privacy.sql',
     ];
     for (const m of migrations) {
       const mPath = path.join(__dirname, m);
