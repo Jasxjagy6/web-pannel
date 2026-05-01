@@ -229,6 +229,17 @@ async function start() {
     } catch (err) {
       logger.warn(`privacyJobWorker.start failed: ${err.message}`);
     }
+
+    // 6. Boot the channel monitoring worker. One jittered tick polls a
+    //    bounded batch of due monitoring_jobs, fetches new history per job
+    //    via the bound session's proxy, and dedup-inserts senders into
+    //    monitoring_users. Crash-safe — every cursor lives in Postgres.
+    try {
+      const monitorService = require('./services/monitorService');
+      monitorService.startWorker();
+    } catch (err) {
+      logger.warn(`monitorService.startWorker failed: ${err.message}`);
+    }
   } catch (error) {
     logger.error('Failed to start server', error);
     process.exit(1);

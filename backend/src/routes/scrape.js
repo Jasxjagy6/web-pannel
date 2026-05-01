@@ -1,6 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const scrapeController = require('../controllers/scrapeController');
+const monitorController = require('../controllers/monitorController');
 const { authenticate, requireApproved } = require('../middleware/auth');
 const { scrapeLimiter } = require('../middleware/rateLimiter');
 
@@ -13,6 +14,18 @@ router.post('/group', scrapeLimiter, scrapeController.scrapeGroup);
 
 // POST /api/scrape/channel - Start channel scraping
 router.post('/channel', scrapeLimiter, scrapeController.scrapeChannel);
+
+// --- Channel/group monitoring (long-running watch jobs) -------------------
+// IMPORTANT: keep these BEFORE /jobs/:id so /jobs/:id/... doesn't shadow
+// /monitor/cancel-all etc.
+router.post('/monitor/cancel-all', monitorController.cancelAll);
+router.post('/monitor', scrapeLimiter, monitorController.createJob);
+router.get('/monitor', monitorController.list);
+router.get('/monitor/:id', monitorController.get);
+router.get('/monitor/:id/users', monitorController.users);
+router.post('/monitor/:id/pause', monitorController.pause);
+router.post('/monitor/:id/resume', monitorController.resume);
+router.post('/monitor/:id/stop', monitorController.stop);
 
 // GET /api/scrape/jobs - List jobs
 router.get('/jobs', scrapeController.listJobs);
