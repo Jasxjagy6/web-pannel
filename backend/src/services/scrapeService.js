@@ -294,10 +294,16 @@ class ScrapeService {
           // Track per-target result
           results.targetResults.push({
             target: targetId,
-            status: 'success',
+            status: scrapeResult.adminOnly ? 'admin_only' : 'success',
             usersFound: scrapeResult.totalFound,
             usersSaved: scrapeResult.newUsers,
+            adminOnly: !!scrapeResult.adminOnly,
+            adminOnlyReason: scrapeResult.adminOnlyReason || null,
           });
+          if (scrapeResult.adminOnly) {
+            results.adminOnlyDetected = true;
+            results.adminOnlyReason = scrapeResult.adminOnlyReason || results.adminOnlyReason;
+          }
 
           // Update progress
           await this._updateProgress(jobId, {
@@ -334,8 +340,12 @@ class ScrapeService {
       // Finalize
       const endTime = Date.now();
       const finalStatus = this._isCancelled(jobId) ? 'cancelled' : (results.errors > 0 ? 'completed_with_errors' : 'completed');
-      
-      await this._updateJobStatus(jobId, finalStatus, { targetResults: results.targetResults });
+
+      await this._updateJobStatus(jobId, finalStatus, {
+        targetResults: results.targetResults,
+        adminOnly: !!results.adminOnlyDetected,
+        adminOnlyReason: results.adminOnlyReason || null,
+      });
       await this._updateProgress(jobId, {
         status: finalStatus,
         endTime: new Date().toISOString(),
@@ -374,7 +384,10 @@ class ScrapeService {
    * Scrape a single target (group or channel).
    */
   async _scrapeTarget(sessionId, targetId, targetType, options, jobId) {
-    const results = { totalFound: 0, newUsers: 0, duplicates: 0, botsFiltered: 0, errors: 0 };
+    const results = {
+      totalFound: 0, newUsers: 0, duplicates: 0, botsFiltered: 0, errors: 0,
+      adminOnly: false, adminOnlyReason: null,
+    };
     let delay = options.floodProtection !== false ? INITIAL_BATCH_DELAY_MS : 0;
 
     if (targetType === TARGET_TYPES.GROUP) {
@@ -454,6 +467,15 @@ class ScrapeService {
 
             // Wait out the flood wait
             await this._delayWithCancellation(jobId, waitSeconds * 1000);
+          } else if (/CHAT_ADMIN_REQUIRED|PARTICIPANTS_TOO_FEW|CHANNEL_PRIVATE/i.test(error.message)) {
+            // The participant list isn't available (group hides members,
+            // broadcast channel that only exposes admins, etc). Mark the
+            // job so the UI can offer a long-running monitoring job, then
+            // stop trying to fetch this target's full list.
+            results.adminOnly = true;
+            results.adminOnlyReason = error.message.match(/[A-Z_]+/)?.[0] || 'CHAT_ADMIN_REQUIRED';
+            logger.warn(`Target ${targetId} hides member list (${results.adminOnlyReason}); will surface monitor option`);
+            hasMore = false;
           } else {
             throw error;
           }
@@ -512,6 +534,11 @@ class ScrapeService {
             const waitSeconds = match ? parseInt(match[1]) : 30;
             delay = Math.min(MAX_BATCH_DELAY_MS, waitSeconds * 1000 * FLOOD_WAIT_MULTIPLIER);
             await this._delayWithCancellation(jobId, waitSeconds * 1000);
+          } else if (/CHAT_ADMIN_REQUIRED|PARTICIPANTS_TOO_FEW|CHANNEL_PRIVATE/i.test(error.message)) {
+            results.adminOnly = true;
+            results.adminOnlyReason = error.message.match(/[A-Z_]+/)?.[0] || 'CHAT_ADMIN_REQUIRED';
+            logger.warn(`Channel ${targetId} hides subscriber list (${results.adminOnlyReason}); will surface monitor option`);
+            hasMore = false;
           } else {
             throw error;
           }
@@ -606,7 +633,9 @@ class ScrapeService {
   async _updateJobStatus(jobId, status, extraData = {}) {
     const id = parseInt(jobId, 10);
     const now = ['completed', 'failed', 'cancelled', 'completed_with_errors'].includes(status);
-    
+    const adminOnly = !!extraData.adminOnly;
+    const adminOnlyReason = extraData.adminOnlyReason || null;
+
     // If there are target results, save them to stats and update total_found and progress
     if (extraData.targetResults && extraData.targetResults.length > 0) {
       const totalFound = extraData.totalFound || 0;
@@ -616,9 +645,11 @@ class ScrapeService {
          completed_at = CASE WHEN $2 THEN NOW() ELSE completed_at END,
          total_found = $3,
          progress = $4,
-         stats = jsonb_set(stats, '{targetResults}', $5::jsonb)
-         WHERE id = $6`,
-        [status, now, totalFound, progress, JSON.stringify(extraData.targetResults), id]
+         stats = jsonb_set(stats, '{targetResults}', $5::jsonb),
+         admin_only_visible = $6,
+         admin_only_reason = COALESCE($7, admin_only_reason)
+         WHERE id = $8`,
+        [status, now, totalFound, progress, JSON.stringify(extraData.targetResults), adminOnly, adminOnlyReason, id]
       );
     } else {
       const totalFound = extraData.totalFound || 0;
@@ -627,9 +658,11 @@ class ScrapeService {
         `UPDATE scraping_jobs SET status = $1,
          completed_at = CASE WHEN $2 THEN NOW() ELSE completed_at END,
          total_found = $3,
-         progress = $4
-         WHERE id = $5`,
-        [status, now, totalFound, progress, id]
+         progress = $4,
+         admin_only_visible = COALESCE($5, admin_only_visible),
+         admin_only_reason = COALESCE($6, admin_only_reason)
+         WHERE id = $7`,
+        [status, now, totalFound, progress, extraData.adminOnly == null ? null : adminOnly, adminOnlyReason, id]
       );
     }
   }
