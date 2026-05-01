@@ -1,5 +1,7 @@
 const scrapeService = require('../services/scrapeService');
 const reportService = require('../services/reportService');
+const monitorService = require('../services/scrapeMonitorService');
+const telegramService = require('../services/telegramService');
 const { pool } = require('../config/database');
 const { AppError, asyncHandler } = require('../utils/errorHandler');
 const logger = require('../utils/logger');
@@ -338,6 +340,190 @@ const scrapeController = {
     await pool.query('DELETE FROM scraping_jobs WHERE id = $1', [jobId]);
 
     res.json({ success: true, message: 'Job deleted' });
+  }),
+
+  // ========================================================================
+  // SCRAPE PREVIEW + ADMIN-ONLY DETECTION (used by the scraping upgrade)
+  // ========================================================================
+
+  /**
+   * POST /api/scrape/preview
+   *
+   * Probe each requested target with the first available session and tell
+   * the UI which targets are *admin-only* (chat hides its participant
+   * roster from non-admins). For those targets the UI offers the user the
+   * option to launch a period-bounded MONITOR job instead of failing.
+   */
+  previewTargets: asyncHandler(async (req, res) => {
+    const userId = req.user.id;
+    const sessionIdRaw = req.body.sessionId
+      ?? (Array.isArray(req.body.sessionIds) ? req.body.sessionIds[0] : null);
+    const targetType = req.body.targetType || 'group';
+    const targets = Array.isArray(req.body.targets)
+      ? req.body.targets
+      : (req.body.target ? [req.body.target] : []);
+
+    if (!sessionIdRaw) throw new AppError('sessionId required', 400, 'MISSING_SESSION');
+    if (!targets.length) throw new AppError('targets required', 400, 'MISSING_TARGETS');
+
+    const sessionId = parseInt(sessionIdRaw, 10);
+    const owned = await pool.query(
+      `SELECT id FROM sessions WHERE id=$1 AND user_id=$2 AND is_logged_in=TRUE`,
+      [sessionId, userId]
+    );
+    if (!owned.rows[0]) {
+      throw new AppError('Session not found or not logged in', 400, 'INVALID_SESSION');
+    }
+
+    const results = [];
+    for (const t of targets) {
+      try {
+        const probe = await telegramService.probeScrapeAccess(String(sessionId), String(t));
+        results.push({ target: String(t), targetType, ...probe });
+      } catch (err) {
+        results.push({
+          target: String(t), targetType, canScrape: false, isAdminOnly: false,
+          reason: err.message, info: {},
+        });
+      }
+    }
+    res.json({ success: true, data: { results } });
+  }),
+
+  // ========================================================================
+  // SCRAPE MONITOR (period-bounded passive scraper for admin-only chats)
+  // ========================================================================
+
+  createMonitor: asyncHandler(async (req, res) => {
+    const userId = req.user.id;
+    const {
+      sessionIds, sessionId, targetId, targetType,
+      durationSeconds, durationDays, durationHours, durationMinutes,
+      targetTitle, reason, options, autoStart,
+    } = req.body || {};
+
+    const sessions = Array.isArray(sessionIds) && sessionIds.length
+      ? sessionIds
+      : (sessionId ? [parseInt(sessionId, 10)] : []);
+
+    let duration = parseInt(durationSeconds, 10);
+    if (!Number.isFinite(duration) || duration <= 0) {
+      const days = parseFloat(durationDays) || 0;
+      const hours = parseFloat(durationHours) || 0;
+      const minutes = parseFloat(durationMinutes) || 0;
+      duration = Math.floor(days * 86400 + hours * 3600 + minutes * 60);
+    }
+
+    const job = await monitorService.createJob({
+      userId,
+      sessionIds: sessions,
+      targetId,
+      targetType: targetType || 'group',
+      targetTitle: targetTitle || null,
+      durationSeconds: duration,
+      reason: reason || null,
+      options: options || {},
+      autoStart: autoStart !== false,
+    });
+
+    await reportService.logActivity(userId, 'monitor_start', 'scrape_monitor', job.id, {
+      sessionCount: sessions.length, targetId, durationSeconds: duration,
+    });
+
+    res.status(202).json({ success: true, data: job });
+  }),
+
+  listMonitors: asyncHandler(async (req, res) => {
+    const userId = req.user.id;
+    const page = parseInt(req.query.page, 10) || 1;
+    const limit = parseInt(req.query.limit, 10) || 20;
+    const status = req.query.status || undefined;
+    const search = req.query.search || undefined;
+    const data = await monitorService.listJobs(userId, { page, limit, status, search });
+    res.json({ success: true, data });
+  }),
+
+  getMonitor: asyncHandler(async (req, res) => {
+    const userId = req.user.id;
+    const data = await monitorService.getJob(parseInt(req.params.id, 10), userId);
+    res.json({ success: true, data });
+  }),
+
+  pauseMonitor: asyncHandler(async (req, res) => {
+    const userId = req.user.id;
+    const data = await monitorService.pauseJob(parseInt(req.params.id, 10), userId);
+    res.json({ success: true, data });
+  }),
+
+  resumeMonitor: asyncHandler(async (req, res) => {
+    const userId = req.user.id;
+    const data = await monitorService.resumeJob(parseInt(req.params.id, 10), userId);
+    res.json({ success: true, data });
+  }),
+
+  stopMonitor: asyncHandler(async (req, res) => {
+    const userId = req.user.id;
+    const data = await monitorService.stopJob(parseInt(req.params.id, 10), userId, 'cancelled');
+    res.json({ success: true, data });
+  }),
+
+  cancelAllMonitors: asyncHandler(async (req, res) => {
+    const userId = req.user.id;
+    const data = await monitorService.cancelAll(userId);
+    res.json({ success: true, data });
+  }),
+
+  monitorUsers: asyncHandler(async (req, res) => {
+    const userId = req.user.id;
+    const jobId = parseInt(req.params.id, 10);
+    const page = parseInt(req.query.page, 10) || 1;
+    const limit = Math.min(500, parseInt(req.query.limit, 10) || 50);
+    const search = req.query.search || undefined;
+    const data = await monitorService.listScrapedUsers(jobId, userId, { page, limit, search });
+    res.json({ success: true, data });
+  }),
+
+  exportMonitor: asyncHandler(async (req, res) => {
+    const userId = req.user.id;
+    const jobId = parseInt(req.params.id, 10);
+    const format = (req.body?.format || req.query.format || 'csv').toLowerCase();
+    // Authorize via list (which verifies ownership) and grab everything in one go.
+    const { users } = await monitorService.listScrapedUsers(jobId, userId, {
+      page: 1, limit: 100000,
+    });
+
+    let content; let mime; let ext;
+    if (format === 'json') {
+      content = JSON.stringify(users, null, 2);
+      mime = 'application/json'; ext = 'json';
+    } else if (format === 'txt') {
+      content = users.map((u) => {
+        const parts = [];
+        if (u.username) parts.push(`@${u.username}`);
+        if (u.first_name) parts.push(u.first_name);
+        if (u.phone) parts.push(u.phone);
+        return parts.join(' | ');
+      }).join('\n');
+      mime = 'text/plain'; ext = 'txt';
+    } else {
+      const cols = [
+        'telegram_id', 'username', 'first_name', 'last_name', 'phone',
+        'is_bot', 'is_premium', 'message_count', 'first_seen_at', 'last_seen_at',
+      ];
+      const escape = (val) => {
+        if (val === null || val === undefined) return '';
+        const s = String(val);
+        return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+      };
+      const header = cols.join(',');
+      const rows = users.map((u) => cols.map((c) => escape(u[c])).join(','));
+      content = [header, ...rows].join('\n');
+      mime = 'text/csv'; ext = 'csv';
+    }
+
+    res.setHeader('Content-Type', mime);
+    res.setHeader('Content-Disposition', `attachment; filename=monitor_${jobId}.${ext}`);
+    res.send(content);
   }),
 };
 

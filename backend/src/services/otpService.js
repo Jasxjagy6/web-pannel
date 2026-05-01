@@ -132,8 +132,8 @@ class OtpService {
     const unsubs = new Map();
     for (const sid of sessionIds) {
       try {
-        const off = await telegramService.addNewMessageHandler(String(sid), (message) =>
-          this._onMessage(jobId, userId, sid, message)
+        const off = await telegramService.addNewMessageHandler(String(sid), (event) =>
+          this._onMessage(jobId, userId, sid, event.message || event)
         );
         unsubs.set(sid, off);
       } catch (err) {

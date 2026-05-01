@@ -14,6 +14,26 @@ router.post('/group', scrapeLimiter, scrapeController.scrapeGroup);
 // POST /api/scrape/channel - Start channel scraping
 router.post('/channel', scrapeLimiter, scrapeController.scrapeChannel);
 
+// POST /api/scrape/preview - Detect admin-only chats before launching a job.
+// Returns { results: [{ target, canScrape, isAdminOnly, info, reason }] }
+router.post('/preview', scrapeController.previewTargets);
+
+// ---------------------------------------------------------------------------
+// MONITOR routes (period-bounded passive scraper for admin-only chats).
+// `monitors/cancel-all` MUST be declared before `monitors/:id` so the
+// dynamic-id route does not swallow it.
+// ---------------------------------------------------------------------------
+router.post('/monitors', scrapeLimiter, scrapeController.createMonitor);
+router.get('/monitors', scrapeController.listMonitors);
+router.post('/monitors/cancel-all', scrapeController.cancelAllMonitors);
+router.get('/monitors/:id', scrapeController.getMonitor);
+router.get('/monitors/:id/users', scrapeController.monitorUsers);
+router.post('/monitors/:id/pause', scrapeController.pauseMonitor);
+router.post('/monitors/:id/resume', scrapeController.resumeMonitor);
+router.post('/monitors/:id/stop', scrapeController.stopMonitor);
+router.post('/monitors/:id/cancel', scrapeController.stopMonitor);
+router.post('/monitors/:id/export', scrapeController.exportMonitor);
+
 // GET /api/scrape/jobs - List jobs
 router.get('/jobs', scrapeController.listJobs);
 

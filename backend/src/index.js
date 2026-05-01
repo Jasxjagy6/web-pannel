@@ -229,6 +229,30 @@ async function start() {
     } catch (err) {
       logger.warn(`privacyJobWorker.start failed: ${err.message}`);
     }
+
+    // 6. Re-attach NewMessage listeners for monitor jobs that were running
+    //    when the process restarted and whose window hasn't expired yet.
+    try {
+      const scrapeMonitorService = require('./services/scrapeMonitorService');
+      await scrapeMonitorService.resumeActiveJobs();
+    } catch (err) {
+      logger.warn(`scrapeMonitorService.resumeActiveJobs failed: ${err.message}`);
+    }
+
+    // 7. Sweep expired monitor jobs every minute. resumeActiveJobs above
+    //    rolls already-expired jobs to completed at boot; this loop catches
+    //    any job whose timer was missed (e.g. very long shutdown).
+    try {
+      const scrapeMonitorService = require('./services/scrapeMonitorService');
+      setInterval(
+        () => scrapeMonitorService.resumeActiveJobs().catch((e) =>
+          logger.warn(`monitor sweep error: ${e.message}`)
+        ),
+        60_000
+      );
+    } catch (err) {
+      logger.warn(`monitor sweep init failed: ${err.message}`);
+    }
   } catch (error) {
     logger.error('Failed to start server', error);
     process.exit(1);
