@@ -64,6 +64,13 @@ const VALID_ACTIONS = [
   'report_generate',
   'report_export',
   'report_delete',
+  // Anti-Detect / Proxy lifecycle
+  'proxy_added',
+  'proxy_deleted',
+  'device_identity_assigned',
+  'device_identity_rotated',
+  'behavior_warmup_tick',
+  'behavior_warmup_run',
 ];
 
 /**
