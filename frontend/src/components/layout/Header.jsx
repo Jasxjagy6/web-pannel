@@ -20,7 +20,7 @@ export default function Header({ onMenuClick, title }) {
         >
           <Menu className="h-5 w-5" />
         </button>
-        <h1 className="text-lg font-semibold text-white">
+        <h1 className="text-base sm:text-lg font-semibold text-white truncate max-w-[55vw] sm:max-w-none">
           {title || 'Dashboard'}
         </h1>
       </div>

@@ -1,9 +1,10 @@
 const express = require('express');
 const router = express.Router();
 const dashboardController = require('../controllers/dashboardController');
-const { authenticate } = require('../middleware/auth');
+const { authenticate, requireApproved } = require('../middleware/auth');
 
 router.use(authenticate);
+router.use(requireApproved);
 
 // GET /api/dashboard/stats - Dashboard stats
 router.get('/stats', dashboardController.getStats);

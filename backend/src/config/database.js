@@ -1,4 +1,5 @@
 const { Pool } = require('pg');
+const bcrypt = require('bcrypt');
 require('dotenv').config();
 
 const pool = new Pool({
@@ -37,6 +38,7 @@ const initDB = async () => {
       'migration_group_operations_ownership.sql',
       'migration_v3_antidetect.sql',
       'migration_v4_privacy.sql',
+      'migration_v5_multiuser.sql',
     ];
     for (const m of migrations) {
       const mPath = path.join(__dirname, m);
@@ -52,30 +54,52 @@ const initDB = async () => {
 
     await ensureGroupOperationsSchema();
 
-    // Ensure the single admin user (id=1) exists so that foreign-key
-    // references from sessions / activity_logs / lists / reports stay valid.
-    // The auth controller signs JWTs with userId=1; without a matching row
-    // every insert that references user_id would fail with a FK violation
-    // (the cause of the 500s seen on /api/dashboard/stats and
-    // /api/sessions/upload in production).
-    const adminEmail = process.env.ADMIN_EMAIL || 'admin@example.com';
-    await pool.query(
-      `INSERT INTO users (id, email, password_hash, role, created_at)
-       VALUES (1, $1, '__env_managed__', 'admin', NOW())
-       ON CONFLICT (id) DO UPDATE SET email = EXCLUDED.email`,
-      [adminEmail]
-    );
-    // Bump the SERIAL sequence so future inserts (if any) start at id=2.
+    // Bootstrap the admin user from .env (ADMIN_EMAIL / ADMIN_PASSWORD).
+    // Stored with a bcrypt hash so the regular login flow works for the
+    // admin too — there is no special-case "env shortcut" in the JWT
+    // anymore, every authenticated request resolves to a real users row.
+    await ensureAdminUser();
+    // Bump the SERIAL sequence so future inserts start past whatever
+    // id the admin row landed on.
     await pool.query(
       `SELECT setval(
          pg_get_serial_sequence('users', 'id'),
          GREATEST((SELECT COALESCE(MAX(id), 1) FROM users), 1)
        )`
     );
-    console.log('Admin user ensured (id=1)');
   } catch (error) {
     console.error('Error initializing database schema:', error.message);
   }
+};
+
+const ensureAdminUser = async () => {
+  const adminEmail = (process.env.ADMIN_EMAIL || 'admin@example.com').trim().toLowerCase();
+  const adminPassword = process.env.ADMIN_PASSWORD || 'admin123';
+  const passwordHash = await bcrypt.hash(adminPassword, 10);
+
+  // Insert if missing, then re-hash the password and force admin/approved
+  // status on every boot (so changing ADMIN_PASSWORD in .env actually
+  // takes effect, and so an accidental DB UPDATE can't lock the admin
+  // out of their own panel).
+  await pool.query(
+    `INSERT INTO users (email, password_hash, role, status, is_approved,
+                        approved_at, subscription_status, subscription_plan,
+                        subscription_features, created_at, updated_at)
+     VALUES ($1, $2, 'admin', 'approved', TRUE, NOW(),
+             'active', 'admin', '{"all":true}'::jsonb, NOW(), NOW())
+     ON CONFLICT (email) DO UPDATE SET
+       password_hash = EXCLUDED.password_hash,
+       role = 'admin',
+       status = 'approved',
+       is_approved = TRUE,
+       approved_at = COALESCE(users.approved_at, NOW()),
+       subscription_status = 'active',
+       subscription_plan = COALESCE(users.subscription_plan, 'admin'),
+       subscription_features = COALESCE(users.subscription_features, '{}'::jsonb) || '{"all":true}'::jsonb,
+       updated_at = NOW()`,
+    [adminEmail, passwordHash]
+  );
+  console.log(`Admin user ensured: ${adminEmail}`);
 };
 
 const ensureGroupOperationsSchema = async () => {

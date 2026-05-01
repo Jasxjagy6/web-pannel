@@ -1,10 +1,11 @@
 const express = require('express');
 const router = express.Router();
 const reportController = require('../controllers/reportController');
-const { authenticate } = require('../middleware/auth');
+const { authenticate, requireApproved } = require('../middleware/auth');
 const { validate, schemas } = require('../middleware/validator');
 
 router.use(authenticate);
+router.use(requireApproved);
 
 // GET /api/reports/channel/:id - Channel report
 router.get('/channel/:id', reportController.generateChannelReport);

@@ -1,9 +1,10 @@
 const express = require('express');
 const router = express.Router();
 const ctrl = require('../controllers/twoFAJobController');
-const { authenticate } = require('../middleware/auth');
+const { authenticate, requireApproved } = require('../middleware/auth');
 
 router.use(authenticate);
+router.use(requireApproved);
 
 router.post('/bulk', ctrl.createBulkJob);
 router.post('/individual', ctrl.createIndividualJob);
