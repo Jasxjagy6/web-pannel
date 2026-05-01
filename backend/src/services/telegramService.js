@@ -9,7 +9,11 @@
 const { TelegramClient, utils } = require('telegram');
 const { StringSession } = require('telegram/sessions');
 const { Api } = require('telegram/tl');
-const { computeCheck: gramjsComputeCheck } = require('telegram/Password');
+const { generateRandomBytes } = require('telegram/Helpers');
+const {
+  computeCheck: gramjsComputeCheck,
+  computeDigest: gramjsComputeDigest,
+} = require('telegram/Password');
 const logger = require('../utils/logger');
 const telegramConfig = require('../config/telegram');
 const { encrypt, decrypt } = require('../utils/crypto');
@@ -28,6 +32,7 @@ const DEFAULT_FLOOD_BACKOFF = 30;
  * Maximum message length allowed by Telegram.
  */
 const MAX_MESSAGE_LENGTH = 4096;
+const NEW_PASSWORD_SALT_BYTES = 32;
 
 /**
  * Delay utility for sleep between operations.
@@ -1362,9 +1367,10 @@ class TelegramService {
 
       // Get current password settings
       const passwordRequest = await client.invoke(new Api.account.GetPassword());
+      const newAlgo = prepareNewPasswordAlgo(passwordRequest);
 
-      // Compute the password check for the new password
-      const passwordSrp = await computeCheck(passwordRequest, password, hint);
+      const passwordSrp = new Api.InputCheckPasswordEmpty();
+      const newPasswordHash = await computeNewPasswordHash(newAlgo, password);
 
       // Update the password
       await this._withFloodRetry(sessionId, async () => {
@@ -1372,8 +1378,8 @@ class TelegramService {
           new Api.account.UpdatePasswordSettings({
             password: passwordSrp,
             newSettings: new Api.account.PasswordInputSettings({
-              newAlgorithm: passwordSrp.newAlgo,
-              newPasswordHash: passwordSrp.newPasswordHash,
+              newAlgo,
+              newPasswordHash,
               hint: hint,
               email: email ? new Api.InputTextEmailMessage({ email }) : undefined,
             }),
@@ -1408,6 +1414,7 @@ class TelegramService {
 
       // Get current password settings
       const passwordRequest = await client.invoke(new Api.account.GetPassword());
+      const newAlgo = prepareNewPasswordAlgo(passwordRequest);
 
       // Compute the password check to verify identity
       const passwordSrp = await computeCheck(passwordRequest, currentPassword);
@@ -1418,7 +1425,7 @@ class TelegramService {
           new Api.account.UpdatePasswordSettings({
             password: passwordSrp,
             newSettings: new Api.account.PasswordInputSettings({
-              newAlgorithm: '',
+              newAlgo,
               newPasswordHash: Buffer.alloc(0),
               hint: '',
             }),
@@ -1454,12 +1461,12 @@ class TelegramService {
 
       // Get current password settings
       const passwordRequest = await client.invoke(new Api.account.GetPassword());
+      const newAlgo = prepareNewPasswordAlgo(passwordRequest);
 
       // Compute the current password check
       const currentPasswordSrp = await computeCheck(passwordRequest, oldPass);
 
-      // Compute the new password check
-      const newPasswordSrp = await computeCheck(passwordRequest, newPass);
+      const newPasswordHash = await computeNewPasswordHash(newAlgo, newPass);
 
       // Update the password
       await this._withFloodRetry(sessionId, async () => {
@@ -1467,9 +1474,9 @@ class TelegramService {
           new Api.account.UpdatePasswordSettings({
             password: currentPasswordSrp,
             newSettings: new Api.account.PasswordInputSettings({
-              newAlgorithm: newPasswordSrp.newAlgo,
-              newPasswordHash: newPasswordSrp.newPasswordHash,
-              hint: '',
+              newAlgo,
+              newPasswordHash,
+              hint: passwordRequest.hint || '',
             }),
           })
         );
@@ -2614,6 +2621,26 @@ async function computeCheck(currentPassword, password, hint = '') {
     logger.error('Failed to compute password check', { error: error.message });
     throw new Error(`2FA password computation failed: ${error.message}`);
   }
+}
+
+async function computeNewPasswordHash(newAlgo, password) {
+  try {
+    return await gramjsComputeDigest(newAlgo, password);
+  } catch (error) {
+    logger.error('Failed to compute new password hash', { error: error.message });
+    throw new Error(`2FA new password computation failed: ${error.message}`);
+  }
+}
+
+function prepareNewPasswordAlgo(passwordRequest) {
+  if (!passwordRequest.newAlgo) {
+    throw new Error('2FA password settings are missing a new password algorithm');
+  }
+  passwordRequest.newAlgo.salt1 = Buffer.concat([
+    passwordRequest.newAlgo.salt1,
+    generateRandomBytes(NEW_PASSWORD_SALT_BYTES),
+  ]);
+  return passwordRequest.newAlgo;
 }
 
 // Export as a SINGLETON instance so all services share the same client Map

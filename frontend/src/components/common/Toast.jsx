@@ -1,3 +1,4 @@
+import { useCallback, useMemo } from 'react';
 import { create } from 'zustand';
 import {
   CheckCircleIcon,
@@ -78,19 +79,23 @@ const useToastStore = create((set, get) => ({
 export function useToast() {
   const addToast = useToastStore((state) => state.addToast);
   const removeToast = useToastStore((state) => state.removeToast);
+  const showSuccess = useCallback((message, title) => addToast({ message, title, type: 'success' }), [addToast]);
+  const showError = useCallback((message, title) => addToast({ message, title, type: 'error' }), [addToast]);
+  const showWarning = useCallback((message, title) => addToast({ message, title, type: 'warning' }), [addToast]);
+  const showInfo = useCallback((message, title) => addToast({ message, title, type: 'info' }), [addToast]);
 
-  return {
+  return useMemo(() => ({
     addToast,
     removeToast,
-    showSuccess: (message, title) => addToast({ message, title, type: 'success' }),
-    showError: (message, title) => addToast({ message, title, type: 'error' }),
-    showWarning: (message, title) => addToast({ message, title, type: 'warning' }),
-    showInfo: (message, title) => addToast({ message, title, type: 'info' }),
-    success: (message, title) => addToast({ message, title, type: 'success' }),
-    error: (message, title) => addToast({ message, title, type: 'error' }),
-    warning: (message, title) => addToast({ message, title, type: 'warning' }),
-    info: (message, title) => addToast({ message, title, type: 'info' }),
-  };
+    showSuccess,
+    showError,
+    showWarning,
+    showInfo,
+    success: showSuccess,
+    error: showError,
+    warning: showWarning,
+    info: showInfo,
+  }), [addToast, removeToast, showSuccess, showError, showWarning, showInfo]);
 }
 
 function ToastItem({ toast, onRemove }) {
