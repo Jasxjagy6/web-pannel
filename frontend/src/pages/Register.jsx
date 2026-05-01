@@ -147,8 +147,10 @@ export default function Register() {
               </div>
             </div>
 
-            <p className="rounded-lg border border-amber-500/30 bg-amber-500/10 p-3 text-xs text-amber-300">
-              New accounts are pending until an admin approves them. You'll be able to log in but the panel features stay locked until then.
+            <p className="rounded-lg border border-primary-500/30 bg-primary-500/10 p-3 text-xs text-primary-200">
+              You'll go straight to the billing page after sign-up — start the
+              free trial or pick a plan. The panel itself unlocks once you set
+              up your Telegram API ID and Hash in Settings.
             </p>
 
             <button

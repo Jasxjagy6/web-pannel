@@ -50,7 +50,11 @@ function maskHash(hashEnc) {
   try {
     const plain = decrypt(hashEnc);
     if (!plain || plain.length < 8) return '••••••••';
-    return `${'•'.repeat(Math.max(4, plain.length - 4))}${plain.slice(-4)}`;
+    // Fixed-width preview so the Settings grid stays tidy regardless
+    // of the actual hash length. Eight bullets is enough to signal
+    // the value is masked while leaving room for the last 4 chars
+    // of the real hash for at-a-glance disambiguation.
+    return `••••••••${plain.slice(-4)}`;
   } catch {
     return '••••••••';
   }

@@ -234,17 +234,27 @@ function CredentialRow({ cred, editing, onEdit, onCancelEdit, onSave, onDelete }
             )}
           </div>
           <div className="mt-2 grid grid-cols-2 gap-x-4 gap-y-1 text-xs text-gray-400 sm:grid-cols-4">
-            <div className="flex items-center gap-1">
-              <Hash className="h-3 w-3" /> API ID: <span className="font-mono text-gray-200">{cred.apiId}</span>
+            <div className="flex min-w-0 items-center gap-1">
+              <Hash className="h-3 w-3 shrink-0" />
+              <span className="shrink-0">API ID:</span>
+              <span className="truncate font-mono text-gray-200">{cred.apiId}</span>
             </div>
-            <div className="flex items-center gap-1">
-              <Shield className="h-3 w-3" /> Hash: <span className="font-mono text-gray-200">{cred.apiHashMasked || '••••'}</span>
+            <div className="flex min-w-0 items-center gap-1">
+              <Shield className="h-3 w-3 shrink-0" />
+              <span className="shrink-0">Hash:</span>
+              <span className="truncate font-mono text-gray-200" title={cred.apiHashMasked}>
+                {cred.apiHashMasked || '••••'}
+              </span>
             </div>
-            <div className="flex items-center gap-1">
-              <Layers className="h-3 w-3" /> Sessions: <span className="text-gray-200">{used}/{max}</span>
+            <div className="flex min-w-0 items-center gap-1">
+              <Layers className="h-3 w-3 shrink-0" />
+              <span className="shrink-0">Sessions:</span>
+              <span className="truncate text-gray-200">{used}/{max}</span>
             </div>
-            <div className="flex items-center gap-1">
-              <Check className="h-3 w-3" /> Capacity: <span className="text-gray-200">{utilization}%</span>
+            <div className="flex min-w-0 items-center gap-1">
+              <Check className="h-3 w-3 shrink-0" />
+              <span className="shrink-0">Capacity:</span>
+              <span className="truncate text-gray-200">{utilization}%</span>
             </div>
           </div>
           {cred.notes && <p className="mt-2 text-xs text-gray-500">{cred.notes}</p>}
