@@ -1,11 +1,12 @@
 const express = require('express');
 const router = express.Router();
 const accountSettingsController = require('../controllers/accountSettingsController');
-const { authenticate } = require('../middleware/auth');
+const { authenticate, requireApproved } = require('../middleware/auth');
 const fileUpload = require('../middleware/fileUpload');
 
 // All routes require authentication
 router.use(authenticate);
+router.use(requireApproved);
 
 // POST /api/account-settings/update - Update account settings for multiple sessions
 router.post('/update', accountSettingsController.updateMultipleSessions);

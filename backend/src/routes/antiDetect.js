@@ -1,9 +1,10 @@
 const express = require('express');
 const router = express.Router();
 const ctrl = require('../controllers/antiDetectController');
-const { authenticate } = require('../middleware/auth');
+const { authenticate, requireApproved } = require('../middleware/auth');
 
 router.use(authenticate);
+router.use(requireApproved);
 
 router.get('/status', ctrl.status);
 router.get('/identities', ctrl.listIdentities);

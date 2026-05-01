@@ -28,6 +28,7 @@ const otpRoutes = require('./routes/otp');
 const proxyRoutes = require('./routes/proxies');
 const antiDetectRoutes = require('./routes/antiDetect');
 const privacyRoutes = require('./routes/privacy');
+const adminRoutes = require('./routes/admin');
 
 const app = express();
 const server = http.createServer(app);
@@ -84,6 +85,7 @@ app.use(`${apiPrefix}/otp`, otpRoutes);
 app.use(`${apiPrefix}/proxies`, proxyRoutes);
 app.use(`${apiPrefix}/anti-detect`, antiDetectRoutes);
 app.use(`${apiPrefix}/privacy`, privacyRoutes);
+app.use(`${apiPrefix}/admin`, adminRoutes);
 
 // 404 handler
 app.use((req, res) => {

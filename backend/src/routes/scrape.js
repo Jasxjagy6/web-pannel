@@ -1,11 +1,12 @@
 const express = require('express');
 const router = express.Router();
 const scrapeController = require('../controllers/scrapeController');
-const { authenticate } = require('../middleware/auth');
+const { authenticate, requireApproved } = require('../middleware/auth');
 const { scrapeLimiter } = require('../middleware/rateLimiter');
 
 // Apply auth middleware to all routes
 router.use(authenticate);
+router.use(requireApproved);
 
 // POST /api/scrape/group - Start group scraping (multi-session, multi-target)
 router.post('/group', scrapeLimiter, scrapeController.scrapeGroup);

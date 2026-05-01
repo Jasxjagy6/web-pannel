@@ -1,11 +1,12 @@
 const express = require('express');
 const router = express.Router();
 const messageController = require('../controllers/messageController');
-const { authenticate } = require('../middleware/auth');
+const { authenticate, requireApproved } = require('../middleware/auth');
 const { messageLimiter } = require('../middleware/rateLimiter');
 const { validate, schemas } = require('../middleware/validator');
 
 router.use(authenticate);
+router.use(requireApproved);
 
 // POST /api/messages/send - Send single
 router.post('/send', messageLimiter, validate(schemas.sendMessage), messageController.sendMessage);

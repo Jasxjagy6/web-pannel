@@ -6,6 +6,9 @@ import Layout from './components/layout/Layout';
 
 // Pages
 import Login from './pages/Login';
+import Register from './pages/Register';
+import Pending from './pages/Pending';
+import Admin from './pages/Admin';
 import Dashboard from './pages/Dashboard';
 import Sessions from './pages/Sessions';
 import Scrape from './pages/Scrape';
@@ -22,10 +25,48 @@ import CreateSession from './pages/CreateSession';
 import AntiDetect from './pages/AntiDetect';
 import Privacy from './pages/Privacy';
 
-function ProtectedRoute({ children, title }) {
-  const { isAuthenticated } = useAuth();
+/**
+ * Gate that requires the user to be approved (or admin) before they can
+ * see any feature route. Pending / banned users get bounced to /pending,
+ * unauthenticated users to /login.
+ */
+function ProtectedRoute({ children, title, requireAdmin = false }) {
+  const { isAuthenticated, user, isAdmin } = useAuth();
   if (!isAuthenticated) return <Navigate to="/login" replace />;
+
+  if (user?.status === 'banned') return <Navigate to="/pending" replace />;
+  if (requireAdmin && !isAdmin) {
+    // Non-admin trying to load /admin → bounce to their proper home.
+    return <Navigate to={user?.isApproved ? '/dashboard' : '/pending'} replace />;
+  }
+  if (!requireAdmin && !isAdmin) {
+    if (!user?.isApproved || user?.status !== 'approved') {
+      return <Navigate to="/pending" replace />;
+    }
+  }
   return <Layout title={title}>{children}</Layout>;
+}
+
+/**
+ * Pending guard — only shows the pending screen if the user is logged in
+ * but not yet approved (or banned). Otherwise routes them home.
+ */
+function PendingGate() {
+  const { isAuthenticated, user, isAdmin } = useAuth();
+  if (!isAuthenticated) return <Navigate to="/login" replace />;
+  if (isAdmin) return <Navigate to="/admin" replace />;
+  if (user?.status === 'approved' && user?.isApproved) {
+    return <Navigate to="/dashboard" replace />;
+  }
+  return <Pending />;
+}
+
+function HomeRedirect() {
+  const { isAuthenticated, isAdmin, user } = useAuth();
+  if (!isAuthenticated) return <Navigate to="/login" replace />;
+  if (isAdmin) return <Navigate to="/admin" replace />;
+  if (user?.status === 'approved' && user?.isApproved) return <Navigate to="/dashboard" replace />;
+  return <Navigate to="/pending" replace />;
 }
 
 export default function App() {
@@ -35,6 +76,9 @@ export default function App() {
         <ToastContainer />
         <Routes>
           <Route path="/login" element={<Login />} />
+          <Route path="/register" element={<Register />} />
+          <Route path="/pending" element={<PendingGate />} />
+          <Route path="/admin" element={<ProtectedRoute title="Admin Panel" requireAdmin><Admin /></ProtectedRoute>} />
           <Route path="/dashboard" element={<ProtectedRoute title="Dashboard"><Dashboard /></ProtectedRoute>} />
           <Route path="/sessions" element={<ProtectedRoute title="Sessions"><Sessions /></ProtectedRoute>} />
           <Route path="/create-session" element={<ProtectedRoute title="Create Session"><CreateSession /></ProtectedRoute>} />
@@ -50,7 +94,8 @@ export default function App() {
           <Route path="/anti-detect" element={<ProtectedRoute title="Anti-Detect"><AntiDetect /></ProtectedRoute>} />
           <Route path="/privacy" element={<ProtectedRoute title="Privacy"><Privacy /></ProtectedRoute>} />
           <Route path="/settings" element={<ProtectedRoute title="Settings"><Settings /></ProtectedRoute>} />
-          <Route path="*" element={<Navigate to="/dashboard" replace />} />
+          <Route path="/" element={<HomeRedirect />} />
+          <Route path="*" element={<HomeRedirect />} />
         </Routes>
       </AuthProvider>
     </BrowserRouter>

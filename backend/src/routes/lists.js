@@ -1,11 +1,12 @@
 const express = require('express');
 const router = express.Router();
 const listController = require('../controllers/listController');
-const { authenticate } = require('../middleware/auth');
+const { authenticate, requireApproved } = require('../middleware/auth');
 const { uploadSingle } = require('../middleware/upload');
 const { validate, schemas } = require('../middleware/validator');
 
 router.use(authenticate);
+router.use(requireApproved);
 
 // POST /api/lists/import
 router.post('/import', uploadSingle('file'), validate(schemas.listImport), listController.importList);

@@ -1,10 +1,11 @@
 const express = require('express');
 const router = express.Router();
 const groupController = require('../controllers/groupController');
-const { authenticate } = require('../middleware/auth');
+const { authenticate, requireApproved } = require('../middleware/auth');
 const { validate, schemas } = require('../middleware/validator');
 
 router.use(authenticate);
+router.use(requireApproved);
 
 // POST /api/groups/add-members
 router.post('/add-members', validate(schemas.addMembersToGroup), groupController.addMembers);

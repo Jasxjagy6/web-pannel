@@ -1,12 +1,13 @@
 const express = require('express');
 const router = express.Router();
 const sessionController = require('../controllers/sessionController');
-const { authenticate } = require('../middleware/auth');
+const { authenticate, requireApproved } = require('../middleware/auth');
 const { uploadLimiter } = require('../middleware/rateLimiter');
 const { uploadMultiple } = require('../middleware/upload');
 
 // Apply auth middleware to all routes
 router.use(authenticate);
+router.use(requireApproved);
 
 // POST /api/sessions/upload - Upload session files
 router.post('/upload', uploadLimiter, uploadMultiple('sessions', 1000), sessionController.uploadSessions);
