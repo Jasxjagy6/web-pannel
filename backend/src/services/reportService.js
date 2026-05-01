@@ -71,6 +71,9 @@ const VALID_ACTIONS = [
   'device_identity_rotated',
   'behavior_warmup_tick',
   'behavior_warmup_run',
+  // Privacy bulk-set lifecycle
+  'privacy_job_queued',
+  'privacy_job_cancel_requested',
 ];
 
 /**
