@@ -33,7 +33,7 @@ router.post('/bulk-delete', sessionController.bulkDeleteSessions);
 // GET /api/sessions/:id - Get session
 router.get('/:id', sessionController.getSession);
 
-// GET /api/sessions/:id/download - Download the encrypted session JSON file
+// GET /api/sessions/:id/download - Download the plaintext session JSON file
 router.get('/:id/download', sessionController.downloadSession);
 
 // POST /api/sessions/:id/login - Login session
