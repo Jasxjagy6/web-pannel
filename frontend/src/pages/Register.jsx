@@ -29,8 +29,12 @@ export default function Register() {
     setLoading(true);
     try {
       await register(email.trim(), password);
-      showSuccess('Account created. Awaiting admin approval.', 'Welcome');
-      navigate('/pending', { replace: true });
+      // v8: admin approval has been removed. New users land on the
+      // billing page so they can either start the free trial or pay.
+      // The panel itself stays gated behind "set up your Telegram API
+      // ID/Hash in Settings" which is enforced on the next request.
+      showSuccess('Account created. Choose a plan or start your trial.', 'Welcome');
+      navigate('/billing', { replace: true });
     } catch (err) {
       const message = parseApiError(err);
       setApiError(message);

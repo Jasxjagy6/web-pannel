@@ -2,19 +2,16 @@ import { useState } from 'react';
 import { useAuth } from '../hooks/useAuth';
 import {
   User,
-  Key,
   Bell,
-  Shield,
   AlertTriangle,
   Trash2,
   Save,
-  Info,
-  ExternalLink,
   MessageSquare,
   Volume2,
 } from 'lucide-react';
 import { useToast } from '../components/common/Toast';
 import { parseApiError } from '@/utils/formatters';
+import TelegramCredentialsCard from '../components/settings/TelegramCredentialsCard';
 
 function SectionCard({ icon: Icon, title, description, children, className = '' }) {
   return (
@@ -177,54 +174,10 @@ export default function Settings() {
         </div>
       </SectionCard>
 
-      {/* TELEGRAM API SECTION */}
-      <SectionCard
-        icon={Key}
-        title="Telegram API"
-        description="Your Telegram API credentials used for authentication and operations."
-      >
-        <div className="space-y-5">
-          <div className="flex gap-3 rounded-lg border border-blue-500/20 bg-blue-500/5 p-4">
-            <Info className="h-5 w-5 text-blue-400 shrink-0 mt-0.5" />
-            <div className="text-sm text-blue-200">
-              <p className="font-medium mb-1">How to get your API credentials</p>
-              <ol className="list-decimal list-inside space-y-1 text-blue-300/80">
-                <li>Go to <a href="https://my.telegram.org" target="_blank" rel="noopener noreferrer" className="underline hover:text-blue-200 transition-colors inline-flex items-center gap-1">my.telegram.org <ExternalLink className="h-3 w-3" /></a></li>
-                <li>Log in with your phone number</li>
-                <li>Navigate to <strong>API development tools</strong></li>
-                <li>Create a new application to get your <strong>API ID</strong> and <strong>API Hash</strong></li>
-                <li>Add them to the backend .env file as TELEGRAM_API_ID and TELEGRAM_API_HASH</li>
-              </ol>
-            </div>
-          </div>
-
-          <div>
-            <label className="mb-1.5 block text-sm font-medium text-gray-300">API ID</label>
-            <div className="relative">
-              <Key className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-gray-500" />
-              <input
-                type="text"
-                value={process.env.VITE_TELEGRAM_API_ID || 'Set in backend .env'}
-                readOnly
-                className="w-full rounded-lg border border-white/10 bg-dark-900 py-2 pl-10 pr-3 text-sm font-mono text-gray-300 cursor-not-allowed"
-              />
-            </div>
-          </div>
-
-          <div>
-            <label className="mb-1.5 block text-sm font-medium text-gray-300">API Hash</label>
-            <div className="relative">
-              <Shield className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-gray-500" />
-              <input
-                type="password"
-                value="Set in backend .env"
-                readOnly
-                className="w-full rounded-lg border border-white/10 bg-dark-900 py-2 pl-10 pr-3 text-sm font-mono text-gray-300 cursor-not-allowed"
-              />
-            </div>
-          </div>
-        </div>
-      </SectionCard>
+      {/* TELEGRAM API SECTION — multi-credential vault, replaces the
+          old read-only env-var card. The user MUST add at least one
+          here before the panel will let them use any feature. */}
+      <TelegramCredentialsCard />
 
       {/* NOTIFICATIONS SECTION */}
       <SectionCard

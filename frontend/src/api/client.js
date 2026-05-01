@@ -50,6 +50,11 @@ function isPanelAuthFailure(error) {
 // Response interceptor: clear creds + redirect ONLY when the panel JWT is
 // the thing that's broken. Otherwise propagate so the caller can show a
 // useful error.
+//
+// v8: also intercept the dedicated 412 API_CREDENTIALS_REQUIRED status
+// (raised by the per-user Telegram credentials gate) and dispatch a
+// global event so any mounted MissingApiCredsModal can pop up,
+// regardless of which page made the request.
 api.interceptors.response.use(
   (response) => response,
   (error) => {
@@ -57,6 +62,19 @@ api.interceptors.response.use(
       localStorage.removeItem('token');
       localStorage.removeItem('user');
       window.location.href = '/login';
+    }
+    if (error?.response?.status === 412) {
+      const code = error.response?.data?.error?.code || error.response?.data?.code;
+      if (code === 'API_CREDENTIALS_REQUIRED') {
+        try {
+          window.dispatchEvent(new CustomEvent('missing-api-creds', {
+            detail: {
+              message: error.response?.data?.error?.message
+                || 'Set up your Telegram API ID and Hash in Settings to use the panel.',
+            },
+          }));
+        } catch (_) { /* SSR safety */ }
+      }
     }
     return Promise.reject(error);
   }

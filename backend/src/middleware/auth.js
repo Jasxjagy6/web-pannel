@@ -98,11 +98,30 @@ async function _gate(req, _res, feature) {
   if (req.user.status === 'banned') {
     throw new AppError('Account is banned', 403, 'ACCOUNT_BANNED');
   }
+  // Approval is now automatic on register (v8). Banned users land in
+  // 'banned' above. The remaining negative case is anyone an admin
+  // explicitly rolled back to 'pending' — keep that path working.
   if (req.user.status !== 'approved' || !req.user.isApproved) {
     throw new AppError(
-      'Account is pending admin approval',
+      'Account is currently disabled. Please contact support.',
       403,
       'NOT_APPROVED'
+    );
+  }
+
+  // Per-user Telegram API credentials gate (v8). The user MUST have at
+  // least one usable credential before they can use any feature route,
+  // including after they have an active subscription. The frontend
+  // uses this to render the "Set up your API ID and Hash in Settings"
+  // popup. Auth, billing, and the credentials CRUD itself are mounted
+  // outside this middleware so they remain reachable.
+  const userApiCredentials = require('../services/userApiCredentialsService');
+  const hasCreds = await userApiCredentials.userHasUsable(req.user.id);
+  if (!hasCreds) {
+    throw new AppError(
+      'Please set up your Telegram API ID and Hash in Settings before using the panel.',
+      412,
+      'API_CREDENTIALS_REQUIRED'
     );
   }
 

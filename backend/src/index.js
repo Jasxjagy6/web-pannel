@@ -3,6 +3,7 @@ const http = require('http');
 const { Server } = require('socket.io');
 const cors = require('cors');
 const helmet = require('helmet');
+const compression = require('compression');
 const jwt = require('jsonwebtoken');
 require('dotenv').config();
 
@@ -30,23 +31,45 @@ const antiDetectRoutes = require('./routes/antiDetect');
 const privacyRoutes = require('./routes/privacy');
 const adminRoutes = require('./routes/admin');
 const billingRoutes = require('./routes/billing');
+const userCredentialsRoutes = require('./routes/userCredentials');
 const billingController = require('./controllers/billingController');
 
 const app = express();
 const server = http.createServer(app);
 
-// Initialize Socket.IO
+// Initialize Socket.IO. The ping/pong cadence is tuned for the
+// 500-700 concurrent user target — short enough to detect a dead
+// client within ~30s, long enough to keep idle WS traffic minimal.
 const io = new Server(server, {
   cors: {
     origin: process.env.FRONTEND_URL || 'http://localhost:5173',
     methods: ['GET', 'POST'],
     credentials: true,
   },
+  pingInterval: parseInt(process.env.WS_PING_INTERVAL_MS || '25000', 10),
+  pingTimeout:  parseInt(process.env.WS_PING_TIMEOUT_MS  || '20000', 10),
+  maxHttpBufferSize: 1e6,
+  perMessageDeflate: { threshold: 1024 },
 });
 
 // Middleware
 app.set('trust proxy', 1); // Trust first proxy (nginx)
 app.use(helmet());
+// gzip / brotli compression for JSON responses. Saves a substantial
+// chunk of egress on the dashboard, sessions list, and scrape job
+// table at scale.
+app.use(compression({
+  threshold: 1024,
+  // Some endpoints stream binary downloads (CSV / XLSX / session
+  // files); express-router handles those separately and we'd rather
+  // not double-compress them.
+  filter: (req, res) => {
+    if (req.headers['x-no-compression']) return false;
+    const ct = String(res.getHeader('Content-Type') || '');
+    if (/^application\/octet-stream/.test(ct)) return false;
+    return compression.filter(req, res);
+  },
+}));
 app.use(cors({
   origin: process.env.FRONTEND_URL || 'http://localhost:5173',
   credentials: true,
@@ -64,12 +87,27 @@ app.post(
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
-// Request logging middleware for debugging
+// Request logging middleware. At 500-700 concurrent users with each
+// browser polling sessions / dashboard / monitor lists, naive per-
+// request logging dominates I/O. We sample successful GETs to 1/N
+// and always log everything else (writes, 4xx, 5xx) so anomalies stay
+// visible.
+const REQ_LOG_SAMPLE = Math.max(1, parseInt(process.env.REQ_LOG_SAMPLE || '20', 10));
+let reqLogCounter = 0;
 app.use((req, res, next) => {
   const start = Date.now();
   res.on('finish', () => {
     const duration = Date.now() - start;
-    logger.info(`${req.method} ${req.originalUrl} ${res.statusCode} - ${duration}ms`);
+    const isHotGet = req.method === 'GET' && res.statusCode < 400;
+    const sampled = isHotGet && (reqLogCounter++ % REQ_LOG_SAMPLE !== 0);
+    if (sampled) return;
+    if (res.statusCode >= 500) {
+      logger.error(`${req.method} ${req.originalUrl} ${res.statusCode} - ${duration}ms`);
+    } else if (res.statusCode >= 400) {
+      logger.warn(`${req.method} ${req.originalUrl} ${res.statusCode} - ${duration}ms`);
+    } else {
+      logger.info(`${req.method} ${req.originalUrl} ${res.statusCode} - ${duration}ms`);
+    }
   });
   next();
 });
@@ -99,6 +137,7 @@ app.use(`${apiPrefix}/anti-detect`, antiDetectRoutes);
 app.use(`${apiPrefix}/privacy`, privacyRoutes);
 app.use(`${apiPrefix}/admin`, adminRoutes);
 app.use(`${apiPrefix}/billing`, billingRoutes);
+app.use(`${apiPrefix}/user-credentials`, userCredentialsRoutes);
 
 // 404 handler
 app.use((req, res) => {
@@ -293,24 +332,47 @@ async function start() {
   }
 }
 
-// Graceful shutdown
-process.on('SIGTERM', async () => {
-  logger.info('SIGTERM received, shutting down gracefully');
-  server.close(async () => {
+// Graceful shutdown. v8: hardened for the 500-700 concurrent user
+// target — we stop accepting new connections, then wait up to
+// SHUTDOWN_GRACE_MS for in-flight requests / WS clients to finish,
+// and only then close queues + DB pool. If the grace window expires
+// we still exit cleanly so the orchestrator doesn't have to SIGKILL.
+const SHUTDOWN_GRACE_MS = parseInt(process.env.SHUTDOWN_GRACE_MS || '20000', 10);
+let shuttingDown = false;
+async function gracefulShutdown(signal) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  logger.info(`${signal} received, shutting down gracefully (${SHUTDOWN_GRACE_MS}ms grace)`);
+  const forceTimer = setTimeout(() => {
+    logger.warn('graceful shutdown timed out, forcing exit');
+    process.exit(1);
+  }, SHUTDOWN_GRACE_MS);
+  forceTimer.unref();
+  try {
+    // Stop accepting new HTTP connections and WS upgrades.
+    server.close();
+    try { io.close(); } catch (_) {}
+    // Drain queues so in-flight jobs commit cleanly.
     await closeQueues();
-    logger.info('Server closed');
+    // Close DB pool last so anything that tried to log a final query
+    // still sees an open connection.
+    try {
+      const { pool } = require('./config/database');
+      await pool.end();
+    } catch (err) {
+      logger.warn(`pool.end failed: ${err.message}`);
+    }
+    logger.info('Server closed cleanly');
+    clearTimeout(forceTimer);
     process.exit(0);
-  });
-});
-
-process.on('SIGINT', async () => {
-  logger.info('SIGINT received, shutting down gracefully');
-  server.close(async () => {
-    await closeQueues();
-    logger.info('Server closed');
-    process.exit(0);
-  });
-});
+  } catch (err) {
+    logger.error('graceful shutdown error', err);
+    clearTimeout(forceTimer);
+    process.exit(1);
+  }
+}
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+process.on('SIGINT',  () => gracefulShutdown('SIGINT'));
 
 start();
 
