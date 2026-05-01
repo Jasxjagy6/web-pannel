@@ -19,8 +19,9 @@
  *        is dropped.
  *
  *   3. password({ tempId, password })
- *        Calls client.checkPassword via Api.auth.CheckPassword and persists
- *        the session on success.
+ *        Runs the MTProto SRP flow (GetPassword -> computeCheck ->
+ *        CheckPassword) against the stored client and persists the session
+ *        on success.
  *
  *   4. resend({ tempId })
  *        Calls auth.ResendCode and refreshes the stored phoneCodeHash.
@@ -46,6 +47,7 @@ const crypto = require('crypto');
 const { v4: uuidv4 } = require('uuid');
 const { TelegramClient, Api } = require('telegram');
 const { StringSession } = require('telegram/sessions');
+const { computeCheck: gramjsComputeCheck } = require('telegram/Password');
 
 const { pool } = require('../config/database');
 const telegramConfig = require('../config/telegram');
@@ -255,11 +257,32 @@ class SessionCreationService {
       throw new AppError('2FA password is required', 400, 'PASSWORD_REQUIRED');
     }
     try {
-      await entry.client.checkPassword(String(password));
+      // GramJS 2.26.x does NOT expose `client.checkPassword` directly. Use the
+      // documented MTProto SRP flow: GetPassword -> computeCheck -> CheckPassword.
+      const passwordRequest = await entry.client.invoke(
+        new Api.account.GetPassword()
+      );
+      const passwordSrp = await gramjsComputeCheck(
+        passwordRequest,
+        String(password)
+      );
+      await entry.client.invoke(
+        new Api.auth.CheckPassword({ password: passwordSrp })
+      );
       return await this._persistAndFinish(userId, tempId, true);
     } catch (err) {
-      const msg = err && (err.errorMessage || err.message) || '';
+      const code = (err && (err.errorMessage || err.code)) || '';
+      const msg = (err && (err.errorMessage || err.message)) || '';
       logger.warn(`Session creation password failed for ${tempId}: ${msg}`);
+      // Surface the most common failure (wrong password) with a 401 so the
+      // frontend doesn't conflate it with a server-side bug.
+      if (/PASSWORD_HASH_INVALID/i.test(code) || /PASSWORD_HASH_INVALID/i.test(msg)) {
+        throw new AppError(
+          'The 2FA cloud password is incorrect.',
+          401,
+          'PASSWORD_HASH_INVALID'
+        );
+      }
       throw new AppError(`2FA failed: ${msg || 'unknown'}`, 400, 'PASSWORD_FAILED');
     }
   }
