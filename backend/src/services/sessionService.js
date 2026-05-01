@@ -1443,6 +1443,17 @@ class SessionService {
       } catch (proxyErr) {
         logger.warn(`Proxy assignment failed for session ${sessionId}: ${proxyErr.message}`);
       }
+
+      // Anti-Detect: load (or generate) the persisted device identity so
+      // every TelegramClient for this row reports the same hardware.
+      let identity = null;
+      try {
+        const identityService = require('./identityService');
+        identity = await identityService.loadOrCreate(sessionId);
+      } catch (idErr) {
+        logger.warn(`Identity load failed for session ${sessionId}: ${idErr.message}`);
+      }
+
       await client.query('BEGIN');
       // Re-acquire our row lock for the rest of the login flow.
       await client.query(
@@ -1456,7 +1467,7 @@ class SessionService {
         fileData.session,
         session.api_id || undefined,
         session.api_hash || undefined,
-        { proxy: assignedProxy }
+        { proxy: assignedProxy, identity }
       );
       const timeoutPromise = new Promise((_, reject) =>
         setTimeout(() => reject(new Error('Login timeout exceeded (30s)')), LOGIN_TIMEOUT_MS)
@@ -2059,13 +2070,19 @@ class SessionService {
           if (proxyConf) {
             const sFile = await this._readSessionFile(sessionId);
             if (sFile) {
+              // Anti-Detect: replay the persisted device identity.
+              let identity = null;
+              try {
+                const identityService = require('./identityService');
+                identity = await identityService.loadOrCreate(sessionId);
+              } catch { /* non-fatal */ }
               await tgService.disconnectSession(String(sessionId)).catch(() => {});
               await tgService.createSession(
                 String(sessionId),
                 sFile.encryptedSession,
                 sFile.apiId,
                 sFile.apiHash,
-                { proxy: proxyConf }
+                { proxy: proxyConf, identity }
               );
             }
           }

@@ -12,7 +12,8 @@
  * Public API:
  *   listProxies(filter), addManualProxy(payload), deleteProxy(id),
  *   refreshFreeProxies(), assignProxyForSession(sessionId), releaseProxy(sessionId),
- *   getProxyForSession(sessionId), buildGramJSProxy(proxy)
+ *   getProxyForSession(sessionId), buildGramJSProxy(proxy),
+ *   reserveAdHoc(key), releaseAdHoc(key), transferAdHocToSession(key, sessionId)
  */
 
 const { pool } = require('../config/database');
@@ -533,13 +534,107 @@ class ProxyService {
               total_assignments = total_assignments + 1 WHERE id = $1`,
       [proxy.id]
     );
-    // NOTE: we deliberately do NOT update sessions.proxy_id here. Callers
-    // (sessionService.loginSession) hold a `SELECT ... FOR UPDATE` on the
-    // sessions row inside their own transaction; updating that row from a
-    // separate pool connection would deadlock-wait. session_proxy_assignments
-    // is the canonical mapping; sessions.proxy_id is just a denormalized
-    // hint that callers can update under their own transaction if needed.
+    // Best-effort: keep sessions.bound_proxy_id in sync so the
+    // Anti-Detect dashboard can show the binding without joining.
+    // sessions.proxy_id (legacy denormalized hint) is intentionally NOT
+    // updated from this connection — callers like loginSession hold a
+    // SELECT ... FOR UPDATE on the row in their own transaction and a
+    // cross-connection UPDATE would deadlock-wait.
+    try {
+      await pool.query(
+        `UPDATE sessions SET bound_proxy_id = $1 WHERE id = $2 AND COALESCE(bound_proxy_id, 0) <> $1`,
+        [proxy.id, sessionId]
+      );
+    } catch (_) {
+      // ignore — column may not exist yet on the very first migration apply.
+    }
     return proxy;
+  }
+
+  /**
+   * Reserve a proxy slot for a flow that doesn't have a session row yet
+   * (the create-session SendCode step). Bumps the active_assignments
+   * counter and remembers the reservation in an in-memory map keyed by
+   * `key`. Caller must call `releaseAdHoc(key)` or
+   * `transferAdHocToSession(key, sessionId)` to clean up.
+   *
+   * @param {string} key - Unique caller-supplied key (e.g. `creation:<tempId>`).
+   * @returns {Promise<object|null>} proxy row or null when nothing is
+   *   available. Caller should respect STRICT_PROXY_ISOLATION at the
+   *   call site.
+   */
+  async reserveAdHoc(key) {
+    if (!key) throw new Error('reserveAdHoc: key required');
+    if (this._adHocReservations && this._adHocReservations.has(key)) {
+      // Idempotent — return the same proxy row.
+      const existingId = this._adHocReservations.get(key);
+      const r = await pool.query(`SELECT * FROM proxies WHERE id = $1`, [existingId]);
+      return r.rows[0] || null;
+    }
+    const r = await pool.query(
+      `SELECT * FROM proxies
+       WHERE is_working = TRUE
+         AND active_assignments < $1
+         AND host <> '__direct__'
+       ORDER BY priority DESC, last_latency_ms NULLS LAST
+       LIMIT 1`,
+      [MAX_SESSIONS_PER_PROXY]
+    );
+    let proxy = r.rows[0];
+    if (!proxy) {
+      // Fall back to the direct row so the caller still sees a non-null
+      // value; the buildGramJSProxy() layer will turn it into "no proxy"
+      // (i.e. direct connection).
+      const d = await pool.query(`SELECT * FROM proxies WHERE host='__direct__' LIMIT 1`);
+      proxy = d.rows[0] || null;
+    }
+    if (!proxy) return null;
+    await pool.query(
+      `UPDATE proxies SET active_assignments = active_assignments + 1,
+              total_assignments = total_assignments + 1 WHERE id = $1`,
+      [proxy.id]
+    );
+    if (!this._adHocReservations) this._adHocReservations = new Map();
+    this._adHocReservations.set(key, proxy.id);
+    return proxy;
+  }
+
+  /**
+   * Release an ad-hoc reservation made by `reserveAdHoc(key)`.
+   */
+  async releaseAdHoc(key) {
+    if (!this._adHocReservations) return;
+    const proxyId = this._adHocReservations.get(key);
+    if (!proxyId) return;
+    this._adHocReservations.delete(key);
+    await pool.query(
+      `UPDATE proxies SET active_assignments = GREATEST(active_assignments - 1, 0)
+       WHERE id = $1`,
+      [proxyId]
+    );
+  }
+
+  /**
+   * Transfer an ad-hoc reservation into a real session_proxy_assignments
+   * row once the session has been persisted. The active_assignments
+   * counter stays the same — we just rebrand the slot.
+   */
+  async transferAdHocToSession(key, sessionId) {
+    if (!this._adHocReservations) this._adHocReservations = new Map();
+    const proxyId = this._adHocReservations.get(key);
+    if (!proxyId) {
+      // No reservation — fall back to a fresh allocation.
+      return await this.assignProxyForSession(sessionId);
+    }
+    this._adHocReservations.delete(key);
+    await pool.query(
+      `INSERT INTO session_proxy_assignments (session_id, proxy_id, assigned_at)
+       VALUES ($1, $2, NOW())
+       ON CONFLICT (session_id) DO UPDATE
+         SET proxy_id = EXCLUDED.proxy_id, assigned_at = NOW()`,
+      [sessionId, proxyId]
+    );
+    return (await pool.query(`SELECT * FROM proxies WHERE id = $1`, [proxyId])).rows[0] || null;
   }
 
   async releaseProxy(sessionId) {

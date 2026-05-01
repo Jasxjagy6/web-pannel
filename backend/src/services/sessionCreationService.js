@@ -56,9 +56,13 @@ const { encrypt } = require('../utils/crypto');
 const logger = require('../utils/logger');
 const { AppError } = require('../utils/errorHandler');
 const telegramService = require('./telegramService');
+const fingerprint = require('../utils/deviceFingerprint');
 
 const SESSION_SUBDIR = 'sessions';
 const CREATION_TTL_MS = parseInt(process.env.SESSION_CREATION_TTL_MS || `${5 * 60 * 1000}`, 10);
+const STRICT_PROXY_ISOLATION = String(
+  process.env.STRICT_PROXY_ISOLATION ?? 'false'
+).toLowerCase() === 'true';
 
 class SessionCreationService {
   constructor() {
@@ -86,6 +90,12 @@ class SessionCreationService {
           await entry.client.disconnect();
         } catch (err) {
           // ignore
+        }
+        if (entry.reservedProxyId) {
+          try {
+            const proxyService = require('./proxyService');
+            await proxyService.releaseAdHoc(`creation:${tempId}`);
+          } catch (_) {}
         }
         this.pending.delete(tempId);
         logger.info(`Session creation flow ${tempId} expired`);
@@ -138,16 +148,51 @@ class SessionCreationService {
     const normalizedPhone = this._normalizePhone(phone);
     const { apiId: id, apiHash: hash } = this._resolveApi(apiId, apiHash);
 
+    // Anti-Detect: build the device identity that this account will use
+    // for the rest of its life. The seed includes the phone so a re-tried
+    // creation flow for the same phone keeps the same identity.
+    const tempId = this._newTempId();
+    const identity = fingerprint.buildIdentity(null, {
+      seed: `creation:${normalizedPhone}:${tempId}`,
+    });
+
+    // Anti-Detect: try to allocate a proxy slot up-front so the SendCode
+    // request itself doesn't leak the VPS direct IP. We don't have a DB
+    // session row yet, so we reserve a "virtual" slot keyed by tempId.
+    let proxyConf = null;
+    let reservedProxyId = null;
+    try {
+      const proxyService = require('./proxyService');
+      const reserved = await proxyService.reserveAdHoc(`creation:${tempId}`);
+      if (reserved) {
+        reservedProxyId = reserved.id;
+        proxyConf = proxyService.buildGramJSProxy(reserved);
+      }
+    } catch (err) {
+      logger.debug(`pre-create proxy reserve skipped: ${err.message}`);
+    }
+
+    if (!proxyConf && STRICT_PROXY_ISOLATION) {
+      throw new AppError(
+        'No proxy available for new session (STRICT_PROXY_ISOLATION=true). ' +
+          'Add a working proxy in the Proxies page first.',
+        503,
+        'NO_PROXY_AVAILABLE'
+      );
+    }
+
     const stringSession = new StringSession('');
     const client = new TelegramClient(stringSession, id, hash, {
       connectionRetries: telegramConfig.connectionRetries,
       timeout: telegramConfig.timeout,
-      deviceModel: telegramConfig.deviceModel,
-      systemVersion: telegramConfig.systemVersion,
-      appVersion: telegramConfig.appVersion,
-      langCode: telegramConfig.langCode,
+      deviceModel: identity.deviceModel,
+      systemVersion: identity.systemVersion,
+      appVersion: identity.appVersion,
+      langCode: identity.langCode,
+      systemLangCode: identity.systemLangCode || identity.langCode,
       baseLogger: telegramConfig.baseLogger,
-      useWSS: telegramConfig.useWSS,
+      useWSS: proxyConf ? false : telegramConfig.useWSS,
+      proxy: proxyConf || undefined,
     });
 
     try {
@@ -161,7 +206,6 @@ class SessionCreationService {
         })
       );
 
-      const tempId = this._newTempId();
       this.pending.set(tempId, {
         client,
         phoneCodeHash: sent.phoneCodeHash,
@@ -171,9 +215,12 @@ class SessionCreationService {
         userId,
         createdAt: Date.now(),
         awaitingPassword: false,
+        identity,
+        proxyConf,
+        reservedProxyId,
       });
 
-      logger.info(`Session creation start: tempId=${tempId} phone=${normalizedPhone}`);
+      logger.info(`Session creation start: tempId=${tempId} phone=${normalizedPhone} platform=${identity.platform}`);
       return {
         tempId,
         status: 'awaiting_code',
@@ -184,6 +231,13 @@ class SessionCreationService {
       };
     } catch (err) {
       try { await client.disconnect(); } catch (_) {}
+      // Release the reserved proxy slot if SendCode failed.
+      if (reservedProxyId) {
+        try {
+          const proxyService = require('./proxyService');
+          await proxyService.releaseAdHoc(`creation:${tempId}`);
+        } catch (_) {}
+      }
       logger.error('Session creation start failed', { phone: normalizedPhone, err: err.message });
       throw new AppError(
         `Failed to send code: ${err.errorMessage || err.message}`,
@@ -323,6 +377,12 @@ class SessionCreationService {
       return { cancelled: false };
     }
     try { await entry.client.disconnect(); } catch (_) {}
+    if (entry.reservedProxyId) {
+      try {
+        const proxyService = require('./proxyService');
+        await proxyService.releaseAdHoc(`creation:${tempId}`);
+      } catch (_) {}
+    }
     this.pending.delete(tempId);
     return { cancelled: true };
   }
@@ -347,7 +407,7 @@ class SessionCreationService {
   // ---------------------------------------------------------------------------
   async _persistAndFinish(userId, tempId, hadTwoFA) {
     const entry = this._mustGet(userId, tempId);
-    const { client, phone, apiId, apiHash } = entry;
+    const { client, phone, apiId, apiHash, identity, reservedProxyId, proxyConf } = entry;
 
     // Pull user info + session string before we hand the client off.
     let me = null;
@@ -395,8 +455,9 @@ class SessionCreationService {
       `INSERT INTO sessions (
          user_id, phone, session_file_path, api_id, api_hash,
          status, is_2fa_enabled, is_logged_in, keep_alive, account_info,
+         device_identity, bound_proxy_id,
          last_heartbeat, last_active, created_at
-       ) VALUES ($1, $2, $3, $4, $5, 'active', $6, TRUE, TRUE, $7, NOW(), NOW(), NOW())
+       ) VALUES ($1, $2, $3, $4, $5, 'active', $6, TRUE, TRUE, $7, $8::jsonb, $9, NOW(), NOW(), NOW())
        RETURNING id`,
       [
         userId,
@@ -411,6 +472,8 @@ class SessionCreationService {
           createdVia: 'panel',
           createdAt: new Date().toISOString(),
         }),
+        identity ? JSON.stringify(identity) : null,
+        reservedProxyId || null,
       ]
     );
     const sessionId = insert.rows[0].id;
@@ -424,6 +487,8 @@ class SessionCreationService {
         connected: true,
         apiId,
         apiHash,
+        proxy: proxyConf || null,
+        identity: identity || null,
       });
       telegramService.sessionStore.set(String(sessionId), encryptedSession);
     } catch (err) {
@@ -431,12 +496,17 @@ class SessionCreationService {
       try { await client.disconnect(); } catch (_) {}
     }
 
-    // Also assign a proxy slot so future reconnects route through the same
-    // pool as login flows do. This call lives outside the original
-    // transaction so it won't deadlock.
+    // Bind the proxy slot to the new session ID so future reconnects
+    // resolve through the same pool. If the start() flow already
+    // reserved one we just transfer that reservation; otherwise we let
+    // proxyService pick.
     try {
       const proxyService = require('./proxyService');
-      await proxyService.assignProxyForSession(sessionId);
+      if (reservedProxyId) {
+        await proxyService.transferAdHocToSession(`creation:${tempId}`, sessionId);
+      } else {
+        await proxyService.assignProxyForSession(sessionId);
+      }
     } catch (err) {
       logger.debug(`proxy assign post-creation skipped: ${err.message}`);
     }

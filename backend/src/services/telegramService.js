@@ -17,6 +17,7 @@ const {
 const logger = require('../utils/logger');
 const telegramConfig = require('../config/telegram');
 const { encrypt, decrypt } = require('../utils/crypto');
+const fingerprint = require('../utils/deviceFingerprint');
 
 /**
  * Maximum number of retries for flood wait errors before giving up.
@@ -217,6 +218,8 @@ class TelegramService {
    * @param {string} apiHash - Telegram API Hash (optional, uses config default)
    * @param {object} [opts]
    * @param {object} [opts.proxy] - GramJS proxy interface (SOCKS / MTProxy)
+   * @param {object} [opts.identity] - Persisted device identity (Anti-Detect).
+   *   When omitted the static `telegramConfig` defaults are used (legacy).
    * @returns {Promise<{ sessionId: string, connected: boolean }>}
    */
   async createSession(sessionId, sessionFile, apiId, apiHash, opts = {}) {
@@ -232,16 +235,18 @@ class TelegramService {
       }
 
       const proxy = opts.proxy || null;
+      const idOpts = fingerprint.toClientOptions(opts.identity);
 
       // Create a new TelegramClient with the string session
       const stringSession = new StringSession(sessionString);
       const client = new TelegramClient(stringSession, finalApiId, finalApiHash, {
         connectionRetries: telegramConfig.connectionRetries,
         timeout: telegramConfig.timeout,
-        deviceModel: telegramConfig.deviceModel,
-        systemVersion: telegramConfig.systemVersion,
-        appVersion: telegramConfig.appVersion,
-        langCode: telegramConfig.langCode,
+        deviceModel: idOpts.deviceModel || telegramConfig.deviceModel,
+        systemVersion: idOpts.systemVersion || telegramConfig.systemVersion,
+        appVersion: idOpts.appVersion || telegramConfig.appVersion,
+        langCode: idOpts.langCode || telegramConfig.langCode,
+        systemLangCode: idOpts.systemLangCode || idOpts.langCode || telegramConfig.langCode,
         baseLogger: telegramConfig.baseLogger,
         // SOCKS / MTProxy connections must use raw TCP, not WSS.
         useWSS: proxy ? false : telegramConfig.useWSS,
@@ -258,11 +263,15 @@ class TelegramService {
         apiId: finalApiId,
         apiHash: finalApiHash,
         proxy: proxy || null,
+        identity: opts.identity || null,
       });
 
       this.sessionStore.set(sessionId, sessionFile);
 
-      logger.info(`Session created and connected: ${sessionId}`, { hasProxy: !!proxy });
+      logger.info(`Session created and connected: ${sessionId}`, {
+        hasProxy: !!proxy,
+        platform: opts.identity ? opts.identity.platform : 'default',
+      });
 
       return {
         sessionId,
@@ -286,9 +295,12 @@ class TelegramService {
    * @param {number} apiId - Telegram API ID
    * @param {string} apiHash - Telegram API Hash
    * @param {string} phoneCodeHash - Hash returned from sendCode request
+   * @param {object} [opts]
+   * @param {object} [opts.proxy] - Optional GramJS proxy (Anti-Detect).
+   * @param {object} [opts.identity] - Optional persisted device identity.
    * @returns {Promise<{ sessionId: string, sessionData: string, me: object }>}
    */
-  async loginWithPhone(phone, code, apiId, apiHash, phoneCodeHash) {
+  async loginWithPhone(phone, code, apiId, apiHash, phoneCodeHash, opts = {}) {
     try {
       const finalApiId = apiId || telegramConfig.apiId;
       const finalApiHash = apiHash || telegramConfig.apiHash;
@@ -300,15 +312,20 @@ class TelegramService {
       const sessionId = `login_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
       const stringSession = new StringSession('');
 
+      const proxy = opts.proxy || null;
+      const idOpts = fingerprint.toClientOptions(opts.identity);
+
       const client = new TelegramClient(stringSession, finalApiId, finalApiHash, {
         connectionRetries: telegramConfig.connectionRetries,
         timeout: telegramConfig.timeout,
-        deviceModel: telegramConfig.deviceModel,
-        systemVersion: telegramConfig.systemVersion,
-        appVersion: telegramConfig.appVersion,
-        langCode: telegramConfig.langCode,
+        deviceModel: idOpts.deviceModel || telegramConfig.deviceModel,
+        systemVersion: idOpts.systemVersion || telegramConfig.systemVersion,
+        appVersion: idOpts.appVersion || telegramConfig.appVersion,
+        langCode: idOpts.langCode || telegramConfig.langCode,
+        systemLangCode: idOpts.systemLangCode || idOpts.langCode || telegramConfig.langCode,
         baseLogger: telegramConfig.baseLogger,
-        useWSS: telegramConfig.useWSS,
+        useWSS: proxy ? false : telegramConfig.useWSS,
+        proxy: proxy || undefined,
       });
 
       await client.connect();
@@ -344,6 +361,8 @@ class TelegramService {
         connected: true,
         apiId: finalApiId,
         apiHash: finalApiHash,
+        proxy: proxy || null,
+        identity: opts.identity || null,
       });
 
       this.sessionStore.set(sessionId, encryptedSession);
@@ -1717,7 +1736,8 @@ class TelegramService {
       const { decrypt } = require('../utils/crypto');
       
       const result = await pool.query(
-        `SELECT id, session_file_path, api_id, api_hash, is_logged_in, status 
+        `SELECT id, session_file_path, api_id, api_hash, is_logged_in, status,
+                device_identity, bound_proxy_id
          FROM sessions WHERE id = $1`,
         [sessionId]
       );
@@ -1757,27 +1777,63 @@ class TelegramService {
       
       const apiId = session.api_id || telegramConfig.apiId;
       const apiHash = session.api_hash || telegramConfig.apiHash;
-      
-//      // DEBUG console.log('[A] About to create StringSession');
+
+      // Anti-Detect: replay the persisted device identity so each
+      // reconnect looks like the same physical device. If the row has
+      // no identity yet (legacy session), generate + persist one now.
+      const identityService = require('./identityService');
+      let identity = null;
+      try {
+        identity = session.device_identity
+          ? fingerprint.sanitizeIdentity(
+              typeof session.device_identity === 'string'
+                ? JSON.parse(session.device_identity)
+                : session.device_identity
+            )
+          : null;
+        if (!identity) {
+          identity = await identityService.loadOrCreate(sessionId);
+        }
+      } catch (idErr) {
+        logger.warn(`identity load failed during _loadSessionFromDB ${sessionId}: ${idErr.message}`);
+      }
+      const idOpts = fingerprint.toClientOptions(identity);
+
+      // Anti-Detect: respect the bound proxy if one is configured.
+      let proxyConf = null;
+      try {
+        const proxyService = require('./proxyService');
+        const row = await proxyService.assignProxyForSession(sessionId);
+        proxyConf = proxyService.buildGramJSProxy(row);
+      } catch (proxyErr) {
+        logger.debug(`proxy assign failed during _loadSessionFromDB ${sessionId}: ${proxyErr.message}`);
+      }
+
       const stringSession = new StringSession(sessionString);
-//      // DEBUG console.log('[B] StringSession created, creating TelegramClient');
       const client = new TelegramClient(stringSession, apiId, apiHash, {
         connectionRetries: telegramConfig.connectionRetries,
         timeout: telegramConfig.timeout,
+        deviceModel: idOpts.deviceModel || telegramConfig.deviceModel,
+        systemVersion: idOpts.systemVersion || telegramConfig.systemVersion,
+        appVersion: idOpts.appVersion || telegramConfig.appVersion,
+        langCode: idOpts.langCode || telegramConfig.langCode,
+        systemLangCode: idOpts.systemLangCode || idOpts.langCode || telegramConfig.langCode,
+        baseLogger: telegramConfig.baseLogger,
+        useWSS: proxyConf ? false : telegramConfig.useWSS,
         autoReconnect: true,
+        proxy: proxyConf || undefined,
       });
-      
-//      // DEBUG console.log('[C] About to connect client');
+
       await client.connect();
-//      // DEBUG console.log('[D] Client connected, about to store in Map');
-      
+
       const sessionIdStr = String(sessionId);
-//      // DEBUG console.log('[E] Storing session, Map size before:', this.clients.size);
       this.clients.set(sessionIdStr, {
         client,
         connected: true,
         apiId,
         apiHash,
+        proxy: proxyConf || null,
+        identity: identity || null,
       });
 //      // DEBUG console.log('[F] Session stored, Map size after:', this.clients.size, 'keys:', Array.from(this.clients.keys()));
       
@@ -1821,6 +1877,8 @@ class TelegramService {
     }
 
     const { client, apiId, apiHash } = entry;
+    const proxyConf = entry.proxy || null;
+    const idOpts = fingerprint.toClientOptions(entry.identity);
 
     // Check if the client is still connected
     let isConnected = false;
@@ -1846,13 +1904,15 @@ class TelegramService {
             const newClient = new TelegramClient(stringSession, apiId, apiHash, {
               connectionRetries: telegramConfig.connectionRetries,
               timeout: telegramConfig.timeout,
-              deviceModel: telegramConfig.deviceModel,
-              systemVersion: telegramConfig.systemVersion,
-              appVersion: telegramConfig.appVersion,
-              langCode: telegramConfig.langCode,
+              deviceModel: idOpts.deviceModel || telegramConfig.deviceModel,
+              systemVersion: idOpts.systemVersion || telegramConfig.systemVersion,
+              appVersion: idOpts.appVersion || telegramConfig.appVersion,
+              langCode: idOpts.langCode || telegramConfig.langCode,
+              systemLangCode: idOpts.systemLangCode || idOpts.langCode || telegramConfig.langCode,
               baseLogger: telegramConfig.baseLogger,
-              useWSS: telegramConfig.useWSS,
+              useWSS: proxyConf ? false : telegramConfig.useWSS,
               autoReconnect: true,
+              proxy: proxyConf || undefined,
             });
 
             await newClient.connect();

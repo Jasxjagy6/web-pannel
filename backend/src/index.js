@@ -26,6 +26,7 @@ const accountSettingsRoutes = require('./routes/accountSettings');
 const twoFAJobsRoutes = require('./routes/twoFAJobs');
 const otpRoutes = require('./routes/otp');
 const proxyRoutes = require('./routes/proxies');
+const antiDetectRoutes = require('./routes/antiDetect');
 
 const app = express();
 const server = http.createServer(app);
@@ -80,6 +81,7 @@ app.use(`${apiPrefix}/account-settings`, accountSettingsRoutes);
 app.use(`${apiPrefix}/2fa-jobs`, twoFAJobsRoutes);
 app.use(`${apiPrefix}/otp`, otpRoutes);
 app.use(`${apiPrefix}/proxies`, proxyRoutes);
+app.use(`${apiPrefix}/anti-detect`, antiDetectRoutes);
 
 // 404 handler
 app.use((req, res) => {
@@ -196,6 +198,22 @@ async function start() {
       proxyService.startBackground();
     } catch (err) {
       logger.warn(`proxyService.startBackground failed: ${err.message}`);
+    }
+
+    // 4. Start the Anti-Detect behavior simulator. It performs a small
+    //    randomized batch of read-only actions (mark-as-read, set-typing,
+    //    occasional reactions) every BEHAVIOR_TICK_INTERVAL_MS so dormant
+    //    sessions don't look like idle bot farms to Telegram's spam filter.
+    try {
+      const behaviorService = require('./services/behaviorService');
+      const enabled = String(process.env.BEHAVIOR_ENABLED ?? 'true').toLowerCase() !== 'false';
+      if (enabled) {
+        behaviorService.start();
+      } else {
+        logger.info('BehaviorService disabled via BEHAVIOR_ENABLED=false');
+      }
+    } catch (err) {
+      logger.warn(`behaviorService.start failed: ${err.message}`);
     }
   } catch (error) {
     logger.error('Failed to start server', error);

@@ -19,6 +19,7 @@ import Change2FA from './pages/Change2FA';
 import GetOTP from './pages/GetOTP';
 import Proxies from './pages/Proxies';
 import CreateSession from './pages/CreateSession';
+import AntiDetect from './pages/AntiDetect';
 
 function ProtectedRoute({ children, title }) {
   const { isAuthenticated } = useAuth();
@@ -45,6 +46,7 @@ export default function App() {
           <Route path="/change-2fa" element={<ProtectedRoute title="Change 2FA"><Change2FA /></ProtectedRoute>} />
           <Route path="/get-otp" element={<ProtectedRoute title="Get OTP"><GetOTP /></ProtectedRoute>} />
           <Route path="/proxies" element={<ProtectedRoute title="Proxies"><Proxies /></ProtectedRoute>} />
+          <Route path="/anti-detect" element={<ProtectedRoute title="Anti-Detect"><AntiDetect /></ProtectedRoute>} />
           <Route path="/settings" element={<ProtectedRoute title="Settings"><Settings /></ProtectedRoute>} />
           <Route path="*" element={<Navigate to="/dashboard" replace />} />
         </Routes>

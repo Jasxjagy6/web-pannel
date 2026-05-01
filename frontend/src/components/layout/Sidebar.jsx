@@ -1,7 +1,7 @@
 import React, { useState } from 'react';
 import { Link, useLocation } from 'react-router-dom';
 import { 
-  LayoutDashboard, Users, Search, MessageSquare, UsersRound, List, BarChart3, Settings, LogOut, ChevronLeft, ChevronRight, UserCog, ShieldCheck, KeyRound, Network, UserPlus
+  LayoutDashboard, Users, Search, MessageSquare, UsersRound, List, BarChart3, Settings, LogOut, ChevronLeft, ChevronRight, UserCog, ShieldCheck, KeyRound, Network, UserPlus, Fingerprint
 } from 'lucide-react';
 import { useAuth } from '@/hooks/useAuth';
 
@@ -16,6 +16,7 @@ const navItems = [
   { path: '/change-2fa', label: 'Change 2FA', icon: ShieldCheck },
   { path: '/get-otp', label: 'Get OTP', icon: KeyRound },
   { path: '/proxies', label: 'Proxies', icon: Network },
+  { path: '/anti-detect', label: 'Anti-Detect', icon: Fingerprint },
   { path: '/reports', label: 'Reports', icon: BarChart3 },
   { path: '/account-settings', label: 'Account Settings', icon: UserCog },
   { path: '/settings', label: 'Settings', icon: Settings },
