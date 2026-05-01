@@ -7,7 +7,10 @@ const sessionCreationService = require('../services/sessionCreationService');
 const telegramService = require('../services/telegramService');
 const reportService = require('../services/reportService');
 const { AppError, asyncHandler } = require('../utils/errorHandler');
+const { decrypt } = require('../utils/crypto');
 const logger = require('../utils/logger');
+
+const ENCRYPTED_SESSION_RE = /^[0-9a-f]+:[0-9a-f]+:[0-9a-f]+$/i;
 
 const sessionController = {
   /**
@@ -374,8 +377,12 @@ const sessionController = {
 
   /**
    * Download the on-disk session file for a session the user owns.
-   * The downloaded JSON contains the encrypted GramJS string session — i.e.
-   * the same format the panel accepts via /upload, so it round-trips.
+   *
+   * For JSON-formatted sessions the file is decrypted on the fly so the
+   * user always receives a plaintext GramJS string session. The same
+   * file format is still accepted by /upload (which re-encrypts the
+   * `session` field on its own), so the round-trip remains intact.
+   * Non-JSON files (e.g. raw Telethon binaries) are streamed as-is.
    */
   downloadSession: asyncHandler(async (req, res) => {
     const userId = req.user.id;
@@ -405,6 +412,45 @@ const sessionController = {
     const ext = path.extname(row.session_file_path) || '.json';
     const safePhone = (row.phone || `session-${row.id}`).replace(/[^A-Za-z0-9+_-]/g, '');
     const downloadName = `${safePhone}${ext}`;
+
+    if (ext.toLowerCase() === '.json') {
+      try {
+        const raw = await fs.readFile(fullPath, 'utf8');
+        const parsed = JSON.parse(raw);
+        if (parsed && typeof parsed.session === 'string') {
+          let plain = parsed.session;
+          if (ENCRYPTED_SESSION_RE.test(plain)) {
+            try {
+              plain = decrypt(plain);
+            } catch (err) {
+              logger.warn(
+                `downloadSession: decrypt failed for session ${row.id}: ${err.message}`
+              );
+            }
+          }
+          const body = {
+            session: plain,
+            createdAt:
+              parsed.createdAt || parsed.uploadedAt || new Date().toISOString(),
+            originalName: parsed.originalName || downloadName,
+          };
+          if (parsed.convertedFrom) body.convertedFrom = parsed.convertedFrom;
+          if (parsed.createdVia) body.createdVia = parsed.createdVia;
+
+          res.setHeader('Content-Type', 'application/json');
+          res.setHeader(
+            'Content-Disposition',
+            `attachment; filename="${downloadName}"`
+          );
+          return res.send(JSON.stringify(body, null, 2));
+        }
+      } catch (err) {
+        logger.warn(
+          `downloadSession: failed to plaintext-serialize session ${row.id}: ${err.message}`
+        );
+      }
+    }
+
     res.setHeader('Content-Type', 'application/octet-stream');
     res.setHeader(
       'Content-Disposition',
