@@ -10,6 +10,14 @@ import {
   exportScrapeJob,
   deleteScrapeJob,
   getScrapeStats,
+  previewScrapeTargets,
+  createMonitorJob,
+  listMonitorJobs,
+  pauseMonitorJob,
+  resumeMonitorJob,
+  stopMonitorJob,
+  cancelAllMonitorJobs,
+  exportMonitorJob,
 } from '../api/scrape';
 import { listsAPI } from '../api/lists';
 import { parseApiError, formatNumber } from '../utils/formatters';
@@ -20,8 +28,40 @@ import {
   Users, Link, Settings, Radio, Download, Check, AlertTriangle,
   Search, ChevronLeft, ChevronRight, ChevronDown, Trash2, CheckSquare, Square,
   Plus, X, Clock, TrendingUp, BarChart3, XCircle, Loader2, Play,
-  StopCircle, ListFilter, FileDown, Eye, List,
+  StopCircle, ListFilter, FileDown, Eye, List, Pause, RefreshCw, Activity, ShieldAlert,
 } from 'lucide-react';
+
+// ----------------------------------------------------------------------------
+// Helpers for the period-bounded MONITOR feature
+// ----------------------------------------------------------------------------
+const PERIOD_PRESETS = [
+  { label: '5 min',  seconds: 5 * 60 },
+  { label: '1 hour', seconds: 60 * 60 },
+  { label: '6 hours', seconds: 6 * 60 * 60 },
+  { label: '1 day',  seconds: 24 * 60 * 60 },
+  { label: '2 days', seconds: 2 * 24 * 60 * 60 },
+  { label: '7 days', seconds: 7 * 24 * 60 * 60 },
+];
+
+function formatDuration(seconds) {
+  if (!seconds || seconds < 0) return '0s';
+  const d = Math.floor(seconds / 86400);
+  const h = Math.floor((seconds % 86400) / 3600);
+  const m = Math.floor((seconds % 3600) / 60);
+  const s = Math.floor(seconds % 60);
+  if (d > 0) return `${d}d ${h}h`;
+  if (h > 0) return `${h}h ${m}m`;
+  if (m > 0) return `${m}m ${s}s`;
+  return `${s}s`;
+}
+
+function remainingSeconds(job) {
+  if (!job) return 0;
+  if (job.status === 'paused') return job.remainingSeconds || 0;
+  if (job.status !== 'running') return 0;
+  if (!job.expiresAt) return 0;
+  return Math.max(0, Math.floor((new Date(job.expiresAt).getTime() - Date.now()) / 1000));
+}
 
 // ============================================================================
 // MAIN SCRAPE PAGE
@@ -61,6 +101,14 @@ export default function Scrape() {
   const [createListModal, setCreateListModal] = useState(null);
   const [createListName, setCreateListName] = useState('');
   const [creatingList, setCreatingList] = useState(false);
+
+  // Monitor (period-bounded) jobs
+  const [monitorJobs, setMonitorJobs] = useState([]);
+  const [monitorPagination, setMonitorPagination] = useState({ total: 0, pages: 0 });
+  const [periodPrompt, setPeriodPrompt] = useState(null); // { adminTargets: [...], scrapableTargets: [...] }
+  const [periodSeconds, setPeriodSeconds] = useState(2 * 24 * 60 * 60); // default 2 days
+  const [creatingMonitors, setCreatingMonitors] = useState(false);
+  const [, forceTickRender] = useState(0);
 
   const { showSuccess, showError } = useToast();
   const ws = useWebSocket();
@@ -107,27 +155,75 @@ export default function Scrape() {
     }
   }, []);
 
+  // Fetch monitor (period-bounded) jobs
+  const fetchMonitors = useCallback(async () => {
+    try {
+      const params = {
+        page: 1,
+        limit: 50,
+      };
+      if (historyFilter) params.search = historyFilter;
+      const response = await listMonitorJobs(params);
+      setMonitorJobs(response.data.data?.jobs || []);
+      setMonitorPagination(response.data.data?.pagination || { total: 0, pages: 0 });
+    } catch (err) {
+      console.error('Failed to fetch monitor jobs:', err);
+    }
+  }, [historyFilter]);
+
   useEffect(() => {
     fetchSessions();
     fetchJobs();
     fetchStats();
-  }, [fetchSessions, fetchJobs, fetchStats]);
+    fetchMonitors();
+  }, [fetchSessions, fetchJobs, fetchStats, fetchMonitors]);
 
-  // WebSocket for progress updates
+  // Re-render once a second so the live "remaining" countdown ticks down.
+  useEffect(() => {
+    const id = setInterval(() => forceTickRender((n) => (n + 1) % 1000), 1000);
+    return () => clearInterval(id);
+  }, []);
+
+  // WebSocket for progress updates (regular scrape + period monitor)
   useEffect(() => {
     if (!ws) return;
-    
-    ws.on('scrape_progress', (data) => {
+
+    const onScrapeProgress = (data) => {
       setJobs(prev => {
         const jobIndex = prev.findIndex(job => job.id === data.jobId);
         if (jobIndex === -1) return prev;
-        
         const updatedJobs = [...prev];
         updatedJobs[jobIndex] = { ...updatedJobs[jobIndex], ...data };
         return updatedJobs;
       });
-    });
-  }, [ws]);
+    };
+    ws.on('scrape_progress', onScrapeProgress);
+
+    const monitorEvents = [
+      'monitor:created', 'monitor:started', 'monitor:paused',
+      'monitor:stopped', 'monitor:completed', 'monitor:failed',
+      'monitor:cancel-all',
+    ];
+    const monitorRefresh = () => fetchMonitors();
+    for (const ev of monitorEvents) ws.on(ev, monitorRefresh);
+
+    const onMonitorProgress = (data) => {
+      setMonitorJobs((prev) => {
+        const idx = prev.findIndex((j) => j.id === data.jobId);
+        if (idx === -1) return prev;
+        const next = [...prev];
+        next[idx] = { ...next[idx], scrapedCount: data.scrapedCount };
+        return next;
+      });
+    };
+    ws.on('monitor:progress', onMonitorProgress);
+
+    return () => {
+      try { ws.off?.('scrape_progress', onScrapeProgress); } catch { /* ignore */ }
+      try { ws.off?.('monitor:progress', onMonitorProgress); } catch { /* ignore */ }
+      try { for (const ev of monitorEvents) ws.off?.(ev, monitorRefresh); } catch { /* ignore */ }
+    };
+  }, [ws, fetchMonitors]);
 
   // Handle session multi-select
   const toggleSession = (sessionId) => {
@@ -146,7 +242,7 @@ export default function Scrape() {
   // Handle scrape submission
   const handleScrape = async (e) => {
     e.preventDefault();
-    
+
     if (selectedSessions.length === 0) {
       showError('Please select at least one session', 'Validation Error');
       return;
@@ -162,16 +258,43 @@ export default function Scrape() {
     }
 
     setSubmitting(true);
-    
-    // Show loading for at least 3 seconds
-    const minLoadingTime = 3000;
+
+    // Show loading for at least 1.5 seconds.
+    const minLoadingTime = 1500;
     const startTime = Date.now();
-    
+
     try {
+      // Preview every target with the first selected session so we can
+      // detect admin-only chats up front and offer the period-monitor
+      // path instead of failing the scrape.
+      let preview = null;
+      try {
+        const previewRes = await previewScrapeTargets({
+          sessionId: selectedSessions[0],
+          targetType: scrapeType,
+          targets: targetList,
+        });
+        preview = previewRes.data?.data?.results || [];
+      } catch (err) {
+        console.warn('preview failed, falling back to direct scrape', err);
+      }
+
+      const adminTargets = preview ? preview.filter((r) => r.isAdminOnly) : [];
+      const scrapableTargets = preview
+        ? preview.filter((r) => !r.isAdminOnly).map((r) => r.target)
+        : targetList;
+
+      // If every target is admin-only, surface the period prompt and stop.
+      if (preview && adminTargets.length === targetList.length) {
+        setPeriodPrompt({ adminTargets, scrapableTargets: [] });
+        return;
+      }
+
+      // Otherwise launch the regular scrape on whatever IS scrapable.
       const apiCall = scrapeType === 'group' ? scrapeGroup : scrapeChannel;
       const response = await apiCall({
         sessionIds: selectedSessions,
-        targetIds: targetList,
+        targetIds: scrapableTargets,
         limit,
         filterBots: botFilterOptions.enabled,
         botFilterOptions: botFilterOptions.enabled ? botFilterOptions : undefined,
@@ -183,24 +306,22 @@ export default function Scrape() {
       const jobId = response.data.data?.jobId;
       const elapsed = Date.now() - startTime;
       const remaining = Math.max(0, minLoadingTime - elapsed);
-      
-      // Wait for minimum loading time
       await new Promise(resolve => setTimeout(resolve, remaining));
-      
-      const targetCount = targetList.length;
-      const sessionCount = selectedSessions.length;
-      
+
       showSuccess(
-        `Scrape job started: ${targetCount} target(s), ${sessionCount} session(s). Job #${jobId}`,
+        `Scrape job started: ${scrapableTargets.length} target(s), ${selectedSessions.length} session(s). Job #${jobId}`,
         'Scrape Started'
       );
-      
-      // Reset form
-      setTargets('');
-      setSelectedSessions([]);
+
+      // If some targets were admin-only, prompt the user to start a
+      // monitor job for those without losing their session selection.
+      if (adminTargets.length > 0) {
+        setPeriodPrompt({ adminTargets, scrapableTargets });
+      } else {
+        setTargets('');
+        setSelectedSessions([]);
+      }
       setHistoryPage(1);
-      
-      // Fetch updated jobs immediately
       await fetchJobs();
       await fetchStats();
     } catch (err) {
@@ -210,6 +331,98 @@ export default function Scrape() {
       showError(parseApiError(err), 'Scrape Error');
     } finally {
       setSubmitting(false);
+    }
+  };
+
+  // Launch period-bounded monitor jobs for the prompted admin-only targets.
+  const handleStartMonitors = async () => {
+    if (!periodPrompt || !periodPrompt.adminTargets?.length) return;
+    if (!selectedSessions.length) {
+      showError('Sessions selection is empty', 'Validation Error');
+      return;
+    }
+    setCreatingMonitors(true);
+    let started = 0;
+    let failed = 0;
+    for (const t of periodPrompt.adminTargets) {
+      try {
+        await createMonitorJob({
+          sessionIds: selectedSessions,
+          targetId: t.target,
+          targetType: t.targetType || scrapeType,
+          targetTitle: t.info?.title || null,
+          durationSeconds: periodSeconds,
+          reason: t.reason || 'admin_only',
+          autoStart: true,
+        });
+        started++;
+      } catch (err) {
+        console.error('failed to create monitor', err);
+        failed++;
+      }
+    }
+    setCreatingMonitors(false);
+    setPeriodPrompt(null);
+    if (started > 0) showSuccess(`${started} monitor job(s) started`, 'Monitor');
+    if (failed > 0) showError(`${failed} monitor(s) failed`, 'Monitor Error');
+    setActiveTab('history');
+    await fetchMonitors();
+  };
+
+  // Monitor controls
+  const handleMonitorPause = async (id) => {
+    try {
+      await pauseMonitorJob(id);
+      showSuccess('Monitor paused', 'Paused');
+      fetchMonitors();
+    } catch (err) {
+      showError(parseApiError(err), 'Pause Error');
+    }
+  };
+  const handleMonitorResume = async (id) => {
+    try {
+      await resumeMonitorJob(id);
+      showSuccess('Monitor resumed', 'Resumed');
+      fetchMonitors();
+    } catch (err) {
+      showError(parseApiError(err), 'Resume Error');
+    }
+  };
+  const handleMonitorStop = async (id) => {
+    if (!confirm('Stop this monitor and finalize it?')) return;
+    try {
+      await stopMonitorJob(id);
+      showSuccess('Monitor stopped', 'Stopped');
+      fetchMonitors();
+    } catch (err) {
+      showError(parseApiError(err), 'Stop Error');
+    }
+  };
+  const handleCancelAllMonitors = async () => {
+    if (!confirm('Cancel ALL of your active monitor jobs? This cannot be undone.')) return;
+    try {
+      const res = await cancelAllMonitorJobs();
+      showSuccess(`Cancelled ${res.data?.data?.cancelled || 0} monitor(s)`, 'Cancelled');
+      fetchMonitors();
+    } catch (err) {
+      showError(parseApiError(err), 'Cancel-all Error');
+    }
+  };
+  const handleMonitorExport = async (id, format = 'csv') => {
+    try {
+      const response = await exportMonitorJob(id, { format });
+      const blob = new Blob([response.data], {
+        type: format === 'json' ? 'application/json' : format === 'csv' ? 'text/csv' : 'text/plain',
+      });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `monitor_${id}.${format}`;
+      a.click();
+      URL.revokeObjectURL(url);
+      showSuccess('Export downloaded', 'Export');
+    } catch (err) {
+      showError(parseApiError(err), 'Export Error');
     }
   };
 
@@ -649,6 +862,137 @@ export default function Scrape() {
             </div>
           </div>
 
+          {/* Period-monitor jobs (admin-only chats) */}
+          <div className={cardClass}>
+            <div className="flex items-center justify-between mb-3">
+              <div>
+                <h3 className="text-sm font-semibold text-white flex items-center gap-2">
+                  <Activity className="w-4 h-4 text-primary-400" />
+                  Period Monitor Jobs
+                  <span className="text-xs text-gray-500 font-normal">
+                    ({monitorJobs.filter(j => ['running','paused','pending'].includes(j.status)).length} active / {monitorJobs.length} total)
+                  </span>
+                </h3>
+                <p className="text-xs text-gray-500 mt-0.5">
+                  Live listeners on admin-only groups/channels. Captures every distinct user that interacts during the window.
+                </p>
+              </div>
+              {monitorJobs.some(j => ['running', 'paused', 'pending'].includes(j.status)) && (
+                <button
+                  onClick={handleCancelAllMonitors}
+                  className="rounded-lg border border-red-500/40 bg-red-500/10 px-3 py-1.5 text-xs font-medium text-red-300 hover:bg-red-500/20 flex items-center gap-1.5"
+                >
+                  <StopCircle className="w-3.5 h-3.5" />
+                  Cancel all
+                </button>
+              )}
+            </div>
+            {monitorJobs.length === 0 ? (
+              <div className="p-6 text-center text-gray-500 text-xs border border-dashed border-white/10 rounded-lg">
+                No monitor jobs yet. Try scraping an admin-only chat — you will be offered the option to monitor it for a period instead.
+              </div>
+            ) : (
+              <div className="overflow-x-auto">
+                <table className="w-full text-xs">
+                  <thead>
+                    <tr className="border-b border-white/5">
+                      <th className="text-left py-2 px-3 text-gray-400">ID</th>
+                      <th className="text-left py-2 px-3 text-gray-400">Target</th>
+                      <th className="text-left py-2 px-3 text-gray-400">Sessions</th>
+                      <th className="text-left py-2 px-3 text-gray-400">Status</th>
+                      <th className="text-left py-2 px-3 text-gray-400">Scraped</th>
+                      <th className="text-left py-2 px-3 text-gray-400">Window</th>
+                      <th className="text-left py-2 px-3 text-gray-400">Remaining</th>
+                      <th className="text-right py-2 px-3 text-gray-400">Actions</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {monitorJobs.map((m) => {
+                      const remain = remainingSeconds(m);
+                      const total = m.durationSeconds || 1;
+                      const progressPct = Math.max(0, Math.min(100,
+                        Math.floor(((total - (remain || 0)) / total) * 100)
+                      ));
+                      return (
+                        <tr key={m.id} className="border-b border-white/5 hover:bg-white/5">
+                          <td className="py-2 px-3 text-gray-300">#{m.id}</td>
+                          <td className="py-2 px-3">
+                            <p className="text-white truncate max-w-40" title={m.targetId}>
+                              {m.targetTitle || m.targetId}
+                            </p>
+                            <p className="text-gray-500">{m.targetType}</p>
+                          </td>
+                          <td className="py-2 px-3 text-gray-300">{m.sessionIds?.length || 0}</td>
+                          <td className="py-2 px-3">
+                            <StatusBadge status={m.status === 'paused' ? 'pending' : m.status} />
+                            {m.status === 'paused' && (
+                              <span className="text-xs text-amber-400 ml-1">(paused)</span>
+                            )}
+                          </td>
+                          <td className="py-2 px-3 text-white font-medium">
+                            {formatNumber(m.scrapedCount || 0)}
+                          </td>
+                          <td className="py-2 px-3 text-gray-400">
+                            <div>{formatDuration(m.durationSeconds)}</div>
+                            <div className="w-20 bg-dark-800 rounded-full h-1 mt-1">
+                              <div
+                                className="bg-primary-500 h-1 rounded-full transition-all"
+                                style={{ width: `${progressPct}%` }}
+                              />
+                            </div>
+                          </td>
+                          <td className="py-2 px-3 text-gray-300">
+                            {['running', 'paused'].includes(m.status) ? formatDuration(remain) : '—'}
+                          </td>
+                          <td className="py-2 px-3 text-right">
+                            <div className="flex justify-end gap-1">
+                              {m.status === 'running' && (
+                                <button
+                                  onClick={() => handleMonitorPause(m.id)}
+                                  className="p-1.5 rounded hover:bg-amber-500/20 text-amber-300"
+                                  title="Pause"
+                                >
+                                  <Pause className="w-3.5 h-3.5" />
+                                </button>
+                              )}
+                              {m.status === 'paused' && (
+                                <button
+                                  onClick={() => handleMonitorResume(m.id)}
+                                  className="p-1.5 rounded hover:bg-emerald-500/20 text-emerald-300"
+                                  title="Resume"
+                                >
+                                  <Play className="w-3.5 h-3.5" />
+                                </button>
+                              )}
+                              {['running', 'paused', 'pending'].includes(m.status) && (
+                                <button
+                                  onClick={() => handleMonitorStop(m.id)}
+                                  className="p-1.5 rounded hover:bg-red-500/20 text-red-400"
+                                  title="Stop"
+                                >
+                                  <StopCircle className="w-3.5 h-3.5" />
+                                </button>
+                              )}
+                              {(m.scrapedCount || 0) > 0 && (
+                                <button
+                                  onClick={() => handleMonitorExport(m.id, 'csv')}
+                                  className="p-1.5 rounded hover:bg-green-500/20 text-green-400"
+                                  title="Export CSV"
+                                >
+                                  <FileDown className="w-3.5 h-3.5" />
+                                </button>
+                              )}
+                            </div>
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </div>
+
           {/* Jobs Table */}
           <div className={cardClass}>
             {loading ? (
@@ -881,6 +1225,125 @@ export default function Scrape() {
                   <>
                     <List className="w-4 h-4" />
                     Create List
+                  </>
+                )}
+              </button>
+            </div>
+          </div>
+        </Modal>
+      )}
+
+      {/* Period prompt modal — shown when one or more targets are admin-only */}
+      {periodPrompt && (
+        <Modal
+          isOpen={true}
+          onClose={() => setPeriodPrompt(null)}
+          title="Admin-only chats detected"
+        >
+          <div className="space-y-4">
+            <div className="flex items-start gap-3 rounded-lg border border-amber-500/30 bg-amber-500/10 p-3">
+              <ShieldAlert className="w-5 h-5 text-amber-400 flex-shrink-0 mt-0.5" />
+              <div className="text-sm text-amber-200">
+                <p className="font-medium">
+                  {periodPrompt.adminTargets.length} chat{periodPrompt.adminTargets.length === 1 ? '' : 's'} hide{periodPrompt.adminTargets.length === 1 ? 's' : ''} the participant list from non-admins.
+                </p>
+                <p className="text-xs text-amber-200/80 mt-1">
+                  We can monitor these chats for the period you choose and capture every distinct user who interacts with them. Duplicates are deduped automatically. Your sessions stay attached the entire window through the anti-detect proxy system.
+                </p>
+              </div>
+            </div>
+
+            <div className="rounded-lg border border-white/5 bg-dark-900/50 p-3 max-h-40 overflow-y-auto">
+              <p className="text-xs text-gray-400 mb-2">Targets that will be monitored:</p>
+              <ul className="space-y-1">
+                {periodPrompt.adminTargets.map((t) => (
+                  <li key={t.target} className="text-xs text-gray-300 flex items-center gap-2">
+                    <ShieldAlert className="w-3 h-3 text-amber-400 flex-shrink-0" />
+                    <span className="truncate">{t.info?.title || t.target}</span>
+                    {t.info?.title && (
+                      <span className="text-gray-500 truncate">({t.target})</span>
+                    )}
+                  </li>
+                ))}
+              </ul>
+            </div>
+
+            <div>
+              <label className={labelClass}>Monitor period</label>
+              <div className="flex flex-wrap gap-2 mb-2">
+                {PERIOD_PRESETS.map((p) => (
+                  <button
+                    key={p.seconds}
+                    type="button"
+                    onClick={() => setPeriodSeconds(p.seconds)}
+                    className={`rounded-lg border px-3 py-1.5 text-xs font-medium transition ${
+                      periodSeconds === p.seconds
+                        ? 'border-primary-500 bg-primary-500/20 text-primary-200'
+                        : 'border-white/10 bg-dark-800 text-gray-300 hover:bg-dark-700'
+                    }`}
+                  >
+                    {p.label}
+                  </button>
+                ))}
+              </div>
+              <div className="grid grid-cols-3 gap-2">
+                {[
+                  { label: 'Days', divisor: 86400 },
+                  { label: 'Hours', divisor: 3600 },
+                  { label: 'Minutes', divisor: 60 },
+                ].map((u) => {
+                  const total = periodSeconds || 0;
+                  const days = Math.floor(total / 86400);
+                  const hours = Math.floor((total % 86400) / 3600);
+                  const minutes = Math.floor((total % 3600) / 60);
+                  const valueByLabel = { Days: days, Hours: hours, Minutes: minutes };
+                  return (
+                    <div key={u.label}>
+                      <label className="block text-xs text-gray-500 mb-1">{u.label}</label>
+                      <input
+                        type="number"
+                        min="0"
+                        value={valueByLabel[u.label]}
+                        onChange={(e) => {
+                          const v = parseInt(e.target.value, 10) || 0;
+                          const others = { Days: days, Hours: hours, Minutes: minutes };
+                          others[u.label] = v;
+                          setPeriodSeconds(
+                            others.Days * 86400 + others.Hours * 3600 + others.Minutes * 60
+                          );
+                        }}
+                        className={inputBase}
+                      />
+                    </div>
+                  );
+                })}
+              </div>
+              <p className="text-xs text-gray-500 mt-2">
+                Total: {formatDuration(periodSeconds)} • Sessions attached: {selectedSessions.length || 0}
+              </p>
+            </div>
+
+            <div className="flex gap-2 justify-end pt-2">
+              <button
+                onClick={() => setPeriodPrompt(null)}
+                className={btnSecondary}
+              >
+                Cancel
+              </button>
+              <button
+                onClick={handleStartMonitors}
+                disabled={creatingMonitors || periodSeconds < 60 || selectedSessions.length === 0}
+                className={btnPrimary}
+              >
+                {creatingMonitors ? (
+                  <>
+                    <Loader2 className="w-4 h-4 animate-spin" />
+                    Starting…
+                  </>
+                ) : (
+                  <>
+                    <Radio className="w-4 h-4" />
+                    Start monitor for {periodPrompt.adminTargets.length} chat{periodPrompt.adminTargets.length === 1 ? '' : 's'}
                   </>
                 )}
               </button>

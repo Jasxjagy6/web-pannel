@@ -2619,23 +2619,34 @@ class TelegramService {
 
   /**
    * Register a new-message handler for a connected session. Used by the OTP
-   * scanner to listen for login codes coming from Telegram service messages.
+   * scanner and the period-bounded scrape monitor to listen for messages
+   * coming through a session.
    *
    * @param {string} sessionId - Active session identifier
-   * @param {(message: object) => void|Promise<void>} handler
+   * @param {(event: object) => void|Promise<void>} handler - Receives the raw
+   *   GramJS event so callers can read `event.message`, `event.chatId`,
+   *   `event.senderId`, and call `event.getSender()` / `event.getChat()`.
+   * @param {object} [options]
+   * @param {Array<string|number>} [options.chats] - Restrict the handler to
+   *   this list of chat IDs / usernames (passed straight through to GramJS
+   *   NewMessage event filter).
    * @returns {Promise<() => void>} unsubscribe function
    */
-  async addNewMessageHandler(sessionId, handler) {
+  async addNewMessageHandler(sessionId, handler, options = {}) {
     await this._ensureConnected(sessionId);
     const entry = this.clients.get(String(sessionId));
     if (!entry) throw new Error(`Session ${sessionId} not found`);
     const { NewMessage } = require('telegram/events');
-    const event = new NewMessage({});
+    const eventOptions = {};
+    if (options.chats && options.chats.length > 0) {
+      eventOptions.chats = options.chats;
+    }
+    const event = new NewMessage(eventOptions);
     const wrapper = async (ev) => {
       try {
-        await handler(ev.message || ev);
+        await handler(ev);
       } catch (err) {
-        logger.warn(`OTP handler error for session ${sessionId}: ${err.message}`);
+        logger.warn(`message handler error for session ${sessionId}: ${err.message}`);
       }
     };
     entry.client.addEventHandler(wrapper, event);
@@ -2646,6 +2657,77 @@ class TelegramService {
         logger.debug(`Failed to remove event handler: ${err.message}`);
       }
     };
+  }
+
+  /**
+   * Probe whether a chat allows the panel session to enumerate participants.
+   *
+   * Returns `{ canScrape, isAdminOnly, info, reason }`. Used by the new
+   * scrape preview endpoint so the UI can offer the user the option to
+   * monitor the chat for a period instead of failing the job.
+   *
+   * @param {string} sessionId
+   * @param {string|number} target  - group/channel id, @username, or invite link
+   * @returns {Promise<{ canScrape: boolean, isAdminOnly: boolean, info: object, reason?: string }>}
+   */
+  async probeScrapeAccess(sessionId, target) {
+    await this._ensureConnected(sessionId);
+    let info = { id: null, title: null, type: null, participantsCount: null };
+    let entity;
+    try {
+      entity = await this._resolveEntity(sessionId, target);
+    } catch (err) {
+      return { canScrape: false, isAdminOnly: false, info, reason: `resolve_failed: ${err.message}` };
+    }
+    if (!entity) {
+      return { canScrape: false, isAdminOnly: false, info, reason: 'entity_not_found' };
+    }
+
+    const normalized = normalizeEntity(entity) || {};
+    info = {
+      id: normalized.id ? String(normalized.id) : null,
+      title: normalized.title || null,
+      username: normalized.username || null,
+      type: normalized.type || null,
+      groupType: normalized.groupType || null,
+      isBroadcast: normalized.isBroadcast || false,
+      participantsCount: normalized.participantsCount || 0,
+    };
+
+    // Channel-only broadcasts: members are inherently admin-only.
+    if (entity.className === 'Channel' && entity.broadcast) {
+      try {
+        // Try to peek at one participant; if Telegram allows it we can scrape.
+        const probe = await this.clients.get(String(sessionId)).client.getParticipants(entity, {
+          limit: 1,
+        });
+        if (probe && probe.length >= 0) {
+          return { canScrape: true, isAdminOnly: false, info };
+        }
+      } catch (err) {
+        if (/CHAT_ADMIN_REQUIRED|PARTICIPANTS_HIDDEN|ADMIN_RANK_INVALID/i.test(err.message || '')) {
+          return { canScrape: false, isAdminOnly: true, info, reason: 'admin_only_channel' };
+        }
+        return { canScrape: false, isAdminOnly: true, info, reason: err.message };
+      }
+    }
+
+    // Group / supergroup: try a single-participant probe.
+    try {
+      const probe = await this.clients.get(String(sessionId)).client.getParticipants(entity, {
+        limit: 1,
+      });
+      if (probe && probe.length >= 0) {
+        return { canScrape: true, isAdminOnly: false, info };
+      }
+      return { canScrape: false, isAdminOnly: true, info, reason: 'empty_or_hidden_roster' };
+    } catch (err) {
+      const msg = err.message || '';
+      if (/CHAT_ADMIN_REQUIRED|PARTICIPANTS_HIDDEN|CHANNEL_PRIVATE/i.test(msg)) {
+        return { canScrape: false, isAdminOnly: true, info, reason: 'chat_admin_required' };
+      }
+      return { canScrape: false, isAdminOnly: true, info, reason: msg };
+    }
   }
 }
 

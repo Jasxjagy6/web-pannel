@@ -29,6 +29,8 @@ const proxyRoutes = require('./routes/proxies');
 const antiDetectRoutes = require('./routes/antiDetect');
 const privacyRoutes = require('./routes/privacy');
 const adminRoutes = require('./routes/admin');
+const billingRoutes = require('./routes/billing');
+const billingController = require('./controllers/billingController');
 
 const app = express();
 const server = http.createServer(app);
@@ -49,6 +51,16 @@ app.use(cors({
   origin: process.env.FRONTEND_URL || 'http://localhost:5173',
   credentials: true,
 }));
+// OxaPay IPN webhook MUST be mounted with raw body parsing so the HMAC
+// header (sha512(rawBody, merchantApiKey)) can be re-validated. We mount
+// it BEFORE express.json() so the body remains a Buffer.
+const apiPrefixForIpn = process.env.API_PREFIX || '/api';
+app.post(
+  `${apiPrefixForIpn}/billing/oxapay/ipn`,
+  express.raw({ type: '*/*', limit: '1mb' }),
+  billingController.oxapayIpn
+);
+
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
@@ -86,6 +98,7 @@ app.use(`${apiPrefix}/proxies`, proxyRoutes);
 app.use(`${apiPrefix}/anti-detect`, antiDetectRoutes);
 app.use(`${apiPrefix}/privacy`, privacyRoutes);
 app.use(`${apiPrefix}/admin`, adminRoutes);
+app.use(`${apiPrefix}/billing`, billingRoutes);
 
 // 404 handler
 app.use((req, res) => {
@@ -228,6 +241,51 @@ async function start() {
       privacyJobWorker.startPrivacyJobWorker();
     } catch (err) {
       logger.warn(`privacyJobWorker.start failed: ${err.message}`);
+    }
+
+    // 6. Re-attach NewMessage listeners for monitor jobs that were running
+    //    when the process restarted and whose window hasn't expired yet.
+    try {
+      const scrapeMonitorService = require('./services/scrapeMonitorService');
+      await scrapeMonitorService.resumeActiveJobs();
+    } catch (err) {
+      logger.warn(`scrapeMonitorService.resumeActiveJobs failed: ${err.message}`);
+    }
+
+    // 7. Sweep expired monitor jobs every minute. resumeActiveJobs above
+    //    rolls already-expired jobs to completed at boot; this loop catches
+    //    any job whose timer was missed (e.g. very long shutdown).
+    try {
+      const scrapeMonitorService = require('./services/scrapeMonitorService');
+      setInterval(
+        () => scrapeMonitorService.resumeActiveJobs().catch((e) =>
+          logger.warn(`monitor sweep error: ${e.message}`)
+        ),
+        60_000
+      );
+    } catch (err) {
+      logger.warn(`monitor sweep init failed: ${err.message}`);
+    }
+
+    // 8. Subscription / trial expiry sweep. Runs every minute so a paid
+    //    user whose monthly window just elapsed gets gated out of the app
+    //    on their very next request. Trial expiry happens implicitly via
+    //    the entitlement check, so we only need to flip subscription_status
+    //    here.
+    try {
+      const subscriptionService = require('./services/subscriptionService');
+      // Run once on boot too so cold starts catch up to wall time.
+      subscriptionService.sweepExpired().catch((e) =>
+        logger.warn(`subscription sweep (boot) error: ${e.message}`)
+      );
+      setInterval(
+        () => subscriptionService.sweepExpired().catch((e) =>
+          logger.warn(`subscription sweep error: ${e.message}`)
+        ),
+        60_000
+      );
+    } catch (err) {
+      logger.warn(`subscription sweep init failed: ${err.message}`);
     }
   } catch (error) {
     logger.error('Failed to start server', error);

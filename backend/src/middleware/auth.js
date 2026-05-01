@@ -28,7 +28,8 @@ const authenticate = asyncHandler(async (req, _res, next) => {
   const result = await pool.query(
     `SELECT id, email, role, status, is_approved,
             subscription_plan, subscription_status, subscription_expires_at,
-            subscription_features
+            subscription_features,
+            trial_started_at, trial_expires_at, trial_used
        FROM users
       WHERE id = $1`,
     [decoded.userId]
@@ -48,6 +49,12 @@ const authenticate = asyncHandler(async (req, _res, next) => {
     subscriptionStatus: row.subscription_status,
     subscriptionExpiresAt: row.subscription_expires_at,
     subscriptionFeatures: row.subscription_features || {},
+    trialStartedAt: row.trial_started_at,
+    trialExpiresAt: row.trial_expires_at,
+    trialUsed: row.trial_used,
+    // Keep a snake_case mirror so subscriptionService can read it
+    // without an extra DB roundtrip.
+    _row: row,
   };
   next();
 });
@@ -74,12 +81,20 @@ const requireAdmin = (req, _res, next) => {
  * or whose account is banned. Mounted on every "feature" route family
  * (sessions, scrape, messaging, …) so the same check exists on the
  * server even if the frontend forgets to gate the page.
+ *
+ * As of the OxaPay subscription rollout this check ALSO requires the
+ * user to have either an active subscription or an active trial (with
+ * the feature on the trial-allowed list, if `feature` is provided).
+ *
+ * Use:
+ *   router.use(requireApproved)             // any feature
+ *   router.use(requireApproved('scrape'))   // restricted feature
  */
-const requireApproved = (req, _res, next) => {
+async function _gate(req, _res, feature) {
   if (!req.user) {
     throw new AppError('Auth required', 401, 'AUTH_REQUIRED');
   }
-  if (req.user.role === 'admin') return next();
+  if (req.user.role === 'admin') return;
   if (req.user.status === 'banned') {
     throw new AppError('Account is banned', 403, 'ACCOUNT_BANNED');
   }
@@ -90,7 +105,48 @@ const requireApproved = (req, _res, next) => {
       'NOT_APPROVED'
     );
   }
-  next();
+
+  // Subscription / trial gate.
+  const subscriptionService = require('../services/subscriptionService');
+  const ent = await subscriptionService.entitlementFor(req.user._row || req.user, feature);
+  if (!ent.allowed) {
+    if (ent.reason === 'trial_feature_not_allowed') {
+      throw new AppError(
+        'This feature is not available on the free trial.',
+        402,
+        'TRIAL_FEATURE_NOT_ALLOWED'
+      );
+    }
+    throw new AppError(
+      'An active subscription is required to use this feature.',
+      402,
+      'SUBSCRIPTION_REQUIRED'
+    );
+  }
+  req.entitlement = ent;
+}
+
+function _isExpressTriple(args) {
+  // Express invokes middleware with `(req, res, next)` where `next` is
+  // a function. That signature is the only reliable way to tell the
+  // "act as middleware now" call apart from the "factory call with a
+  // feature label" call.
+  return (
+    args.length === 3 &&
+    typeof args[2] === 'function' &&
+    args[0] && typeof args[0] === 'object' && args[0].method &&
+    args[1] && typeof args[1].setHeader === 'function'
+  );
+}
+
+const requireApproved = (...args) => {
+  if (_isExpressTriple(args)) {
+    const [req, res, next] = args;
+    return _gate(req, res, null).then(() => next()).catch(next);
+  }
+  const feature = args[0] || null;
+  return (req, res, next) =>
+    _gate(req, res, feature).then(() => next()).catch(next);
 };
 
 const optionalAuth = asyncHandler(async (req, _res, next) => {

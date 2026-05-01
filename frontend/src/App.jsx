@@ -24,13 +24,34 @@ import Proxies from './pages/Proxies';
 import CreateSession from './pages/CreateSession';
 import AntiDetect from './pages/AntiDetect';
 import Privacy from './pages/Privacy';
+import Billing from './pages/Billing';
+
+/**
+ * Predicate: does the user have an active paid subscription or running
+ * trial right now? Admins always pass. We mirror the backend
+ * `entitlementFor()` here so the UI can route correctly without an
+ * extra request roundtrip.
+ */
+function hasEntitlement(user) {
+  if (!user) return false;
+  if (user.role === 'admin') return true;
+  const sub = user.subscription || {};
+  if (sub.status === 'active' && sub.expiresAt && new Date(sub.expiresAt) > new Date()) {
+    return true;
+  }
+  const trial = user.trial || {};
+  if (trial.expiresAt && new Date(trial.expiresAt) > new Date()) return true;
+  return false;
+}
 
 /**
  * Gate that requires the user to be approved (or admin) before they can
  * see any feature route. Pending / banned users get bounced to /pending,
- * unauthenticated users to /login.
+ * unauthenticated users to /login. As of the OxaPay rollout, approved
+ * users without an active subscription or trial are redirected to
+ * /billing where they can pay or start the free trial.
  */
-function ProtectedRoute({ children, title, requireAdmin = false }) {
+function ProtectedRoute({ children, title, requireAdmin = false, allowWithoutSubscription = false }) {
   const { isAuthenticated, user, isAdmin } = useAuth();
   if (!isAuthenticated) return <Navigate to="/login" replace />;
 
@@ -42,6 +63,9 @@ function ProtectedRoute({ children, title, requireAdmin = false }) {
   if (!requireAdmin && !isAdmin) {
     if (!user?.isApproved || user?.status !== 'approved') {
       return <Navigate to="/pending" replace />;
+    }
+    if (!allowWithoutSubscription && !hasEntitlement(user)) {
+      return <Navigate to="/billing" replace />;
     }
   }
   return <Layout title={title}>{children}</Layout>;
@@ -65,7 +89,11 @@ function HomeRedirect() {
   const { isAuthenticated, isAdmin, user } = useAuth();
   if (!isAuthenticated) return <Navigate to="/login" replace />;
   if (isAdmin) return <Navigate to="/admin" replace />;
-  if (user?.status === 'approved' && user?.isApproved) return <Navigate to="/dashboard" replace />;
+  if (user?.status === 'approved' && user?.isApproved) {
+    return hasEntitlement(user)
+      ? <Navigate to="/dashboard" replace />
+      : <Navigate to="/billing" replace />;
+  }
   return <Navigate to="/pending" replace />;
 }
 
@@ -79,6 +107,7 @@ export default function App() {
           <Route path="/register" element={<Register />} />
           <Route path="/pending" element={<PendingGate />} />
           <Route path="/admin" element={<ProtectedRoute title="Admin Panel" requireAdmin><Admin /></ProtectedRoute>} />
+          <Route path="/billing" element={<ProtectedRoute title="Billing" allowWithoutSubscription><Billing /></ProtectedRoute>} />
           <Route path="/dashboard" element={<ProtectedRoute title="Dashboard"><Dashboard /></ProtectedRoute>} />
           <Route path="/sessions" element={<ProtectedRoute title="Sessions"><Sessions /></ProtectedRoute>} />
           <Route path="/create-session" element={<ProtectedRoute title="Create Session"><CreateSession /></ProtectedRoute>} />

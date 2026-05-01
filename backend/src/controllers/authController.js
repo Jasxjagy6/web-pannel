@@ -9,6 +9,7 @@ const SAFE_USER_COLUMNS = `
   banned_at, banned_reason,
   subscription_plan, subscription_status, subscription_expires_at,
   subscription_features,
+  trial_started_at, trial_expires_at, trial_used,
   notes, created_at, updated_at, last_login
 `;
 
@@ -28,6 +29,11 @@ function publicUser(row) {
       status: row.subscription_status,
       expiresAt: row.subscription_expires_at,
       features: row.subscription_features || {},
+    },
+    trial: {
+      startedAt: row.trial_started_at || null,
+      expiresAt: row.trial_expires_at || null,
+      used: !!row.trial_used,
     },
     notes: row.notes,
     createdAt: row.created_at,

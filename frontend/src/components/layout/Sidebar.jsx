@@ -3,7 +3,7 @@ import { Link, useLocation } from 'react-router-dom';
 import {
   LayoutDashboard, Users, Search, MessageSquare, UsersRound, List, BarChart3,
   Settings, LogOut, ChevronLeft, ChevronRight, UserCog, ShieldCheck, KeyRound,
-  Network, UserPlus, Fingerprint, Shield, Crown, X,
+  Network, UserPlus, Fingerprint, Shield, Crown, X, CreditCard,
 } from 'lucide-react';
 import { useAuth } from '@/hooks/useAuth';
 
@@ -22,6 +22,7 @@ const userNavItems = [
   { path: '/reports', label: 'Reports', icon: BarChart3 },
   { path: '/account-settings', label: 'Account Settings', icon: UserCog },
   { path: '/privacy', label: 'Privacy', icon: Shield },
+  { path: '/billing', label: 'Billing', icon: CreditCard },
   { path: '/settings', label: 'Settings', icon: Settings },
 ];
 

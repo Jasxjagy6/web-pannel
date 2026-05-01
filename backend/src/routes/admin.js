@@ -1,6 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const ctrl = require('../controllers/adminController');
+const billing = require('../controllers/billingController');
 const { authenticate, requireAdmin } = require('../middleware/auth');
 
 router.use(authenticate);
@@ -16,5 +17,17 @@ router.post('/users/:id/approve', ctrl.approveUser);
 router.post('/users/:id/ban', ctrl.banUser);
 router.post('/users/:id/unban', ctrl.unbanUser);
 router.put('/users/:id/subscription', ctrl.setSubscription);
+
+// ---------------------------------------------------------------------
+// Billing admin endpoints
+// ---------------------------------------------------------------------
+router.get('/billing/settings',  billing.adminGetSettings);
+router.put('/billing/settings',  billing.adminSetSettings);
+
+router.get('/billing/invoices',           billing.adminListInvoices);
+router.get('/billing/users/:id/invoices', billing.adminGetUserInvoices);
+
+router.post('/billing/users/:id/grant',  billing.adminGrantSubscription);
+router.post('/billing/users/:id/expire', billing.adminExpireSubscription);
 
 module.exports = router;
