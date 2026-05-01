@@ -35,7 +35,8 @@
     "moment": "^2.29.4",
     "node-cron": "^3.0.3",
     "better-sqlite3": "^9.4.3",
-    "express-fileupload": "^1.4.3"
+    "express-fileupload": "^1.4.3",
+    "compression": "^1.7.4"
   },
   "devDependencies": {
     "nodemon": "^3.0.2"

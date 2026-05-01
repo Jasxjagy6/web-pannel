@@ -2,15 +2,22 @@ const { Pool } = require('pg');
 const bcrypt = require('bcrypt');
 require('dotenv').config();
 
+// Pool sized for the 500-700 concurrent user target. With ~50 conns
+// per panel pod and ~150 max connections in Postgres, three panel
+// pods saturates the DB; tune `DB_POOL_MAX` per pod accordingly. See
+// OPS.md for the full scale-up procedure.
 const pool = new Pool({
   host: process.env.DB_HOST || 'localhost',
   port: parseInt(process.env.DB_PORT || '5432'),
   database: process.env.DB_NAME || 'telegram_panel',
   user: process.env.DB_USER || 'postgres',
   password: process.env.DB_PASSWORD || 'your_secure_password',
-  max: 20,
-  idleTimeoutMillis: 30000,
-  connectionTimeoutMillis: 2000,
+  max: parseInt(process.env.DB_POOL_MAX || '50'),
+  idleTimeoutMillis: parseInt(process.env.DB_POOL_IDLE_MS || '30000'),
+  connectionTimeoutMillis: parseInt(process.env.DB_POOL_CONNECT_MS || '5000'),
+  // Rotate every 10 minutes so a long-lived pod never builds up too
+  // many half-dead connections.
+  maxLifetimeSeconds: parseInt(process.env.DB_POOL_LIFETIME_SEC || '600'),
 });
 
 pool.on('error', (err) => {
@@ -41,6 +48,7 @@ const initDB = async () => {
       'migration_v5_multiuser.sql',
       'migration_v6_scrape_monitor.sql',
       'migration_v7_billing.sql',
+      'migration_v8_per_user_api_and_auto_approve.sql',
     ];
     for (const m of migrations) {
       const mPath = path.join(__dirname, m);

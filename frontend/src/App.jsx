@@ -1,30 +1,44 @@
+import { lazy, Suspense } from 'react';
 import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom';
 import { AuthProvider } from './context/AuthContext';
 import { ToastContainer } from './components/common/Toast';
+import MissingApiCredsModal from './components/common/MissingApiCredsModal';
 import { useAuth } from './hooks/useAuth';
 import Layout from './components/layout/Layout';
 
-// Pages
+// Always-eager pages — Login / Register / Pending are tiny and on
+// the critical path of the very first paint. Everything else is
+// lazy-loaded so the initial bundle stays small at the 500-700
+// concurrent user target.
 import Login from './pages/Login';
 import Register from './pages/Register';
 import Pending from './pages/Pending';
-import Admin from './pages/Admin';
-import Dashboard from './pages/Dashboard';
-import Sessions from './pages/Sessions';
-import Scrape from './pages/Scrape';
-import Messaging from './pages/Messaging';
-import Groups from './pages/Groups';
-import Lists from './pages/Lists';
-import Reports from './pages/Reports';
-import Settings from './pages/Settings';
-import AccountSettings from './pages/AccountSettings';
-import Change2FA from './pages/Change2FA';
-import GetOTP from './pages/GetOTP';
-import Proxies from './pages/Proxies';
-import CreateSession from './pages/CreateSession';
-import AntiDetect from './pages/AntiDetect';
-import Privacy from './pages/Privacy';
-import Billing from './pages/Billing';
+
+const Admin = lazy(() => import('./pages/Admin'));
+const Dashboard = lazy(() => import('./pages/Dashboard'));
+const Sessions = lazy(() => import('./pages/Sessions'));
+const Scrape = lazy(() => import('./pages/Scrape'));
+const Messaging = lazy(() => import('./pages/Messaging'));
+const Groups = lazy(() => import('./pages/Groups'));
+const Lists = lazy(() => import('./pages/Lists'));
+const Reports = lazy(() => import('./pages/Reports'));
+const Settings = lazy(() => import('./pages/Settings'));
+const AccountSettings = lazy(() => import('./pages/AccountSettings'));
+const Change2FA = lazy(() => import('./pages/Change2FA'));
+const GetOTP = lazy(() => import('./pages/GetOTP'));
+const Proxies = lazy(() => import('./pages/Proxies'));
+const CreateSession = lazy(() => import('./pages/CreateSession'));
+const AntiDetect = lazy(() => import('./pages/AntiDetect'));
+const Privacy = lazy(() => import('./pages/Privacy'));
+const Billing = lazy(() => import('./pages/Billing'));
+
+function RouteFallback() {
+  return (
+    <div className="flex h-full min-h-[40vh] w-full items-center justify-center text-sm text-dark-300">
+      Loading…
+    </div>
+  );
+}
 
 /**
  * Predicate: does the user have an active paid subscription or running
@@ -102,6 +116,8 @@ export default function App() {
     <BrowserRouter>
       <AuthProvider>
         <ToastContainer />
+        <MissingApiCredsModal />
+        <Suspense fallback={<RouteFallback />}>
         <Routes>
           <Route path="/login" element={<Login />} />
           <Route path="/register" element={<Register />} />
@@ -122,10 +138,15 @@ export default function App() {
           <Route path="/proxies" element={<ProtectedRoute title="Proxies"><Proxies /></ProtectedRoute>} />
           <Route path="/anti-detect" element={<ProtectedRoute title="Anti-Detect"><AntiDetect /></ProtectedRoute>} />
           <Route path="/privacy" element={<ProtectedRoute title="Privacy"><Privacy /></ProtectedRoute>} />
-          <Route path="/settings" element={<ProtectedRoute title="Settings"><Settings /></ProtectedRoute>} />
+          {/* Settings is reachable without an active subscription so the
+              user can configure their Telegram API ID/Hash before paying.
+              The credentials popup deep-links to /settings#api-credentials
+              from anywhere in the app. */}
+          <Route path="/settings" element={<ProtectedRoute title="Settings" allowWithoutSubscription><Settings /></ProtectedRoute>} />
           <Route path="/" element={<HomeRedirect />} />
           <Route path="*" element={<HomeRedirect />} />
         </Routes>
+        </Suspense>
       </AuthProvider>
     </BrowserRouter>
   );

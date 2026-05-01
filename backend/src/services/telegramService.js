@@ -1737,7 +1737,7 @@ class TelegramService {
       
       const result = await pool.query(
         `SELECT id, session_file_path, api_id, api_hash, is_logged_in, status,
-                device_identity, bound_proxy_id
+                device_identity, bound_proxy_id, user_api_credential_id
          FROM sessions WHERE id = $1`,
         [sessionId]
       );
@@ -1775,8 +1775,24 @@ class TelegramService {
         logger.debug(`Session ${sessionId} may not be encrypted, using as-is`);
       }
       
-      const apiId = session.api_id || telegramConfig.apiId;
-      const apiHash = session.api_hash || telegramConfig.apiHash;
+      // v8: prefer the live per-user credential vault — that way an
+      // owner who rotates their api_hash in Settings has the new hash
+      // picked up on the next reconnect. Fall back to the per-row
+      // snapshot (legacy) and finally to the panel-wide env-vars.
+      let apiId = session.api_id || telegramConfig.apiId;
+      let apiHash = session.api_hash || telegramConfig.apiHash;
+      if (session.user_api_credential_id) {
+        try {
+          const userApiCredentials = require('./userApiCredentialsService');
+          const cred = await userApiCredentials.loadDecrypted(session.user_api_credential_id);
+          if (cred && cred.isActive) {
+            apiId = cred.apiId;
+            apiHash = cred.apiHash;
+          }
+        } catch (credErr) {
+          logger.debug(`credential load failed for session ${sessionId}: ${credErr.message}; falling back to snapshot`);
+        }
+      }
 
       // Anti-Detect: replay the persisted device identity so each
       // reconnect looks like the same physical device. If the row has

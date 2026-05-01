@@ -124,17 +124,56 @@ class SessionCreationService {
     return cleaned.startsWith('+') ? cleaned : `+${cleaned}`;
   }
 
-  _resolveApi(apiId, apiHash) {
+  /**
+   * Pick the Telegram API credential the new session should be minted
+   * under. v8 changed this from "use the panel-wide TELEGRAM_API_ID
+   * env-var" to "pick one of the user's per-user credentials, rotating
+   * by max_sessions". The caller may still pass an explicit
+   * `apiId/apiHash` override (used when re-trying a flow under a
+   * specific credential) but in the common case we just call
+   * `userApiCredentialsService.pickForNewSession(userId)`.
+   *
+   * Returns `{ apiId, apiHash, credentialId }`. `credentialId` is null
+   * when falling back to env-vars (legacy / admin path).
+   */
+  async _resolveApi(userId, apiId, apiHash) {
+    if (apiId && apiHash) {
+      return {
+        apiId: Number(apiId),
+        apiHash: String(apiHash),
+        credentialId: null,
+      };
+    }
+    if (userId) {
+      try {
+        const userApiCredentials = require('./userApiCredentialsService');
+        const pick = await userApiCredentials.pickForNewSession(userId);
+        return {
+          apiId: pick.apiId,
+          apiHash: pick.apiHash,
+          credentialId: pick.id,
+        };
+      } catch (err) {
+        // pickForNewSession throws either API_CREDENTIALS_REQUIRED or
+        // NO_CREDENTIAL_CAPACITY — surface those verbatim. Anything
+        // else falls through to the env-var legacy path so admins can
+        // still bootstrap without per-user credentials.
+        if (err && (err.code === 'API_CREDENTIALS_REQUIRED' || err.code === 'NO_CREDENTIAL_CAPACITY')) {
+          throw err;
+        }
+        logger.warn(`pickForNewSession failed for user ${userId}: ${err.message}; falling back to env`);
+      }
+    }
     const id = Number(apiId) || telegramConfig.apiId;
     const hash = String(apiHash || telegramConfig.apiHash || '');
     if (!id || !hash) {
       throw new AppError(
-        'Telegram API ID/Hash not configured',
-        500,
-        'TELEGRAM_API_NOT_CONFIGURED'
+        'Telegram API ID/Hash not configured. Add credentials in Settings.',
+        412,
+        'API_CREDENTIALS_REQUIRED'
       );
     }
-    return { apiId: id, apiHash: hash };
+    return { apiId: id, apiHash: hash, credentialId: null };
   }
 
   _userSessionDir(userId) {
@@ -146,7 +185,8 @@ class SessionCreationService {
   // ---------------------------------------------------------------------------
   async start({ userId, phone, apiId, apiHash }) {
     const normalizedPhone = this._normalizePhone(phone);
-    const { apiId: id, apiHash: hash } = this._resolveApi(apiId, apiHash);
+    const { apiId: id, apiHash: hash, credentialId } =
+      await this._resolveApi(userId, apiId, apiHash);
 
     // Anti-Detect: build the device identity that this account will use
     // for the rest of its life. The seed includes the phone so a re-tried
@@ -212,6 +252,7 @@ class SessionCreationService {
         phone: normalizedPhone,
         apiId: id,
         apiHash: hash,
+        credentialId,
         userId,
         createdAt: Date.now(),
         awaitingPassword: false,
@@ -407,7 +448,7 @@ class SessionCreationService {
   // ---------------------------------------------------------------------------
   async _persistAndFinish(userId, tempId, hadTwoFA) {
     const entry = this._mustGet(userId, tempId);
-    const { client, phone, apiId, apiHash, identity, reservedProxyId, proxyConf } = entry;
+    const { client, phone, apiId, apiHash, credentialId, identity, reservedProxyId, proxyConf } = entry;
 
     // Pull user info + session string before we hand the client off.
     let me = null;
@@ -454,10 +495,11 @@ class SessionCreationService {
     const insert = await pool.query(
       `INSERT INTO sessions (
          user_id, phone, session_file_path, api_id, api_hash,
+         user_api_credential_id,
          status, is_2fa_enabled, is_logged_in, keep_alive, account_info,
          device_identity, bound_proxy_id,
          last_heartbeat, last_active, created_at
-       ) VALUES ($1, $2, $3, $4, $5, 'active', $6, TRUE, TRUE, $7, $8::jsonb, $9, NOW(), NOW(), NOW())
+       ) VALUES ($1, $2, $3, $4, $5, $6, 'active', $7, TRUE, TRUE, $8, $9::jsonb, $10, NOW(), NOW(), NOW())
        RETURNING id`,
       [
         userId,
@@ -465,6 +507,7 @@ class SessionCreationService {
         relativePath,
         apiId,
         apiHash,
+        credentialId || null,
         hadTwoFA,
         JSON.stringify({
           ...accountInfo,

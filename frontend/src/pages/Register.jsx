@@ -29,8 +29,12 @@ export default function Register() {
     setLoading(true);
     try {
       await register(email.trim(), password);
-      showSuccess('Account created. Awaiting admin approval.', 'Welcome');
-      navigate('/pending', { replace: true });
+      // v8: admin approval has been removed. New users land on the
+      // billing page so they can either start the free trial or pay.
+      // The panel itself stays gated behind "set up your Telegram API
+      // ID/Hash in Settings" which is enforced on the next request.
+      showSuccess('Account created. Choose a plan or start your trial.', 'Welcome');
+      navigate('/billing', { replace: true });
     } catch (err) {
       const message = parseApiError(err);
       setApiError(message);
@@ -143,8 +147,10 @@ export default function Register() {
               </div>
             </div>
 
-            <p className="rounded-lg border border-amber-500/30 bg-amber-500/10 p-3 text-xs text-amber-300">
-              New accounts are pending until an admin approves them. You'll be able to log in but the panel features stay locked until then.
+            <p className="rounded-lg border border-primary-500/30 bg-primary-500/10 p-3 text-xs text-primary-200">
+              You'll go straight to the billing page after sign-up — start the
+              free trial or pick a plan. The panel itself unlocks once you set
+              up your Telegram API ID and Hash in Settings.
             </p>
 
             <button

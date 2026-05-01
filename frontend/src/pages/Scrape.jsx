@@ -107,6 +107,12 @@ export default function Scrape() {
   const [monitorPagination, setMonitorPagination] = useState({ total: 0, pages: 0 });
   const [periodPrompt, setPeriodPrompt] = useState(null); // { adminTargets: [...], scrapableTargets: [...] }
   const [periodSeconds, setPeriodSeconds] = useState(2 * 24 * 60 * 60); // default 2 days
+  // v8: explicit "are members hidden?" toggle. When ON, we skip the
+  // preview probe entirely and route the submission straight into
+  // monitor-mode using `periodSeconds` as the window. The previous
+  // auto-detect path is kept as a safety net for users who don't know
+  // whether their target is admin-only.
+  const [hiddenMembers, setHiddenMembers] = useState(false);
   const [creatingMonitors, setCreatingMonitors] = useState(false);
   const [, forceTickRender] = useState(0);
 
@@ -218,9 +224,29 @@ export default function Scrape() {
     };
     ws.on('monitor:progress', onMonitorProgress);
 
+    // v8: lightweight tick (scrapedCount + remainingSeconds + rate)
+    // emitted every TICK_INTERVAL_MS by the backend so quiet chats
+    // still update the UI countdown.
+    const onMonitorTick = (data) => {
+      setMonitorJobs((prev) => {
+        const idx = prev.findIndex((j) => j.id === data.jobId);
+        if (idx === -1) return prev;
+        const next = [...prev];
+        next[idx] = {
+          ...next[idx],
+          scrapedCount: data.scrapedCount ?? next[idx].scrapedCount,
+          remainingSeconds: data.remainingSeconds ?? next[idx].remainingSeconds,
+          ratePerMinute: data.ratePerMinute ?? next[idx].ratePerMinute,
+        };
+        return next;
+      });
+    };
+    ws.on('monitor:tick', onMonitorTick);
+
     return () => {
       try { ws.off?.('scrape_progress', onScrapeProgress); } catch { /* ignore */ }
       try { ws.off?.('monitor:progress', onMonitorProgress); } catch { /* ignore */ }
+      try { ws.off?.('monitor:tick', onMonitorTick); } catch { /* ignore */ }
       try { for (const ev of monitorEvents) ws.off?.(ev, monitorRefresh); } catch { /* ignore */ }
     };
   }, [ws, fetchMonitors]);
@@ -264,6 +290,21 @@ export default function Scrape() {
     const startTime = Date.now();
 
     try {
+      // v8: explicit hidden-members toggle short-circuits the preview
+      // probe entirely. The user already told us "this chat hides its
+      // member list", so we go straight to monitor mode for every
+      // entered target — no API call to verify, no duplicate work.
+      if (hiddenMembers) {
+        const adminTargets = targetList.map((t) => ({
+          target: t,
+          targetType: scrapeType,
+          reason: 'user_marked_hidden',
+          info: { title: null },
+        }));
+        setPeriodPrompt({ adminTargets, scrapableTargets: [] });
+        return;
+      }
+
       // Preview every target with the first selected session so we can
       // detect admin-only chats up front and offer the period-monitor
       // path instead of failing the scrape.
@@ -645,6 +686,45 @@ export default function Scrape() {
             <p className="text-xs text-gray-500 mt-1">
               Enter one target per line. Supports: usernames, links, or numeric IDs
             </p>
+          </div>
+
+          {/* v8: explicit hidden-members toggle. When ON we route the
+              entire submit straight to monitor mode and surface the
+              "this is allowed via period monitoring" copy below. */}
+          <div className={cardClass}>
+            <div className="flex items-start justify-between gap-3">
+              <div className="flex-1">
+                <p className="text-sm font-medium text-gray-200 flex items-center gap-2">
+                  <ShieldAlert className="h-4 w-4 text-warning-400" />
+                  Are this group / channel's members hidden?
+                </p>
+                <p className="mt-1 text-xs text-gray-500">
+                  Turn this on if the chat is configured so that only admins can see the participant list. We'll switch this submission to <strong>period monitor mode</strong>.
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => setHiddenMembers((v) => !v)}
+                className={`relative h-6 w-11 shrink-0 rounded-full transition-colors ${hiddenMembers ? 'bg-warning-500' : 'bg-white/10'}`}
+                role="switch"
+                aria-checked={hiddenMembers}
+              >
+                <span className={`absolute top-0.5 left-0.5 h-5 w-5 rounded-full bg-white shadow-sm transition-transform ${hiddenMembers ? 'translate-x-5' : 'translate-x-0'}`} />
+              </button>
+            </div>
+            {hiddenMembers && (
+              <div className="mt-3 rounded-lg border border-warning-500/30 bg-warning-500/10 p-3 text-xs text-warning-200 space-y-1.5">
+                <p>
+                  <strong>Heads up:</strong> Telegram does not allow scraping users instantly from groups or channels with hidden members.
+                </p>
+                <p>
+                  However, the panel can <strong>monitor that group / channel</strong> for the period of time you specify. During that window we passively listen for every distinct user that interacts (sends, replies, joins, posts) and dedupe them in real time. The job runs entirely on our backend and survives reloads, restarts and pauses — you can come back later and export the captured users.
+                </p>
+                <p>
+                  After you click <em>Start Scrape</em> we'll ask you to pick the monitoring window. You'll see live progress (count, rate, time remaining) on the History tab and can stop or pause anytime.
+                </p>
+              </div>
+            )}
           </div>
 
           {/* Settings Row */}

@@ -111,7 +111,30 @@ class SessionService {
    */
   async uploadSessions(files, userId, options = {}) {
     const startTime = Date.now();
-    const { apiId, apiHash, autoLogin = false } = options;
+    let { apiId, apiHash, autoLogin = false } = options;
+    let userApiCredentialId = null;
+
+    // v8: every uploaded session must be tied to one of the user's
+    // per-user Telegram credentials. If the user didn't pass an
+    // explicit override, we pick one credential up-front and bind every
+    // file in this batch to it. We deliberately allocate ONE
+    // credential for the whole batch so the rotation cap counts the
+    // batch as one logical group rather than racing N times.
+    if (!apiId || !apiHash) {
+      try {
+        const userApiCredentials = require('./userApiCredentialsService');
+        const pick = await userApiCredentials.pickForNewSession(userId);
+        apiId = pick.apiId;
+        apiHash = pick.apiHash;
+        userApiCredentialId = pick.id;
+      } catch (err) {
+        if (err && err.code === 'API_CREDENTIALS_REQUIRED') throw err;
+        if (err && err.code === 'NO_CREDENTIAL_CAPACITY') throw err;
+        // Fall through to legacy behaviour if no credentials and no
+        // override — sessionService will reject the upload via the
+        // existing api_id/api_hash NULL handling.
+      }
+    }
 
     logger.info(`Starting bulk session upload for user ${userId}`, {
       fileCount: files.length,
@@ -166,7 +189,8 @@ class SessionService {
               userId,
               apiId,
               apiHash,
-              autoLogin
+              autoLogin,
+              userApiCredentialId
             );
             fileResult.status = 'success';
             fileResult.sessionId = inserted.length > 0 ? inserted[0] : null;
@@ -180,7 +204,8 @@ class SessionService {
               userId,
               ext,
               apiId,
-              apiHash
+              apiHash,
+              userApiCredentialId
             );
             fileResult.status = 'success';
             fileResult.sessionId = sessionId;
@@ -242,7 +267,7 @@ class SessionService {
    * @returns {Promise<number[]>} Array of inserted session IDs
    * @private
    */
-  async _processJsonUpload(client, file, userId, apiId, apiHash, autoLogin) {
+  async _processJsonUpload(client, file, userId, apiId, apiHash, autoLogin, userApiCredentialId = null) {
     const content = await fs.readFile(file.path, 'utf8');
     let sessionStrings = [];
 
@@ -342,8 +367,9 @@ class SessionService {
       const result = await client.query(
         `INSERT INTO sessions (
           user_id, phone, session_file_path, api_id, api_hash,
+          user_api_credential_id,
           status, is_2fa_enabled, is_logged_in, account_info, created_at
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW())
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW())
         RETURNING id`,
         [
           userId,
@@ -351,6 +377,7 @@ class SessionService {
           relativePath,
           apiId || null,
           apiHash || null,
+          userApiCredentialId || null,
           status,
           false,
           autoLogin,
@@ -391,7 +418,7 @@ class SessionService {
    * @returns {Promise<number>} Inserted session database ID
    * @private
    */
-  async _processBinaryUpload(client, file, userId, ext, apiId, apiHash) {
+  async _processBinaryUpload(client, file, userId, ext, apiId, apiHash, userApiCredentialId = null) {
     const sessionDir = this._getUserSessionDir(userId);
     await fs.ensureDir(sessionDir);
 
@@ -480,8 +507,9 @@ class SessionService {
     const result = await client.query(
       `INSERT INTO sessions (
         user_id, phone, session_file_path, api_id, api_hash,
+        user_api_credential_id,
         status, is_2fa_enabled, is_logged_in, account_info, created_at
-      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW())
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW())
       RETURNING id`,
       [
         userId,
@@ -489,6 +517,7 @@ class SessionService {
         storagePath,
         apiId || null,
         apiHash || null,
+        userApiCredentialId || null,
         'uploaded',
         false,
         false,

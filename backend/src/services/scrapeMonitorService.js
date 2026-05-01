@@ -46,6 +46,18 @@ const MAX_DURATION_SECONDS = 60 * 60 * 24 * 30;   // 30 days hard cap
 const MIN_DURATION_SECONDS = 60;                  // 1 minute lower bound
 const MAX_SESSIONS_PER_JOB = 10;
 const PROGRESS_EMIT_DEBOUNCE_MS = 500;
+// v8: hard cap on simultaneously-running monitor jobs PER USER, to
+// keep the WS event load and DB upsert load predictable at the
+// 500–700 concurrent user target. A motivated user can still queue
+// more jobs in `pending` and they'll start as running ones complete.
+const MAX_RUNNING_MONITORS_PER_USER = parseInt(
+  process.env.MAX_RUNNING_MONITORS_PER_USER || '20',
+  10
+);
+// How often we tell the UI "you have X seconds left and Y users so
+// far" even when nothing has happened. Lower = snappier countdown,
+// higher = less WS chatter. 10s is a good default.
+const TICK_INTERVAL_MS = 10_000;
 
 function emit(userId, event, payload) {
   try {
@@ -193,6 +205,23 @@ class ScrapeMonitorService {
       throw new AppError(
         `Cannot start a job in status '${job.status}'`, 400, 'INVALID_STATE'
       );
+    }
+    // Per-user running cap. We only enforce on transition from
+    // pending -> running so resume-from-pause is never blocked (the
+    // user has already paid the slot).
+    if (job.status === 'pending') {
+      const r = await pool.query(
+        `SELECT COUNT(*)::int AS n FROM scrape_monitor_jobs
+          WHERE user_id = $1 AND status = 'running'`,
+        [userId]
+      );
+      if (r.rows[0].n >= MAX_RUNNING_MONITORS_PER_USER) {
+        throw new AppError(
+          `You already have ${r.rows[0].n} running monitor jobs. Wait for one to finish or stop it before starting another.`,
+          429,
+          'TOO_MANY_RUNNING_MONITORS'
+        );
+      }
     }
     const remaining = Math.max(
       MIN_DURATION_SECONDS,
@@ -446,13 +475,45 @@ class ScrapeMonitorService {
       remainingSeconds * 1000
     );
 
-    this._active.set(jobId, { unsubs, timer, userId, lastEmitAt: 0 });
+    // v8: periodic tick so the UI gets a steady "remaining" countdown
+    // and per-window scrape rate even on quiet chats.
+    let lastTickScraped = 0;
+    const ticker = setInterval(async () => {
+      try {
+        const r = await pool.query(
+          `SELECT scraped_count, expires_at
+             FROM scrape_monitor_jobs
+            WHERE id = $1`,
+          [jobId]
+        );
+        const row = r.rows[0];
+        if (!row) return;
+        const remaining = row.expires_at
+          ? Math.max(0, Math.floor((new Date(row.expires_at).getTime() - Date.now()) / 1000))
+          : 0;
+        const scraped = row.scraped_count || 0;
+        const delta = Math.max(0, scraped - lastTickScraped);
+        lastTickScraped = scraped;
+        emit(userId, 'monitor:tick', {
+          jobId,
+          scrapedCount: scraped,
+          remainingSeconds: remaining,
+          // events / TICK_INTERVAL_MS, normalized to events/min for UI
+          ratePerMinute: Math.round((delta / TICK_INTERVAL_MS) * 60_000),
+        });
+      } catch (err) {
+        logger.debug(`monitor:tick ${jobId} error: ${err.message}`);
+      }
+    }, TICK_INTERVAL_MS);
+
+    this._active.set(jobId, { unsubs, timer, ticker, userId, lastEmitAt: 0 });
   }
 
   async _detach(jobId) {
     const ctx = this._active.get(jobId);
     if (!ctx) return;
     try { clearTimeout(ctx.timer); } catch { /* ignore */ }
+    try { clearInterval(ctx.ticker); } catch { /* ignore */ }
     for (const off of ctx.unsubs.values()) {
       try { off(); } catch { /* ignore */ }
     }

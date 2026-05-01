@@ -13,7 +13,7 @@ const SAFE_USER_COLUMNS = `
   notes, created_at, updated_at, last_login
 `;
 
-function publicUser(row) {
+function publicUser(row, extras = {}) {
   if (!row) return null;
   return {
     id: row.id,
@@ -35,11 +35,32 @@ function publicUser(row) {
       expiresAt: row.trial_expires_at || null,
       used: !!row.trial_used,
     },
+    // v8: tells the frontend whether to show the "set up your API ID
+    // and Hash in Settings" popup. We always populate this — it's
+    // computed in getProfile / login / refresh — so the AuthContext
+    // doesn't have to fire a second request.
+    apiCredentialsCount: extras.apiCredentialsCount ?? null,
     notes: row.notes,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
     lastLogin: row.last_login,
   };
+}
+
+async function countApiCredentials(userId) {
+  if (!userId) return 0;
+  try {
+    const r = await pool.query(
+      `SELECT COUNT(*)::int AS n FROM user_api_credentials
+        WHERE user_id = $1 AND deleted_at IS NULL AND is_active = TRUE`,
+      [userId]
+    );
+    return r.rows[0]?.n || 0;
+  } catch {
+    // If the table doesn't exist yet (migrations haven't run),
+    // return 0 so we don't break login.
+    return 0;
+  }
 }
 
 function generateToken(user) {
@@ -52,9 +73,15 @@ function generateToken(user) {
 
 const authController = {
   /**
-   * Register a new user. Email + password only — no email OTP yet.
-   * New accounts land in `status='pending'` and cannot use any feature
-   * until an admin approves them via /api/admin/users/:id/approve.
+   * Register a new user. Email + password only.
+   *
+   * v8: admin approval is removed — new accounts land in
+   * `status='approved', is_approved=TRUE` immediately and the
+   * frontend redirects them to /billing where they can either start
+   * the free trial or pay. Subscription / API-credentials gating is
+   * still applied by `requireApproved` so they can't actually use
+   * any feature route until they finish billing + add their
+   * Telegram API ID / Hash in Settings.
    */
   register: asyncHandler(async (req, res) => {
     const email = String(req.body.email || '').trim().toLowerCase();
@@ -75,9 +102,9 @@ const authController = {
     const passwordHash = await bcrypt.hash(password, 10);
 
     const result = await pool.query(
-      `INSERT INTO users (email, password_hash, role, status, is_approved,
+      `INSERT INTO users (email, password_hash, role, status, is_approved, approved_at,
                           subscription_status, created_at, updated_at)
-       VALUES ($1, $2, 'user', 'pending', FALSE, 'inactive', NOW(), NOW())
+       VALUES ($1, $2, 'user', 'approved', TRUE, NOW(), 'inactive', NOW(), NOW())
        RETURNING ${SAFE_USER_COLUMNS}`,
       [email, passwordHash]
     );
@@ -86,10 +113,12 @@ const authController = {
     logger.info('User registered', { userId: user.id, email });
 
     const token = generateToken(user);
+    // Brand-new user has 0 credentials by definition; skip the count
+    // query and ship the response immediately.
     return res.status(201).json({
       success: true,
       token,
-      user: publicUser(user),
+      user: publicUser(user, { apiCredentialsCount: 0 }),
     });
   }),
 
@@ -135,12 +164,13 @@ const authController = {
     const user = fullResult.rows[0];
 
     const token = generateToken(user);
+    const apiCredentialsCount = await countApiCredentials(user.id);
     logger.info('User logged in', { userId: user.id, email: user.email, role: user.role });
 
     return res.status(200).json({
       success: true,
       token,
-      user: publicUser(user),
+      user: publicUser(user, { apiCredentialsCount }),
     });
   }),
 
@@ -160,7 +190,12 @@ const authController = {
       throw new AppError('Account is banned', 403, 'ACCOUNT_BANNED');
     }
     const token = generateToken(user);
-    return res.status(200).json({ success: true, token, user: publicUser(user) });
+    const apiCredentialsCount = await countApiCredentials(user.id);
+    return res.status(200).json({
+      success: true,
+      token,
+      user: publicUser(user, { apiCredentialsCount }),
+    });
   }),
 
   /**
@@ -175,7 +210,8 @@ const authController = {
     if (!user) {
       throw new AppError('User not found', 401, 'USER_NOT_FOUND');
     }
-    return res.status(200).json({ success: true, user: publicUser(user) });
+    const apiCredentialsCount = await countApiCredentials(user.id);
+    return res.status(200).json({ success: true, user: publicUser(user, { apiCredentialsCount }) });
   }),
 
   /**
@@ -214,7 +250,8 @@ const authController = {
       `SELECT ${SAFE_USER_COLUMNS} FROM users WHERE id = $1`,
       [req.user.id]
     );
-    return res.status(200).json({ success: true, user: publicUser(result.rows[0]) });
+    const apiCredentialsCount = await countApiCredentials(req.user.id);
+    return res.status(200).json({ success: true, user: publicUser(result.rows[0], { apiCredentialsCount }) });
   }),
 
   /**
