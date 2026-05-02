@@ -113,14 +113,6 @@ export default function Scrape() {
   // auto-detect path is kept as a safety net for users who don't know
   // whether their target is admin-only.
   const [hiddenMembers, setHiddenMembers] = useState(false);
-  // v9: per-job toggles for the live monitor.
-  //   * monitorDedupEnabled — when ON, repeat sightings of the same user
-  //     merge into one row and bump message_count. When OFF, every chat
-  //     event inserts a new row so a chatty user can appear N times.
-  //   * monitorBotFilterEnabled — when ON, is_bot=TRUE senders are
-  //     dropped at insert time and never enter the captured set.
-  const [monitorDedupEnabled, setMonitorDedupEnabled] = useState(true);
-  const [monitorBotFilterEnabled, setMonitorBotFilterEnabled] = useState(false);
   const [creatingMonitors, setCreatingMonitors] = useState(false);
   const [, forceTickRender] = useState(0);
 
@@ -403,9 +395,6 @@ export default function Scrape() {
           durationSeconds: periodSeconds,
           reason: t.reason || 'admin_only',
           autoStart: true,
-          // v9: per-job dedup + bot-filter toggles.
-          dedupEnabled: monitorDedupEnabled,
-          botFilterEnabled: monitorBotFilterEnabled,
         });
         started++;
       } catch (err) {
@@ -1012,29 +1001,6 @@ export default function Scrape() {
                               {m.targetTitle || m.targetId}
                             </p>
                             <p className="text-gray-500">{m.targetType}</p>
-                            {/* v9: show the per-job toggle state. Defaults
-                                are dedup ON / bot filter OFF, so we only
-                                surface a badge when the value differs from
-                                the default to keep the row visually quiet
-                                for users who never touched the toggles. */}
-                            <div className="flex flex-wrap gap-1 mt-1">
-                              {m.dedupEnabled === false && (
-                                <span
-                                  className="text-[10px] px-1.5 py-0.5 rounded bg-amber-500/15 text-amber-300 border border-amber-500/30"
-                                  title="Duplicates allowed — every observed message is its own row."
-                                >
-                                  dups: on
-                                </span>
-                              )}
-                              {m.botFilterEnabled === true && (
-                                <span
-                                  className="text-[10px] px-1.5 py-0.5 rounded bg-emerald-500/15 text-emerald-300 border border-emerald-500/30"
-                                  title="Bot filter on — is_bot=true senders are dropped before insert."
-                                >
-                                  bots: filtered
-                                </span>
-                              )}
-                            </div>
                           </td>
                           <td className="py-2 px-3 text-gray-300">{m.sessionIds?.length || 0}</td>
                           <td className="py-2 px-3">
@@ -1362,7 +1328,7 @@ export default function Scrape() {
                   {periodPrompt.adminTargets.length} chat{periodPrompt.adminTargets.length === 1 ? '' : 's'} hide{periodPrompt.adminTargets.length === 1 ? 's' : ''} the participant list from non-admins.
                 </p>
                 <p className="text-xs text-amber-200/80 mt-1">
-                  We can monitor these chats for the period you choose and capture every user who interacts with them. Use the capture options below to control whether the same user is allowed to appear more than once and whether Telegram bots are filtered out. Your sessions stay attached the entire window through the anti-detect proxy system.
+                  We can monitor these chats for the period you choose and capture every distinct user who interacts with them. Duplicates are deduped automatically. Your sessions stay attached the entire window through the anti-detect proxy system.
                 </p>
               </div>
             </div>
@@ -1435,45 +1401,6 @@ export default function Scrape() {
               <p className="text-xs text-gray-500 mt-2">
                 Total: {formatDuration(periodSeconds)} • Sessions attached: {selectedSessions.length || 0}
               </p>
-            </div>
-
-            {/* v9: capture options — dedup + bot filter toggles. */}
-            <div className="rounded-lg border border-white/10 bg-dark-900/40 p-3 space-y-3">
-              <p className="text-xs font-medium text-gray-300">Capture options</p>
-
-              <label className="flex items-start gap-3 cursor-pointer">
-                <input
-                  type="checkbox"
-                  checked={monitorDedupEnabled}
-                  onChange={(e) => setMonitorDedupEnabled(e.target.checked)}
-                  className="mt-0.5 rounded border-white/20 bg-dark-900 text-primary-600"
-                />
-                <span className="text-sm text-gray-200 select-none">
-                  Avoid duplicates
-                  <span className="block text-xs text-gray-500 mt-0.5">
-                    {monitorDedupEnabled
-                      ? 'On — each user appears once; repeat messages bump their message count.'
-                      : 'Off — every observed message is a separate row, so a chatty user appears multiple times. Use this when no user must be missed, even at the cost of duplicates.'}
-                  </span>
-                </span>
-              </label>
-
-              <label className="flex items-start gap-3 cursor-pointer">
-                <input
-                  type="checkbox"
-                  checked={monitorBotFilterEnabled}
-                  onChange={(e) => setMonitorBotFilterEnabled(e.target.checked)}
-                  className="mt-0.5 rounded border-white/20 bg-dark-900 text-primary-600"
-                />
-                <span className="text-sm text-gray-200 select-none">
-                  Filter out bots
-                  <span className="block text-xs text-gray-500 mt-0.5">
-                    {monitorBotFilterEnabled
-                      ? 'On — Telegram bots (is_bot=true) are dropped before they ever land in the list.'
-                      : 'Off — bots are recorded with an is_bot flag; you can filter them visually later.'}
-                  </span>
-                </span>
-              </label>
             </div>
 
             <div className="flex gap-2 justify-end pt-2">

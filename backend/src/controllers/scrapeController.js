@@ -400,9 +400,6 @@ const scrapeController = {
       sessionIds, sessionId, targetId, targetType,
       durationSeconds, durationDays, durationHours, durationMinutes,
       targetTitle, reason, options, autoStart,
-      // v9: per-job toggles. Both are optional; the service applies
-      // legacy defaults (dedup ON, bot filter OFF) when omitted.
-      dedupEnabled, botFilterEnabled,
     } = req.body || {};
 
     const sessions = Array.isArray(sessionIds) && sessionIds.length
@@ -427,8 +424,6 @@ const scrapeController = {
       reason: reason || null,
       options: options || {},
       autoStart: autoStart !== false,
-      dedupEnabled: dedupEnabled !== undefined ? !!dedupEnabled : true,
-      botFilterEnabled: !!botFilterEnabled,
     });
 
     await reportService.logActivity(userId, 'monitor_start', 'scrape_monitor', job.id, {
