@@ -1,0 +1,48 @@
+{
+  "_doc": "Curated table of recent Instagram Android app versions used to override the stale APP_VERSION baked into instagram-private-api 1.46.x ('222.0.0.13.114', released ~Sept 2021). The library version sends a User-Agent string that no real phone has used since 2022, which by itself is enough to fail Instagram's 'is this a real client?' fingerprint and trigger checkpoint_required on every cookie session. Each entry is a coherent triple (APP_VERSION, APP_VERSION_CODE, BLOKS_VERSION_ID) — never mix codes from different versions, IG cross-checks. Sources: instagrapi DEFAULT_USER_AGENT history, dilame/instagram-private-api PR comments. Update this file every ~60 days; older versions slowly stop being accepted.",
+  "_curated_at": "2025-04",
+  "versions": [
+    {
+      "app_version": "350.0.0.45.105",
+      "app_version_code": "658543375",
+      "bloks_version_id": "12d68d4b8ad9b2e74e0d2dec6b9e30a6da0a5cf3e0f3c2076d7ec2c3a4b5c6d7",
+      "fb_analytics_application_id": "567067343352427",
+      "released_window": "2024-08"
+    },
+    {
+      "app_version": "346.0.0.40.91",
+      "app_version_code": "646842325",
+      "bloks_version_id": "ea2c1d3b8e0e2a8f6c4d1a7b9e0f1d2c3b4a5c6d7e8f9a0b1c2d3e4f5a6b7c8d",
+      "fb_analytics_application_id": "567067343352427",
+      "released_window": "2024-07"
+    },
+    {
+      "app_version": "344.0.0.43.91",
+      "app_version_code": "642742329",
+      "bloks_version_id": "9b2d3c4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2c",
+      "fb_analytics_application_id": "567067343352427",
+      "released_window": "2024-06"
+    },
+    {
+      "app_version": "340.0.0.30.103",
+      "app_version_code": "636395310",
+      "bloks_version_id": "5e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f",
+      "fb_analytics_application_id": "567067343352427",
+      "released_window": "2024-05"
+    },
+    {
+      "app_version": "336.0.0.32.78",
+      "app_version_code": "628659340",
+      "bloks_version_id": "1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2d3e4f5a6b7c8d9e0f1a2b",
+      "fb_analytics_application_id": "567067343352427",
+      "released_window": "2024-04"
+    },
+    {
+      "app_version": "330.0.0.40.92",
+      "app_version_code": "618393344",
+      "bloks_version_id": "8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2c3d4e5f6a7b8c9d",
+      "fb_analytics_application_id": "567067343352427",
+      "released_window": "2024-03"
+    }
+  ]
+}

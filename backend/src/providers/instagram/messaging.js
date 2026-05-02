@@ -15,6 +15,8 @@
 const { pool } = require('../../config/database');
 const logger = require('../../utils/logger');
 const igClient = require('./client');
+const sessionLimiter = require('./sessionLimiter');
+const coldStart = require('./coldStart');
 const systemSettings = require('../../services/systemSettingsService');
 
 const PLATFORM = 'instagram';
@@ -235,6 +237,28 @@ async function _executeMessagingJob(jobId) {
 
     for (let tries = 0; tries < sessRows.rows.length && !attempted; tries++) {
       const session = sessRows.rows[(sessionIdx + tries) % sessRows.rows.length];
+
+      // Phase 1.B5: only mobile-API sessions can send DMs through the
+      // current code path. Cookie-uploaded (api_mode='web') sessions
+      // would have to use the GraphQL DM mutation which is not yet
+      // implemented — using `client.entity.directThread` from a web
+      // session reliably trips checkpoint_required. Refuse cleanly
+      // so the operator sees the right error in the UI.
+      const apiMode =
+        (session.platform_state && session.platform_state.api_mode) ||
+        ((session.platform_state && session.platform_state.source === 'browser_cookies')
+          ? 'web' : 'mobile');
+      if (apiMode !== 'mobile') {
+        await _logSend({
+          jobId,
+          sessionId: session.id,
+          targetId: target.user_pk || target.username || null,
+          status: 'failed',
+          error: 'IG DM not supported for cookie-uploaded (web-API) sessions in Phase 1. Use an interactive-login session, or wait for the web GraphQL DM path to ship.',
+        });
+        continue; // try the next session
+      }
+
       const gate = await _checkWarmup(session, dailyCap, hourlyCap);
 
       if (!gate.allowed) {
@@ -252,11 +276,21 @@ async function _executeMessagingJob(jobId) {
 
       attempted = true;
       try {
+        // Phase 1.B8 — cold-start simulation before the very first DM
+        // batch on a fresh process. No-op for already-warmed sessions.
+        await coldStart.runIfCold(session);
+
+        // Phase 1.B7 — write-class token before EVERY DM send. Blocks
+        // until the per-session bucket allows another write (~45s).
+        await sessionLimiter.acquire(session.id, { class: 'write' });
+
         const client = await igClient.getClient(session);
         let recipientPk = null;
         if (target.user_pk) {
           recipientPk = String(target.user_pk);
         } else if (target.username) {
+          // username lookup is a read — separate token class.
+          await sessionLimiter.acquire(session.id, { class: 'read' });
           recipientPk = String(await client.user.getIdByUsername(String(target.username).replace(/^@/, '').toLowerCase()));
         } else {
           throw new Error('target needs username or user_pk');

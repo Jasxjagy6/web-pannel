@@ -37,13 +37,18 @@ function _jitterSleep(minMs = 1500, maxMs = 3000) {
 /**
  * Build a session context object from a session row OR from a raw
  * cookie blob (back-compat — the old API took a `blob` directly).
+ *
+ * Async because `sessionContext` now persists pinned per-session web
+ * fingerprint / locale on first use (Phase 1, B3).
  */
-function _resolveCtx(sessionOrBlob) {
+async function _resolveCtx(sessionOrBlob) {
   if (sessionOrBlob && (sessionOrBlob.id || sessionOrBlob.session_data)) {
     return sessionContext(sessionOrBlob);
   }
-  // Treat as a raw cookie blob (no proxy binding).
-  const { cookieHeaderFromBlob } = require('./igFetch');
+  // Treat as a raw cookie blob (no proxy binding). Use a deterministic
+  // pinned fingerprint based on the blob's ds_user_id so repeated
+  // calls with the same raw blob send the same UA.
+  const { cookieHeaderFromBlob, pickWebFingerprint } = require('./igFetch');
   const { header, csrftoken, dsUserId } = cookieHeaderFromBlob(sessionOrBlob);
   return {
     sessionId: null,
@@ -53,11 +58,14 @@ function _resolveCtx(sessionOrBlob) {
     csrftoken,
     dsUserId,
     blob: sessionOrBlob,
+    webFingerprint: pickWebFingerprint(`raw_${dsUserId || 'anon'}`),
+    locale: { language: 'en_US', timezoneOffset: 0, regionHint: 'US' },
+    apiMode: 'web',
   };
 }
 
 async function getUserIdByUsername(sessionOrBlob, username) {
-  const ctx = _resolveCtx(sessionOrBlob);
+  const ctx = await _resolveCtx(sessionOrBlob);
   if (!ctx.cookieHeader) {
     const e = new Error('Session has no cookies');
     e.statusCode = 401;
@@ -98,7 +106,7 @@ async function* paginateFriendList(sessionOrBlob, targetPk, kind, opts = {}) {
   if (!['followers', 'following'].includes(kind)) {
     throw new Error(`Unsupported kind: ${kind}`);
   }
-  const ctx = _resolveCtx(sessionOrBlob);
+  const ctx = await _resolveCtx(sessionOrBlob);
   if (!ctx.cookieHeader) {
     const e = new Error('Session has no cookies');
     e.statusCode = 401;

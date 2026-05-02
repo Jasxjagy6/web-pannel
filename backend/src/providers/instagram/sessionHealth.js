@@ -140,7 +140,7 @@ async function runHealthCheck(sessionId, opts = {}) {
 
   let ctx;
   try {
-    ctx = sessionContext(session);
+    ctx = await sessionContext(session);
   } catch (err) {
     await _saveWarmupState(
       sessionId,
