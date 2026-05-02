@@ -5,6 +5,8 @@ const messageService = require('../services/messageService');
 const { AppError, asyncHandler } = require('../utils/errorHandler');
 const logger = require('../utils/logger');
 
+function _isInstagram(req) { return req && req.platform === 'instagram'; }
+
 const dashboardController = {
   /**
    * Get comprehensive dashboard statistics for the authenticated user.
@@ -20,7 +22,56 @@ const dashboardController = {
     const userId = req.user.id;
     const period = req.query.period || '7d';
 
-    logger.info(`Dashboard stats requested by user ${userId}`, { period });
+    logger.info(`Dashboard stats requested by user ${userId}`, { period, platform: req.platform });
+
+    // Instagram dashboard: scope all numbers to the IG platform via the
+    // IG provider so TG numbers don't bleed into the IG header KPI cards.
+    if (_isInstagram(req)) {
+      const provider = req.provider;
+      const [igSessionStats, igScrapeStats, recent] = await Promise.all([
+        provider.sessions.getSessionStats(userId),
+        provider.scrape.getStats(userId),
+        reportService.getActivityLog(userId, { page: 1, limit: 10 }),
+      ]);
+      const response = {
+        platform: 'instagram',
+        overview: {
+          sessions: {
+            total: igSessionStats.total || 0,
+            active: igSessionStats.active || 0,
+            loggedIn: igSessionStats.logged_in || 0,
+            banned: igSessionStats.banned || 0,
+          },
+          scraping: {
+            totalJobs: igScrapeStats.total_jobs || 0,
+            completedJobs: igScrapeStats.completed_jobs || 0,
+            failedJobs: igScrapeStats.failed_jobs || 0,
+            activeJobs: igScrapeStats.active_jobs || 0,
+            totalUsersFound: igScrapeStats.total_users_scraped || 0,
+            byTargetType: igScrapeStats.by_target_type || {},
+          },
+        },
+        sessionStats: {
+          total: igSessionStats.total || 0,
+          active: igSessionStats.active || 0,
+          loggedIn: igSessionStats.logged_in || 0,
+          banned: igSessionStats.banned || 0,
+        },
+        scrapeStats: {
+          totalJobs: igScrapeStats.total_jobs || 0,
+          completedJobs: igScrapeStats.completed_jobs || 0,
+          failedJobs: igScrapeStats.failed_jobs || 0,
+          totalUsersScraped: igScrapeStats.total_users_scraped || 0,
+          jobsByType: igScrapeStats.by_target_type || {},
+        },
+        recentActivity: (recent.activities || []).filter(
+          (a) => !a.metadata || !a.metadata.platform || a.metadata.platform === 'instagram'
+        ),
+        generatedAt: new Date().toISOString(),
+        period,
+      };
+      return res.status(200).json({ success: true, data: response });
+    }
 
     // Get the core dashboard stats from report service
     const [

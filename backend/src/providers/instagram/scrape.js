@@ -264,6 +264,56 @@ async function getJob(jobId, userId) {
   return r.rows[0] || null;
 }
 
+async function getStats(userId) {
+  const r = await pool.query(
+    `SELECT
+        COUNT(*)::int AS total_jobs,
+        SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END)::int AS completed_jobs,
+        SUM(CASE WHEN status = 'failed'    THEN 1 ELSE 0 END)::int AS failed_jobs,
+        SUM(CASE WHEN status IN ('pending', 'running') THEN 1 ELSE 0 END)::int AS active_jobs,
+        COALESCE(SUM(total_found), 0)::int AS total_users_scraped
+       FROM scraping_jobs
+      WHERE user_id = $1 AND platform = 'instagram'`,
+    [userId]
+  );
+  const byType = await pool.query(
+    `SELECT target_type, COUNT(*)::int AS count
+       FROM scraping_jobs
+      WHERE user_id = $1 AND platform = 'instagram'
+      GROUP BY target_type`,
+    [userId]
+  );
+  const stats = r.rows[0] || {};
+  stats.by_target_type = {};
+  for (const row of byType.rows) {
+    stats.by_target_type[row.target_type] = row.count;
+  }
+  return stats;
+}
+
+async function getProgress(jobId, userId) {
+  const job = await getJob(jobId, userId);
+  if (!job) {
+    const e = new Error('Job not found');
+    e.statusCode = 404;
+    throw e;
+  }
+  const limit = Number(job.options?.limit || 1000);
+  const totalFound = job.total_found || 0;
+  return {
+    jobId: job.id,
+    status: job.status,
+    totalFound,
+    limit,
+    progress: job.progress != null ? Number(job.progress) : (
+      limit > 0 ? Math.min(100, Math.floor((totalFound / limit) * 100)) : 0
+    ),
+    error: job.error_message || null,
+    startedAt: job.created_at,
+    completedAt: job.completed_at,
+  };
+}
+
 async function cancelJob(jobId, userId) {
   const job = await getJob(jobId, userId);
   if (!job) {
@@ -284,6 +334,7 @@ module.exports = {
   startMembersScrape: createScrapeJob,
   startMessagesScrape: () => { throw new Error('Recent messages scrape is TG-only'); },
   createScrapeJob,
+  createJob: createScrapeJob,
   _executeScrapeJob,
   listJobs,
   list: listJobs,
@@ -291,4 +342,7 @@ module.exports = {
   getJob,
   cancelJob,
   cancel: cancelJob,
+  getStats,
+  stats: getStats,
+  getProgress,
 };

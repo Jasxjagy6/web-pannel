@@ -14,6 +14,13 @@ export const unbanUser = (id) => api.post(`/admin/users/${id}/unban`);
 export const setSubscription = (id, payload) =>
   api.put(`/admin/users/${id}/subscription`, payload);
 
+// Per-platform subscription editor (used by the multi-platform admin UI).
+export const listUserPlatformSubscriptions = (id) =>
+  api.get(`/admin/users/${id}/subscriptions`);
+
+export const setUserPlatformSubscription = (id, platform, payload) =>
+  api.put(`/admin/users/${id}/subscriptions/${platform}`, payload);
+
 // ---------------------------------------------------------------------
 // Billing — admin endpoints
 // ---------------------------------------------------------------------

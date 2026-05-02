@@ -270,6 +270,89 @@ const adminController = {
   }),
 
   /**
+   * GET /api/admin/users/:id/subscriptions
+   *
+   * Return all per-platform subscriptions for a user, plus a default
+   * row for any platform the user doesn't have a row in yet.
+   */
+  listUserSubscriptions: asyncHandler(async (req, res) => {
+    const userId = parseInt(req.params.id, 10);
+    if (!Number.isFinite(userId)) throw new AppError('Invalid user id', 400, 'BAD_ID');
+
+    const r = await pool.query(
+      `SELECT id, user_id, platform, plan, status, expires_at, features,
+              trial_started_at, trial_expires_at, trial_used,
+              created_at, updated_at
+         FROM user_subscriptions
+        WHERE user_id = $1
+        ORDER BY platform`,
+      [userId]
+    );
+
+    const byPlatform = {};
+    for (const row of r.rows) byPlatform[row.platform] = row;
+
+    const platforms = ['telegram', 'instagram'];
+    const subs = platforms.map((p) => byPlatform[p] || {
+      user_id: userId, platform: p, plan: null, status: 'inactive',
+      expires_at: null, features: {}, trial_used: false,
+    });
+
+    return res.status(200).json({ success: true, subscriptions: subs });
+  }),
+
+  /**
+   * PUT /api/admin/users/:id/subscriptions/:platform
+   *
+   * Upsert one platform's subscription row.
+   * Body: { plan, status, expiresAt, features }
+   */
+  setUserPlatformSubscription: asyncHandler(async (req, res) => {
+    const userId = parseInt(req.params.id, 10);
+    const platform = String(req.params.platform || '').toLowerCase();
+    if (!Number.isFinite(userId)) throw new AppError('Invalid user id', 400, 'BAD_ID');
+    if (!['telegram', 'instagram'].includes(platform)) {
+      throw new AppError('Invalid platform', 400, 'BAD_PLATFORM');
+    }
+    const { plan, status, expiresAt, features } = req.body || {};
+    if (plan != null && typeof plan === 'string' && !VALID_PLANS.has(plan)) {
+      throw new AppError('Invalid plan', 400, 'BAD_PLAN');
+    }
+    if (status != null && !['inactive', 'active', 'expired', 'cancelled'].includes(status)) {
+      throw new AppError('Invalid subscription status', 400, 'BAD_STATUS');
+    }
+    let expiresIso = null;
+    if (expiresAt) {
+      const d = new Date(expiresAt);
+      if (Number.isNaN(d.getTime())) throw new AppError('Invalid expiresAt', 400, 'BAD_DATE');
+      expiresIso = d.toISOString();
+    }
+
+    const featObj = (features && typeof features === 'object') ? features : {};
+
+    const result = await pool.query(
+      `INSERT INTO user_subscriptions
+         (user_id, platform, plan, status, expires_at, features, created_at, updated_at)
+       VALUES ($1, $2::platform_type, $3, $4, $5, $6::jsonb, NOW(), NOW())
+       ON CONFLICT (user_id, platform) DO UPDATE
+         SET plan        = EXCLUDED.plan,
+             status      = EXCLUDED.status,
+             expires_at  = EXCLUDED.expires_at,
+             features    = EXCLUDED.features,
+             updated_at  = NOW()
+       RETURNING id, user_id, platform, plan, status, expires_at, features,
+                 trial_started_at, trial_expires_at, trial_used, created_at, updated_at`,
+      [userId, platform, plan || null, status || 'inactive', expiresIso, JSON.stringify(featObj)]
+    );
+
+    await recordAdminAction(req.user.id, userId, 'subscription_update', {
+      platform, plan, status, expiresAt, features,
+    });
+
+    return res.status(200).json({ success: true, subscription: result.rows[0] });
+  }),
+
+  /**
    * DELETE /api/admin/users/:id
    *
    * Hard-delete: cascades to sessions, jobs etc. via FK.

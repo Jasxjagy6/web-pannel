@@ -18,6 +18,12 @@ router.post('/users/:id/ban', ctrl.banUser);
 router.post('/users/:id/unban', ctrl.unbanUser);
 router.put('/users/:id/subscription', ctrl.setSubscription);
 
+// Per-platform subscription editor (used by the multi-platform admin UI).
+// GET returns one row per platform (creates synthetic 'inactive' rows for
+// platforms the user has no record on yet); PUT upserts a single platform.
+router.get('/users/:id/subscriptions', ctrl.listUserSubscriptions);
+router.put('/users/:id/subscriptions/:platform', ctrl.setUserPlatformSubscription);
+
 // ---------------------------------------------------------------------
 // Billing admin endpoints
 // ---------------------------------------------------------------------

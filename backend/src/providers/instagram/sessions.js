@@ -178,9 +178,103 @@ async function deleteSession(sessionId, userId) {
     throw e;
   }
   igClient.releaseClient(sessionId);
-  await pool.query(`DELETE FROM sessions WHERE id = $1 AND user_id = $2`, [sessionId, userId]);
+  await pool.query(
+    `DELETE FROM sessions WHERE id = $1 AND user_id = $2 AND platform = 'instagram'`,
+    [sessionId, userId]
+  );
   logger.info(`IG.delete session=${sessionId} user=${userId}`);
-  return { id: sessionId, deleted: true };
+  return { id: sessionId, sessionId, deleted: true };
+}
+
+async function bulkDelete(sessionIds, userId) {
+  const results = [];
+  let successful = 0;
+  let failed = 0;
+  for (const id of sessionIds || []) {
+    try {
+      await deleteSession(id, userId);
+      results.push({ sessionId: id, success: true });
+      successful += 1;
+    } catch (err) {
+      results.push({ sessionId: id, success: false, error: err.message });
+      failed += 1;
+    }
+  }
+  return {
+    total: results.length,
+    successful,
+    failed,
+    results,
+  };
+}
+
+/**
+ * Re-attach a previously-uploaded IG session to the in-memory client
+ * pool and confirm the cookies are still valid by pinging the
+ * `accounts/current_user` endpoint. If the cookies have been
+ * invalidated by Instagram (e.g. password change, checkpoint), the
+ * row is marked status='expired' and the operator is told to
+ * recreate the session via the Create Session wizard.
+ */
+async function login(sessionId, userId) {
+  const session = await get(sessionId, userId);
+  if (!session) {
+    const e = new Error('Session not found');
+    e.statusCode = 404;
+    throw e;
+  }
+  const fullRow = await pool.query(
+    `SELECT id, user_id, platform, username, proxy_url, session_data
+       FROM sessions WHERE id = $1 AND user_id = $2 AND platform = 'instagram'`,
+    [sessionId, userId]
+  );
+  const row = fullRow.rows[0];
+  if (!row || !row.session_data) {
+    const e = new Error(
+      'No stored Instagram session blob — please re-create this session via the Create Session wizard.'
+    );
+    e.statusCode = 400;
+    throw e;
+  }
+  try {
+    const client = await igClient.getClient(row);
+    const probe = await igClient.ping(client);
+    if (!probe.ok) {
+      await pool.query(
+        `UPDATE sessions SET is_logged_in = FALSE, status = 'expired', updated_at = NOW() WHERE id = $1`,
+        [sessionId]
+      );
+      const e = new Error(
+        `Instagram session is no longer valid (${probe.error || 'cookies expired'}) — please re-create.`
+      );
+      e.statusCode = 410;
+      throw e;
+    }
+    await pool.query(
+      `UPDATE sessions
+          SET is_logged_in = TRUE,
+              status = 'active',
+              last_login = NOW(),
+              last_used = NOW(),
+              updated_at = NOW()
+        WHERE id = $1`,
+      [sessionId]
+    );
+    logger.info(`IG.login session=${sessionId} user=${userId} ok`);
+    return {
+      sessionId,
+      status: 'active',
+      accountInfo: {
+        username: row.username,
+        platform: 'instagram',
+      },
+    };
+  } catch (err) {
+    if (err.statusCode) throw err;
+    const e = new Error(`IG re-attach failed: ${err.message}`);
+    e.statusCode = 500;
+    throw e;
+  }
 }
 
 async function logoutSession(sessionId, userId) {
@@ -357,11 +451,18 @@ module.exports = {
   listSessions,
   list: listSessions,    // alias matching telegram facade
   get,
+  getById: get,          // alias for the controller's getSessionById call shape
   delete: deleteSession,
   deleteSession,
+  bulkDelete,
+  bulkDeleteSessions: bulkDelete,
+  login,
+  loginSession: login,
   logoutSession,
   logout: logoutSession,
   status,
+  getSessionStatus: status,
+  checkSessionStatus: status,
   download,
   stats: getSessionStats,
   getSessionStats,

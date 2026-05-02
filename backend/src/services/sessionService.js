@@ -1060,12 +1060,14 @@ class SessionService {
   async getSessionById(sessionId, userId) {
     logger.info(`Fetching session by ID`, { sessionId, userId });
 
+    // Scoped to platform = 'telegram' so /api/sessions/:id (legacy) and
+    // /api/telegram/sessions/:id never accidentally return an IG row.
     const result = await pool.query(
       `SELECT id, user_id, phone, session_file_path, api_id, api_hash,
               status, is_2fa_enabled, is_logged_in, account_info,
               created_at, last_active
        FROM sessions
-       WHERE id = $1 AND user_id = $2`,
+       WHERE id = $1 AND user_id = $2 AND platform = 'telegram'`,
       [sessionId, userId]
     );
 
@@ -1106,8 +1108,8 @@ class SessionService {
    *   pagination: { currentPage, pageSize, totalPages, total, hasNext, hasPrev }
    * }>}
    */
-  async listSessions(userId, { page = 1, limit = 20, sort = 'created_at', order = 'DESC', filter } = {}) {
-    logger.info(`Listing sessions for user ${userId}`, { page, limit, sort, order, filter });
+  async listSessions(userId, { page = 1, limit = 20, sort = 'created_at', order = 'DESC', filter, platform } = {}) {
+    logger.info(`Listing sessions for user ${userId}`, { page, limit, sort, order, filter, platform });
 
     const { applyPagination, applySorting } = require('../utils/pagination');
 
@@ -1115,9 +1117,21 @@ class SessionService {
     const { field: sortField, order: sortOrder } = applySorting(sort, order, validSortFields);
     const { offset, limit: pageSize } = applyPagination(null, page, limit);
 
+    // Hard-scope to a single platform when requested. Legacy callers
+    // (no platform argument) keep their previous Telegram-only behaviour
+    // because every TG row has platform='telegram' by default.
     const queryConditions = ['user_id = $1'];
     const queryParams = [userId];
     let paramIndex = 2;
+    if (platform === 'telegram' || platform === 'instagram') {
+      queryConditions.push(`platform = $${paramIndex}`);
+      queryParams.push(platform);
+      paramIndex++;
+    } else {
+      // No platform forced — default to Telegram so /api/sessions never
+      // surfaces an Instagram row in the legacy Telegram-only UI.
+      queryConditions.push("platform = 'telegram'");
+    }
 
     if (filter && filter !== 'all') {
       if (VALID_STATUSES.includes(filter)) {
@@ -1204,10 +1218,11 @@ class SessionService {
     try {
       await client.query('BEGIN');
 
-      // Fetch the session
+      // Fetch the session — scoped to platform='telegram' so this
+      // service can never accidentally delete an Instagram row.
       const sessionResult = await client.query(
         `SELECT id, user_id, session_file_path, status, is_logged_in
-         FROM sessions WHERE id = $1 AND user_id = $2 FOR UPDATE`,
+         FROM sessions WHERE id = $1 AND user_id = $2 AND platform = 'telegram' FOR UPDATE`,
         [sessionId, userId]
       );
 
@@ -1361,7 +1376,7 @@ class SessionService {
       const sessionResult = await client.query(
         `SELECT id, user_id, session_file_path, api_id, api_hash, status,
                 is_logged_in, account_info
-         FROM sessions WHERE id = $1 AND user_id = $2 FOR UPDATE`,
+         FROM sessions WHERE id = $1 AND user_id = $2 AND platform = 'telegram' FOR UPDATE`,
         [sessionId, userId]
       );
 
@@ -1655,7 +1670,7 @@ class SessionService {
 
       const sessionResult = await client.query(
         `SELECT id, user_id, is_logged_in
-         FROM sessions WHERE id = $1 AND user_id = $2 FOR UPDATE`,
+         FROM sessions WHERE id = $1 AND user_id = $2 AND platform = 'telegram' FOR UPDATE`,
         [sessionId, userId]
       );
 
@@ -1871,8 +1886,10 @@ class SessionService {
     logger.info(`Fetching session stats for user ${userId}`);
 
     // Overall count
+    // Stats are scoped to platform='telegram' to match the rest of
+    // sessionService — IG stats live in the IG provider.
     const totalResult = await pool.query(
-      'SELECT COUNT(*) as total FROM sessions WHERE user_id = $1',
+      "SELECT COUNT(*) as total FROM sessions WHERE user_id = $1 AND platform = 'telegram'",
       [userId]
     );
     const total = parseInt(totalResult.rows[0].total, 10);
@@ -1881,7 +1898,7 @@ class SessionService {
     const statusResult = await pool.query(
       `SELECT status, COUNT(*) as count
        FROM sessions
-       WHERE user_id = $1
+       WHERE user_id = $1 AND platform = 'telegram'
        GROUP BY status`,
       [userId]
     );
@@ -1895,7 +1912,7 @@ class SessionService {
          COUNT(*) FILTER (WHERE is_2fa_enabled = false) as without_2fa,
          MAX(last_active) as last_active
        FROM sessions
-       WHERE user_id = $1`,
+       WHERE user_id = $1 AND platform = 'telegram'`,
       [userId]
     );
 
