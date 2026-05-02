@@ -92,12 +92,18 @@ const billingController = {
       [req.user.id]
     );
     const row = r.rows[0];
-    const ent = await subscriptionService.entitlementFor(row);
+    const platform = _resolvePlatform(req);
+    // Load per-platform subscriptions so the snapshot exposes the
+    // user_subscriptions table state (admin-managed IG trials, etc),
+    // not just the legacy users.subscription_* columns.
+    const subs = await subscriptionService.loadSubscriptions(row.id);
+    const ent = await subscriptionService.entitlementFor(row, platform);
     res.json({
       success: true,
       data: {
-        user: subscriptionService.userPublicSnapshot(row),
-        entitlement: ent,
+        user: subscriptionService.userPublicSnapshot(row, subs),
+        entitlement: { ...ent, platform },
+        platform,
         config: await settingsService.getBillingConfig(),
       },
     });

@@ -1,4 +1,5 @@
 import { lazy, Suspense } from 'react';
+import InstagramRouteFallback from '../../components/instagram/InstagramRouteFallback';
 import { MessageCircle } from 'lucide-react';
 import InstagramFeatureShell from '../../components/instagram/InstagramFeatureShell';
 
@@ -11,7 +12,7 @@ export default function InstagramMessaging() {
       title="Direct messages"
       subtitle="Bulk DM campaigns from your Instagram accounts. Use lists from the Saved lists page."
     >
-      <Suspense fallback={<div className="text-sm text-pink-500">Loading messaging…</div>}>
+      <Suspense fallback={<InstagramRouteFallback label="Loading" />}>
         <MessagingShared />
       </Suspense>
     </InstagramFeatureShell>

@@ -1,4 +1,5 @@
 import { lazy, Suspense } from 'react';
+import InstagramRouteFallback from '../../components/instagram/InstagramRouteFallback';
 import { UserCog } from 'lucide-react';
 import InstagramFeatureShell from '../../components/instagram/InstagramFeatureShell';
 
@@ -11,7 +12,7 @@ export default function InstagramAccountSettings() {
       title="Account settings"
       subtitle="Update your panel email, password, and notification preferences."
     >
-      <Suspense fallback={<div className="text-sm text-pink-500">Loading account settings…</div>}>
+      <Suspense fallback={<InstagramRouteFallback label="Loading" />}>
         <AccountSettingsShared />
       </Suspense>
     </InstagramFeatureShell>

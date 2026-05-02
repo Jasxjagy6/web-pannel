@@ -4,7 +4,7 @@ import { AuthProvider } from './context/AuthContext';
 import { PlatformProvider, PLATFORMS, DEFAULT_PLATFORM, PLATFORM_FEATURE_FLAG_KEY } from './context/PlatformContext';
 import { ToastContainer } from './components/common/Toast';
 import MissingApiCredsModal from './components/common/MissingApiCredsModal';
-import RouteFallback from './components/common/RouteFallback';
+import PlatformRouteFallback from './components/common/PlatformRouteFallback';
 import { useAuth } from './hooks/useAuth';
 import Layout from './components/layout/Layout';
 import InstagramLayout from './components/instagram/InstagramLayout';
@@ -55,6 +55,7 @@ const InstagramChange2FA       = lazy(() => import('./pages/instagram/Change2FA'
 const InstagramSettings        = lazy(() => import('./pages/instagram/Settings'));
 const InstagramBilling         = lazy(() => import('./pages/instagram/Billing'));
 const InstagramMessaging       = lazy(() => import('./pages/instagram/Messaging'));
+const InstagramAdmin           = lazy(() => import('./pages/instagram/Admin'));
 
 /**
  * Picks the right page component based on the active panel platform.
@@ -68,6 +69,19 @@ function PlatformPage({ tg: TgComponent, ig: IgComponent }) {
   const { platform } = useParams();
   if (platform === 'instagram' && IgComponent) return <IgComponent />;
   return <TgComponent />;
+}
+
+/**
+ * The Instagram admin panel only makes sense under /instagram/admin.
+ * If an admin hits /telegram/admin we redirect them to the Telegram
+ * admin (top-level /admin), which is the historic Telegram-themed
+ * page. Keeps both admins reachable but visually scoped to their
+ * platform.
+ */
+function InstagramAdminGuard() {
+  const { platform } = useParams();
+  if (platform !== 'instagram') return <Navigate to="/admin" replace />;
+  return <InstagramAdmin />;
 }
 
 /**
@@ -184,12 +198,16 @@ function PendingGate() {
 function HomeRedirect() {
   const { isAuthenticated, isAdmin, user } = useAuth();
   if (!isAuthenticated) return <Navigate to="/login" replace />;
-  if (isAdmin) return <Navigate to="/admin" replace />;
   let platform = DEFAULT_PLATFORM;
   try {
     const stored = localStorage.getItem('panel_platform');
     if (stored && PLATFORMS.includes(stored) && isPlatformAvailable(stored)) platform = stored;
   } catch (_) { /* SSR / private mode */ }
+  if (isAdmin) {
+    return platform === 'instagram'
+      ? <Navigate to="/instagram/admin" replace />
+      : <Navigate to="/admin" replace />;
+  }
 
   if (user?.status === 'approved' && user?.isApproved) {
     return hasEntitlement(user, platform)
@@ -226,9 +244,19 @@ function PlatformRoutes() {
       <Route path="create-session" element={<ProtectedRoute title="Create Session"><PlatformPage tg={CreateSession} ig={InstagramCreateSession} /></ProtectedRoute>} />
       <Route path="upload-session" element={<ProtectedRoute title="Upload Session"><PlatformPage tg={Sessions} ig={InstagramUploadSession} /></ProtectedRoute>} />
       <Route path="scrape" element={<ProtectedRoute title="Scrape"><PlatformPage tg={Scrape} ig={InstagramScrape} /></ProtectedRoute>} />
+      {/* Messaging / Groups / Threads are Telegram-only features. They
+          stay routable under /telegram/* but are hidden from the IG
+          panel sidebar (and IG-side use of these URLs falls back to
+          the Telegram implementation, since the IG wrapper exists for
+          backwards-compat only — the IG panel UI doesn't expose them). */}
       <Route path="messaging" element={<ProtectedRoute title="Messaging"><PlatformPage tg={Messaging} ig={InstagramMessaging} /></ProtectedRoute>} />
       <Route path="groups" element={<ProtectedRoute title="Groups"><Groups /></ProtectedRoute>} />
       <Route path="threads" element={<ProtectedRoute title="Threads"><Threads /></ProtectedRoute>} />
+      {/* Instagram-only admin panel. Mounted under /:platform/admin so
+          it picks up the InstagramLayout chrome. PlatformGate +
+          ProtectedRoute(requireAdmin) ensure only admins can reach it
+          and only via /instagram/admin. */}
+      <Route path="admin" element={<ProtectedRoute title="Instagram Admin" requireAdmin allowWithoutSubscription><InstagramAdminGuard /></ProtectedRoute>} />
       <Route path="lists" element={<ProtectedRoute title="Lists"><PlatformPage tg={Lists} ig={InstagramLists} /></ProtectedRoute>} />
       <Route path="reports" element={<ProtectedRoute title="Reports"><PlatformPage tg={Reports} ig={InstagramReports} /></ProtectedRoute>} />
       <Route path="account-settings" element={<ProtectedRoute title="Account Settings"><PlatformPage tg={AccountSettings} ig={InstagramAccountSettings} /></ProtectedRoute>} />
@@ -251,7 +279,7 @@ export default function App() {
           <ToastContainer />
           <MissingApiCredsModal />
           <PanelSwitchOverlay />
-          <Suspense fallback={<RouteFallback />}>
+          <Suspense fallback={<PlatformRouteFallback />}>
             <Routes>
               <Route path="/login" element={<Login />} />
               <Route path="/register" element={<Register />} />

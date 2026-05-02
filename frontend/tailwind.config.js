@@ -1,6 +1,12 @@
 /** @type {import('tailwindcss').Config} */
 export default {
   content: ['./index.html', './src/**/*.{js,ts,jsx,tsx}'],
+  // Enable Tailwind's `dark:` variant on the Instagram panel only.
+  // The Telegram panel uses explicit `dark-*` color classes
+  // (bg-dark-950, etc.) and never relies on `dark:`, so this scoping
+  // doesn't affect it. Instagram pages are always rendered against an
+  // obsidian background regardless of the user's OS color scheme.
+  darkMode: ['selector', 'html[data-platform="instagram"]'],
   theme: {
     extend: {
       colors: {

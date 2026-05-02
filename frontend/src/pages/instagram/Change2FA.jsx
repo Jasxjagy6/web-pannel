@@ -1,4 +1,5 @@
 import { lazy, Suspense } from 'react';
+import InstagramRouteFallback from '../../components/instagram/InstagramRouteFallback';
 import { ShieldCheck } from 'lucide-react';
 import InstagramFeatureShell from '../../components/instagram/InstagramFeatureShell';
 
@@ -11,7 +12,7 @@ export default function InstagramChange2FA() {
       title="Two-factor authentication"
       subtitle="Enroll, rotate, or disable 2FA on your panel account."
     >
-      <Suspense fallback={<div className="text-sm text-pink-500">Loading 2FA settings…</div>}>
+      <Suspense fallback={<InstagramRouteFallback label="Loading" />}>
         <Change2FAShared />
       </Suspense>
     </InstagramFeatureShell>

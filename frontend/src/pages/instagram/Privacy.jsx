@@ -1,4 +1,5 @@
 import { lazy, Suspense } from 'react';
+import InstagramRouteFallback from '../../components/instagram/InstagramRouteFallback';
 import { Shield } from 'lucide-react';
 import InstagramFeatureShell from '../../components/instagram/InstagramFeatureShell';
 
@@ -11,7 +12,7 @@ export default function InstagramPrivacy() {
       title="Privacy"
       subtitle="Control which data the panel keeps, exports, and erases for your Instagram accounts."
     >
-      <Suspense fallback={<div className="text-sm text-pink-500">Loading privacy controls…</div>}>
+      <Suspense fallback={<InstagramRouteFallback label="Loading" />}>
         <PrivacyShared />
       </Suspense>
     </InstagramFeatureShell>
