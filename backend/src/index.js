@@ -33,6 +33,7 @@ const adminRoutes = require('./routes/admin');
 const billingRoutes = require('./routes/billing');
 const userCredentialsRoutes = require('./routes/userCredentials');
 const billingController = require('./controllers/billingController');
+const { parsePlatform, resolvePlatform } = require('./middleware/platform');
 
 const app = express();
 const server = http.createServer(app);
@@ -120,23 +121,54 @@ app.get('/health', (req, res) => {
 });
 
 // API Routes
+//
+// Multi-platform mounting strategy (§4.6 of INSTAGRAM_PANEL_ARCHITECTURE.md):
+//
+//   Per-account routers (sessions, scrape, messages, groups, lists, reports,
+//   dashboard, account-settings, 2fa-jobs, otp, proxies, anti-detect, privacy)
+//   are mounted THREE times:
+//
+//     /api/telegram/<router>   parsePlatform('telegram')   ← Telegram panel
+//     /api/instagram/<router>  parsePlatform('instagram')  ← Instagram panel
+//     /api/<router>            resolvePlatform              ← legacy alias kept
+//                                                           for one release;
+//                                                           defaults to telegram
+//
+//   Global routers (auth, billing, admin, user-credentials) are mounted ONCE
+//   without a platform prefix; they accept ?platform= or X-Platform: <p> for
+//   the few endpoints that need to know which platform the user is asking
+//   about (e.g. /billing/checkout, /billing/status, /billing/invoices).
 const apiPrefix = process.env.API_PREFIX || '/api';
+
+const PLATFORM_ROUTERS = [
+  ['/sessions',         sessionRoutes],
+  ['/scrape',           scrapeRoutes],
+  ['/messages',         messageRoutes],
+  ['/groups',           groupRoutes],
+  ['/lists',            listRoutes],
+  ['/reports',          reportRoutes],
+  ['/dashboard',        dashboardRoutes],
+  ['/account-settings', accountSettingsRoutes],
+  ['/2fa-jobs',         twoFAJobsRoutes],
+  ['/otp',              otpRoutes],
+  ['/proxies',          proxyRoutes],
+  ['/anti-detect',      antiDetectRoutes],
+  ['/privacy',          privacyRoutes],
+];
+
+for (const [mountPath, router] of PLATFORM_ROUTERS) {
+  app.use(`${apiPrefix}/telegram${mountPath}`,  parsePlatform('telegram'),  router);
+  app.use(`${apiPrefix}/instagram${mountPath}`, parsePlatform('instagram'), router);
+  // Legacy alias — kept for one release cycle. resolvePlatform reads
+  // X-Platform / ?platform= / body.platform so a forward-thinking client
+  // can opt in by header without changing URL.
+  app.use(`${apiPrefix}${mountPath}`, resolvePlatform, router);
+}
+
+// Global, platform-agnostic routers.
 app.use(`${apiPrefix}/auth`, authRoutes);
-app.use(`${apiPrefix}/sessions`, sessionRoutes);
-app.use(`${apiPrefix}/scrape`, scrapeRoutes);
-app.use(`${apiPrefix}/messages`, messageRoutes);
-app.use(`${apiPrefix}/groups`, groupRoutes);
-app.use(`${apiPrefix}/lists`, listRoutes);
-app.use(`${apiPrefix}/reports`, reportRoutes);
-app.use(`${apiPrefix}/dashboard`, dashboardRoutes);
-app.use(`${apiPrefix}/account-settings`, accountSettingsRoutes);
-app.use(`${apiPrefix}/2fa-jobs`, twoFAJobsRoutes);
-app.use(`${apiPrefix}/otp`, otpRoutes);
-app.use(`${apiPrefix}/proxies`, proxyRoutes);
-app.use(`${apiPrefix}/anti-detect`, antiDetectRoutes);
-app.use(`${apiPrefix}/privacy`, privacyRoutes);
 app.use(`${apiPrefix}/admin`, adminRoutes);
-app.use(`${apiPrefix}/billing`, billingRoutes);
+app.use(`${apiPrefix}/billing`, resolvePlatform, billingRoutes);
 app.use(`${apiPrefix}/user-credentials`, userCredentialsRoutes);
 
 // 404 handler
