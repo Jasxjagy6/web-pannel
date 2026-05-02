@@ -83,6 +83,15 @@ export function useToast() {
   const showError = useCallback((message, title) => addToast({ message, title, type: 'error' }), [addToast]);
   const showWarning = useCallback((message, title) => addToast({ message, title, type: 'warning' }), [addToast]);
   const showInfo = useCallback((message, title) => addToast({ message, title, type: 'info' }), [addToast]);
+  // Generic `showToast(message, type)` overload — several pages use it
+  // because the standalone helper functions (`showSuccess` etc.) made
+  // call sites split a "success/error" branch into two separate calls.
+  // Pass it explicitly so the IG upload / IG scrape pages don't crash
+  // with "showToast is not a function".
+  const showToast = useCallback(
+    (message, type = 'info', title) => addToast({ message, title, type }),
+    [addToast]
+  );
 
   return useMemo(() => ({
     addToast,
@@ -91,11 +100,13 @@ export function useToast() {
     showError,
     showWarning,
     showInfo,
+    showToast,
     success: showSuccess,
     error: showError,
     warning: showWarning,
     info: showInfo,
-  }), [addToast, removeToast, showSuccess, showError, showWarning, showInfo]);
+    toast: showToast,
+  }), [addToast, removeToast, showSuccess, showError, showWarning, showInfo, showToast]);
 }
 
 function ToastItem({ toast, onRemove }) {

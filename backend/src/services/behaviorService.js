@@ -380,12 +380,16 @@ class BehaviorService {
   async _pickEligible(batchSize) {
     // Prefer sessions that haven't been touched recently. Order by
     // last_warmup_at ascending so we cycle fairly through the pool.
+    // BehaviorService is Telegram-specific (uses GramJS warm-up
+    // primitives + the TG-only _loadSessionFromDB), so filter to
+    // platform='telegram' here so IG sessions never get picked up.
     const r = await pool.query(
       `SELECT id, user_id, phone, is_logged_in, created_at, last_warmup_at,
               device_identity, bound_proxy_id
          FROM sessions
         WHERE is_logged_in = TRUE
           AND COALESCE(keep_alive, TRUE) = TRUE
+          AND platform = 'telegram'
           AND (last_warmup_at IS NULL OR last_warmup_at < NOW() - ($1::int * INTERVAL '1 millisecond'))
         ORDER BY COALESCE(last_warmup_at, TIMESTAMP 'epoch') ASC, id ASC
         LIMIT $2`,

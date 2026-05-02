@@ -5,3 +5,4 @@ node_modules/
 logs/
 uploads/
 dist/
+frontend/package-lock.json
