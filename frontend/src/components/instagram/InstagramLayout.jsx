@@ -36,6 +36,7 @@ import {
   Send,
   Camera,
   Sparkles,
+  Upload,
 } from 'lucide-react';
 import { useAuth } from '@/hooks/useAuth';
 import { usePlatform, useCapabilities } from '../../context/PlatformContext';
@@ -44,6 +45,7 @@ const IG_NAV = [
   { path: 'dashboard',         label: 'Dashboard',     icon: LayoutDashboard, capability: null,                section: 'main' },
   { path: 'sessions',          label: 'Accounts',      icon: Users,           capability: 'sessions_list',     section: 'main' },
   { path: 'create-session',    label: 'Add account',   icon: UserPlus,        capability: 'sessions_create',   section: 'main' },
+  { path: 'upload-session',    label: 'Upload session',icon: Upload,          capability: 'sessions_create',   section: 'main' },
   { path: 'scrape',            label: 'Scraping',      icon: Search,          capability: 'scrape_any',        section: 'main' },
   { path: 'messaging',         label: 'Direct messages', icon: MessageCircle, capability: 'messaging_bulk',    section: 'engage' },
   { path: 'lists',             label: 'Saved lists',   icon: ListIcon,        capability: 'lists',             section: 'engage' },

@@ -43,6 +43,7 @@ const Billing = lazy(() => import('./pages/Billing'));
 const InstagramDashboard       = lazy(() => import('./pages/instagram/Dashboard'));
 const InstagramSessions        = lazy(() => import('./pages/instagram/Sessions'));
 const InstagramCreateSession   = lazy(() => import('./pages/instagram/CreateSession'));
+const InstagramUploadSession   = lazy(() => import('./pages/instagram/UploadSession'));
 const InstagramScrape          = lazy(() => import('./pages/instagram/Scrape'));
 const InstagramLists           = lazy(() => import('./pages/instagram/Lists'));
 const InstagramReports         = lazy(() => import('./pages/instagram/Reports'));
@@ -223,6 +224,7 @@ function PlatformRoutes() {
       <Route path="dashboard" element={<ProtectedRoute title="Dashboard"><PlatformPage tg={Dashboard} ig={InstagramDashboard} /></ProtectedRoute>} />
       <Route path="sessions" element={<ProtectedRoute title="Sessions"><PlatformPage tg={Sessions} ig={InstagramSessions} /></ProtectedRoute>} />
       <Route path="create-session" element={<ProtectedRoute title="Create Session"><PlatformPage tg={CreateSession} ig={InstagramCreateSession} /></ProtectedRoute>} />
+      <Route path="upload-session" element={<ProtectedRoute title="Upload Session"><PlatformPage tg={Sessions} ig={InstagramUploadSession} /></ProtectedRoute>} />
       <Route path="scrape" element={<ProtectedRoute title="Scrape"><PlatformPage tg={Scrape} ig={InstagramScrape} /></ProtectedRoute>} />
       <Route path="messaging" element={<ProtectedRoute title="Messaging"><PlatformPage tg={Messaging} ig={InstagramMessaging} /></ProtectedRoute>} />
       <Route path="groups" element={<ProtectedRoute title="Groups"><Groups /></ProtectedRoute>} />
