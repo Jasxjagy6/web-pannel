@@ -1,0 +1,73 @@
+/* -----------------------------------------------------------------------------
+ * Per-platform brand tokens.
+ *
+ * Each platform sets a small set of CSS variables on html[data-platform=…].
+ * Tailwind utilities (see tailwind.config.js: colors.brand.*) read from these
+ * variables, so toggling the platform attribute repaints the whole panel
+ * — header accents, sidebar highlights, primary buttons, charts — without
+ * recompiling JS.
+ *
+ * The shared structural colors (gray, dark, success/warning/error) stay the
+ * same across platforms; only the brand-* family flips.
+ *
+ * Telegram brand   = Telegram blue  (#0088cc, #0099e5, #0055aa)
+ * Instagram brand  = Instagram gradient endpoints (#E1306C → #F77737)
+ *
+ * The IG gradient is exposed via --brand-gradient so per-component CSS
+ * (Header chip, primary CTA) can reuse it.
+ * ----------------------------------------------------------------------------- */
+
+:root {
+  /* Default to Telegram so SSR / first paint without JS hydrated still
+     looks consistent with the historic UI. */
+  --brand-50:  #e6f4fa;
+  --brand-100: #bee0f3;
+  --brand-200: #93cce8;
+  --brand-300: #66b5dd;
+  --brand-400: #3aa1d2;
+  --brand-500: #0088cc;
+  --brand-600: #0077b5;
+  --brand-700: #00669b;
+  --brand-800: #00557f;
+  --brand-900: #003d5c;
+  --brand-gradient: linear-gradient(135deg, #0088cc 0%, #0099e5 100%);
+  --brand-on:        #ffffff;
+}
+
+html[data-platform="telegram"] {
+  --brand-50:  #e6f4fa;
+  --brand-100: #bee0f3;
+  --brand-200: #93cce8;
+  --brand-300: #66b5dd;
+  --brand-400: #3aa1d2;
+  --brand-500: #0088cc;
+  --brand-600: #0077b5;
+  --brand-700: #00669b;
+  --brand-800: #00557f;
+  --brand-900: #003d5c;
+  --brand-gradient: linear-gradient(135deg, #0088cc 0%, #0099e5 100%);
+  --brand-on:        #ffffff;
+}
+
+html[data-platform="instagram"] {
+  --brand-50:  #fdecef;
+  --brand-100: #fbd0d8;
+  --brand-200: #f7a3b5;
+  --brand-300: #f37692;
+  --brand-400: #ee4a6f;
+  --brand-500: #e1306c;
+  --brand-600: #c1265c;
+  --brand-700: #a01f4d;
+  --brand-800: #80183d;
+  --brand-900: #58112c;
+  --brand-gradient: linear-gradient(135deg, #f09433 0%, #e6683c 25%, #dc2743 50%, #cc2366 75%, #bc1888 100%);
+  --brand-on:        #ffffff;
+}
+
+/* Generic brand-aware utility classes. Use in JSX with `bg-brand-500`
+   from tailwind, or these helpers for the gradient. */
+.brand-gradient    { background: var(--brand-gradient); color: var(--brand-on); }
+.text-brand        { color: var(--brand-500); }
+.bg-brand          { background-color: var(--brand-500); color: var(--brand-on); }
+.ring-brand        { box-shadow: 0 0 0 2px var(--brand-500); }
+.border-brand      { border-color: var(--brand-500); }

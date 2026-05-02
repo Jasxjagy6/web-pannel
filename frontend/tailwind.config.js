@@ -16,6 +16,21 @@ export default {
           800: '#1e40af',
           900: '#1e3a8a',
         },
+        // Brand family — driven by the CSS variables in platform-tokens.css.
+        // `bg-brand-500`, `text-brand-700`, etc. swap automatically when
+        // <html data-platform=…> changes.
+        brand: {
+          50:  'var(--brand-50)',
+          100: 'var(--brand-100)',
+          200: 'var(--brand-200)',
+          300: 'var(--brand-300)',
+          400: 'var(--brand-400)',
+          500: 'var(--brand-500)',
+          600: 'var(--brand-600)',
+          700: 'var(--brand-700)',
+          800: 'var(--brand-800)',
+          900: 'var(--brand-900)',
+        },
         dark: {
           50: '#f8fafc',
           100: '#f1f5f9',
