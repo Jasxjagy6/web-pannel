@@ -50,6 +50,7 @@ const initDB = async () => {
       'migration_v7_billing.sql',
       'migration_v8_per_user_api_and_auto_approve.sql',
       'migration_v9_multiplatform.sql',
+      'migration_v9_2_instagram_extras.sql',
       'migration_v9_3_subscription_split.sql',
     ];
     for (const m of migrations) {
