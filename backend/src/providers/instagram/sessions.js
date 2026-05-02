@@ -157,7 +157,7 @@ async function listSessions(userId, opts = {}) {
   const sql = `
     SELECT id, user_id, platform, username, status, is_logged_in,
            proxy_url, last_login, last_used, created_at, updated_at,
-           platform_state
+           platform_state, warmup_state, last_warmup_at
       FROM sessions
      WHERE ${where.join(' AND ')}
      ORDER BY ${sortCol} ${sortDir}
@@ -180,6 +180,7 @@ async function get(sessionId, userId) {
   const result = await pool.query(
     `SELECT id, user_id, platform, username, status, is_logged_in,
             proxy_url, last_login, last_used, platform_state,
+            warmup_state, last_warmup_at,
             created_at, updated_at
        FROM sessions
       WHERE id = $1 AND user_id = $2 AND platform = 'instagram'`,

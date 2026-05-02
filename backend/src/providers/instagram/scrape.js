@@ -215,14 +215,32 @@ async function _executeScrapeJob(jobId) {
   const limit = Number(job.options?.limit || job.options?.scrape_limit || 1000);
 
   const sessRows = await pool.query(
-    `SELECT id, user_id, username, proxy_url, session_data, platform_state
+    `SELECT id, user_id, username, proxy_url, session_data, platform_state,
+            warmup_state
        FROM sessions
       WHERE id = ANY($1::int[]) AND platform = 'instagram'
-        AND is_logged_in = TRUE`,
+        AND is_logged_in = TRUE
+        AND COALESCE(warmup_state->>'state', 'active')
+            NOT IN ('needs_attention', 'dead')`,
     [sessionIds]
   );
   if (sessRows.rows.length === 0) {
-    await _setStatus(jobId, 'failed', { error: 'No usable IG sessions' });
+    // Distinguish "no sessions at all" from "all flagged" so the
+    // operator gets a clearer error in the job row.
+    const flaggedRows = await pool.query(
+      `SELECT id, warmup_state->>'state' AS state
+         FROM sessions
+        WHERE id = ANY($1::int[]) AND platform = 'instagram'`,
+      [sessionIds]
+    );
+    const hasFlagged = flaggedRows.rows.some((r) =>
+      ['needs_attention', 'dead'].includes(r.state || '')
+    );
+    await _setStatus(jobId, 'failed', {
+      error: hasFlagged
+        ? 'All selected IG sessions are currently flagged by Instagram (checkpoint or expired). Re-upload a fresh session and retry.'
+        : 'No usable IG sessions',
+    });
     return;
   }
 
@@ -258,6 +276,43 @@ async function _executeScrapeJob(jobId) {
       error: mapped.message,
       total_found: finalRow?.total_found || totalScraped,
     });
+    // Cross-cutting health update: if the failure was caused by IG
+    // flagging the session (checkpoint / login_required / action
+    // blocked), flip the session row to `needs_attention` so the
+    // warm-up worker stops touching it and the operator sees the
+    // state in the UI. We pull `kind` off the underlying error so
+    // the classifier in igFetch is the single source of truth.
+    try {
+      const kind = err && (err.kind || (err.cause && err.cause.kind));
+      if (kind === 'checkpoint' || kind === 'login_required' || kind === 'action_blocked') {
+        // eslint-disable-next-line global-require
+        const { pool } = require('../../config/database');
+        const newState = kind === 'login_required' ? 'dead' : 'needs_attention';
+        const newStatus = kind === 'login_required' ? 'expired' : 'checkpoint';
+        await pool.query(
+          `UPDATE sessions
+              SET warmup_state = COALESCE(warmup_state, '{}'::jsonb)
+                                 || jsonb_build_object(
+                                      'state', $2::text,
+                                      'last_error', $3::text,
+                                      'last_error_kind', $4::text,
+                                      'last_failed_at', NOW()::text),
+                  status = $5,
+                  is_logged_in = CASE WHEN $4::text = 'login_required'
+                                      THEN FALSE ELSE is_logged_in END,
+                  updated_at = NOW()
+            WHERE id = $1`,
+          [session.id, newState, mapped.message, kind, newStatus]
+        );
+        logger.warn(
+          `IG.scrape: flipped session ${session.id} → ${newState} (${kind})`
+        );
+      }
+    } catch (flipErr) {
+      logger.warn(
+        `IG.scrape: failed to flip session ${session.id} health state: ${flipErr.message}`
+      );
+    }
   }
 }
 
@@ -297,11 +352,14 @@ async function _runWebScrape({ jobId, job, session, targets, limit }) {
   for (const target of targets) {
     if (totalScraped >= limit) break;
     const targetUsername = String(target).replace(/^@/, '').toLowerCase();
-    const profile = await webScraper.getUserIdByUsername(blob, targetUsername);
+    // Pass the full session row (not the bare blob) so the web scraper
+    // routes the request through the per-session proxy + browser-grade
+    // headers via igFetch.
+    const profile = await webScraper.getUserIdByUsername(session, targetUsername);
 
     let received = 0;
     const buffer = [];
-    for await (const u of webScraper.paginateFriendList(blob, profile.pk, job.target_type, {
+    for await (const u of webScraper.paginateFriendList(session, profile.pk, job.target_type, {
       limit: limit - totalScraped,
       pageSize: 50,
       targetUsername,

@@ -348,6 +348,25 @@ async function start() {
       logger.warn(`privacyJobWorker.start failed: ${err.message}`);
     }
 
+    // 6. Boot the Instagram session warm-up scheduler. Every minute it
+    //    picks one IG session whose last_warmup_at is older than the
+    //    25-35 min jittered stale window and runs a single cheap probe
+    //    (web account-edit endpoint) through the session's bound proxy.
+    //    This is what keeps cookie-uploaded sessions alive against IG's
+    //    age-decay + IP-rotation risk model.
+    try {
+      const igHealthEnabled =
+        String(process.env.IG_WARMUP_ENABLED ?? 'true').toLowerCase() !== 'false';
+      if (igHealthEnabled) {
+        const sessionHealth = require('./providers/instagram/sessionHealth');
+        sessionHealth.startWarmupScheduler();
+      } else {
+        logger.info('IG warmup scheduler disabled via IG_WARMUP_ENABLED=false');
+      }
+    } catch (err) {
+      logger.warn(`IG sessionHealth scheduler.start failed: ${err.message}`);
+    }
+
     // 6. Re-attach NewMessage listeners for monitor jobs that were running
     //    when the process restarted and whose window hasn't expired yet.
     try {

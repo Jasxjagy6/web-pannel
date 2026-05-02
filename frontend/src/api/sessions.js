@@ -39,6 +39,18 @@ export const createSessionCancel = (payload) =>
  * Uses the configured axios instance (so the JWT is attached) and synthesises
  * a temporary <a> tag to invoke the browser's download flow.
  */
+// --- Instagram-only session-health surface ---
+// These endpoints only exist on the IG side (see backend
+// sessions router). Calling them on a TG session returns 404.
+
+export const getSessionHealth = (id) => api.get(`/sessions/${id}/health`);
+
+export const runSessionHealthCheck = (id) =>
+  api.post(`/sessions/${id}/health/check`);
+
+export const setSessionProxy = (id, proxyUrl) =>
+  api.patch(`/sessions/${id}/proxy`, { proxyUrl });
+
 export const downloadSession = async (id, suggestedName = 'session.json') => {
   const response = await api.get(`/sessions/${id}/download`, {
     responseType: 'blob',
