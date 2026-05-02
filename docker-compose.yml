@@ -37,9 +37,11 @@ services:
 
   backend:
     build: ./backend
-    # Backend HTTP/WebSocket port +3 (3000 -> 3003).
+    # Backend HTTP/WebSocket port. Originally shifted +3 (3000 -> 3003);
+    # bumped further to 3005 to coexist with another local service
+    # already holding 3003.
     ports:
-      - "3003:3003"
+      - "3005:3005"
     env_file:
       - ./backend/.env
     environment:
@@ -53,7 +55,7 @@ services:
       - REDIS_PASSWORD=Navneetbb1###
       - JWT_SECRET=zI1zt20iQZ/uW+L+90SXj7QkGHTFwoEJOezPrUBJCgo4CvkEMpWaPHGh8YhFNtT9
       - JWT_EXPIRE=7d
-      - PORT=3003
+      - PORT=3005
       - NODE_ENV=development
       - RATE_LIMIT_WINDOW=15
       - RATE_LIMIT_MAX=5000
