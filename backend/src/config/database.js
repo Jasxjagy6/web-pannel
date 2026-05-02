@@ -49,7 +49,6 @@ const initDB = async () => {
       'migration_v6_scrape_monitor.sql',
       'migration_v7_billing.sql',
       'migration_v8_per_user_api_and_auto_approve.sql',
-      'migration_v9_monitor_dedup_toggle.sql',
     ];
     for (const m of migrations) {
       const mPath = path.join(__dirname, m);
