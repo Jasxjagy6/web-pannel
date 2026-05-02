@@ -4,13 +4,25 @@ const { pool } = require('../config/database');
 const { uploadDir } = require('../middleware/upload');
 const sessionService = require('../services/sessionService');
 const sessionCreationService = require('../services/sessionCreationService');
-const telegramService = require('../services/telegramService');
 const reportService = require('../services/reportService');
 const { AppError, asyncHandler } = require('../utils/errorHandler');
 const { decrypt } = require('../utils/crypto');
 const logger = require('../utils/logger');
 
 const ENCRYPTED_SESSION_RE = /^[0-9a-f]+:[0-9a-f]+:[0-9a-f]+$/i;
+
+// ---------------------------------------------------------------------------
+// Multi-platform dispatch helpers.
+//
+// Telegram and Instagram both expose `req.provider.sessions.<verb>` and
+// `req.provider.create.<verb>`, but the legacy Telegram code path still
+// calls the service singletons directly (no behaviour changes for TG users).
+// Instagram dispatches into the IG provider, which writes/reads only
+// `platform = 'instagram'` rows so the two panels are hard-isolated.
+// ---------------------------------------------------------------------------
+function _isInstagram(req) {
+  return req && req.platform === 'instagram';
+}
 
 const sessionController = {
   /**
@@ -19,6 +31,9 @@ const sessionController = {
    * Expects multipart/form-data with files under the "sessions" field name.
    * Optional query params: apiId, apiHash, autoLogin
    * Multer middleware populates req.files before this handler runs.
+   *
+   * On `/api/instagram/sessions/upload`, the IG provider expects a JSON
+   * file with one or more `{ username, sessionBlob, proxyUrl? }` records.
    */
   uploadSessions: asyncHandler(async (req, res) => {
     if (!req.files || req.files.length === 0) {
@@ -26,21 +41,46 @@ const sessionController = {
     }
 
     const userId = req.user.id;
+
+    if (_isInstagram(req)) {
+      const provider = req.provider;
+      const result = await provider.sessions.upload(req.files, userId, {});
+      logger.info(`IG session upload by user ${userId}`, {
+        total: result.total, successful: result.successful, failed: result.failed,
+      });
+      await reportService.logActivity(
+        userId,
+        'session_upload',
+        'session',
+        result.results[0]?.sessionId || null,
+        { platform: 'instagram', total: result.total, successful: result.successful, failed: result.failed }
+      );
+      return res.status(200).json({
+        success: true,
+        data: {
+          total: result.total,
+          successful: result.successful,
+          failed: result.failed,
+          results: result.results,
+          duration: result.duration,
+        },
+      });
+    }
+
+    // Telegram path (unchanged behaviour)
     const options = {
       apiId: req.query.apiId ? parseInt(req.query.apiId, 10) : undefined,
       apiHash: req.query.apiHash || undefined,
       autoLogin: req.query.autoLogin === 'true' || req.query.autoLogin === '1',
     };
-
     const result = await sessionService.uploadSessions(req.files, userId, options);
-
-    // Log the upload activity
     await reportService.logActivity(
       userId,
       'session_upload',
       'session',
       result.results[0]?.sessionId || null,
       {
+        platform: 'telegram',
         totalFiles: result.total,
         successful: result.successful,
         failed: result.failed,
@@ -48,13 +88,11 @@ const sessionController = {
         autoLogin: options.autoLogin,
       }
     );
-
     logger.info(`Session files uploaded by user ${userId}`, {
       total: result.total,
       successful: result.successful,
       failed: result.failed,
     });
-
     return res.status(200).json({
       success: true,
       data: {
@@ -71,6 +109,9 @@ const sessionController = {
    * List sessions for the authenticated user with pagination and filtering.
    *
    * Query params: page, limit, sort, order, filter
+   *
+   * Hard-scoped to req.platform — `/api/instagram/sessions` returns only
+   * IG rows, `/api/telegram/sessions` returns only TG rows.
    */
   listSessions: asyncHandler(async (req, res) => {
     const userId = req.user.id;
@@ -81,12 +122,38 @@ const sessionController = {
     const order = req.query.order || 'DESC';
     const filter = req.query.filter || undefined;
 
+    if (_isInstagram(req)) {
+      const provider = req.provider;
+      const igFilter = {};
+      if (filter && filter !== 'all') igFilter.status = filter;
+      if (req.query.search) igFilter.search = req.query.search;
+      const out = await provider.sessions.listSessions(userId, {
+        page, limit, sort, order, filter: igFilter,
+      });
+      return res.status(200).json({
+        success: true,
+        data: {
+          sessions: out.sessions,
+          pagination: {
+            page: out.page,
+            limit: out.limit,
+            total: out.total,
+            totalPages: Math.max(1, Math.ceil(out.total / Math.max(1, out.limit))),
+          },
+        },
+      });
+    }
+
+    // Telegram path (unchanged) — also adds an explicit platform filter
+    // as defense-in-depth so a stray /api/sessions request without an
+    // X-Platform header can't bleed IG rows into the TG response.
     const { sessions, pagination } = await sessionService.listSessions(userId, {
       page,
       limit,
       sort,
       order,
       filter,
+      platform: 'telegram',
     });
 
     return res.status(200).json({
@@ -100,8 +167,6 @@ const sessionController = {
 
   /**
    * Get detailed information for a single session.
-   *
-   * Session ID comes from req.params.id.
    */
   getSession: asyncHandler(async (req, res) => {
     const userId = req.user.id;
@@ -111,8 +176,14 @@ const sessionController = {
       throw new AppError('Session ID is required', 400, 'MISSING_SESSION_ID');
     }
 
-    const session = await sessionService.getSessionById(sessionId, userId);
+    if (_isInstagram(req)) {
+      const provider = req.provider;
+      const session = await provider.sessions.get(sessionId, userId);
+      if (!session) throw new AppError('Session not found', 404, 'SESSION_NOT_FOUND');
+      return res.status(200).json({ success: true, data: { session } });
+    }
 
+    const session = await sessionService.getSessionById(sessionId, userId);
     return res.status(200).json({
       success: true,
       data: {
@@ -122,9 +193,13 @@ const sessionController = {
   }),
 
   /**
-   * Login (activate) a session by connecting it to Telegram.
+   * Login (activate) a session.
    *
-   * Session ID comes from req.params.id.
+   * On Telegram this connects the stored session string to a GramJS client.
+   * On Instagram this re-attaches the stored cookies to instagram-private-api,
+   * pings the user endpoint to confirm the cookies are still valid, and
+   * marks `is_logged_in = TRUE`. If the cookies have expired the operator
+   * is told to re-create the session from scratch (IG can't refresh tokens).
    */
   loginSession: asyncHandler(async (req, res) => {
     const userId = req.user.id;
@@ -134,15 +209,27 @@ const sessionController = {
       throw new AppError('Session ID is required', 400, 'MISSING_SESSION_ID');
     }
 
-    const result = await sessionService.loginSession(sessionId, userId);
+    if (_isInstagram(req)) {
+      const provider = req.provider;
+      const result = await provider.sessions.login(sessionId, userId);
+      await reportService.logActivity(
+        userId,
+        'session_login',
+        'session',
+        sessionId,
+        { platform: 'instagram', status: result.status }
+      );
+      return res.status(200).json({ success: true, data: result });
+    }
 
-    // Log the login activity
+    const result = await sessionService.loginSession(sessionId, userId);
     await reportService.logActivity(
       userId,
       'session_login',
       'session',
       sessionId,
       {
+        platform: 'telegram',
         status: result.status,
         phone: result.accountInfo ? result.accountInfo.phone : null,
       }
@@ -164,9 +251,7 @@ const sessionController = {
   }),
 
   /**
-   * Logout (deactivate) a session by disconnecting it from Telegram.
-   *
-   * Session ID comes from req.params.id.
+   * Logout (deactivate) a session.
    */
   logoutSession: asyncHandler(async (req, res) => {
     const userId = req.user.id;
@@ -176,15 +261,21 @@ const sessionController = {
       throw new AppError('Session ID is required', 400, 'MISSING_SESSION_ID');
     }
 
+    if (_isInstagram(req)) {
+      const provider = req.provider;
+      const result = await provider.sessions.logoutSession(sessionId, userId);
+      await reportService.logActivity(userId, 'session_logout', 'session', sessionId, { platform: 'instagram' });
+      return res.status(200).json({ success: true, data: result });
+    }
+
     const result = await sessionService.logoutSession(sessionId, userId);
 
-    // Log the logout activity
     await reportService.logActivity(
       userId,
       'session_logout',
       'session',
       sessionId,
-      {}
+      { platform: 'telegram' }
     );
 
     logger.info(`Session logged out by user ${userId}`, { sessionId });
@@ -199,8 +290,6 @@ const sessionController = {
 
   /**
    * Delete a single session.
-   *
-   * Session ID comes from req.params.id.
    */
   deleteSession: asyncHandler(async (req, res) => {
     const userId = req.user.id;
@@ -210,15 +299,22 @@ const sessionController = {
       throw new AppError('Session ID is required', 400, 'MISSING_SESSION_ID');
     }
 
+    if (_isInstagram(req)) {
+      const provider = req.provider;
+      const result = await provider.sessions.deleteSession(sessionId, userId);
+      await reportService.logActivity(userId, 'session_delete', 'session', sessionId, { platform: 'instagram' });
+      return res.status(200).json({ success: true, data: { sessionId: result.id, deleted: result.deleted } });
+    }
+
     const result = await sessionService.deleteSession(sessionId, userId);
 
-    // Log the delete activity
     await reportService.logActivity(
       userId,
       'session_delete',
       'session',
       sessionId,
       {
+        platform: 'telegram',
         fileDeleted: result.fileDeleted,
       }
     );
@@ -239,8 +335,6 @@ const sessionController = {
 
   /**
    * Bulk delete multiple sessions at once.
-   *
-   * Expects req.body: { sessionIds: [number, ...] }
    */
   bulkDeleteSessions: asyncHandler(async (req, res) => {
     const userId = req.user.id;
@@ -250,9 +344,21 @@ const sessionController = {
       throw new AppError('sessionIds array is required and must not be empty', 400, 'MISSING_SESSION_IDS');
     }
 
+    if (_isInstagram(req)) {
+      const provider = req.provider;
+      const result = await provider.sessions.bulkDelete(sessionIds, userId);
+      for (const item of result.results) {
+        if (item.success) {
+          await reportService.logActivity(
+            userId, 'session_delete', 'session', item.sessionId, { platform: 'instagram', bulkDelete: true }
+          );
+        }
+      }
+      return res.status(200).json({ success: true, data: result });
+    }
+
     const result = await sessionService.bulkDeleteSessions(sessionIds, userId);
 
-    // Log each deletion
     for (const item of result.results) {
       if (item.success) {
         await reportService.logActivity(
@@ -260,7 +366,7 @@ const sessionController = {
           'session_delete',
           'session',
           item.sessionId,
-          { bulkDelete: true }
+          { platform: 'telegram', bulkDelete: true }
         );
       }
     }
@@ -284,14 +390,19 @@ const sessionController = {
 
   /**
    * Check the live status of a session (connected, disconnected, error).
-   *
-   * Session ID comes from req.params.id.
    */
   checkSessionStatus: asyncHandler(async (req, res) => {
+    const userId = req.user.id;
     const sessionId = req.params.id;
 
     if (!sessionId) {
       throw new AppError('Session ID is required', 400, 'MISSING_SESSION_ID');
+    }
+
+    if (_isInstagram(req)) {
+      const provider = req.provider;
+      const status = await provider.sessions.status(sessionId, userId);
+      return res.status(200).json({ success: true, data: status });
     }
 
     const status = await sessionService.getSessionStatus(sessionId);
@@ -314,10 +425,17 @@ const sessionController = {
   }),
 
   /**
-   * Get aggregated session statistics for the authenticated user.
+   * Get aggregated session statistics for the authenticated user, scoped
+   * to the active panel platform.
    */
   getSessionStats: asyncHandler(async (req, res) => {
     const userId = req.user.id;
+
+    if (_isInstagram(req)) {
+      const provider = req.provider;
+      const stats = await provider.sessions.getSessionStats(userId);
+      return res.status(200).json({ success: true, data: stats });
+    }
 
     const stats = await sessionService.getSessionStats(userId);
 
@@ -328,11 +446,39 @@ const sessionController = {
   }),
 
   // =========================================================================
-  // Upgrade 5 — Create Session via panel (interactive sendCode → signIn flow)
+  // Create-Session flow
+  //
+  // Telegram: phone -> code -> (optional 2FA cloud password) -> session.
+  // Instagram: username + password -> (optional 2FA TOTP/SMS) ->
+  //            (optional checkpoint) -> session.
+  //
+  // The frontend hits the same endpoints on both platforms; the controller
+  // dispatches via req.provider.create.<verb>. Both providers consume the
+  // same request shape but the body fields differ:
+  //
+  //   TG /create/start  body: { phone, apiId, apiHash }
+  //   IG /create/start  body: { username, password, proxyUrl? }
+  //
+  //   TG /create/verify body: { tempId, code }
+  //   IG /create/verify body: { sessionToken, code }   (challenge step)
+  //
+  //   TG /create/password body: { tempId, password }
+  //   IG /create/password body: { sessionToken, code } (2FA TOTP step)
   // =========================================================================
 
   createSessionStart: asyncHandler(async (req, res) => {
     const userId = req.user.id;
+
+    if (_isInstagram(req)) {
+      const { username, password, proxyUrl } = req.body || {};
+      if (!username || !password) {
+        throw new AppError('username and password are required', 400, 'MISSING_FIELDS');
+      }
+      const provider = req.provider;
+      const result = await provider.create.start({ userId, username, password, proxyUrl });
+      return res.status(200).json({ success: true, data: result });
+    }
+
     const { phone, apiId, apiHash } = req.body || {};
     const result = await sessionCreationService.start({
       userId,
@@ -345,6 +491,17 @@ const sessionController = {
 
   createSessionVerify: asyncHandler(async (req, res) => {
     const userId = req.user.id;
+
+    if (_isInstagram(req)) {
+      const { sessionToken, code } = req.body || {};
+      if (!sessionToken || !code) {
+        throw new AppError('sessionToken and code are required', 400, 'MISSING_FIELDS');
+      }
+      const provider = req.provider;
+      const result = await provider.create.verify({ sessionToken, code });
+      return res.status(200).json({ success: true, data: result });
+    }
+
     const { tempId, code } = req.body || {};
     const result = await sessionCreationService.verify({ userId, tempId, code });
     return res.status(200).json({ success: true, data: result });
@@ -352,6 +509,17 @@ const sessionController = {
 
   createSessionPassword: asyncHandler(async (req, res) => {
     const userId = req.user.id;
+
+    if (_isInstagram(req)) {
+      const { sessionToken, code } = req.body || {};
+      if (!sessionToken || !code) {
+        throw new AppError('sessionToken and code are required', 400, 'MISSING_FIELDS');
+      }
+      const provider = req.provider;
+      const result = await provider.create.password({ sessionToken, code });
+      return res.status(200).json({ success: true, data: result });
+    }
+
     const { tempId, password } = req.body || {};
     const result = await sessionCreationService.password({
       userId,
@@ -363,6 +531,14 @@ const sessionController = {
 
   createSessionResend: asyncHandler(async (req, res) => {
     const userId = req.user.id;
+
+    if (_isInstagram(req)) {
+      const { sessionToken, method } = req.body || {};
+      const provider = req.provider;
+      const result = await provider.create.resend({ sessionToken, method });
+      return res.status(200).json({ success: true, data: result });
+    }
+
     const { tempId } = req.body || {};
     const result = await sessionCreationService.resend({ userId, tempId });
     return res.status(200).json({ success: true, data: result });
@@ -370,19 +546,23 @@ const sessionController = {
 
   createSessionCancel: asyncHandler(async (req, res) => {
     const userId = req.user.id;
+
+    if (_isInstagram(req)) {
+      const { sessionToken } = req.body || {};
+      const provider = req.provider;
+      const result = await provider.create.cancel({ sessionToken });
+      return res.status(200).json({ success: true, data: result });
+    }
+
     const { tempId } = req.body || {};
     const result = await sessionCreationService.cancel({ userId, tempId });
     return res.status(200).json({ success: true, data: result });
   }),
 
   /**
-   * Download the on-disk session file for a session the user owns.
-   *
-   * For JSON-formatted sessions the file is decrypted on the fly so the
-   * user always receives a plaintext GramJS string session. The same
-   * file format is still accepted by /upload (which re-encrypts the
-   * `session` field on its own), so the round-trip remains intact.
-   * Non-JSON files (e.g. raw Telethon binaries) are streamed as-is.
+   * Download the session file. For Telegram this returns the on-disk
+   * GramJS string (decrypted). For Instagram it returns the encrypted
+   * JSON cookie/device blob from `sessions.session_data`.
    */
   downloadSession: asyncHandler(async (req, res) => {
     const userId = req.user.id;
@@ -391,10 +571,24 @@ const sessionController = {
       throw new AppError('Session ID is required', 400, 'MISSING_SESSION_ID');
     }
 
+    if (_isInstagram(req)) {
+      const provider = req.provider;
+      const out = await provider.sessions.download(sessionId, userId);
+      const downloadName = `${(out.username || 'instagram-session').replace(/[^A-Za-z0-9_+-]/g, '')}.json`;
+      res.setHeader('Content-Type', 'application/json');
+      res.setHeader('Content-Disposition', `attachment; filename="${downloadName}"`);
+      return res.send(JSON.stringify({
+        platform: 'instagram',
+        username: out.username,
+        sessionBlob: out.blob,
+        exportedAt: new Date().toISOString(),
+      }, null, 2));
+    }
+
     const r = await pool.query(
       `SELECT id, phone, session_file_path, account_info
          FROM sessions
-        WHERE id = $1 AND user_id = $2`,
+        WHERE id = $1 AND user_id = $2 AND platform = 'telegram'`,
       [sessionId, userId]
     );
     const row = r.rows[0];

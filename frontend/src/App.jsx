@@ -35,6 +35,28 @@ const Privacy = lazy(() => import('./pages/Privacy'));
 const Threads = lazy(() => import('./pages/Threads'));
 const Billing = lazy(() => import('./pages/Billing'));
 
+// Instagram-specific page components — used by PlatformPage to render the
+// IG-themed pink experience for /instagram/<route> URLs. Telegram still
+// renders the original (steel-blue) component on /telegram/<route>.
+const InstagramDashboard      = lazy(() => import('./pages/instagram/Dashboard'));
+const InstagramSessions       = lazy(() => import('./pages/instagram/Sessions'));
+const InstagramCreateSession  = lazy(() => import('./pages/instagram/CreateSession'));
+const InstagramScrape         = lazy(() => import('./pages/instagram/Scrape'));
+
+/**
+ * Picks the right page component based on the active panel platform.
+ * The platform is taken from the URL (:platform) so that /telegram/dashboard
+ * always renders the Telegram (steel-blue) page and /instagram/dashboard
+ * always renders the Instagram (pink) page, regardless of what the user
+ * last visited. Falls back to the TG version when no IG implementation
+ * is supplied (shared pages like Reports, Privacy, Groups, etc.).
+ */
+function PlatformPage({ tg: TgComponent, ig: IgComponent }) {
+  const { platform } = useParams();
+  if (platform === 'instagram' && IgComponent) return <IgComponent />;
+  return <TgComponent />;
+}
+
 /**
  * Predicate: does the user have an active paid subscription or running
  * trial right now on the requested platform? Admins always pass. We
@@ -182,10 +204,10 @@ function PlatformRoutes() {
   return (
     <Routes>
       <Route path="billing" element={<ProtectedRoute title="Billing" allowWithoutSubscription><Billing /></ProtectedRoute>} />
-      <Route path="dashboard" element={<ProtectedRoute title="Dashboard"><Dashboard /></ProtectedRoute>} />
-      <Route path="sessions" element={<ProtectedRoute title="Sessions"><Sessions /></ProtectedRoute>} />
-      <Route path="create-session" element={<ProtectedRoute title="Create Session"><CreateSession /></ProtectedRoute>} />
-      <Route path="scrape" element={<ProtectedRoute title="Scrape"><Scrape /></ProtectedRoute>} />
+      <Route path="dashboard" element={<ProtectedRoute title="Dashboard"><PlatformPage tg={Dashboard} ig={InstagramDashboard} /></ProtectedRoute>} />
+      <Route path="sessions" element={<ProtectedRoute title="Sessions"><PlatformPage tg={Sessions} ig={InstagramSessions} /></ProtectedRoute>} />
+      <Route path="create-session" element={<ProtectedRoute title="Create Session"><PlatformPage tg={CreateSession} ig={InstagramCreateSession} /></ProtectedRoute>} />
+      <Route path="scrape" element={<ProtectedRoute title="Scrape"><PlatformPage tg={Scrape} ig={InstagramScrape} /></ProtectedRoute>} />
       <Route path="messaging" element={<ProtectedRoute title="Messaging"><Messaging /></ProtectedRoute>} />
       <Route path="groups" element={<ProtectedRoute title="Groups"><Groups /></ProtectedRoute>} />
       <Route path="threads" element={<ProtectedRoute title="Threads"><Threads /></ProtectedRoute>} />

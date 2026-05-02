@@ -6,6 +6,8 @@ const { pool } = require('../config/database');
 const { AppError, asyncHandler } = require('../utils/errorHandler');
 const logger = require('../utils/logger');
 
+function _isInstagram(req) { return req && req.platform === 'instagram'; }
+
 const scrapeController = {
   /**
    * Create and start a scraping job.
@@ -37,6 +39,8 @@ const scrapeController = {
       interGroupDelay = 5,
       floodProtection = true,
       async = true,
+      // Instagram-specific
+      targetType: bodyTargetType,
     } = req.body;
 
     // Build session IDs array
@@ -52,7 +56,45 @@ const scrapeController = {
       throw new AppError('targetIds, groupId, or targetId is required', 400, 'MISSING_TARGETS');
     }
 
-    // Create job
+    if (_isInstagram(req)) {
+      // For Instagram, "scrapeGroup" maps to a followers/following/likers job.
+      // The frontend sends `targetType: 'followers' | 'following' | 'likers'`
+      // and the targets array carries usernames (or media PKs for likers).
+      const igTargetType = ['followers', 'following', 'likers', 'commenters', 'tagged']
+        .includes(bodyTargetType) ? bodyTargetType : 'followers';
+
+      const job = await req.provider.scrape.createScrapeJob({
+        userId,
+        sessionIds: sessions.map((x) => parseInt(x, 10)),
+        targetType: igTargetType,
+        targetIdentifiers: targets.map(String),
+        limit: parseInt(limit, 10) || 1000,
+        options: { saveToList, listName },
+      });
+
+      await reportService.logActivity(userId, 'scrape_start', 'scrape_job', job.id, {
+        platform: 'instagram',
+        targetType: igTargetType,
+        sessionCount: sessions.length,
+        targetCount: targets.length,
+        limit,
+      });
+
+      return res.status(202).json({
+        success: true,
+        data: {
+          jobId: job.id,
+          status: job.status,
+          targetType: job.target_type,
+          createdAt: job.created_at,
+          sessionCount: sessions.length,
+          targetCount: targets.length,
+          platform: 'instagram',
+        },
+      });
+    }
+
+    // Telegram path (unchanged behaviour)
     const job = await scrapeService.createScrapeJob({
       sessionIds: sessions,
       targetIds: targets,
@@ -74,6 +116,7 @@ const scrapeController = {
 
     // Log activity
     await reportService.logActivity(userId, 'scrape_start', 'scrape_job', job.jobId, {
+      platform: 'telegram',
       sessionCount: sessions.length,
       targetCount: targets.length,
       limit,
@@ -153,6 +196,11 @@ const scrapeController = {
    * Get job details.
    */
   getJob: asyncHandler(async (req, res) => {
+    if (_isInstagram(req)) {
+      const job = await req.provider.scrape.getJob(req.params.id, req.user.id);
+      if (!job) throw new AppError('Job not found', 404, 'JOB_NOT_FOUND');
+      return res.json({ success: true, data: job });
+    }
     const job = await scrapeService.getJob(req.params.id);
     if (!job) {
       throw new AppError('Job not found', 404, 'JOB_NOT_FOUND');
@@ -164,6 +212,11 @@ const scrapeController = {
    * Get job progress.
    */
   getJobProgress: asyncHandler(async (req, res) => {
+    if (_isInstagram(req)) {
+      const progress = await req.provider.scrape.getProgress(req.params.id, req.user.id);
+      if (!progress) throw new AppError('Job progress not found', 404, 'PROGRESS_NOT_FOUND');
+      return res.json({ success: true, data: progress });
+    }
     const progress = await scrapeService.getProgress(req.params.id);
     if (!progress) {
       throw new AppError('Job progress not found', 404, 'PROGRESS_NOT_FOUND');
@@ -181,6 +234,24 @@ const scrapeController = {
     const sort = req.query.sort || 'created_at';
     const order = req.query.order || 'DESC';
     const filter = req.query.filter || undefined;
+
+    if (_isInstagram(req)) {
+      const filterObj = {};
+      if (req.query.status) filterObj.status = req.query.status;
+      if (req.query.target_type) filterObj.target_type = req.query.target_type;
+      const data = await req.provider.scrape.listJobs(userId, {
+        page, limit, sort, order, filter: filterObj,
+      });
+      const pagination = {
+        currentPage: data.page,
+        pageSize: data.limit,
+        total: data.total,
+        totalPages: Math.max(1, Math.ceil(data.total / data.limit)),
+        hasNext: page * limit < data.total,
+        hasPrev: page > 1,
+      };
+      return res.json({ success: true, data: { jobs: data.jobs, pagination } });
+    }
 
     const { jobs, pagination } = await scrapeService.listJobs(userId, {
       page,
@@ -200,6 +271,10 @@ const scrapeController = {
    * Cancel a job.
    */
   cancelJob: asyncHandler(async (req, res) => {
+    if (_isInstagram(req)) {
+      const out = await req.provider.scrape.cancelJob(req.params.id, req.user.id);
+      return res.json({ success: true, message: 'Job cancelled', data: out });
+    }
     await scrapeService.cancelJob(req.params.id);
     res.json({ success: true, message: 'Job cancelled' });
   }),
@@ -209,6 +284,10 @@ const scrapeController = {
    */
   getScrapeStats: asyncHandler(async (req, res) => {
     const userId = req.user.id;
+    if (_isInstagram(req)) {
+      const stats = await req.provider.scrape.getStats(userId);
+      return res.json({ success: true, data: stats });
+    }
     const stats = await scrapeService.getStats(userId);
     res.json({ success: true, data: stats });
   }),
@@ -219,7 +298,8 @@ const scrapeController = {
   exportJob: asyncHandler(async (req, res) => {
     const jobId = req.params.id;
     const format = req.body.format || req.query.format || 'csv';
-    
+    const ig = _isInstagram(req);
+
     // Get filters
     const filters = {
       excludeBots: req.body.excludeBots !== undefined ? req.body.excludeBots === 'true' : true,
@@ -231,8 +311,10 @@ const scrapeController = {
       columns: req.body.columns || null, // null = all columns
     };
 
-    // Get job
-    const job = await scrapeService.getJob(jobId);
+    // Get job — scoped by platform
+    const job = ig
+      ? await req.provider.scrape.getJob(jobId, req.user.id)
+      : await scrapeService.getJob(jobId);
     if (!job) {
       throw new AppError('Job not found', 404, 'JOB_NOT_FOUND');
     }
@@ -242,29 +324,39 @@ const scrapeController = {
     const params = [jobId];
     let paramIdx = 2;
 
-    if (filters.excludeBots) {
-      conditions.push(`(is_bot = FALSE OR is_bot IS NULL)`);
-    }
-    if (filters.requireUsername) {
-      conditions.push(`username IS NOT NULL AND username != ''`);
-    }
-    if (filters.requirePhone) {
-      conditions.push(`phone IS NOT NULL AND phone != ''`);
-    }
-    if (filters.maxBotScore < 1.0) {
-      conditions.push(`bot_score <= $${paramIdx}`);
-      params.push(filters.maxBotScore);
-      paramIdx++;
+    if (ig) {
+      conditions.push(`platform = 'instagram'`);
+    } else {
+      conditions.push(`(platform = 'telegram' OR platform IS NULL)`);
+      if (filters.excludeBots) {
+        conditions.push(`(is_bot = FALSE OR is_bot IS NULL)`);
+      }
+      if (filters.requireUsername) {
+        conditions.push(`username IS NOT NULL AND username != ''`);
+      }
+      if (filters.requirePhone) {
+        conditions.push(`phone IS NOT NULL AND phone != ''`);
+      }
+      if (filters.maxBotScore < 1.0) {
+        conditions.push(`bot_score <= $${paramIdx}`);
+        params.push(filters.maxBotScore);
+        paramIdx++;
+      }
     }
 
     const whereClause = conditions.join(' AND ');
 
     // Get columns
-    const allColumns = [
+    const tgColumns = [
       'telegram_id', 'username', 'first_name', 'last_name', 'phone',
       'is_bot', 'is_premium', 'access_hash', 'bot_score', 'bot_flags',
       'account_created_at', 'has_profile_photo', 'bio', 'scraped_at'
     ];
+    const igColumns = [
+      'instagram_pk', 'username', 'full_name', 'is_private', 'is_verified',
+      'thumbnail_url', 'scraped_at'
+    ];
+    const allColumns = ig ? igColumns : tgColumns;
     const columns = filters.columns || allColumns;
     const colSelect = columns.join(', ');
 
@@ -328,16 +420,29 @@ const scrapeController = {
   deleteJob: asyncHandler(async (req, res) => {
     const jobId = req.params.id;
     const userId = req.user.id;
+    const ig = _isInstagram(req);
 
-    // Verify ownership
-    const job = await scrapeService.getJob(jobId);
+    const job = ig
+      ? await req.provider.scrape.getJob(jobId, userId)
+      : await scrapeService.getJob(jobId);
     if (!job) {
       throw new AppError('Job not found', 404, 'JOB_NOT_FOUND');
     }
 
-    // Delete users and job
-    await pool.query('DELETE FROM scraped_users WHERE job_id = $1', [jobId]);
-    await pool.query('DELETE FROM scraping_jobs WHERE id = $1', [jobId]);
+    // Delete users and job — only matching this platform's data
+    if (ig) {
+      await pool.query(
+        `DELETE FROM scraped_users WHERE job_id = $1 AND platform = 'instagram'`,
+        [jobId]
+      );
+      await pool.query(
+        `DELETE FROM scraping_jobs WHERE id = $1 AND user_id = $2 AND platform = 'instagram'`,
+        [jobId, userId]
+      );
+    } else {
+      await pool.query('DELETE FROM scraped_users WHERE job_id = $1', [jobId]);
+      await pool.query('DELETE FROM scraping_jobs WHERE id = $1', [jobId]);
+    }
 
     res.json({ success: true, message: 'Job deleted' });
   }),

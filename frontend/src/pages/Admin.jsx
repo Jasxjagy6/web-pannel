@@ -9,6 +9,7 @@ import {
   setSubscription, getSystemStats,
   getBillingSettings, updateBillingSettings, listAdminInvoices,
   grantUserSubscription, expireUserSubscription,
+  listUserPlatformSubscriptions, setUserPlatformSubscription,
 } from '../api/admin';
 import { useToast } from '../components/common/Toast';
 import { parseApiError, formatDateTime, formatRelativeTime } from '../utils/formatters';
@@ -393,13 +394,43 @@ function StatusBadge({ status }) {
 
 function SubscriptionDrawer({ user, onClose, onSaved }) {
   const toast = useToast();
-  const [plan, setPlan] = useState(user.subscription?.plan || 'trial');
-  const [status, setStatus] = useState(user.subscription?.status || 'active');
-  const [expires, setExpires] = useState(
-    user.subscription?.expiresAt ? user.subscription.expiresAt.slice(0, 10) : ''
-  );
-  const [features, setFeatures] = useState(JSON.stringify(user.subscription?.features || { all: true }, null, 2));
+
+  // Per-platform editor state. We default to telegram so legacy admins
+  // see the familiar UI; the IG tab pulls from the per-platform endpoint.
+  const [platform, setPlatform] = useState('telegram');
+  const [perPlatformSubs, setPerPlatformSubs] = useState(null); // null => loading
+  const [plan, setPlan] = useState('trial');
+  const [status, setStatus] = useState('active');
+  const [expires, setExpires] = useState('');
+  const [features, setFeatures] = useState(JSON.stringify({ all: true }, null, 2));
   const [saving, setSaving] = useState(false);
+
+  // Load per-platform subscriptions on open.
+  useEffect(() => {
+    let alive = true;
+    listUserPlatformSubscriptions(user.id)
+      .then((r) => {
+        if (!alive) return;
+        const subs = r.data?.subscriptions || [];
+        const map = {};
+        for (const s of subs) map[s.platform] = s;
+        setPerPlatformSubs(map);
+      })
+      .catch(() => {
+        if (alive) setPerPlatformSubs({});
+      });
+    return () => { alive = false; };
+  }, [user.id]);
+
+  // Sync the form fields with the active platform's row.
+  useEffect(() => {
+    if (!perPlatformSubs) return;
+    const sub = perPlatformSubs[platform] || {};
+    setPlan(sub.plan || 'trial');
+    setStatus(sub.status || 'inactive');
+    setExpires(sub.expires_at ? String(sub.expires_at).slice(0, 10) : '');
+    setFeatures(JSON.stringify(sub.features || { all: true }, null, 2));
+  }, [perPlatformSubs, platform]);
 
   const onSave = async () => {
     let parsed = {};
@@ -411,12 +442,25 @@ function SubscriptionDrawer({ user, onClose, onSaved }) {
     }
     setSaving(true);
     try {
-      await setSubscription(user.id, {
+      // Save against the per-platform endpoint so TG and IG don't clobber
+      // each other. Also write to the legacy single-row endpoint when the
+      // active platform is Telegram so admins still see the legacy mirror
+      // populated for one release window.
+      await setUserPlatformSubscription(user.id, platform, {
         plan, status,
         expiresAt: expires ? new Date(expires).toISOString() : null,
         features: parsed,
       });
-      toast.success('Subscription updated');
+      if (platform === 'telegram') {
+        try {
+          await setSubscription(user.id, {
+            plan, status,
+            expiresAt: expires ? new Date(expires).toISOString() : null,
+            features: parsed,
+          });
+        } catch (_) { /* legacy mirror is best-effort */ }
+      }
+      toast.success(`${platform === 'instagram' ? 'Instagram' : 'Telegram'} subscription updated`);
       onSaved();
     } catch (e) {
       toast.error(parseApiError(e), 'Save failed');
@@ -436,6 +480,33 @@ function SubscriptionDrawer({ user, onClose, onSaved }) {
           <button onClick={onClose} className="rounded-lg p-1 text-dark-400 hover:bg-dark-800 hover:text-white">
             <X className="h-5 w-5" />
           </button>
+        </div>
+        {/* Per-platform tab switcher */}
+        <div className="border-b border-dark-800 px-4 pt-3">
+          <div className="flex gap-2">
+            {[
+              { id: 'telegram', label: 'Telegram', tone: 'bg-sky-500/15 text-sky-300 border-sky-500/30' },
+              { id: 'instagram', label: 'Instagram', tone: 'bg-pink-500/15 text-pink-300 border-pink-500/30' },
+            ].map((tab) => (
+              <button
+                key={tab.id}
+                onClick={() => setPlatform(tab.id)}
+                disabled={!perPlatformSubs}
+                className={`rounded-t-lg border-b-2 px-3 py-1.5 text-xs font-semibold transition ${
+                  platform === tab.id
+                    ? `${tab.tone}`
+                    : 'border-transparent text-dark-400 hover:text-white'
+                }`}
+              >
+                {tab.label}
+              </button>
+            ))}
+            {perPlatformSubs && perPlatformSubs[platform]?.status === 'active' && (
+              <span className="ml-2 self-center rounded-full bg-emerald-500/20 px-2 py-0.5 text-[10px] font-medium text-emerald-300">
+                active
+              </span>
+            )}
+          </div>
         </div>
         <div className="space-y-4 p-4">
           <div>
