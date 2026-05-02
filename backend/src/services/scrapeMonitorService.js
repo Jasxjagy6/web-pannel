@@ -68,9 +68,78 @@ function emit(userId, event, payload) {
 }
 
 /**
+ * Convert a GramJS BigInteger / number / string into a stable string
+ * representation suitable for storing in `telegram_id`. Telegram IDs are
+ * 64-bit ints; using `Number()` would lose precision for IDs > 2^53.
+ */
+function bigToString(v) {
+  if (v === null || v === undefined) return null;
+  // GramJS BigInteger objects expose either `.value` (BigInt) or
+  // `.toString()`. big-integer objects expose `.toString()`. Plain
+  // bigints/numbers/strings just stringify directly.
+  if (typeof v === 'object') {
+    if (v.value !== undefined) return String(v.value);
+    if (typeof v.toString === 'function') {
+      const s = v.toString();
+      return s === '[object Object]' ? null : s;
+    }
+    return null;
+  }
+  return String(v);
+}
+
+/**
+ * Pull `userId` out of any GramJS Peer-ish or fromId-ish object. Returns
+ * a stable string or null.
+ */
+function extractUserIdFromPeer(peer) {
+  if (!peer) return null;
+  // PeerUser has `.userId`. fromId may itself be a PeerUser.
+  if (peer.userId !== undefined && peer.userId !== null) {
+    return bigToString(peer.userId);
+  }
+  // Some GramJS shapes just put the bigint directly.
+  if (typeof peer === 'number' || typeof peer === 'bigint' || typeof peer === 'string') {
+    const s = String(peer);
+    return /^-?\d+$/.test(s) ? s : null;
+  }
+  return null;
+}
+
+/**
+ * Enrich a profile object in-place with a cached sender entity if one is
+ * available. Safe to call with nulls.
+ */
+function applySenderEntity(profile, entity) {
+  if (!profile || !entity || entity.className !== 'User') return;
+  profile.username = entity.username || profile.username || null;
+  profile.firstName = entity.firstName || profile.firstName || null;
+  profile.lastName = entity.lastName || profile.lastName || null;
+  profile.phone = entity.phone || profile.phone || null;
+  profile.isBot = !!(entity.bot || profile.isBot);
+  profile.isPremium = !!(entity.premium || profile.isPremium);
+}
+
+function blankProfile(telegramId) {
+  return {
+    telegramId,
+    username: null,
+    firstName: null,
+    lastName: null,
+    phone: null,
+    isBot: false,
+    isPremium: false,
+  };
+}
+
+/**
  * Best-effort: extract the sender user ID and basic profile from a GramJS
  * NewMessage event. Returns `null` when the message has no user sender
- * (channel posts, service messages, etc).
+ * (channel posts on behalf of the channel, etc).
+ *
+ * Service messages (joins/adds/leaves) are handled here too: the joining
+ * user is taken from `msg.fromId` / `msg.action.users` so a "user joined"
+ * event still records the user as having "performed an action".
  */
 async function extractSenderProfile(event) {
   const msg = event?.message || event;
@@ -79,43 +148,143 @@ async function extractSenderProfile(event) {
   // Try senderId first (most reliable in modern GramJS).
   let telegramId = null;
   if (msg.senderId) {
-    telegramId = Number(msg.senderId.value || msg.senderId);
-  } else if (msg.fromId && msg.fromId.userId) {
-    telegramId = Number(msg.fromId.userId.value || msg.fromId.userId);
-  } else if (msg.peerId && msg.peerId.userId) {
-    telegramId = Number(msg.peerId.userId.value || msg.peerId.userId);
+    telegramId = bigToString(msg.senderId);
+  }
+  if (!telegramId && msg.fromId) {
+    telegramId = extractUserIdFromPeer(msg.fromId);
+  }
+  if (!telegramId && msg.peerId && msg.peerId.userId !== undefined) {
+    telegramId = extractUserIdFromPeer(msg.peerId);
+  }
+
+  // For MessageService(action=MessageActionChatAddUser/JoinedByLink/...) we
+  // can fall back to the action's `userId` / `users` lists if the sender
+  // wasn't otherwise obvious.
+  const action = msg.action;
+  if (!telegramId && action) {
+    if (Array.isArray(action.users) && action.users.length > 0) {
+      telegramId = bigToString(action.users[0]);
+    } else if (action.userId !== undefined && action.userId !== null) {
+      telegramId = bigToString(action.userId);
+    } else if (action.fromId !== undefined && action.fromId !== null) {
+      telegramId = extractUserIdFromPeer(action.fromId);
+    }
   }
   if (!telegramId) return null;
+  // Telegram channel-posts-as-channel produce IDs that look like a
+  // user's but with the wrong sign / shape. We require positive
+  // numeric ids for users.
+  if (!/^\d+$/.test(telegramId)) return null;
 
-  let username = null;
-  let firstName = null;
-  let lastName = null;
-  let phone = null;
-  let isBot = false;
-  let isPremium = false;
+  const profile = blankProfile(telegramId);
 
   // Try to enrich with the cached sender entity. GramJS attaches `_sender`
   // automatically when the event passes through its dispatcher.
-  const sender = msg._sender || (typeof event.getSender === 'function' ? null : null);
-  let senderEntity = sender;
-  if (!senderEntity && typeof event.getSender === 'function') {
+  const cachedSender = msg._sender;
+  if (cachedSender) {
+    applySenderEntity(profile, cachedSender);
+  } else if (typeof event.getSender === 'function') {
     try {
-      senderEntity = await event.getSender();
+      const fetched = await event.getSender();
+      applySenderEntity(profile, fetched);
     } catch {
-      senderEntity = null;
+      // Sender not in cache and we lack access_hash to fetch — that's OK,
+      // we still capture the bare telegramId.
     }
   }
-  if (senderEntity && senderEntity.className === 'User') {
-    username = senderEntity.username || null;
-    firstName = senderEntity.firstName || null;
-    lastName = senderEntity.lastName || null;
-    phone = senderEntity.phone || null;
-    isBot = senderEntity.bot || false;
-    isPremium = senderEntity.premium || false;
-  }
 
-  return { telegramId, username, firstName, lastName, phone, isBot, isPremium };
+  return profile;
 }
+
+/**
+ * Extract a user profile out of a Raw GramJS update (typing, reactions,
+ * channel-participant changes). Returns `null` when the update doesn't
+ * belong to a real user (channel-as-sender, system updates, etc).
+ *
+ * The shape of `update` depends on its className; this function knows the
+ * specific update types we subscribe to.
+ */
+function extractSenderFromRawUpdate(update) {
+  if (!update || !update.className) return null;
+  switch (update.className) {
+    // Typing: the user is "performing an action" without sending a msg.
+    case 'UpdateUserTyping':
+    case 'UpdateChatUserTyping':
+    case 'UpdateChannelUserTyping': {
+      const id = update.fromId
+        ? extractUserIdFromPeer(update.fromId)
+        : update.userId !== undefined
+          ? bigToString(update.userId)
+          : null;
+      if (!id || !/^\d+$/.test(id)) return null;
+      return blankProfile(id);
+    }
+    // Reactions on a single message in a group/supergroup. We can credit
+    // the most recent reactor (anonymous reactions in big channels are
+    // normally suppressed by Telegram — recentReactions is empty there).
+    case 'UpdateMessageReactions':
+    case 'UpdateChannelMessageReactions': {
+      const recent =
+        update.reactions && Array.isArray(update.reactions.recentReactions)
+          ? update.reactions.recentReactions
+          : [];
+      // Return the LAST recent reactor — that's the user who just acted.
+      for (let i = recent.length - 1; i >= 0; i--) {
+        const r = recent[i];
+        const id = extractUserIdFromPeer(r?.peerId);
+        if (id && /^\d+$/.test(id)) return blankProfile(id);
+      }
+      return null;
+    }
+    // Admin-visible: user joined / was added / was banned / left.
+    case 'UpdateChannelParticipant':
+    case 'UpdateChatParticipant': {
+      const id = update.userId !== undefined ? bigToString(update.userId) : null;
+      if (!id || !/^\d+$/.test(id)) return null;
+      return blankProfile(id);
+    }
+    case 'UpdateChatParticipantAdd': {
+      const id = update.userId !== undefined ? bigToString(update.userId) : null;
+      if (!id || !/^\d+$/.test(id)) return null;
+      return blankProfile(id);
+    }
+    case 'UpdateChatParticipantDelete': {
+      const id = update.userId !== undefined ? bigToString(update.userId) : null;
+      if (!id || !/^\d+$/.test(id)) return null;
+      return blankProfile(id);
+    }
+    default:
+      return null;
+  }
+}
+
+/**
+ * GramJS Api.* update class names that the Raw handler subscribes to.
+ * Kept as className strings so we can match without importing the Api
+ * objects at module load time (the require chain pulls in tons of code).
+ */
+const RAW_UPDATE_CLASSNAMES = new Set([
+  // The actual NewMessage/NewChannelMessage updates — we use these to
+  // capture MessageService events (joins, adds, etc) that NewMessage's
+  // build() filter rejects.
+  'UpdateNewMessage',
+  'UpdateNewChannelMessage',
+  'UpdateShortChatMessage',
+  'UpdateShortMessage',
+  // Typing / interaction signals.
+  'UpdateUserTyping',
+  'UpdateChatUserTyping',
+  'UpdateChannelUserTyping',
+  // Reactions.
+  'UpdateMessageReactions',
+  'UpdateChannelMessageReactions',
+  // Membership churn (delivered to admins for channel/supergroup; to all
+  // members for basic chats via UpdateChatParticipantAdd/Delete).
+  'UpdateChannelParticipant',
+  'UpdateChatParticipant',
+  'UpdateChatParticipantAdd',
+  'UpdateChatParticipantDelete',
+]);
 
 class ScrapeMonitorService {
   constructor() {
@@ -473,28 +642,40 @@ class ScrapeMonitorService {
 
     const dedupEnabled = attachOpts.dedupEnabled !== false; // v6 default = TRUE
 
-    // v10: Pre-resolve the target entity on every selected session
-    // BEFORE attaching the NewMessage handler. This is the dominant
-    // fix for the "5-minute job, 10 active users, only 3 captured"
-    // symptom: GramJS's `chats` filter only matches once the session
-    // has the entity in its peer cache, and freshly booted sessions
-    // often haven't opened the chat yet, so the filter silently rejects
-    // every event. Calling _resolveEntity() on each session warms the
-    // cache so the filter starts working immediately. We also collect
-    // every form of the chat's id (raw user input, resolved entity id,
-    // and the bot-API "-100" prefixed form) into an allow list so we
-    // can do a defense-in-depth check inside _onEvent.
+    // Build an allow-list of every chat id form we recognise for the
+    // target. _resolveEntity warms each session's peer cache so future
+    // `getSender()` / `getInputEntity()` calls during dispatch hit the
+    // cache instead of going to the network. The allow list is then
+    // used by `_eventMatchesTarget` to keep cross-talk events from
+    // other chats out of this monitor job.
+    //
+    // History note: previous versions of this service ALSO passed a
+    // `chats` filter into GramJS's NewMessage builder. That turned out
+    // to be the dominant cause of the "10 active users, only 2-3
+    // captured" symptom: GramJS resolves the filter lazily on the first
+    // event by calling `getInputEntity()` on every entry, and any
+    // single failure (URL form, transient FloodWait, anything) rejects
+    // the resolve and leaves `builder.resolved=false`, so EVERY
+    // subsequent event is dropped at the dispatcher. We now skip the
+    // GramJS filter entirely and rely on our own allow-list check.
     const allowedChatIds = new Set();
     const rawTarget = String(targetId).trim();
     allowedChatIds.add(rawTarget);
     if (rawTarget.startsWith('@')) allowedChatIds.add(rawTarget.slice(1));
+    // Strip any t.me/<x> URL form down to the bare username so the
+    // self-warming match in _eventMatchesTarget can match on it.
+    const urlMatch = rawTarget.match(/(?:t\.me|telegram\.me)\/(?:s\/)?(@?[\w_+]+)/i);
+    if (urlMatch && urlMatch[1]) {
+      const stripped = urlMatch[1].replace(/^@/, '');
+      if (stripped) allowedChatIds.add(stripped);
+    }
 
     const unsubs = new Map();
     for (const sid of sessionIds) {
       // Try to resolve the entity on this session and harvest every
-      // numeric form of its id. Failures are non-fatal — we still
-      // attach with the raw target string, which is enough when the
-      // session already has the chat cached from prior usage.
+      // numeric form of its id. Failures are non-fatal — when we miss
+      // the entity here, _eventMatchesTarget will self-warm on the
+      // first event whose chat we recognise.
       let resolved = null;
       try {
         resolved = await telegramService._resolveEntity(String(sid), rawTarget);
@@ -502,11 +683,11 @@ class ScrapeMonitorService {
         logger.debug(`Monitor job ${jobId} session ${sid} could not pre-resolve target: ${err.message}`);
       }
       if (resolved && resolved.id !== undefined && resolved.id !== null) {
-        const idStr = String(resolved.id?.value ?? resolved.id);
+        const idStr = bigToString(resolved.id);
         if (idStr) {
           allowedChatIds.add(idStr);
-          // Bot-API form ("-100" prefix) for channels / supergroups, in
-          // case GramJS ever emits the chatId in that shape.
+          // Bot-API form ("-100" prefix) for channels / supergroups,
+          // because that's the chatId form NewMessage events carry.
           if (resolved.className === 'Channel' || resolved.className === 'ChannelForbidden') {
             allowedChatIds.add(`-100${idStr}`);
           } else if (resolved.className === 'Chat') {
@@ -519,48 +700,32 @@ class ScrapeMonitorService {
         allowedChatIds.add(`@${resolved.username}`);
       }
 
-      // Build the GramJS chat filter for this session. IMPORTANT: we
-      // pass only string/number identifiers — never the resolved
-      // entity object. GramJS's _intoIdSet calls getInputEntity() on
-      // every item, and a bare entity object whose className is not
-      // one of the InputPeer-like shapes makes it fall through to
-      // `getEntityFromString(String(item))`, which yields the literal
-      // text "[object Object]" and crashes the whole NewMessage
-      // dispatcher. Warming the peer cache via _resolveEntity above
-      // is what makes the filter actually match — the filter list
-      // itself just needs identifiers GramJS can parse.
-      const chats = [];
-      if (resolved && resolved.id !== undefined && resolved.id !== null) {
-        const idStr = String(resolved.id?.value ?? resolved.id);
-        if (idStr) {
-          chats.push(idStr);
-          // Bot-API style for channels / supergroups, since some GramJS
-          // call sites compare against the "-100" form internally.
-          if (resolved.className === 'Channel' || resolved.className === 'ChannelForbidden') {
-            chats.push(`-100${idStr}`);
-          } else if (resolved.className === 'Chat') {
-            chats.push(`-${idStr}`);
-          }
-        }
-      }
-      if (resolved && resolved.username) {
-        chats.push(String(resolved.username));
-      }
-      // Always include the raw user-supplied target as a final
-      // fallback; if every other form failed to resolve, the original
-      // string (a username, an invite link, a numeric id) is still the
-      // user's source-of-truth identifier for this chat.
-      if (rawTarget && !chats.includes(rawTarget)) chats.push(rawTarget);
-
+      // Attach the regular NewMessage handler. We deliberately do NOT
+      // pass a `chats` filter — see comment above.
       try {
         const off = await telegramService.addNewMessageHandler(
           String(sid),
           (event) => this._onEvent(jobId, userId, sid, event),
-          { chats }
         );
-        unsubs.set(sid, off);
+        unsubs.set(`nm:${sid}`, off);
       } catch (err) {
-        logger.warn(`Monitor job ${jobId} could not attach to session ${sid}: ${err.message}`);
+        logger.warn(`Monitor job ${jobId} could not attach NewMessage to session ${sid}: ${err.message}`);
+      }
+
+      // Also attach a Raw update handler so we can record interactions
+      // beyond the regular text-message path: typing indicators,
+      // reactions, channel-participant changes, and MessageService
+      // events (joins / adds / leaves) that NewMessage's build() filter
+      // rejects. Each of these counts as the user "performing an action"
+      // in the chat, which is the user-facing contract for this job.
+      try {
+        const offRaw = await telegramService.addRawUpdateHandler(
+          String(sid),
+          (update) => this._onRawUpdate(jobId, userId, sid, update),
+        );
+        unsubs.set(`raw:${sid}`, offRaw);
+      } catch (err) {
+        logger.warn(`Monitor job ${jobId} could not attach Raw handler to session ${sid}: ${err.message}`);
       }
     }
 
@@ -646,126 +811,128 @@ class ScrapeMonitorService {
   }
 
   /**
-   * Defense-in-depth chat filter. GramJS's NewMessage `chats` filter
-   * sometimes silently rejects events for chats whose entity isn't in
-   * the session's peer cache, and we've ALSO seen it occasionally
-   * leak through events from other chats when a session is in many.
-   * We do our own match against the allow list built in _attach().
+   * Collect every chat-id form carried by a GramJS event/update, returned
+   * as an array of strings. Used by `_eventMatchesTarget` and the Raw
+   * update path. Defensively handles BigInts (`.value`) and plain
+   * numbers/strings.
    */
-  _eventMatchesTarget(event, allowedChatIds) {
-    if (!allowedChatIds || allowedChatIds.size === 0) return true;
-    const candidates = new Set();
+  _eventChatCandidates(eventOrUpdate) {
+    const candidates = [];
+    const seen = new Set();
     const push = (v) => {
       if (v === null || v === undefined) return;
-      const s = String(v?.value ?? v);
-      if (s) candidates.add(s);
+      const s = bigToString(v);
+      if (!s || seen.has(s)) return;
+      seen.add(s);
+      candidates.push(s);
     };
-    const msg = event?.message || event;
-    push(event?.chatId);
-    if (msg) {
+
+    const msg = eventOrUpdate?.message || eventOrUpdate;
+    push(eventOrUpdate?.chatId);
+    push(eventOrUpdate?.channelId);
+    if (msg && msg !== eventOrUpdate) {
       push(msg.chatId);
-      if (msg.peerId) {
-        push(msg.peerId.channelId);
-        push(msg.peerId.chatId);
-        push(msg.peerId.userId);
-      }
     }
-    // Also pull from getChat() if GramJS has cached it on the event.
-    const cachedChat = event?._chat || msg?._chat;
+    const peerSrc = msg?.peerId || eventOrUpdate?.peer;
+    if (peerSrc) {
+      push(peerSrc.channelId);
+      push(peerSrc.chatId);
+      push(peerSrc.userId);
+    }
+    // _chat cached by GramJS for NewMessage events.
+    const cachedChat = eventOrUpdate?._chat || msg?._chat;
     if (cachedChat) {
       push(cachedChat.id);
-      if (cachedChat.username) candidates.add(String(cachedChat.username));
+      if (cachedChat.username) push(cachedChat.username);
     }
-
-    // Quick wins on raw matches.
-    for (const c of candidates) {
-      if (allowedChatIds.has(c)) return true;
-      if (allowedChatIds.has(`-${c}`)) return true;
-      if (allowedChatIds.has(`-100${c}`)) return true;
-      if (c.startsWith('-100') && allowedChatIds.has(c.slice(4))) return true;
-      if (c.startsWith('-') && allowedChatIds.has(c.slice(1))) return true;
-    }
-    return false;
+    return candidates;
   }
 
-  async _onEvent(jobId, userId, sessionId, event) {
-    try {
-      const ctx = this._active.get(jobId);
-      const dedupEnabled = ctx ? ctx.dedupEnabled !== false : true;
-      const allowed = ctx ? ctx.allowedChatIds : null;
+  /**
+   * Defense-in-depth chat filter. GramJS's NewMessage `chats` filter is
+   * fragile (see comments in `_attach`) so we do our own match against
+   * the allow list. As a side effect, the first time we recognise a
+   * chat by one form (e.g. via the cached `_chat.username`) we add the
+   * other forms (raw id, `-100` form) into the allow list, so matching
+   * speeds up for subsequent events even if pre-resolve never ran.
+   */
+  _eventMatchesTarget(eventOrUpdate, allowedChatIds) {
+    if (!allowedChatIds || allowedChatIds.size === 0) return true;
+    const candidates = this._eventChatCandidates(eventOrUpdate);
 
-      if (allowed && allowed.size > 0 && !this._eventMatchesTarget(event, allowed)) {
-        // Cross-talk from a different chat the session is also in.
-        return;
+    let matchedCandidate = null;
+    for (const c of candidates) {
+      if (allowedChatIds.has(c)) { matchedCandidate = c; break; }
+      if (allowedChatIds.has(`-${c}`)) { matchedCandidate = c; break; }
+      if (allowedChatIds.has(`-100${c}`)) { matchedCandidate = c; break; }
+      if (c.startsWith('-100') && allowedChatIds.has(c.slice(4))) {
+        matchedCandidate = c; break;
       }
+      if (c.startsWith('-') && allowedChatIds.has(c.slice(1))) {
+        matchedCandidate = c; break;
+      }
+    }
+    if (!matchedCandidate) return false;
 
-      const profile = await extractSenderProfile(event);
-      if (!profile) return;
+    // Self-warm: we just saw the chat for the first time. Adding all
+    // candidate forms to the allow list lets future events match in
+    // O(1) without re-running the prefix logic.
+    for (const c of candidates) {
+      allowedChatIds.add(c);
+      if (c.startsWith('-100')) allowedChatIds.add(c.slice(4));
+      else if (/^\d+$/.test(c)) allowedChatIds.add(`-100${c}`);
+    }
+    return true;
+  }
 
-      // Every accepted event — regardless of dedup mode — contributes
-      // to events_observed so the operator can tell at a glance how
-      // many messages we actually heard versus how many distinct users
-      // we recorded.
-      await pool.query(
-        `UPDATE scrape_monitor_jobs
-            SET events_observed = events_observed + 1,
-                updated_at = NOW()
-          WHERE id = $1`,
-        [jobId]
+  /**
+   * Insert / update a single observation into the database. Shared by
+   * the NewMessage and Raw event paths. The `kind` param is purely for
+   * logging.
+   */
+  async _recordProfile(jobId, userId, sessionId, profile, kind = 'message') {
+    if (!profile || !profile.telegramId) return;
+    const ctx = this._active.get(jobId);
+    const dedupEnabled = ctx ? ctx.dedupEnabled !== false : true;
+
+    // Every accepted observation contributes to events_observed so the
+    // operator can compare "events heard" vs "distinct users recorded".
+    await pool.query(
+      `UPDATE scrape_monitor_jobs
+          SET events_observed = events_observed + 1,
+              updated_at = NOW()
+        WHERE id = $1`,
+      [jobId]
+    );
+
+    let inserted = false;
+    if (dedupEnabled) {
+      const existing = await pool.query(
+        `SELECT id FROM scrape_monitor_users
+          WHERE monitor_job_id = $1 AND telegram_id = $2
+          LIMIT 1`,
+        [jobId, profile.telegramId]
       );
-
-      let inserted = false;
-      if (dedupEnabled) {
-        // v6 contract: one row per (job, telegram_id). With the v10
-        // migration the unique constraint is gone, so we emulate the
-        // old behavior with an explicit SELECT-then-INSERT-or-UPDATE.
-        // A small race on the very first message from a new user could
-        // produce two rows; that's acceptable and self-healing on the
-        // next message.
-        const existing = await pool.query(
-          `SELECT id FROM scrape_monitor_users
-            WHERE monitor_job_id = $1 AND telegram_id = $2
-            LIMIT 1`,
-          [jobId, profile.telegramId]
+      if (existing.rows[0]) {
+        await pool.query(
+          `UPDATE scrape_monitor_users
+              SET message_count = message_count + 1,
+                  last_seen_at  = NOW(),
+                  username      = COALESCE($3, username),
+                  first_name    = COALESCE($4, first_name),
+                  last_name     = COALESCE($5, last_name),
+                  phone         = COALESCE($6, phone),
+                  is_premium    = is_premium OR $7,
+                  is_bot        = is_bot OR $8
+            WHERE id = $1 AND monitor_job_id = $2`,
+          [
+            existing.rows[0].id, jobId, profile.username,
+            profile.firstName, profile.lastName, profile.phone,
+            !!profile.isPremium, !!profile.isBot,
+          ]
         );
-        if (existing.rows[0]) {
-          await pool.query(
-            `UPDATE scrape_monitor_users
-                SET message_count = message_count + 1,
-                    last_seen_at  = NOW(),
-                    username      = COALESCE($3, username),
-                    first_name    = COALESCE($4, first_name),
-                    last_name     = COALESCE($5, last_name),
-                    phone         = COALESCE($6, phone),
-                    is_premium    = is_premium OR $7,
-                    is_bot        = is_bot OR $8
-              WHERE id = $1 AND monitor_job_id = $2`,
-            [
-              existing.rows[0].id, jobId, profile.username,
-              profile.firstName, profile.lastName, profile.phone,
-              !!profile.isPremium, !!profile.isBot,
-            ]
-          );
-          inserted = false;
-        } else {
-          await pool.query(
-            `INSERT INTO scrape_monitor_users
-               (monitor_job_id, telegram_id, username, first_name, last_name,
-                phone, is_bot, is_premium, message_count,
-                first_seen_at, last_seen_at, via_session_id)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 1, NOW(), NOW(), $9)`,
-            [
-              jobId, profile.telegramId, profile.username,
-              profile.firstName, profile.lastName, profile.phone,
-              !!profile.isBot, !!profile.isPremium, sessionId,
-            ]
-          );
-          inserted = true;
-        }
+        inserted = false;
       } else {
-        // dedup OFF: every observed message is its own row, even from
-        // the same user. The user explicitly opted in to a raw activity
-        // log, so we MUST NOT skip anything here.
         await pool.query(
           `INSERT INTO scrape_monitor_users
              (monitor_job_id, telegram_id, username, first_name, last_name,
@@ -780,35 +947,134 @@ class ScrapeMonitorService {
         );
         inserted = true;
       }
+    } else {
+      // dedup OFF: every observation is its own row, even from the same
+      // user. The user explicitly opted in to a raw activity log, so
+      // we MUST NOT skip anything here.
+      await pool.query(
+        `INSERT INTO scrape_monitor_users
+           (monitor_job_id, telegram_id, username, first_name, last_name,
+            phone, is_bot, is_premium, message_count,
+            first_seen_at, last_seen_at, via_session_id)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 1, NOW(), NOW(), $9)`,
+        [
+          jobId, profile.telegramId, profile.username,
+          profile.firstName, profile.lastName, profile.phone,
+          !!profile.isBot, !!profile.isPremium, sessionId,
+        ]
+      );
+      inserted = true;
+    }
 
-      if (inserted) {
-        await pool.query(
-          `UPDATE scrape_monitor_jobs SET scraped_count = scraped_count + 1, updated_at=NOW() WHERE id=$1`,
-          [jobId]
-        );
+    if (inserted) {
+      await pool.query(
+        `UPDATE scrape_monitor_jobs SET scraped_count = scraped_count + 1, updated_at=NOW() WHERE id=$1`,
+        [jobId]
+      );
+    }
+
+    // Debounced WS emit so a flood of messages doesn't drown the channel.
+    const now = Date.now();
+    if (ctx && (now - ctx.lastEmitAt) >= PROGRESS_EMIT_DEBOUNCE_MS) {
+      ctx.lastEmitAt = now;
+      const r = await pool.query(
+        `SELECT scraped_count, events_observed FROM scrape_monitor_jobs WHERE id=$1`, [jobId]
+      );
+      emit(userId, 'monitor:progress', {
+        jobId,
+        scrapedCount: r.rows[0]?.scraped_count || 0,
+        eventsObserved: r.rows[0]?.events_observed || 0,
+        newUser: inserted ? {
+          telegramId: String(profile.telegramId),
+          username: profile.username,
+          firstName: profile.firstName,
+          lastName: profile.lastName,
+          source: kind,
+        } : null,
+      });
+    }
+  }
+
+  async _onEvent(jobId, userId, sessionId, event) {
+    try {
+      const ctx = this._active.get(jobId);
+      if (!ctx) return;
+      const allowed = ctx.allowedChatIds;
+
+      if (allowed && allowed.size > 0 && !this._eventMatchesTarget(event, allowed)) {
+        // Cross-talk from a different chat the session is also in.
+        return;
       }
 
-      // Debounced WS emit so a flood of messages doesn't drown the channel.
-      const now = Date.now();
-      if (ctx && (now - ctx.lastEmitAt) >= PROGRESS_EMIT_DEBOUNCE_MS) {
-        ctx.lastEmitAt = now;
-        const r = await pool.query(
-          `SELECT scraped_count, events_observed FROM scrape_monitor_jobs WHERE id=$1`, [jobId]
-        );
-        emit(userId, 'monitor:progress', {
-          jobId,
-          scrapedCount: r.rows[0]?.scraped_count || 0,
-          eventsObserved: r.rows[0]?.events_observed || 0,
-          newUser: inserted ? {
-            telegramId: String(profile.telegramId),
-            username: profile.username,
-            firstName: profile.firstName,
-            lastName: profile.lastName,
-          } : null,
-        });
-      }
+      const profile = await extractSenderProfile(event);
+      if (!profile) return;
+
+      await this._recordProfile(jobId, userId, sessionId, profile, 'message');
     } catch (err) {
       logger.warn(`Monitor job ${jobId} event error: ${err.message}`);
+    }
+  }
+
+  /**
+   * Raw GramJS update handler. Captures interactions that NewMessage
+   * misses: typing indicators, reactions, channel-participant changes,
+   * and MessageService events.
+   *
+   * To avoid double-counting, regular Api.Message updates inside
+   * UpdateNewMessage / UpdateNewChannelMessage are SKIPPED here — the
+   * NewMessage handler already credited them.
+   */
+  async _onRawUpdate(jobId, userId, sessionId, update) {
+    try {
+      if (!update || !update.className) return;
+      if (!RAW_UPDATE_CLASSNAMES.has(update.className)) return;
+
+      const ctx = this._active.get(jobId);
+      if (!ctx) return;
+      const allowed = ctx.allowedChatIds;
+
+      // Special-case: UpdateNew*Message — extract `update.message` and
+      // delegate. NewMessage already handled Api.Message; we only act
+      // on Api.MessageService here.
+      if (
+        update.className === 'UpdateNewMessage'
+        || update.className === 'UpdateNewChannelMessage'
+      ) {
+        const m = update.message;
+        if (!m) return;
+        if (m.className !== 'MessageService') {
+          // Regular Api.Message — already handled by NewMessage.
+          return;
+        }
+        // Filter by chat using a synthetic event-like object.
+        if (allowed && allowed.size > 0
+            && !this._eventMatchesTarget({ message: m }, allowed)) {
+          return;
+        }
+        const profile = await extractSenderProfile({ message: m });
+        if (!profile) return;
+        await this._recordProfile(jobId, userId, sessionId, profile, 'service');
+        return;
+      }
+
+      // For everything else (typing, reactions, participant changes)
+      // the chat-id forms live on the update itself.
+      if (allowed && allowed.size > 0
+          && !this._eventMatchesTarget(update, allowed)) {
+        return;
+      }
+
+      const profile = extractSenderFromRawUpdate(update);
+      if (!profile) return;
+
+      let kind = 'raw';
+      if (update.className.includes('Typing')) kind = 'typing';
+      else if (update.className.includes('Reaction')) kind = 'reaction';
+      else if (update.className.includes('Participant')) kind = 'membership';
+
+      await this._recordProfile(jobId, userId, sessionId, profile, kind);
+    } catch (err) {
+      logger.warn(`Monitor job ${jobId} raw update error: ${err.message}`);
     }
   }
 
