@@ -1,3 +1,4 @@
+import { apiError } from '../../utils/apiError';
 import { useEffect, useState } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import {
@@ -67,7 +68,7 @@ export default function InstagramSessions() {
       setSessions(data.sessions || []);
     } catch (err) {
       showToast(
-        err?.response?.data?.error || err.message || 'Failed to load Instagram sessions',
+        apiError(err, 'Failed to load Instagram sessions'),
         'error'
       );
     } finally {
@@ -90,7 +91,7 @@ export default function InstagramSessions() {
       showToast('Session re-attached', 'success');
       await reload();
     } catch (err) {
-      showToast(err?.response?.data?.error || err.message, 'error');
+      showToast(apiError(err), 'error');
     } finally {
       setBusyId(null);
     }
@@ -103,7 +104,7 @@ export default function InstagramSessions() {
       showToast('Logged out', 'info');
       await reload();
     } catch (err) {
-      showToast(err?.response?.data?.error || err.message, 'error');
+      showToast(apiError(err), 'error');
     } finally {
       setBusyId(null);
     }
@@ -117,7 +118,7 @@ export default function InstagramSessions() {
       showToast('Session deleted', 'info');
       await reload();
     } catch (err) {
-      showToast(err?.response?.data?.error || err.message, 'error');
+      showToast(apiError(err), 'error');
     } finally {
       setBusyId(null);
     }
@@ -132,7 +133,7 @@ export default function InstagramSessions() {
       showToast('Sessions deleted', 'info');
       await reload();
     } catch (err) {
-      showToast(err?.response?.data?.error || err.message, 'error');
+      showToast(apiError(err), 'error');
     }
   }
 

@@ -1,3 +1,4 @@
+import { apiError } from '../../utils/apiError';
 import { useEffect, useState } from 'react';
 import { Network, Plus, Trash2, RefreshCw, Globe } from 'lucide-react';
 import { listProxies, addProxy, deleteProxy, refreshProxies } from '@/api/proxies';
@@ -16,7 +17,7 @@ export default function InstagramProxies() {
       const r = await listProxies();
       setProxies(r.data?.data?.proxies || r.data?.proxies || r.data || []);
     } catch (err) {
-      showToast(err?.response?.data?.error || err.message, 'error');
+      showToast(apiError(err), 'error');
     } finally {
       setLoading(false);
     }
@@ -32,7 +33,7 @@ export default function InstagramProxies() {
       setForm({ url: '', label: '' });
       await reload();
     } catch (err) {
-      showToast(err?.response?.data?.error || err.message, 'error');
+      showToast(apiError(err), 'error');
     }
   }
 
@@ -42,7 +43,7 @@ export default function InstagramProxies() {
       await deleteProxy(id);
       await reload();
     } catch (err) {
-      showToast(err?.response?.data?.error || err.message, 'error');
+      showToast(apiError(err), 'error');
     }
   }
 
@@ -62,7 +63,7 @@ export default function InstagramProxies() {
           <button
             onClick={async () => {
               try { await refreshProxies(); await reload(); }
-              catch (err) { showToast(err?.response?.data?.error || err.message, 'error'); }
+              catch (err) { showToast(apiError(err), 'error'); }
             }}
             className="inline-flex items-center gap-1 rounded-lg bg-white px-3 py-2 text-sm font-semibold text-[#dc2743] shadow hover:bg-pink-50"
           >

@@ -1,3 +1,4 @@
+import { apiError } from '../../utils/apiError';
 import { useEffect, useState } from 'react';
 import {
   BarChart3,
@@ -45,7 +46,7 @@ export default function InstagramReports() {
       setActivity(act.filter((x) => !x?.metadata?.platform || x.metadata.platform === 'instagram'));
       setSaved(r.data?.data?.reports || r.data?.reports || []);
     } catch (err) {
-      showToast(err?.response?.data?.error || err.message || 'Failed to load reports', 'error');
+      showToast(apiError(err, 'Failed to load reports'), 'error');
     } finally {
       setLoading(false);
     }
@@ -149,7 +150,7 @@ export default function InstagramReports() {
                     a.remove();
                     setTimeout(() => URL.revokeObjectURL(url), 1000);
                   } catch (err) {
-                    showToast(err?.response?.data?.error || err.message, 'error');
+                    showToast(apiError(err), 'error');
                   }
                 }}
                 className="inline-flex items-center gap-1 rounded-md border border-pink-200 bg-white px-3 py-1.5 text-xs font-medium text-pink-700 hover:bg-pink-50 dark:border-pink-300/20 dark:bg-pink-950/40 dark:text-pink-100"

@@ -1,3 +1,4 @@
+import { apiError } from '../../utils/apiError';
 import { useEffect, useState } from 'react';
 import {
   ListChecks,
@@ -30,7 +31,7 @@ export default function InstagramLists() {
       const data = r.data?.data || r.data || {};
       setLists(data.lists || data || []);
     } catch (err) {
-      showToast(err?.response?.data?.error || err.message || 'Failed to load lists', 'error');
+      showToast(apiError(err, 'Failed to load lists'), 'error');
     } finally {
       setLoading(false);
     }
@@ -45,7 +46,7 @@ export default function InstagramLists() {
       showToast('List deleted', 'info');
       await reload();
     } catch (err) {
-      showToast(err?.response?.data?.error || err.message, 'error');
+      showToast(apiError(err), 'error');
     }
   }
 
@@ -62,7 +63,7 @@ export default function InstagramLists() {
       a.remove();
       setTimeout(() => URL.revokeObjectURL(url), 1000);
     } catch (err) {
-      showToast(err?.response?.data?.error || err.message, 'error');
+      showToast(apiError(err), 'error');
     }
   }
 
@@ -72,7 +73,7 @@ export default function InstagramLists() {
       showToast('Deduplication queued', 'success');
       await reload();
     } catch (err) {
-      showToast(err?.response?.data?.error || err.message, 'error');
+      showToast(apiError(err), 'error');
     }
   }
 
@@ -90,7 +91,7 @@ export default function InstagramLists() {
       setCreating(false);
       await reload();
     } catch (err) {
-      showToast(err?.response?.data?.error || err.message || 'Failed to create list', 'error');
+      showToast(apiError(err, 'Failed to create list'), 'error');
     }
   }
 

@@ -87,7 +87,14 @@ async function start({ userId, username, password, proxyUrl = null }) {
   // Build a fresh client; we don't reuse pool clients here because the
   // session row doesn't exist yet.
   // eslint-disable-next-line global-require
-  const { IgApiClient, IgLoginTwoFactorRequiredError, IgCheckpointError } = require('instagram-private-api');
+  const {
+    IgApiClient,
+    IgLoginTwoFactorRequiredError,
+    IgCheckpointError,
+    IgLoginBadPasswordError,
+    IgLoginInvalidUserError,
+    IgChallengeWrongCodeError,
+  } = require('instagram-private-api');
   const client = new IgApiClient();
   client.state.generateDevice(username.toLowerCase());
   if (proxyUrl) client.state.proxyUrl = proxyUrl;
@@ -184,7 +191,44 @@ async function start({ userId, username, password, proxyUrl = null }) {
     }
     _pending.delete(token);
     logger.warn(`IG.create.start failed user=${userId} username=${username}: ${err.message}`);
-    throw err;
+    // Map well-known IG errors into user-facing 4xx responses so the UI
+    // shows a clean "wrong password" / "no such user" / "rate-limited"
+    // message instead of a 500 stack trace.
+    if (err && err.constructor && (
+      err.constructor.name === 'IgLoginBadPasswordError' ||
+      err instanceof IgLoginBadPasswordError
+    )) {
+      const e = new Error(
+        'Instagram rejected the username or password. Double-check your credentials and try again. ' +
+        'If you reused this password recently, Instagram may also be blocking the login from a new location — ' +
+        'try logging in from the Instagram app on your phone first to confirm the device.'
+      );
+      e.statusCode = 401;
+      e.code = 'IG_BAD_PASSWORD';
+      throw e;
+    }
+    if (err && err.constructor && (
+      err.constructor.name === 'IgLoginInvalidUserError' ||
+      err instanceof IgLoginInvalidUserError
+    )) {
+      const e = new Error('No Instagram account exists with that username.');
+      e.statusCode = 404;
+      e.code = 'IG_NO_USER';
+      throw e;
+    }
+    if (err && /rate.?limit|please wait a few minutes/i.test(err.message || '')) {
+      const e = new Error(
+        'Instagram is rate-limiting this device. Wait 10–15 minutes and try again, or attach a residential proxy.'
+      );
+      e.statusCode = 429;
+      e.code = 'IG_RATE_LIMITED';
+      throw e;
+    }
+    // Unknown failure — surface a clean message but keep the original status.
+    const wrapped = new Error(`Instagram login failed: ${err.message}`);
+    wrapped.statusCode = err.statusCode || 502;
+    wrapped.code = err.code || 'IG_LOGIN_FAILED';
+    throw wrapped;
   }
 }
 
