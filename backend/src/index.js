@@ -198,11 +198,42 @@ io.use((socket, next) => {
   }
 });
 
+const VALID_PLATFORMS = new Set(['telegram', 'instagram']);
+
 io.on('connection', (socket) => {
   logger.info(`User connected: ${socket.userId}`);
 
-  // Join user-specific room
+  // Join user-specific room (cross-platform notifications still flow here).
   socket.join(`user:${socket.userId}`);
+
+  // Per-platform rooms — services emit to `platform:<userId>:<platform>`
+  // for events that should be scoped to a single panel (e.g. IG warmup
+  // throttle decisions, TG group-invite progress). The frontend asks
+  // for the room it cares about via 'platform:subscribe' and will
+  // re-subscribe whenever the user toggles platforms.
+  const _joinPlatform = (platform) => {
+    if (!VALID_PLATFORMS.has(platform)) return;
+    socket.join(`platform:${socket.userId}:${platform}`);
+  };
+  const _leavePlatform = (platform) => {
+    if (!VALID_PLATFORMS.has(platform)) return;
+    socket.leave(`platform:${socket.userId}:${platform}`);
+  };
+
+  // Handshake-time platform (sent in io({ query: { platform } })). We
+  // join the room immediately so the very first event after connect is
+  // routed correctly.
+  const handshakePlatform = socket.handshake?.query?.platform;
+  if (handshakePlatform && VALID_PLATFORMS.has(handshakePlatform)) {
+    _joinPlatform(handshakePlatform);
+  }
+
+  socket.on('platform:subscribe', (data) => {
+    _joinPlatform(data?.platform);
+  });
+  socket.on('platform:unsubscribe', (data) => {
+    _leavePlatform(data?.platform);
+  });
 
   // Handle client events
   socket.on('scrape:cancel', async (data) => {
