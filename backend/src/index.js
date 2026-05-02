@@ -257,7 +257,7 @@ io.on('connection', (socket) => {
 global.io = io;
 
 // Initialize and start server
-const PORT = process.env.PORT || 3003;
+const PORT = process.env.PORT || 3005;
 
 async function start() {
   try {

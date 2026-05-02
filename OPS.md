@@ -242,7 +242,7 @@ a new one that fixes it.
 
 ```bash
 # Backend health
-curl -s http://localhost:3003/health
+curl -s http://localhost:3005/health
 
 # Postgres connection saturation
 psql -c "SELECT count(*) FROM pg_stat_activity WHERE datname='telegram_panel';"
@@ -380,7 +380,7 @@ the same host. The current set is:
 
 | Service                 | Original | Current (+3) | Notes                                   |
 | ----------------------- | -------- | ------------ | --------------------------------------- |
-| Backend HTTP/WebSocket  | `3000`   | `3003`       | Express + Socket.IO                     |
+| Backend HTTP/WebSocket  | `3000`   | `3005`       | Express + Socket.IO. Bumped from `3003` to coexist with another host service. |
 | Postgres (in-container) | `5432`   | `5435`       | overridden via `command: postgres -p`   |
 | Postgres (host-mapped)  | `5436`   | `5439`       | docker-compose `ports:` left side       |
 | Redis (in-container)    | `6379`   | `6382`       | overridden via `redis-server --port`    |
