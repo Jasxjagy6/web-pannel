@@ -7,6 +7,8 @@ import MissingApiCredsModal from './components/common/MissingApiCredsModal';
 import RouteFallback from './components/common/RouteFallback';
 import { useAuth } from './hooks/useAuth';
 import Layout from './components/layout/Layout';
+import InstagramLayout from './components/instagram/InstagramLayout';
+import PanelSwitchOverlay from './components/common/PanelSwitchOverlay';
 
 // Always-eager pages — Login / Register / Pending are tiny and on the
 // critical path of the very first paint. Everything else is lazy-loaded
@@ -38,10 +40,20 @@ const Billing = lazy(() => import('./pages/Billing'));
 // Instagram-specific page components — used by PlatformPage to render the
 // IG-themed pink experience for /instagram/<route> URLs. Telegram still
 // renders the original (steel-blue) component on /telegram/<route>.
-const InstagramDashboard      = lazy(() => import('./pages/instagram/Dashboard'));
-const InstagramSessions       = lazy(() => import('./pages/instagram/Sessions'));
-const InstagramCreateSession  = lazy(() => import('./pages/instagram/CreateSession'));
-const InstagramScrape         = lazy(() => import('./pages/instagram/Scrape'));
+const InstagramDashboard       = lazy(() => import('./pages/instagram/Dashboard'));
+const InstagramSessions        = lazy(() => import('./pages/instagram/Sessions'));
+const InstagramCreateSession   = lazy(() => import('./pages/instagram/CreateSession'));
+const InstagramScrape          = lazy(() => import('./pages/instagram/Scrape'));
+const InstagramLists           = lazy(() => import('./pages/instagram/Lists'));
+const InstagramReports         = lazy(() => import('./pages/instagram/Reports'));
+const InstagramProxies         = lazy(() => import('./pages/instagram/Proxies'));
+const InstagramAntiDetect      = lazy(() => import('./pages/instagram/AntiDetect'));
+const InstagramAccountSettings = lazy(() => import('./pages/instagram/AccountSettings'));
+const InstagramPrivacy         = lazy(() => import('./pages/instagram/Privacy'));
+const InstagramChange2FA       = lazy(() => import('./pages/instagram/Change2FA'));
+const InstagramSettings        = lazy(() => import('./pages/instagram/Settings'));
+const InstagramBilling         = lazy(() => import('./pages/instagram/Billing'));
+const InstagramMessaging       = lazy(() => import('./pages/instagram/Messaging'));
 
 /**
  * Picks the right page component based on the active panel platform.
@@ -146,7 +158,11 @@ function ProtectedRoute({ children, title, requireAdmin = false, allowWithoutSub
       return <Navigate to={`/${platform}/billing`} replace />;
     }
   }
-  return <Layout title={title}>{children}</Layout>;
+  // Per-platform chrome: Instagram routes get the dedicated pink
+  // InstagramLayout (custom sidebar/header), Telegram keeps its own
+  // dark Layout. The two panels share zero visual DNA.
+  const Shell = platform === 'instagram' ? InstagramLayout : Layout;
+  return <Shell title={title}>{children}</Shell>;
 }
 
 function PendingGate() {
@@ -203,23 +219,23 @@ function LegacyRedirect({ to }) {
 function PlatformRoutes() {
   return (
     <Routes>
-      <Route path="billing" element={<ProtectedRoute title="Billing" allowWithoutSubscription><Billing /></ProtectedRoute>} />
+      <Route path="billing" element={<ProtectedRoute title="Billing" allowWithoutSubscription><PlatformPage tg={Billing} ig={InstagramBilling} /></ProtectedRoute>} />
       <Route path="dashboard" element={<ProtectedRoute title="Dashboard"><PlatformPage tg={Dashboard} ig={InstagramDashboard} /></ProtectedRoute>} />
       <Route path="sessions" element={<ProtectedRoute title="Sessions"><PlatformPage tg={Sessions} ig={InstagramSessions} /></ProtectedRoute>} />
       <Route path="create-session" element={<ProtectedRoute title="Create Session"><PlatformPage tg={CreateSession} ig={InstagramCreateSession} /></ProtectedRoute>} />
       <Route path="scrape" element={<ProtectedRoute title="Scrape"><PlatformPage tg={Scrape} ig={InstagramScrape} /></ProtectedRoute>} />
-      <Route path="messaging" element={<ProtectedRoute title="Messaging"><Messaging /></ProtectedRoute>} />
+      <Route path="messaging" element={<ProtectedRoute title="Messaging"><PlatformPage tg={Messaging} ig={InstagramMessaging} /></ProtectedRoute>} />
       <Route path="groups" element={<ProtectedRoute title="Groups"><Groups /></ProtectedRoute>} />
       <Route path="threads" element={<ProtectedRoute title="Threads"><Threads /></ProtectedRoute>} />
-      <Route path="lists" element={<ProtectedRoute title="Lists"><Lists /></ProtectedRoute>} />
-      <Route path="reports" element={<ProtectedRoute title="Reports"><Reports /></ProtectedRoute>} />
-      <Route path="account-settings" element={<ProtectedRoute title="Account Settings"><AccountSettings /></ProtectedRoute>} />
-      <Route path="change-2fa" element={<ProtectedRoute title="Change 2FA"><Change2FA /></ProtectedRoute>} />
+      <Route path="lists" element={<ProtectedRoute title="Lists"><PlatformPage tg={Lists} ig={InstagramLists} /></ProtectedRoute>} />
+      <Route path="reports" element={<ProtectedRoute title="Reports"><PlatformPage tg={Reports} ig={InstagramReports} /></ProtectedRoute>} />
+      <Route path="account-settings" element={<ProtectedRoute title="Account Settings"><PlatformPage tg={AccountSettings} ig={InstagramAccountSettings} /></ProtectedRoute>} />
+      <Route path="change-2fa" element={<ProtectedRoute title="Change 2FA"><PlatformPage tg={Change2FA} ig={InstagramChange2FA} /></ProtectedRoute>} />
       <Route path="get-otp" element={<ProtectedRoute title="Get OTP"><GetOTP /></ProtectedRoute>} />
-      <Route path="proxies" element={<ProtectedRoute title="Proxies"><Proxies /></ProtectedRoute>} />
-      <Route path="anti-detect" element={<ProtectedRoute title="Anti-Detect"><AntiDetect /></ProtectedRoute>} />
-      <Route path="privacy" element={<ProtectedRoute title="Privacy"><Privacy /></ProtectedRoute>} />
-      <Route path="settings" element={<ProtectedRoute title="Settings" allowWithoutSubscription><Settings /></ProtectedRoute>} />
+      <Route path="proxies" element={<ProtectedRoute title="Proxies"><PlatformPage tg={Proxies} ig={InstagramProxies} /></ProtectedRoute>} />
+      <Route path="anti-detect" element={<ProtectedRoute title="Anti-Detect"><PlatformPage tg={AntiDetect} ig={InstagramAntiDetect} /></ProtectedRoute>} />
+      <Route path="privacy" element={<ProtectedRoute title="Privacy"><PlatformPage tg={Privacy} ig={InstagramPrivacy} /></ProtectedRoute>} />
+      <Route path="settings" element={<ProtectedRoute title="Settings" allowWithoutSubscription><PlatformPage tg={Settings} ig={InstagramSettings} /></ProtectedRoute>} />
       <Route path="*" element={<Navigate to="dashboard" replace />} />
     </Routes>
   );
@@ -232,6 +248,7 @@ export default function App() {
         <PlatformProvider>
           <ToastContainer />
           <MissingApiCredsModal />
+          <PanelSwitchOverlay />
           <Suspense fallback={<RouteFallback />}>
             <Routes>
               <Route path="/login" element={<Login />} />
