@@ -140,7 +140,10 @@ app.get('/health', (req, res) => {
 //   about (e.g. /billing/checkout, /billing/status, /billing/invoices).
 const apiPrefix = process.env.API_PREFIX || '/api';
 
+const platformMetaRoutes = require('./routes/platformMeta');
+
 const PLATFORM_ROUTERS = [
+  ['/meta',             platformMetaRoutes],
   ['/sessions',         sessionRoutes],
   ['/scrape',           scrapeRoutes],
   ['/messages',         messageRoutes],

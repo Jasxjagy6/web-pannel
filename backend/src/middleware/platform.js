@@ -42,6 +42,22 @@ function parsePlatform(forced) {
   const normalized = _normalize(forced) || DEFAULT_PLATFORM;
   return (req, res, next) => {
     req.platform = normalized;
+    // Lazily resolve the provider on first access so we don't pay the
+    // require() cost of either platform's runtime if the request never
+    // touches them (e.g. health checks, auth).
+    let _provider = null;
+    Object.defineProperty(req, 'provider', {
+      configurable: true,
+      enumerable: false,
+      get() {
+        if (!_provider) {
+          // eslint-disable-next-line global-require
+          const { getProvider } = require('../providers');
+          _provider = getProvider(req.platform);
+        }
+        return _provider;
+      },
+    });
     res.setHeader('X-Platform', normalized);
     next();
   };
@@ -65,6 +81,21 @@ function resolvePlatform(req, res, next) {
     const fromQuery = _normalize(req.query?.platform);
     const fromBody = _normalize(req.body?.platform);
     req.platform = fromHeader || fromQuery || fromBody || DEFAULT_PLATFORM;
+  }
+  if (!Object.getOwnPropertyDescriptor(req, 'provider')) {
+    let _provider = null;
+    Object.defineProperty(req, 'provider', {
+      configurable: true,
+      enumerable: false,
+      get() {
+        if (!_provider) {
+          // eslint-disable-next-line global-require
+          const { getProvider } = require('../providers');
+          _provider = getProvider(req.platform);
+        }
+        return _provider;
+      },
+    });
   }
   res.setHeader('X-Platform', req.platform);
   next();
