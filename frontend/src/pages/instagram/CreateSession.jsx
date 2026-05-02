@@ -18,6 +18,7 @@ import {
   createSessionCancel,
 } from '@/api/sessions';
 import { useToast } from '../../components/common/Toast';
+import { apiError } from '../../utils/apiError';
 
 const IG_GRADIENT = 'bg-gradient-to-tr from-[#f09433] via-[#dc2743] to-[#bc1888]';
 
@@ -100,7 +101,7 @@ export default function InstagramCreateSession() {
   const [createdSession, setCreatedSession] = useState(null);
 
   function _err(e) {
-    return e?.response?.data?.error || e?.response?.data?.message || e?.message || 'Unknown error';
+    return apiError(e);
   }
 
   async function startLogin(evt) {

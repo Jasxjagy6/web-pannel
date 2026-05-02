@@ -1,3 +1,4 @@
+import { apiError } from '../../utils/apiError';
 import { useEffect, useState } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import {
@@ -10,6 +11,7 @@ import {
   CheckCircle2,
   AlertCircle,
   Power,
+  Upload,
 } from 'lucide-react';
 import {
   listSessions,
@@ -67,7 +69,7 @@ export default function InstagramSessions() {
       setSessions(data.sessions || []);
     } catch (err) {
       showToast(
-        err?.response?.data?.error || err.message || 'Failed to load Instagram sessions',
+        apiError(err, 'Failed to load Instagram sessions'),
         'error'
       );
     } finally {
@@ -90,7 +92,7 @@ export default function InstagramSessions() {
       showToast('Session re-attached', 'success');
       await reload();
     } catch (err) {
-      showToast(err?.response?.data?.error || err.message, 'error');
+      showToast(apiError(err), 'error');
     } finally {
       setBusyId(null);
     }
@@ -103,7 +105,7 @@ export default function InstagramSessions() {
       showToast('Logged out', 'info');
       await reload();
     } catch (err) {
-      showToast(err?.response?.data?.error || err.message, 'error');
+      showToast(apiError(err), 'error');
     } finally {
       setBusyId(null);
     }
@@ -117,7 +119,7 @@ export default function InstagramSessions() {
       showToast('Session deleted', 'info');
       await reload();
     } catch (err) {
-      showToast(err?.response?.data?.error || err.message, 'error');
+      showToast(apiError(err), 'error');
     } finally {
       setBusyId(null);
     }
@@ -132,7 +134,7 @@ export default function InstagramSessions() {
       showToast('Sessions deleted', 'info');
       await reload();
     } catch (err) {
-      showToast(err?.response?.data?.error || err.message, 'error');
+      showToast(apiError(err), 'error');
     }
   }
 
@@ -156,6 +158,12 @@ export default function InstagramSessions() {
           >
             <RefreshCw className={`h-4 w-4 ${loading ? 'animate-spin' : ''}`} /> Refresh
           </button>
+          <Link
+            to="/instagram/upload-session"
+            className="flex items-center gap-1 rounded-lg border border-white/30 bg-white/10 px-3 py-2 text-sm font-medium text-white transition hover:bg-white/20"
+          >
+            <Upload className="h-4 w-4" /> Upload session
+          </Link>
           <Link
             to="/instagram/create-session"
             className="flex items-center gap-1 rounded-lg bg-white px-3 py-2 text-sm font-semibold text-[#dc2743] shadow transition hover:bg-pink-50"
@@ -214,12 +222,20 @@ export default function InstagramSessions() {
                     <div className="mt-2 text-sm text-gray-500 dark:text-gray-400">
                       Click <strong>Create session</strong> to log in your first Instagram account.
                     </div>
-                    <button
-                      onClick={() => navigate('/instagram/create-session')}
-                      className={`mt-4 inline-flex items-center gap-1 rounded-lg ${IG_GRADIENT} px-4 py-2 text-sm font-semibold text-white shadow`}
-                    >
-                      <Plus className="h-4 w-4" /> Create session
-                    </button>
+                    <div className="mt-4 flex items-center justify-center gap-2">
+                      <button
+                        onClick={() => navigate('/instagram/create-session')}
+                        className={`inline-flex items-center gap-1 rounded-lg ${IG_GRADIENT} px-4 py-2 text-sm font-semibold text-white shadow`}
+                      >
+                        <Plus className="h-4 w-4" /> Create session
+                      </button>
+                      <button
+                        onClick={() => navigate('/instagram/upload-session')}
+                        className="inline-flex items-center gap-1 rounded-lg border border-pink-200 bg-white px-4 py-2 text-sm font-semibold text-[#dc2743] shadow-sm hover:bg-pink-50 dark:border-pink-900/30 dark:bg-dark-700 dark:text-pink-300 dark:hover:bg-dark-600"
+                      >
+                        <Upload className="h-4 w-4" /> Upload session
+                      </button>
+                    </div>
                   </div>
                 </td>
               </tr>

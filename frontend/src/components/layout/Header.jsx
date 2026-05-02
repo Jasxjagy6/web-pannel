@@ -27,8 +27,14 @@ export default function Header({ onMenuClick, title }) {
       </div>
 
       {/* Right: platform toggle, notification bell, user avatar */}
-      <div className="flex items-center gap-3">
-        {/* Platform toggle (TG / IG segmented control) */}
+      <div className="flex items-center gap-2 sm:gap-3">
+        {/* Platform toggle — visible on mobile too so users on phones
+            can swap between Telegram and Instagram panels. The compact
+            `size=sm` variant keeps it from blowing out the header on
+            <360px screens. */}
+        <div className="block sm:hidden">
+          <PlatformToggle size="sm" />
+        </div>
         <div className="hidden sm:block">
           <PlatformToggle />
         </div>

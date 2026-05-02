@@ -1,3 +1,4 @@
+import { apiError } from '../../utils/apiError';
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import {
@@ -77,7 +78,7 @@ export default function InstagramScrape() {
         return list.length ? [list[0].id] : [];
       });
     } catch (err) {
-      showToast(err?.response?.data?.error || err.message || 'Failed to load sessions', 'error');
+      showToast(apiError(err, 'Failed to load sessions'), 'error');
     }
   }
 
@@ -88,7 +89,7 @@ export default function InstagramScrape() {
       const data = r.data?.data || r.data || {};
       setJobs(data.jobs || []);
     } catch (err) {
-      showToast(err?.response?.data?.error || err.message || 'Failed to load scrape jobs', 'error');
+      showToast(apiError(err, 'Failed to load scrape jobs'), 'error');
     } finally {
       setJobsLoading(false);
     }
@@ -143,7 +144,7 @@ export default function InstagramScrape() {
       setTargetUsernames('');
       await reloadJobs();
     } catch (err) {
-      showToast(err?.response?.data?.error || err.message || 'Failed to start job', 'error');
+      showToast(apiError(err, 'Failed to start job'), 'error');
     } finally {
       setSubmitting(false);
     }
@@ -155,7 +156,7 @@ export default function InstagramScrape() {
       showToast('Job cancelled', 'info');
       await reloadJobs();
     } catch (err) {
-      showToast(err?.response?.data?.error || err.message, 'error');
+      showToast(apiError(err), 'error');
     }
   }
 
@@ -166,7 +167,7 @@ export default function InstagramScrape() {
       showToast('Job deleted', 'info');
       await reloadJobs();
     } catch (err) {
-      showToast(err?.response?.data?.error || err.message, 'error');
+      showToast(apiError(err), 'error');
     }
   }
 
@@ -183,7 +184,7 @@ export default function InstagramScrape() {
       a.remove();
       setTimeout(() => URL.revokeObjectURL(url), 1000);
     } catch (err) {
-      showToast(err?.response?.data?.error || err.message, 'error');
+      showToast(apiError(err), 'error');
     }
   }
 

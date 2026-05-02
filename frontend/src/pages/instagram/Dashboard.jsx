@@ -1,3 +1,4 @@
+import { apiError } from '../../utils/apiError';
 import { useEffect, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import {
@@ -79,7 +80,7 @@ export default function InstagramDashboard() {
       .catch((err) => {
         if (!alive) return;
         showToast(
-          err?.response?.data?.error || err.message || 'Failed to load Instagram dashboard',
+          apiError(err, 'Failed to load Instagram dashboard'),
           'error'
         );
       })
