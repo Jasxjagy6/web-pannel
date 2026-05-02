@@ -519,12 +519,38 @@ class ScrapeMonitorService {
         allowedChatIds.add(`@${resolved.username}`);
       }
 
-      // Build the GramJS chat filter for this session. Pass both the
-      // resolved entity (preferred) and the raw target string so the
-      // filter has the best chance of matching across GramJS versions.
+      // Build the GramJS chat filter for this session. IMPORTANT: we
+      // pass only string/number identifiers — never the resolved
+      // entity object. GramJS's _intoIdSet calls getInputEntity() on
+      // every item, and a bare entity object whose className is not
+      // one of the InputPeer-like shapes makes it fall through to
+      // `getEntityFromString(String(item))`, which yields the literal
+      // text "[object Object]" and crashes the whole NewMessage
+      // dispatcher. Warming the peer cache via _resolveEntity above
+      // is what makes the filter actually match — the filter list
+      // itself just needs identifiers GramJS can parse.
       const chats = [];
-      if (resolved) chats.push(resolved);
-      chats.push(rawTarget);
+      if (resolved && resolved.id !== undefined && resolved.id !== null) {
+        const idStr = String(resolved.id?.value ?? resolved.id);
+        if (idStr) {
+          chats.push(idStr);
+          // Bot-API style for channels / supergroups, since some GramJS
+          // call sites compare against the "-100" form internally.
+          if (resolved.className === 'Channel' || resolved.className === 'ChannelForbidden') {
+            chats.push(`-100${idStr}`);
+          } else if (resolved.className === 'Chat') {
+            chats.push(`-${idStr}`);
+          }
+        }
+      }
+      if (resolved && resolved.username) {
+        chats.push(String(resolved.username));
+      }
+      // Always include the raw user-supplied target as a final
+      // fallback; if every other form failed to resolve, the original
+      // string (a username, an invite link, a numeric id) is still the
+      // user's source-of-truth identifier for this chat.
+      if (rawTarget && !chats.includes(rawTarget)) chats.push(rawTarget);
 
       try {
         const off = await telegramService.addNewMessageHandler(

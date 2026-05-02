@@ -8,8 +8,21 @@
   * {
     @apply border-gray-200;
   }
+  /* The panel ships in dark mode; the previous light bg-gray-100
+     leaked through during route chunk loads (RouteFallback is
+     positioned inside <main>, so on small viewports the body's
+     background was visible above and below it). Setting both html
+     and body to bg-dark-950 means even when a fallback is shorter
+     than the viewport, the surrounding area stays on-theme. */
+  html, body {
+    @apply bg-dark-950 text-white antialiased;
+    min-height: 100%;
+  }
   body {
-    @apply bg-gray-100 text-gray-900 antialiased;
+    /* `100dvh` adapts to the mobile browser chrome (URL bar / nav)
+       so we don't get a thin white strip under the loader on
+       Safari / Chrome mobile when the bar collapses. */
+    min-height: 100dvh;
   }
 }
 
@@ -47,6 +60,15 @@
 }
 ::-webkit-scrollbar-thumb:hover {
   @apply bg-gray-400;
+}
+
+/* The Suspense fallback for route transitions sits where the lazy
+   route's <Layout> would normally be, so it has no parent that
+   defines a height. Force it to fill the viewport so on mobile we
+   never see a white strip under (or over) the loader. */
+.route-fallback {
+  min-height: 100vh;
+  min-height: 100dvh;
 }
 
 /* Animations */

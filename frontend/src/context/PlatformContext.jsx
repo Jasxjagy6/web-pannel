@@ -34,13 +34,20 @@ export const PLATFORM_LABELS = {
 
 export const PLATFORM_FEATURE_FLAG_KEY = 'feature_instagram_panel';
 
+/**
+ * The Instagram panel ships enabled by default. The localStorage flag
+ * is now an *opt-out* — set it to "0" to hide the Instagram tab. This
+ * matches operator expectations: previously the flag was opt-in and
+ * Instagram silently never appeared until someone manually flipped it
+ * in DevTools.
+ */
 function isPlatformEnabled(platform) {
   if (platform === 'telegram') return true;
   if (platform === 'instagram') {
     try {
-      return localStorage.getItem(PLATFORM_FEATURE_FLAG_KEY) === '1';
+      return localStorage.getItem(PLATFORM_FEATURE_FLAG_KEY) !== '0';
     } catch (_) {
-      return false;
+      return true;
     }
   }
   return false;

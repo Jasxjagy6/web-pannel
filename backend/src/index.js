@@ -440,6 +440,22 @@ async function gracefulShutdown(signal) {
 process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
 process.on('SIGINT',  () => gracefulShutdown('SIGINT'));
 
+// Defense in depth: a single thrown error inside a third-party update
+// loop (notably GramJS's _updateLoop) used to crash the whole process
+// and take every other in-flight job with it. Log and keep going. The
+// caller-specific handlers (e.g. scrapeMonitorService._onEvent) already
+// catch their own errors; this is a backstop for everything below them.
+process.on('uncaughtException', (err) => {
+  logger.error(`uncaughtException: ${err && err.message}`, {
+    stack: err && err.stack,
+  });
+});
+process.on('unhandledRejection', (reason) => {
+  logger.error(`unhandledRejection: ${reason && reason.message ? reason.message : reason}`, {
+    stack: reason && reason.stack,
+  });
+});
+
 start();
 
 module.exports = { app, server, io };
