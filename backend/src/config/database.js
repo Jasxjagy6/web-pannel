@@ -52,6 +52,7 @@ const initDB = async () => {
       'migration_v9_multiplatform.sql',
       'migration_v9_2_instagram_extras.sql',
       'migration_v9_3_subscription_split.sql',
+      'migration_v10_monitor_dedup_toggle.sql',
     ];
     for (const m of migrations) {
       const mPath = path.join(__dirname, m);

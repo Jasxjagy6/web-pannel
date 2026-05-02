@@ -400,6 +400,7 @@ const scrapeController = {
       sessionIds, sessionId, targetId, targetType,
       durationSeconds, durationDays, durationHours, durationMinutes,
       targetTitle, reason, options, autoStart,
+      dedupEnabled, allowDuplicates,
     } = req.body || {};
 
     const sessions = Array.isArray(sessionIds) && sessionIds.length
@@ -414,6 +415,16 @@ const scrapeController = {
       duration = Math.floor(days * 86400 + hours * 3600 + minutes * 60);
     }
 
+    // v10: Resolve the dedup toggle. Accept all of:
+    //   { dedupEnabled: true|false }
+    //   { allowDuplicates: true|false }   (mirror; true = dedup OFF)
+    //   { options: { dedupEnabled / allowDuplicates: ... } }
+    // Any unset field defers to the next, and the service falls back
+    // to the v6 default (dedup ON) if none are present.
+    let resolvedDedup;
+    if (dedupEnabled !== undefined) resolvedDedup = !!dedupEnabled;
+    else if (allowDuplicates !== undefined) resolvedDedup = !allowDuplicates;
+
     const job = await monitorService.createJob({
       userId,
       sessionIds: sessions,
@@ -424,6 +435,7 @@ const scrapeController = {
       reason: reason || null,
       options: options || {},
       autoStart: autoStart !== false,
+      dedupEnabled: resolvedDedup,
     });
 
     await reportService.logActivity(userId, 'monitor_start', 'scrape_monitor', job.id, {
