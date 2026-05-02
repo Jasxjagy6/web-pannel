@@ -43,7 +43,7 @@ const server = http.createServer(app);
 // client within ~30s, long enough to keep idle WS traffic minimal.
 const io = new Server(server, {
   cors: {
-    origin: process.env.FRONTEND_URL || 'http://localhost:5173',
+    origin: process.env.FRONTEND_URL || 'http://localhost:5176',
     methods: ['GET', 'POST'],
     credentials: true,
   },
@@ -72,7 +72,7 @@ app.use(compression({
   },
 }));
 app.use(cors({
-  origin: process.env.FRONTEND_URL || 'http://localhost:5173',
+  origin: process.env.FRONTEND_URL || 'http://localhost:5176',
   credentials: true,
 }));
 // OxaPay IPN webhook MUST be mounted with raw body parsing so the HMAC
@@ -257,7 +257,7 @@ io.on('connection', (socket) => {
 global.io = io;
 
 // Initialize and start server
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 3003;
 
 async function start() {
   try {

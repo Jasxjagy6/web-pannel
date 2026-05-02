@@ -15,7 +15,7 @@ const QUEUE_NAME = 'change-2fa-jobs';
 
 const redisConnection = {
   host: process.env.REDIS_HOST || 'localhost',
-  port: parseInt(process.env.REDIS_PORT || '6379'),
+  port: parseInt(process.env.REDIS_PORT || '6382'),
   password: process.env.REDIS_PASSWORD || undefined,
 };
 

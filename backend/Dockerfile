@@ -10,6 +10,6 @@ COPY . .
 
 RUN mkdir -p /app/uploads /app/logs
 
-EXPOSE 3000
+EXPOSE 3003
 
 CMD ["node", "src/index.js"]
