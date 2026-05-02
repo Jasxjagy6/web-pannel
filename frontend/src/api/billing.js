@@ -1,11 +1,19 @@
 import api from './client';
 
-// User-facing endpoints
-export const getBillingConfig  = () => api.get('/billing/config');
-export const getBillingStatus  = () => api.get('/billing/status');
+// User-facing endpoints — accept an optional `platform` arg so per-platform
+// billing pages (TG vs IG) can fetch their own pricing / trial config.
+// All endpoints fall back to /api/billing/* when no platform is supplied
+// for backwards-compat with the pre-multiplatform UI.
+const _q = (platform) => (platform ? { params: { platform } } : undefined);
 
-export const startTrial        = () => api.post('/billing/trial/start');
-export const createCheckout    = () => api.post('/billing/checkout');
+export const getBillingConfig  = (platform) => api.get('/billing/config', _q(platform));
+export const getBillingStatus  = (platform) => api.get('/billing/status', _q(platform));
+
+export const startTrial        = (platform) =>
+  api.post('/billing/trial/start', platform ? { platform } : undefined);
+
+export const createCheckout    = (opts = {}) =>
+  api.post('/billing/checkout', opts);
 
 export const listMyInvoices    = (params) => api.get('/billing/invoices', { params });
 export const listMyEvents      = (params) => api.get('/billing/events', { params });
