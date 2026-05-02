@@ -30,6 +30,9 @@
   --brand-700: #00669b;
   --brand-800: #00557f;
   --brand-900: #003d5c;
+  /* Comma-separated R, G, B for use with rgba() — the route
+     fallback's radial halo reads this so it can fade alpha. */
+  --brand-500-rgb: 0, 136, 204;
   --brand-gradient: linear-gradient(135deg, #0088cc 0%, #0099e5 100%);
   --brand-on:        #ffffff;
 }
@@ -45,6 +48,7 @@ html[data-platform="telegram"] {
   --brand-700: #00669b;
   --brand-800: #00557f;
   --brand-900: #003d5c;
+  --brand-500-rgb: 0, 136, 204;
   --brand-gradient: linear-gradient(135deg, #0088cc 0%, #0099e5 100%);
   --brand-on:        #ffffff;
 }
@@ -60,6 +64,7 @@ html[data-platform="instagram"] {
   --brand-700: #a01f4d;
   --brand-800: #80183d;
   --brand-900: #58112c;
+  --brand-500-rgb: 225, 48, 108;
   --brand-gradient: linear-gradient(135deg, #f09433 0%, #e6683c 25%, #dc2743 50%, #cc2366 75%, #bc1888 100%);
   --brand-on:        #ffffff;
 }

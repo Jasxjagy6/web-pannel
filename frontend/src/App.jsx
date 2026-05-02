@@ -4,6 +4,7 @@ import { AuthProvider } from './context/AuthContext';
 import { PlatformProvider, PLATFORMS, DEFAULT_PLATFORM, PLATFORM_FEATURE_FLAG_KEY } from './context/PlatformContext';
 import { ToastContainer } from './components/common/Toast';
 import MissingApiCredsModal from './components/common/MissingApiCredsModal';
+import RouteFallback from './components/common/RouteFallback';
 import { useAuth } from './hooks/useAuth';
 import Layout from './components/layout/Layout';
 
@@ -33,14 +34,6 @@ const AntiDetect = lazy(() => import('./pages/AntiDetect'));
 const Privacy = lazy(() => import('./pages/Privacy'));
 const Threads = lazy(() => import('./pages/Threads'));
 const Billing = lazy(() => import('./pages/Billing'));
-
-function RouteFallback() {
-  return (
-    <div className="flex h-full min-h-[40vh] w-full items-center justify-center text-sm text-dark-300">
-      Loading…
-    </div>
-  );
-}
 
 /**
  * Predicate: does the user have an active paid subscription or running

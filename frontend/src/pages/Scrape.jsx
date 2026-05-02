@@ -114,6 +114,11 @@ export default function Scrape() {
   // whether their target is admin-only.
   const [hiddenMembers, setHiddenMembers] = useState(false);
   const [creatingMonitors, setCreatingMonitors] = useState(false);
+  // v10: per-job dedup toggle. ON (default) keeps the v6 contract —
+  // one row per distinct user. OFF records every observed message as
+  // its own row, so a chatty user appears N times. The state lives on
+  // the period prompt modal but is sent up the API as `dedupEnabled`.
+  const [monitorDedupEnabled, setMonitorDedupEnabled] = useState(true);
   const [, forceTickRender] = useState(0);
 
   const { showSuccess, showError } = useToast();
@@ -218,7 +223,11 @@ export default function Scrape() {
         const idx = prev.findIndex((j) => j.id === data.jobId);
         if (idx === -1) return prev;
         const next = [...prev];
-        next[idx] = { ...next[idx], scrapedCount: data.scrapedCount };
+        next[idx] = {
+          ...next[idx],
+          scrapedCount: data.scrapedCount,
+          eventsObserved: data.eventsObserved ?? next[idx].eventsObserved,
+        };
         return next;
       });
     };
@@ -235,6 +244,7 @@ export default function Scrape() {
         next[idx] = {
           ...next[idx],
           scrapedCount: data.scrapedCount ?? next[idx].scrapedCount,
+          eventsObserved: data.eventsObserved ?? next[idx].eventsObserved,
           remainingSeconds: data.remainingSeconds ?? next[idx].remainingSeconds,
           ratePerMinute: data.ratePerMinute ?? next[idx].ratePerMinute,
         };
@@ -395,6 +405,7 @@ export default function Scrape() {
           durationSeconds: periodSeconds,
           reason: t.reason || 'admin_only',
           autoStart: true,
+          dedupEnabled: monitorDedupEnabled,
         });
         started++;
       } catch (err) {
@@ -1011,6 +1022,19 @@ export default function Scrape() {
                           </td>
                           <td className="py-2 px-3 text-white font-medium">
                             {formatNumber(m.scrapedCount || 0)}
+                            {m.dedupEnabled === false && (
+                              <span
+                                className="ml-1.5 inline-block px-1.5 py-0.5 rounded text-[10px] font-medium bg-amber-500/20 text-amber-200 align-middle"
+                                title="Dedup off — every observed message is its own row, so the same user can appear multiple times."
+                              >
+                                no-dedup
+                              </span>
+                            )}
+                            {(m.eventsObserved || 0) > 0 && (
+                              <div className="text-[10px] text-gray-500 font-normal mt-0.5">
+                                {formatNumber(m.eventsObserved)} msg observed
+                              </div>
+                            )}
                           </td>
                           <td className="py-2 px-3 text-gray-400">
                             <div>{formatDuration(m.durationSeconds)}</div>
@@ -1328,7 +1352,7 @@ export default function Scrape() {
                   {periodPrompt.adminTargets.length} chat{periodPrompt.adminTargets.length === 1 ? '' : 's'} hide{periodPrompt.adminTargets.length === 1 ? 's' : ''} the participant list from non-admins.
                 </p>
                 <p className="text-xs text-amber-200/80 mt-1">
-                  We can monitor these chats for the period you choose and capture every distinct user who interacts with them. Duplicates are deduped automatically. Your sessions stay attached the entire window through the anti-detect proxy system.
+                  We can monitor these chats for the period you choose and capture every user who interacts with them. Use the <em>Avoid duplicates</em> toggle below to choose between one row per distinct user (default) or one row per observed message. Your sessions stay attached the entire window through the anti-detect proxy system.
                 </p>
               </div>
             </div>
@@ -1401,6 +1425,34 @@ export default function Scrape() {
               <p className="text-xs text-gray-500 mt-2">
                 Total: {formatDuration(periodSeconds)} • Sessions attached: {selectedSessions.length || 0}
               </p>
+            </div>
+
+            {/* v10: Avoid-duplicates toggle. ON keeps one row per
+                distinct user (default). OFF records every observed
+                message — chatty users will appear N times. */}
+            <div className="rounded-lg border border-white/5 bg-dark-900/50 p-3">
+              <div className="flex items-start justify-between gap-3">
+                <div className="flex-1">
+                  <p className="text-sm font-medium text-gray-200">
+                    Avoid duplicates
+                  </p>
+                  <p className="mt-1 text-xs text-gray-400">
+                    {monitorDedupEnabled
+                      ? 'On — each user is recorded once, and repeat messages just bump their message_count.'
+                      : 'Off — every observed message is saved as its own row, so the same user can appear many times. Use this when you want a raw activity log.'}
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setMonitorDedupEnabled((v) => !v)}
+                  className={`relative h-6 w-11 shrink-0 rounded-full transition-colors ${monitorDedupEnabled ? 'bg-primary-500' : 'bg-white/10'}`}
+                  role="switch"
+                  aria-checked={monitorDedupEnabled}
+                  aria-label="Avoid duplicates"
+                >
+                  <span className={`absolute top-0.5 left-0.5 h-5 w-5 rounded-full bg-white shadow-sm transition-transform ${monitorDedupEnabled ? 'translate-x-5' : 'translate-x-0'}`} />
+                </button>
+              </div>
             </div>
 
             <div className="flex gap-2 justify-end pt-2">

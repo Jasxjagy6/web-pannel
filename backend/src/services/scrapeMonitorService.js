@@ -135,7 +135,7 @@ class ScrapeMonitorService {
   async createJob({
     userId, sessionIds, targetId, targetType = 'group',
     targetTitle = null, durationSeconds, reason = null, options = {},
-    autoStart = true,
+    autoStart = true, dedupEnabled,
   }) {
     if (!userId) throw new AppError('User id required', 400, 'MISSING_USER_ID');
     if (!Array.isArray(sessionIds) || sessionIds.length === 0) {
@@ -155,6 +155,27 @@ class ScrapeMonitorService {
       throw new AppError('durationSeconds required', 400, 'MISSING_DURATION');
     }
 
+    // v10: Resolve dedup mode. The frontend passes the toggle as either
+    // a top-level `dedupEnabled` field on the request body, or nested
+    // under options.dedupEnabled / options.allowDuplicates. We accept
+    // all three to keep the surface forgiving for direct API users.
+    const optsIn = (options && typeof options === 'object') ? options : {};
+    let dedup = dedupEnabled;
+    if (dedup === undefined && Object.prototype.hasOwnProperty.call(optsIn, 'dedupEnabled')) {
+      dedup = optsIn.dedupEnabled;
+    }
+    if (dedup === undefined && Object.prototype.hasOwnProperty.call(optsIn, 'allowDuplicates')) {
+      // `allowDuplicates: true`  → dedup OFF.
+      dedup = !optsIn.allowDuplicates;
+    }
+    if (dedup === undefined) dedup = true;        // v6 default
+    dedup = !!dedup;
+
+    // Persist the resolved flag inside `options` too so it survives
+    // existing tooling that only reads the JSONB blob, while the new
+    // top-level column remains the source of truth for queries.
+    const persistedOptions = { ...optsIn, dedupEnabled: dedup };
+
     const ids = sessionIds.map((s) => parseInt(s, 10)).filter(Number.isFinite);
     const owned = await pool.query(
       `SELECT id FROM sessions
@@ -169,18 +190,21 @@ class ScrapeMonitorService {
     const insert = await pool.query(
       `INSERT INTO scrape_monitor_jobs
          (user_id, session_ids, target_id, target_type, target_title,
-          status, duration_seconds, remaining_seconds, options, reason)
+          status, duration_seconds, remaining_seconds, options, reason,
+          dedup_enabled)
        VALUES ($1, $2::int[], $3, $4, $5,
-               'pending', $6::int, $6::int, $7::jsonb, $8)
+               'pending', $6::int, $6::int, $7::jsonb, $8, $9)
        RETURNING *`,
       [
         userId, validIds, String(targetId), String(targetType),
-        targetTitle, duration, JSON.stringify(options || {}), reason,
+        targetTitle, duration, JSON.stringify(persistedOptions), reason,
+        dedup,
       ]
     );
     const job = insert.rows[0];
     logger.info(`Monitor job created`, {
       jobId: job.id, userId, sessionCount: validIds.length, durationSeconds: duration,
+      dedupEnabled: dedup,
     });
     emit(userId, 'monitor:created', { jobId: job.id });
 
@@ -242,7 +266,10 @@ class ScrapeMonitorService {
       [remaining, expiresAt, jobId]
     );
 
-    await this._attach(jobId, userId, job.session_ids, remaining, job.target_id);
+    await this._attach(
+      jobId, userId, job.session_ids, remaining, job.target_id,
+      { dedupEnabled: !!job.dedup_enabled }
+    );
     emit(userId, 'monitor:started', { jobId, expiresAt });
     return await this.getJob(jobId, userId);
   }
@@ -403,7 +430,7 @@ class ScrapeMonitorService {
    */
   async resumeActiveJobs() {
     const r = await pool.query(
-      `SELECT id, user_id, session_ids, target_id, expires_at
+      `SELECT id, user_id, session_ids, target_id, expires_at, dedup_enabled
          FROM scrape_monitor_jobs
         WHERE status = 'running'`
     );
@@ -416,7 +443,10 @@ class ScrapeMonitorService {
         continue;
       }
       try {
-        await this._attach(job.id, job.user_id, job.session_ids, remaining, job.target_id);
+        await this._attach(
+          job.id, job.user_id, job.session_ids, remaining, job.target_id,
+          { dedupEnabled: job.dedup_enabled !== false }
+        );
         logger.info(`Resumed monitor job ${job.id} (${remaining}s remaining)`);
       } catch (err) {
         logger.warn(`Failed to resume monitor job ${job.id}: ${err.message}`);
@@ -437,13 +467,65 @@ class ScrapeMonitorService {
     return r.rows[0];
   }
 
-  async _attach(jobId, userId, sessionIds, remainingSeconds, targetId) {
+  async _attach(jobId, userId, sessionIds, remainingSeconds, targetId, attachOpts = {}) {
     // Idempotent: replace any existing listeners for this job.
     await this._detach(jobId);
 
+    const dedupEnabled = attachOpts.dedupEnabled !== false; // v6 default = TRUE
+
+    // v10: Pre-resolve the target entity on every selected session
+    // BEFORE attaching the NewMessage handler. This is the dominant
+    // fix for the "5-minute job, 10 active users, only 3 captured"
+    // symptom: GramJS's `chats` filter only matches once the session
+    // has the entity in its peer cache, and freshly booted sessions
+    // often haven't opened the chat yet, so the filter silently rejects
+    // every event. Calling _resolveEntity() on each session warms the
+    // cache so the filter starts working immediately. We also collect
+    // every form of the chat's id (raw user input, resolved entity id,
+    // and the bot-API "-100" prefixed form) into an allow list so we
+    // can do a defense-in-depth check inside _onEvent.
+    const allowedChatIds = new Set();
+    const rawTarget = String(targetId).trim();
+    allowedChatIds.add(rawTarget);
+    if (rawTarget.startsWith('@')) allowedChatIds.add(rawTarget.slice(1));
+
     const unsubs = new Map();
-    const chats = [String(targetId)];
     for (const sid of sessionIds) {
+      // Try to resolve the entity on this session and harvest every
+      // numeric form of its id. Failures are non-fatal — we still
+      // attach with the raw target string, which is enough when the
+      // session already has the chat cached from prior usage.
+      let resolved = null;
+      try {
+        resolved = await telegramService._resolveEntity(String(sid), rawTarget);
+      } catch (err) {
+        logger.debug(`Monitor job ${jobId} session ${sid} could not pre-resolve target: ${err.message}`);
+      }
+      if (resolved && resolved.id !== undefined && resolved.id !== null) {
+        const idStr = String(resolved.id?.value ?? resolved.id);
+        if (idStr) {
+          allowedChatIds.add(idStr);
+          // Bot-API form ("-100" prefix) for channels / supergroups, in
+          // case GramJS ever emits the chatId in that shape.
+          if (resolved.className === 'Channel' || resolved.className === 'ChannelForbidden') {
+            allowedChatIds.add(`-100${idStr}`);
+          } else if (resolved.className === 'Chat') {
+            allowedChatIds.add(`-${idStr}`);
+          }
+        }
+      }
+      if (resolved && resolved.username) {
+        allowedChatIds.add(String(resolved.username));
+        allowedChatIds.add(`@${resolved.username}`);
+      }
+
+      // Build the GramJS chat filter for this session. Pass both the
+      // resolved entity (preferred) and the raw target string so the
+      // filter has the best chance of matching across GramJS versions.
+      const chats = [];
+      if (resolved) chats.push(resolved);
+      chats.push(rawTarget);
+
       try {
         const off = await telegramService.addNewMessageHandler(
           String(sid),
@@ -481,7 +563,7 @@ class ScrapeMonitorService {
     const ticker = setInterval(async () => {
       try {
         const r = await pool.query(
-          `SELECT scraped_count, expires_at
+          `SELECT scraped_count, events_observed, expires_at
              FROM scrape_monitor_jobs
             WHERE id = $1`,
           [jobId]
@@ -497,6 +579,7 @@ class ScrapeMonitorService {
         emit(userId, 'monitor:tick', {
           jobId,
           scrapedCount: scraped,
+          eventsObserved: row.events_observed || 0,
           remainingSeconds: remaining,
           // events / TICK_INTERVAL_MS, normalized to events/min for UI
           ratePerMinute: Math.round((delta / TICK_INTERVAL_MS) * 60_000),
@@ -506,7 +589,11 @@ class ScrapeMonitorService {
       }
     }, TICK_INTERVAL_MS);
 
-    this._active.set(jobId, { unsubs, timer, ticker, userId, lastEmitAt: 0 });
+    this._active.set(jobId, {
+      unsubs, timer, ticker, userId, lastEmitAt: 0,
+      dedupEnabled,
+      allowedChatIds,
+    });
   }
 
   async _detach(jobId) {
@@ -532,33 +619,142 @@ class ScrapeMonitorService {
     emit(userId, 'monitor:completed', { jobId });
   }
 
+  /**
+   * Defense-in-depth chat filter. GramJS's NewMessage `chats` filter
+   * sometimes silently rejects events for chats whose entity isn't in
+   * the session's peer cache, and we've ALSO seen it occasionally
+   * leak through events from other chats when a session is in many.
+   * We do our own match against the allow list built in _attach().
+   */
+  _eventMatchesTarget(event, allowedChatIds) {
+    if (!allowedChatIds || allowedChatIds.size === 0) return true;
+    const candidates = new Set();
+    const push = (v) => {
+      if (v === null || v === undefined) return;
+      const s = String(v?.value ?? v);
+      if (s) candidates.add(s);
+    };
+    const msg = event?.message || event;
+    push(event?.chatId);
+    if (msg) {
+      push(msg.chatId);
+      if (msg.peerId) {
+        push(msg.peerId.channelId);
+        push(msg.peerId.chatId);
+        push(msg.peerId.userId);
+      }
+    }
+    // Also pull from getChat() if GramJS has cached it on the event.
+    const cachedChat = event?._chat || msg?._chat;
+    if (cachedChat) {
+      push(cachedChat.id);
+      if (cachedChat.username) candidates.add(String(cachedChat.username));
+    }
+
+    // Quick wins on raw matches.
+    for (const c of candidates) {
+      if (allowedChatIds.has(c)) return true;
+      if (allowedChatIds.has(`-${c}`)) return true;
+      if (allowedChatIds.has(`-100${c}`)) return true;
+      if (c.startsWith('-100') && allowedChatIds.has(c.slice(4))) return true;
+      if (c.startsWith('-') && allowedChatIds.has(c.slice(1))) return true;
+    }
+    return false;
+  }
+
   async _onEvent(jobId, userId, sessionId, event) {
     try {
+      const ctx = this._active.get(jobId);
+      const dedupEnabled = ctx ? ctx.dedupEnabled !== false : true;
+      const allowed = ctx ? ctx.allowedChatIds : null;
+
+      if (allowed && allowed.size > 0 && !this._eventMatchesTarget(event, allowed)) {
+        // Cross-talk from a different chat the session is also in.
+        return;
+      }
+
       const profile = await extractSenderProfile(event);
       if (!profile) return;
-      const upserted = await pool.query(
-        `INSERT INTO scrape_monitor_users
-           (monitor_job_id, telegram_id, username, first_name, last_name,
-            phone, is_bot, is_premium, message_count,
-            first_seen_at, last_seen_at, via_session_id)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 1, NOW(), NOW(), $9)
-         ON CONFLICT (monitor_job_id, telegram_id) DO UPDATE
-            SET message_count = scrape_monitor_users.message_count + 1,
-                last_seen_at  = NOW(),
-                username      = COALESCE(EXCLUDED.username, scrape_monitor_users.username),
-                first_name    = COALESCE(EXCLUDED.first_name, scrape_monitor_users.first_name),
-                last_name     = COALESCE(EXCLUDED.last_name, scrape_monitor_users.last_name),
-                phone         = COALESCE(EXCLUDED.phone, scrape_monitor_users.phone),
-                is_premium    = scrape_monitor_users.is_premium OR EXCLUDED.is_premium,
-                is_bot        = scrape_monitor_users.is_bot OR EXCLUDED.is_bot
-         RETURNING xmax = 0 AS inserted`,
-        [
-          jobId, profile.telegramId, profile.username,
-          profile.firstName, profile.lastName, profile.phone,
-          !!profile.isBot, !!profile.isPremium, sessionId,
-        ]
+
+      // Every accepted event — regardless of dedup mode — contributes
+      // to events_observed so the operator can tell at a glance how
+      // many messages we actually heard versus how many distinct users
+      // we recorded.
+      await pool.query(
+        `UPDATE scrape_monitor_jobs
+            SET events_observed = events_observed + 1,
+                updated_at = NOW()
+          WHERE id = $1`,
+        [jobId]
       );
-      const inserted = upserted.rows[0]?.inserted;
+
+      let inserted = false;
+      if (dedupEnabled) {
+        // v6 contract: one row per (job, telegram_id). With the v10
+        // migration the unique constraint is gone, so we emulate the
+        // old behavior with an explicit SELECT-then-INSERT-or-UPDATE.
+        // A small race on the very first message from a new user could
+        // produce two rows; that's acceptable and self-healing on the
+        // next message.
+        const existing = await pool.query(
+          `SELECT id FROM scrape_monitor_users
+            WHERE monitor_job_id = $1 AND telegram_id = $2
+            LIMIT 1`,
+          [jobId, profile.telegramId]
+        );
+        if (existing.rows[0]) {
+          await pool.query(
+            `UPDATE scrape_monitor_users
+                SET message_count = message_count + 1,
+                    last_seen_at  = NOW(),
+                    username      = COALESCE($3, username),
+                    first_name    = COALESCE($4, first_name),
+                    last_name     = COALESCE($5, last_name),
+                    phone         = COALESCE($6, phone),
+                    is_premium    = is_premium OR $7,
+                    is_bot        = is_bot OR $8
+              WHERE id = $1 AND monitor_job_id = $2`,
+            [
+              existing.rows[0].id, jobId, profile.username,
+              profile.firstName, profile.lastName, profile.phone,
+              !!profile.isPremium, !!profile.isBot,
+            ]
+          );
+          inserted = false;
+        } else {
+          await pool.query(
+            `INSERT INTO scrape_monitor_users
+               (monitor_job_id, telegram_id, username, first_name, last_name,
+                phone, is_bot, is_premium, message_count,
+                first_seen_at, last_seen_at, via_session_id)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 1, NOW(), NOW(), $9)`,
+            [
+              jobId, profile.telegramId, profile.username,
+              profile.firstName, profile.lastName, profile.phone,
+              !!profile.isBot, !!profile.isPremium, sessionId,
+            ]
+          );
+          inserted = true;
+        }
+      } else {
+        // dedup OFF: every observed message is its own row, even from
+        // the same user. The user explicitly opted in to a raw activity
+        // log, so we MUST NOT skip anything here.
+        await pool.query(
+          `INSERT INTO scrape_monitor_users
+             (monitor_job_id, telegram_id, username, first_name, last_name,
+              phone, is_bot, is_premium, message_count,
+              first_seen_at, last_seen_at, via_session_id)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 1, NOW(), NOW(), $9)`,
+          [
+            jobId, profile.telegramId, profile.username,
+            profile.firstName, profile.lastName, profile.phone,
+            !!profile.isBot, !!profile.isPremium, sessionId,
+          ]
+        );
+        inserted = true;
+      }
+
       if (inserted) {
         await pool.query(
           `UPDATE scrape_monitor_jobs SET scraped_count = scraped_count + 1, updated_at=NOW() WHERE id=$1`,
@@ -567,16 +763,16 @@ class ScrapeMonitorService {
       }
 
       // Debounced WS emit so a flood of messages doesn't drown the channel.
-      const ctx = this._active.get(jobId);
       const now = Date.now();
       if (ctx && (now - ctx.lastEmitAt) >= PROGRESS_EMIT_DEBOUNCE_MS) {
         ctx.lastEmitAt = now;
         const r = await pool.query(
-          `SELECT scraped_count FROM scrape_monitor_jobs WHERE id=$1`, [jobId]
+          `SELECT scraped_count, events_observed FROM scrape_monitor_jobs WHERE id=$1`, [jobId]
         );
         emit(userId, 'monitor:progress', {
           jobId,
           scrapedCount: r.rows[0]?.scraped_count || 0,
+          eventsObserved: r.rows[0]?.events_observed || 0,
           newUser: inserted ? {
             telegramId: String(profile.telegramId),
             username: profile.username,
@@ -603,6 +799,8 @@ class ScrapeMonitorService {
       durationSeconds: row.duration_seconds,
       remainingSeconds: row.remaining_seconds,
       scrapedCount: row.scraped_count,
+      eventsObserved: row.events_observed || 0,
+      dedupEnabled: row.dedup_enabled !== false,
       reason: row.reason,
       options: row.options || {},
       startedAt: row.started_at,
