@@ -86,3 +86,45 @@
 .animate-fade-in {
   animation: fade-in 0.2s ease-in;
 }
+
+/* Instagram-only animations used by the IG layout & loader. Scoped
+   so they don't pollute the Telegram panel. */
+@keyframes igHaloSpin {
+  to { transform: rotate(360deg); }
+}
+@keyframes igDot {
+  0%, 80%, 100% { transform: scale(0.6); opacity: 0.5; }
+  40% { transform: scale(1.1); opacity: 1; }
+}
+@keyframes igAuroraDrift {
+  0% { transform: translate3d(0, 0, 0) rotate(0deg); }
+  50% { transform: translate3d(2%, -1%, 0) rotate(180deg); }
+  100% { transform: translate3d(0, 0, 0) rotate(360deg); }
+}
+@keyframes igFadeUp {
+  from { opacity: 0; transform: translateY(8px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+.ig-fade-up { animation: igFadeUp 0.35s ease-out both; }
+
+/* IG-themed page background for the panel main area. The TG main area
+   keeps its existing dark-950 background. */
+.ig-panel-bg {
+  background:
+    radial-gradient(ellipse at 0% 0%, rgba(244,114,182,0.18) 0%, transparent 55%),
+    radial-gradient(ellipse at 100% 100%, rgba(245,158,11,0.14) 0%, transparent 55%),
+    linear-gradient(180deg, #0b0410 0%, #150620 60%, #1a0820 100%);
+}
+
+/* The Instagram loading screen gets its own min-height so it fully
+   covers the viewport during route swaps just like RouteFallback. */
+.ig-route-fallback {
+  min-height: 100vh;
+  min-height: 100dvh;
+  background-color: #0b0410;
+}
+
+/* Mobile-only safe area padding for the bottom dock. */
+.ig-bottom-dock {
+  padding-bottom: max(env(safe-area-inset-bottom), 0px);
+}

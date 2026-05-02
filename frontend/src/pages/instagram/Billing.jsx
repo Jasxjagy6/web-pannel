@@ -1,4 +1,5 @@
 import { lazy, Suspense } from 'react';
+import InstagramRouteFallback from '../../components/instagram/InstagramRouteFallback';
 import { CreditCard } from 'lucide-react';
 import InstagramFeatureShell from '../../components/instagram/InstagramFeatureShell';
 
@@ -11,7 +12,7 @@ export default function InstagramBilling() {
       title="Billing & subscription"
       subtitle="Your Instagram-side trial, plan and crypto invoices."
     >
-      <Suspense fallback={<div className="text-sm text-pink-500">Loading billing…</div>}>
+      <Suspense fallback={<InstagramRouteFallback label="Loading" />}>
         <BillingShared />
       </Suspense>
     </InstagramFeatureShell>
