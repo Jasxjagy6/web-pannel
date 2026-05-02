@@ -256,3 +256,117 @@ psql -c "SELECT user_id, COUNT(*) FROM scrape_monitor_jobs WHERE status='running
 # Active sessions per credential
 psql -c "SELECT user_api_credential_id, COUNT(*) FROM sessions WHERE status='active' GROUP BY 1 ORDER BY 2 DESC LIMIT 10;"
 ```
+
+---
+
+## 10. Multi-platform (Telegram + Instagram) — v9+
+
+The panel now runs **two providers** behind the same web UI: Telegram
+(`telegram-private-api` / GramJS) and Instagram (`instagram-private-api`).
+Both providers expose the same shape (sessions, scrape, messaging,
+threads, lists, reports, …) but route to platform-specific
+implementations. This section covers everything you need to operate
+the Instagram side at the 500-700 user target.
+
+### 10.1 Feature flag
+
+Frontend visibility of the Instagram panel is gated by a per-browser
+flag for the staged rollout:
+
+```js
+// In the browser dev console (or set programmatically in Settings)
+localStorage.setItem('feature_instagram_panel', '1');
+```
+
+Backend always serves Instagram routes; the flag only hides the UI
+toggle. Once general availability is reached, remove the flag and the
+toggle becomes unconditional.
+
+### 10.2 Per-platform queue knobs
+
+Two new BullMQ queues run alongside the Telegram queues:
+
+| Queue                | Default concurrency       | Env var                          |
+| -------------------- | ------------------------- | -------------------------------- |
+| `scrape:instagram`   | 3                         | `IG_SCRAPE_CONCURRENCY`          |
+| `messaging:instagram`| 2                         | `IG_MESSAGING_CONCURRENCY`       |
+
+Set `IG_QUEUES_ENABLED=false` to disable IG queue initialization on
+emergency rollback (frontend will degrade gracefully — IG endpoints
+return 503 from the queue dispatcher).
+
+The default Instagram concurrency is **lower** than Telegram (3/2 vs
+TG 5/x) because Instagram's account-level rate limits are stricter
+and a single IG account that bursts past ~30 actions per 15 minutes
+gets challenged within hours.
+
+### 10.3 Per-platform proxies
+
+Both providers consume the same `proxies` table but each has its own
+**validator**:
+
+- Telegram (`backend/src/providers/telegram/proxies.js::validate`) —
+  opens a TG-style transport handshake to `149.154.167.50:443`.
+- Instagram (`backend/src/providers/instagram/proxies.js::validate`) —
+  performs a TLS handshake to `i.instagram.com:443` and pulls
+  `/api/v1/users/checkpoint/` as a sanity check.
+
+A proxy can be marked as TG-only, IG-only, or both via the
+`platforms` JSONB column on `proxies` (default = both).
+
+### 10.4 Per-platform billing
+
+Three pricing rails:
+
+```
+billing.telegram.subscription_price_usd   (defaults: 9.99 / 30 days)
+billing.instagram.subscription_price_usd  (defaults: 9.99 / 30 days)
+billing.bundle.subscription_price_usd     (defaults: 14.99 / 30 days)
+```
+
+The bundle invoice unlocks both platforms in a single payment.
+Trials are **per-platform** — using the trial on Telegram doesn't
+consume the Instagram trial credit.
+
+### 10.5 Per-platform Socket.IO rooms
+
+Each browser tab joins:
+
+- `user:<userId>` (always — cross-platform notifications)
+- `platform:<userId>:<telegram|instagram>` (active panel only)
+
+When the user toggles platforms in the header, the client emits
+`platform:unsubscribe` then `platform:subscribe` so live counters
+flip cleanly.
+
+### 10.6 Capacity dial-up procedure (IG-specific)
+
+In addition to the Telegram capacity steps in §3:
+
+1. **IG sessions are heavier** than TG (full HTTPS round-trip per
+   action vs TG's persistent MTProto socket). At >300 concurrent IG
+   users, double `IG_SCRAPE_CONCURRENCY` and watch IG account ban
+   rates closely. If bans tick up, halve it.
+2. **IG warmup queue** runs at `IG_WARMUP_CONCURRENCY` (default 1) —
+   keep it serial; warmup races trigger checkpoints.
+3. **IG client pool memory**: each logged-in IG client holds ~3-4 MB
+   for cookies, device state, and feed cache. At 500 concurrent IG
+   sessions per pod, expect ~1.5-2 GB resident set just for IG.
+   Plan accordingly when sizing pods.
+
+### 10.7 Quick health checks (IG)
+
+```bash
+# IG sessions per status
+psql -c "SELECT status, COUNT(*) FROM sessions WHERE platform='instagram' GROUP BY 1;"
+
+# IG scrape queue depth
+redis-cli -p 6389 -a "$REDIS_PASSWORD" LLEN bull:scrape:instagram:waiting
+
+# IG messaging queue depth
+redis-cli -p 6389 -a "$REDIS_PASSWORD" LLEN bull:messaging:instagram:waiting
+
+# IG accounts that hit checkpoint (login / 2FA / device confirmation)
+psql -c "SELECT id, username, last_error FROM sessions WHERE platform='instagram' AND status='checkpointed' ORDER BY updated_at DESC LIMIT 20;"
+```
+
