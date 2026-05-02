@@ -23,7 +23,7 @@ import React from 'react';
 export default function RouteFallback({ label = 'Loading' }) {
   return (
     <div
-      className="relative flex h-full min-h-[40vh] w-full items-center justify-center overflow-hidden bg-dark-950"
+      className="route-fallback relative flex h-full w-full items-center justify-center overflow-hidden bg-dark-950"
       role="status"
       aria-live="polite"
       aria-label={label}

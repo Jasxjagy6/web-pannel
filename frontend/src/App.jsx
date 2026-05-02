@@ -75,7 +75,10 @@ function hasEntitlement(user, platform = DEFAULT_PLATFORM) {
 function isPlatformAvailable(platform) {
   if (platform === 'telegram') return true;
   if (platform === 'instagram') {
-    try { return localStorage.getItem(PLATFORM_FEATURE_FLAG_KEY) === '1'; } catch (_) { return false; }
+    // Default-on; only hide if the operator has explicitly opted out
+    // by setting the feature flag to "0". Mirrors the helper in
+    // PlatformContext so route guards and the toggle stay in sync.
+    try { return localStorage.getItem(PLATFORM_FEATURE_FLAG_KEY) !== '0'; } catch (_) { return true; }
   }
   return false;
 }
