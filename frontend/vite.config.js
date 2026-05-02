@@ -10,14 +10,16 @@ export default defineConfig({
     },
   },
   server: {
-    port: 5173,
+    // Vite dev-server port +3 (5173 -> 5176). The two proxy targets
+    // point at the backend, which also moved +3 (3000 -> 3003).
+    port: 5176,
     proxy: {
       '/api': {
-        target: 'http://localhost:3000',
+        target: 'http://localhost:3003',
         changeOrigin: true,
       },
       '/socket.io': {
-        target: 'http://localhost:3000',
+        target: 'http://localhost:3003',
         changeOrigin: true,
         ws: true,
       },

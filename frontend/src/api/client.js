@@ -10,11 +10,57 @@ const api = axios.create({
   },
 });
 
-// Request interceptor: add JWT token
+// Request interceptor: add JWT token + auto-prefix the active platform on
+// platform-agnostic relative paths.
+//
+// To keep call sites simple (e.g. `api.get('/sessions')`), if the URL
+// starts with one of the per-platform-noun paths and isn't already
+// prefixed with `/telegram/` or `/instagram/`, we prepend the active
+// platform from localStorage('panel_platform'). This means a page that
+// was written before multiplatform routing — and just calls
+// `/sessions` — still hits the right per-platform endpoint after the
+// user toggles between TG and IG.
+const PLATFORM_AGNOSTIC_NOUNS = new Set([
+  'sessions', 'scrape', 'messages', 'messaging', 'groups', 'threads',
+  'lists', 'reports', 'proxies', 'twoFAJobs', 'two-fa-jobs',
+  'antiDetect', 'anti-detect', 'privacy', 'accountSettings',
+  'account-settings', 'otp', 'meta',
+]);
+function _prefixPlatform(url) {
+  if (!url || typeof url !== 'string') return url;
+  if (/^https?:\/\//i.test(url)) return url; // absolute URL — leave alone
+  // Already prefixed?
+  if (/^\/?(telegram|instagram)\//.test(url)) return url;
+  // Match the first path segment.
+  const stripped = url.replace(/^\/+/, '');
+  const seg = stripped.split('/')[0];
+  if (!PLATFORM_AGNOSTIC_NOUNS.has(seg)) return url;
+  let platform = 'telegram';
+  try {
+    const stored = localStorage.getItem('panel_platform');
+    if (stored === 'telegram' || stored === 'instagram') platform = stored;
+  } catch (_) { /* SSR / private mode */ }
+  const leading = url.startsWith('/') ? '/' : '';
+  return `${leading}${platform}/${stripped}`;
+}
+
 api.interceptors.request.use((config) => {
   const token = localStorage.getItem('token');
   if (token) {
     config.headers.Authorization = `Bearer ${token}`;
+  }
+  // Stamp X-Platform from localStorage so the backend can route
+  // requests through the right provider even if the URL is one of the
+  // legacy paths still served by /api/* (backwards-compat).
+  try {
+    const stored = localStorage.getItem('panel_platform');
+    if ((stored === 'telegram' || stored === 'instagram') && !config.headers['X-Platform']) {
+      config.headers['X-Platform'] = stored;
+    }
+  } catch (_) { /* SSR */ }
+  // Auto-prefix /<platform>/ on platform-agnostic relative paths.
+  if (config.url) {
+    config.url = _prefixPlatform(config.url);
   }
   return config;
 });
@@ -75,6 +121,21 @@ api.interceptors.response.use(
           }));
         } catch (_) { /* SSR safety */ }
       }
+    }
+    // 402 Payment Required — backend's signal that the user has no
+    // active subscription on the platform they just hit. Redirect to
+    // /:platform/billing so they can subscribe / start the trial.
+    if (error?.response?.status === 402) {
+      try {
+        const platform = error.response?.data?.error?.platform
+          || error.response?.data?.platform
+          || error.config?.headers?.['X-Platform']
+          || 'telegram';
+        const target = `/${platform}/billing`;
+        if (window.location.pathname !== target) {
+          window.location.href = target;
+        }
+      } catch (_) { /* SSR safety */ }
     }
     return Promise.reject(error);
   }

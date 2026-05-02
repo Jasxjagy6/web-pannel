@@ -175,16 +175,16 @@ Highlights:
 ## 6. Sample pgbouncer config (transaction pooling)
 
 Use when running 3+ panel pods or BullMQ worker pods. Drop in as
-`/etc/pgbouncer/pgbouncer.ini` and point the panel at port 6432
-instead of 5432.
+`/etc/pgbouncer/pgbouncer.ini` and point the panel at port 6435
+instead of 5435 (these are the +3-shifted defaults; see §11).
 
 ```ini
 [databases]
-telegram_panel = host=127.0.0.1 port=5432 dbname=telegram_panel
+telegram_panel = host=127.0.0.1 port=5435 dbname=telegram_panel
 
 [pgbouncer]
 listen_addr = 127.0.0.1
-listen_port = 6432
+listen_port = 6435
 auth_type = scram-sha-256
 auth_file = /etc/pgbouncer/userlist.txt
 pool_mode = transaction
@@ -242,13 +242,13 @@ a new one that fixes it.
 
 ```bash
 # Backend health
-curl -s http://localhost:3000/health
+curl -s http://localhost:3003/health
 
 # Postgres connection saturation
 psql -c "SELECT count(*) FROM pg_stat_activity WHERE datname='telegram_panel';"
 
 # Redis health
-redis-cli -p 6389 -a "$REDIS_PASSWORD" PING
+redis-cli -p 6392 -a "$REDIS_PASSWORD" PING
 
 # Active monitor jobs
 psql -c "SELECT user_id, COUNT(*) FROM scrape_monitor_jobs WHERE status='running' GROUP BY user_id ORDER BY 2 DESC LIMIT 10;"
@@ -256,3 +256,205 @@ psql -c "SELECT user_id, COUNT(*) FROM scrape_monitor_jobs WHERE status='running
 # Active sessions per credential
 psql -c "SELECT user_api_credential_id, COUNT(*) FROM sessions WHERE status='active' GROUP BY 1 ORDER BY 2 DESC LIMIT 10;"
 ```
+
+---
+
+## 10. Multi-platform (Telegram + Instagram) — v9+
+
+The panel now runs **two providers** behind the same web UI: Telegram
+(`telegram-private-api` / GramJS) and Instagram (`instagram-private-api`).
+Both providers expose the same shape (sessions, scrape, messaging,
+threads, lists, reports, …) but route to platform-specific
+implementations. This section covers everything you need to operate
+the Instagram side at the 500-700 user target.
+
+### 10.1 Feature flag
+
+Frontend visibility of the Instagram panel is gated by a per-browser
+flag for the staged rollout:
+
+```js
+// In the browser dev console (or set programmatically in Settings)
+localStorage.setItem('feature_instagram_panel', '1');
+```
+
+Backend always serves Instagram routes; the flag only hides the UI
+toggle. Once general availability is reached, remove the flag and the
+toggle becomes unconditional.
+
+### 10.2 Per-platform queue knobs
+
+Two new BullMQ queues run alongside the Telegram queues:
+
+| Queue                | Default concurrency       | Env var                          |
+| -------------------- | ------------------------- | -------------------------------- |
+| `scrape:instagram`   | 3                         | `IG_SCRAPE_CONCURRENCY`          |
+| `messaging:instagram`| 2                         | `IG_MESSAGING_CONCURRENCY`       |
+
+Set `IG_QUEUES_ENABLED=false` to disable IG queue initialization on
+emergency rollback (frontend will degrade gracefully — IG endpoints
+return 503 from the queue dispatcher).
+
+The default Instagram concurrency is **lower** than Telegram (3/2 vs
+TG 5/x) because Instagram's account-level rate limits are stricter
+and a single IG account that bursts past ~30 actions per 15 minutes
+gets challenged within hours.
+
+### 10.3 Per-platform proxies
+
+Both providers consume the same `proxies` table but each has its own
+**validator**:
+
+- Telegram (`backend/src/providers/telegram/proxies.js::validate`) —
+  opens a TG-style transport handshake to `149.154.167.50:443`.
+- Instagram (`backend/src/providers/instagram/proxies.js::validate`) —
+  performs a TLS handshake to `i.instagram.com:443` and pulls
+  `/api/v1/users/checkpoint/` as a sanity check.
+
+A proxy can be marked as TG-only, IG-only, or both via the
+`platforms` JSONB column on `proxies` (default = both).
+
+### 10.4 Per-platform billing
+
+Three pricing rails:
+
+```
+billing.telegram.subscription_price_usd   (defaults: 9.99 / 30 days)
+billing.instagram.subscription_price_usd  (defaults: 9.99 / 30 days)
+billing.bundle.subscription_price_usd     (defaults: 14.99 / 30 days)
+```
+
+The bundle invoice unlocks both platforms in a single payment.
+Trials are **per-platform** — using the trial on Telegram doesn't
+consume the Instagram trial credit.
+
+### 10.5 Per-platform Socket.IO rooms
+
+Each browser tab joins:
+
+- `user:<userId>` (always — cross-platform notifications)
+- `platform:<userId>:<telegram|instagram>` (active panel only)
+
+When the user toggles platforms in the header, the client emits
+`platform:unsubscribe` then `platform:subscribe` so live counters
+flip cleanly.
+
+### 10.6 Capacity dial-up procedure (IG-specific)
+
+In addition to the Telegram capacity steps in §3:
+
+1. **IG sessions are heavier** than TG (full HTTPS round-trip per
+   action vs TG's persistent MTProto socket). At >300 concurrent IG
+   users, double `IG_SCRAPE_CONCURRENCY` and watch IG account ban
+   rates closely. If bans tick up, halve it.
+2. **IG warmup queue** runs at `IG_WARMUP_CONCURRENCY` (default 1) —
+   keep it serial; warmup races trigger checkpoints.
+3. **IG client pool memory**: each logged-in IG client holds ~3-4 MB
+   for cookies, device state, and feed cache. At 500 concurrent IG
+   sessions per pod, expect ~1.5-2 GB resident set just for IG.
+   Plan accordingly when sizing pods.
+
+### 10.7 Quick health checks (IG)
+
+```bash
+# IG sessions per status
+psql -c "SELECT status, COUNT(*) FROM sessions WHERE platform='instagram' GROUP BY 1;"
+
+# IG scrape queue depth
+redis-cli -p 6392 -a "$REDIS_PASSWORD" LLEN bull:scrape:instagram:waiting
+
+# IG messaging queue depth
+redis-cli -p 6392 -a "$REDIS_PASSWORD" LLEN bull:messaging:instagram:waiting
+
+# IG accounts that hit checkpoint (login / 2FA / device confirmation)
+psql -c "SELECT id, username, last_error FROM sessions WHERE platform='instagram' AND status='checkpointed' ORDER BY updated_at DESC LIMIT 20;"
+```
+
+---
+
+## 11. Shifting all service ports
+
+The stack ships with every port shifted by **+3** from the canonical
+defaults so it can coexist with a stock Postgres/Redis/Vite install on
+the same host. The current set is:
+
+| Service                 | Original | Current (+3) | Notes                                   |
+| ----------------------- | -------- | ------------ | --------------------------------------- |
+| Backend HTTP/WebSocket  | `3000`   | `3003`       | Express + Socket.IO                     |
+| Postgres (in-container) | `5432`   | `5435`       | overridden via `command: postgres -p`   |
+| Postgres (host-mapped)  | `5436`   | `5439`       | docker-compose `ports:` left side       |
+| Redis (in-container)    | `6379`   | `6382`       | overridden via `redis-server --port`    |
+| Redis (host-mapped)     | `6389`   | `6392`       | docker-compose `ports:` left side       |
+| Vite dev server         | `5173`   | `5176`       | `frontend/vite.config.js`               |
+| Frontend nginx (in-c.)  | `80`     | `83`         | `frontend/nginx.conf` + `Dockerfile`    |
+| Frontend nginx (host)   | `8080`   | `8083`       | docker-compose `ports:` left side       |
+| pgbouncer (optional)    | `6432`   | `6435`       | §6 sample config                        |
+
+### 11.1 To shift everything by another delta `D`
+
+Replace `D` with the desired offset (e.g. `+3`, `-3`, `+10`):
+
+1. **`docker-compose.yml`**
+   - `postgres.command`: `postgres -p <5432+D>`
+   - `postgres.environment.PGPORT`: `<5432+D>`
+   - `postgres.ports`: `"<host+D>:<5432+D>"`
+   - `postgres.healthcheck`: `pg_isready -U postgres -p <5432+D>`
+   - `redis.command`: `redis-server --port <6379+D> --requirepass …`
+   - `redis.ports`: `"<host+D>:<6379+D>"`
+   - `redis.healthcheck`: add `-p <6379+D>`
+   - `backend.ports`: `"<3000+D>:<3000+D>"`
+   - `backend.environment`: `DB_PORT=<5432+D>`, `REDIS_PORT=<6379+D>`,
+     `PORT=<3000+D>`
+   - `frontend.ports`: `"<8080+D>:<80+D>"`
+2. **`backend/.env.example`** — bump `PORT`, `DB_PORT`, `REDIS_PORT`.
+3. **`backend/Dockerfile`** — `EXPOSE <3000+D>`.
+4. **`backend/src/index.js`** — three literals to update:
+   - `cors.origin` default (Socket.IO block)
+   - `cors()` middleware default
+   - `const PORT = process.env.PORT || <3000+D>`
+5. **`backend/src/config/database.js`** — `DB_PORT` fallback.
+6. **`backend/src/config/redis.js`** — `REDIS_PORT` fallback.
+7. **`backend/src/queues/{scrapeQueue,twoFAQueue,instagramScrapeQueue,instagramMessageQueue}.js`**
+   — each has its own `REDIS_PORT` fallback. (`messageQueue.js` and
+   `groupQueue.js` reuse `config/redis.js`, so they pick it up
+   automatically.)
+8. **`frontend/vite.config.js`** — `server.port`, `proxy['/api'].target`,
+   `proxy['/socket.io'].target`.
+9. **`frontend/nginx.conf`** — `listen` directive + two `proxy_pass`
+   lines.
+10. **`frontend/Dockerfile`** — same three lines inside the inline
+    nginx config + the final `EXPOSE`.
+11. **`OPS.md`** — update §6 (pgbouncer), §9 (health checks),
+    §10.7 (IG health checks), and this §11 table itself.
+
+### 11.2 Verification
+
+```bash
+# Backend syntax
+cd backend && find src -name '*.js' -exec node --check {} \;
+
+# Frontend build
+cd frontend && npm run build
+
+# Confirm no stale references to the old ports remain (replace 5432
+# etc. with whatever you just shifted away from):
+rg -n '\\b(3000|5432|6379|5173|6389|5436|8080)\\b' \
+   docker-compose.yml backend/.env.example backend/src frontend
+```
+
+### 11.3 Anything that does NOT need to change
+
+These all look like ports but are **not**:
+
+- Timeout / delay values: `LOGIN_TIMEOUT_MS = 30000`,
+  `DEFAULT_DELAY_MAX = 3000`, `pingInterval = 25000`, `pingTimeout =
+  20000`, `usePolling(fn, 30000, …)`, `Toast.duration = 3000`, etc.
+- Connection-string or capacity numbers in
+  `INSTAGRAM_PANEL_ARCHITECTURE.md` (e.g. "3000 active sessions").
+- Telegram / Instagram remote API ports (always `443`).
+
+When grepping for ports, prefer matching the variable / config key
+(`PORT=`, `REDIS_PORT`, `DB_PORT`, `proxy_pass http://`, `listen `,
+`server.port`) over matching the bare number, so you don't get fooled
+by timeouts that happen to look like port numbers.
+

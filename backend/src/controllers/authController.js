@@ -3,6 +3,7 @@ const bcrypt = require('bcrypt');
 const { pool } = require('../config/database');
 const { AppError, asyncHandler } = require('../utils/errorHandler');
 const logger = require('../utils/logger');
+const subscriptionService = require('../services/subscriptionService');
 
 const SAFE_USER_COLUMNS = `
   id, email, role, status, is_approved, approved_at,
@@ -15,6 +16,10 @@ const SAFE_USER_COLUMNS = `
 
 function publicUser(row, extras = {}) {
   if (!row) return null;
+  // Build the canonical multi-platform snapshot from subscriptionService so
+  // the response shape matches /billing/status. The legacy `subscription`
+  // and `trial` keys mirror the telegram row for one release cycle.
+  const snap = subscriptionService.userPublicSnapshot(row, extras.subsByPlatform);
   return {
     id: row.id,
     email: row.email,
@@ -24,17 +29,18 @@ function publicUser(row, extras = {}) {
     approvedAt: row.approved_at,
     bannedAt: row.banned_at,
     bannedReason: row.banned_reason,
-    subscription: {
+    subscription: snap?.subscription || {
       plan: row.subscription_plan,
       status: row.subscription_status,
       expiresAt: row.subscription_expires_at,
       features: row.subscription_features || {},
     },
-    trial: {
+    trial: snap?.trial || {
       startedAt: row.trial_started_at || null,
       expiresAt: row.trial_expires_at || null,
       used: !!row.trial_used,
     },
+    subscriptions: snap?.subscriptions,
     // v8: tells the frontend whether to show the "set up your API ID
     // and Hash in Settings" popup. We always populate this — it's
     // computed in getProfile / login / refresh — so the AuthContext
@@ -114,11 +120,12 @@ const authController = {
 
     const token = generateToken(user);
     // Brand-new user has 0 credentials by definition; skip the count
-    // query and ship the response immediately.
+    // query and ship the response immediately. No subscriptions yet either.
+    const subsByPlatform = await subscriptionService.loadSubscriptions(user.id);
     return res.status(201).json({
       success: true,
       token,
-      user: publicUser(user, { apiCredentialsCount: 0 }),
+      user: publicUser(user, { apiCredentialsCount: 0, subsByPlatform }),
     });
   }),
 
@@ -165,12 +172,13 @@ const authController = {
 
     const token = generateToken(user);
     const apiCredentialsCount = await countApiCredentials(user.id);
+    const subsByPlatform = await subscriptionService.loadSubscriptions(user.id);
     logger.info('User logged in', { userId: user.id, email: user.email, role: user.role });
 
     return res.status(200).json({
       success: true,
       token,
-      user: publicUser(user, { apiCredentialsCount }),
+      user: publicUser(user, { apiCredentialsCount, subsByPlatform }),
     });
   }),
 
@@ -191,10 +199,11 @@ const authController = {
     }
     const token = generateToken(user);
     const apiCredentialsCount = await countApiCredentials(user.id);
+    const subsByPlatform = await subscriptionService.loadSubscriptions(user.id);
     return res.status(200).json({
       success: true,
       token,
-      user: publicUser(user, { apiCredentialsCount }),
+      user: publicUser(user, { apiCredentialsCount, subsByPlatform }),
     });
   }),
 
@@ -211,7 +220,11 @@ const authController = {
       throw new AppError('User not found', 401, 'USER_NOT_FOUND');
     }
     const apiCredentialsCount = await countApiCredentials(user.id);
-    return res.status(200).json({ success: true, user: publicUser(user, { apiCredentialsCount }) });
+    const subsByPlatform = await subscriptionService.loadSubscriptions(user.id);
+    return res.status(200).json({
+      success: true,
+      user: publicUser(user, { apiCredentialsCount, subsByPlatform }),
+    });
   }),
 
   /**
@@ -251,7 +264,11 @@ const authController = {
       [req.user.id]
     );
     const apiCredentialsCount = await countApiCredentials(req.user.id);
-    return res.status(200).json({ success: true, user: publicUser(result.rows[0], { apiCredentialsCount }) });
+    const subsByPlatform = await subscriptionService.loadSubscriptions(req.user.id);
+    return res.status(200).json({
+      success: true,
+      user: publicUser(result.rows[0], { apiCredentialsCount, subsByPlatform }),
+    });
   }),
 
   /**

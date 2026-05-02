@@ -20,7 +20,7 @@ RUN rm /etc/nginx/conf.d/default.conf
 
 COPY <<'EOF' /etc/nginx/conf.d/default.conf
 server {
-    listen 80;
+    listen 83;
     server_name localhost;
     root /usr/share/nginx/html;
     index index.html;
@@ -32,7 +32,7 @@ server {
 
     # Proxy API requests to backend
     location /api {
-        proxy_pass http://backend:3000;
+        proxy_pass http://backend:3003;
         proxy_http_version 1.1;
         proxy_set_header Upgrade $http_upgrade;
         proxy_set_header Connection 'upgrade';
@@ -45,7 +45,7 @@ server {
 
     # Proxy Socket.IO connections to backend
     location /socket.io {
-        proxy_pass http://backend:3000;
+        proxy_pass http://backend:3003;
         proxy_http_version 1.1;
         proxy_set_header Upgrade $http_upgrade;
         proxy_set_header Connection "upgrade";
@@ -57,6 +57,6 @@ server {
 }
 EOF
 
-EXPOSE 80
+EXPOSE 83
 
 CMD ["nginx", "-g", "daemon off;"]

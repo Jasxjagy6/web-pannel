@@ -1,51 +1,59 @@
 services:
   postgres:
     image: postgres:15
+    # Override the internal Postgres port so the whole stack runs on
+    # +3 ports. To revert, drop this `command:` and the `-p 5435` arg.
+    command: postgres -p 5435
     environment:
       POSTGRES_DB: telegram_panel
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: Navneetbb1###@
+      PGPORT: 5435
     volumes:
       - postgres_data:/var/lib/postgresql/data
     ports:
-      - "5436:5432"
+      - "5439:5435"
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      test: ["CMD-SHELL", "pg_isready -U postgres -p 5435"]
       interval: 10s
       timeout: 5s
       retries: 5
 
   redis:
     image: redis:7-alpine
-    command: redis-server --requirepass Navneetbb1###
+    # Internal Redis port +3 (6379 -> 6382) so the whole stack is on
+    # the +3 set. To revert, drop `--port 6382` and the `-p 6382` in
+    # the healthcheck below.
+    command: redis-server --port 6382 --requirepass Navneetbb1###
     volumes:
       - redis_data:/data
     ports:
-      - "6389:6379"
+      - "6392:6382"
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test: ["CMD", "redis-cli", "-p", "6382", "-a", "Navneetbb1###", "ping"]
       interval: 10s
       timeout: 5s
       retries: 5
 
   backend:
     build: ./backend
+    # Backend HTTP/WebSocket port +3 (3000 -> 3003).
     ports:
-      - "3000:3000"
+      - "3003:3003"
     env_file:
       - ./backend/.env
     environment:
       - DB_HOST=postgres
-      - DB_PORT=5432
+      - DB_PORT=5435
       - DB_NAME=telegram_panel
       - DB_USER=postgres
       - DB_PASSWORD=Navneetbb1###@
       - REDIS_HOST=redis
-      - REDIS_PORT=6379
+      - REDIS_PORT=6382
       - REDIS_PASSWORD=Navneetbb1###
       - JWT_SECRET=zI1zt20iQZ/uW+L+90SXj7QkGHTFwoEJOezPrUBJCgo4CvkEMpWaPHGh8YhFNtT9
       - JWT_EXPIRE=7d
-      - PORT=3000
+      - PORT=3003
       - NODE_ENV=development
       - RATE_LIMIT_WINDOW=15
       - RATE_LIMIT_MAX=5000
@@ -62,8 +70,9 @@ services:
 
   frontend:
     build: ./frontend
+    # Frontend nginx +3 inside (80 -> 83) and host-mapped 8080 -> 8083.
     ports:
-      - "8080:80"
+      - "8083:83"
     depends_on:
       - backend
 

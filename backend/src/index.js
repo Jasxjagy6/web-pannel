@@ -33,6 +33,7 @@ const adminRoutes = require('./routes/admin');
 const billingRoutes = require('./routes/billing');
 const userCredentialsRoutes = require('./routes/userCredentials');
 const billingController = require('./controllers/billingController');
+const { parsePlatform, resolvePlatform } = require('./middleware/platform');
 
 const app = express();
 const server = http.createServer(app);
@@ -42,7 +43,7 @@ const server = http.createServer(app);
 // client within ~30s, long enough to keep idle WS traffic minimal.
 const io = new Server(server, {
   cors: {
-    origin: process.env.FRONTEND_URL || 'http://localhost:5173',
+    origin: process.env.FRONTEND_URL || 'http://localhost:5176',
     methods: ['GET', 'POST'],
     credentials: true,
   },
@@ -71,7 +72,7 @@ app.use(compression({
   },
 }));
 app.use(cors({
-  origin: process.env.FRONTEND_URL || 'http://localhost:5173',
+  origin: process.env.FRONTEND_URL || 'http://localhost:5176',
   credentials: true,
 }));
 // OxaPay IPN webhook MUST be mounted with raw body parsing so the HMAC
@@ -120,23 +121,57 @@ app.get('/health', (req, res) => {
 });
 
 // API Routes
+//
+// Multi-platform mounting strategy (§4.6 of INSTAGRAM_PANEL_ARCHITECTURE.md):
+//
+//   Per-account routers (sessions, scrape, messages, groups, lists, reports,
+//   dashboard, account-settings, 2fa-jobs, otp, proxies, anti-detect, privacy)
+//   are mounted THREE times:
+//
+//     /api/telegram/<router>   parsePlatform('telegram')   ← Telegram panel
+//     /api/instagram/<router>  parsePlatform('instagram')  ← Instagram panel
+//     /api/<router>            resolvePlatform              ← legacy alias kept
+//                                                           for one release;
+//                                                           defaults to telegram
+//
+//   Global routers (auth, billing, admin, user-credentials) are mounted ONCE
+//   without a platform prefix; they accept ?platform= or X-Platform: <p> for
+//   the few endpoints that need to know which platform the user is asking
+//   about (e.g. /billing/checkout, /billing/status, /billing/invoices).
 const apiPrefix = process.env.API_PREFIX || '/api';
+
+const platformMetaRoutes = require('./routes/platformMeta');
+
+const PLATFORM_ROUTERS = [
+  ['/meta',             platformMetaRoutes],
+  ['/sessions',         sessionRoutes],
+  ['/scrape',           scrapeRoutes],
+  ['/messages',         messageRoutes],
+  ['/groups',           groupRoutes],
+  ['/lists',            listRoutes],
+  ['/reports',          reportRoutes],
+  ['/dashboard',        dashboardRoutes],
+  ['/account-settings', accountSettingsRoutes],
+  ['/2fa-jobs',         twoFAJobsRoutes],
+  ['/otp',              otpRoutes],
+  ['/proxies',          proxyRoutes],
+  ['/anti-detect',      antiDetectRoutes],
+  ['/privacy',          privacyRoutes],
+];
+
+for (const [mountPath, router] of PLATFORM_ROUTERS) {
+  app.use(`${apiPrefix}/telegram${mountPath}`,  parsePlatform('telegram'),  router);
+  app.use(`${apiPrefix}/instagram${mountPath}`, parsePlatform('instagram'), router);
+  // Legacy alias — kept for one release cycle. resolvePlatform reads
+  // X-Platform / ?platform= / body.platform so a forward-thinking client
+  // can opt in by header without changing URL.
+  app.use(`${apiPrefix}${mountPath}`, resolvePlatform, router);
+}
+
+// Global, platform-agnostic routers.
 app.use(`${apiPrefix}/auth`, authRoutes);
-app.use(`${apiPrefix}/sessions`, sessionRoutes);
-app.use(`${apiPrefix}/scrape`, scrapeRoutes);
-app.use(`${apiPrefix}/messages`, messageRoutes);
-app.use(`${apiPrefix}/groups`, groupRoutes);
-app.use(`${apiPrefix}/lists`, listRoutes);
-app.use(`${apiPrefix}/reports`, reportRoutes);
-app.use(`${apiPrefix}/dashboard`, dashboardRoutes);
-app.use(`${apiPrefix}/account-settings`, accountSettingsRoutes);
-app.use(`${apiPrefix}/2fa-jobs`, twoFAJobsRoutes);
-app.use(`${apiPrefix}/otp`, otpRoutes);
-app.use(`${apiPrefix}/proxies`, proxyRoutes);
-app.use(`${apiPrefix}/anti-detect`, antiDetectRoutes);
-app.use(`${apiPrefix}/privacy`, privacyRoutes);
 app.use(`${apiPrefix}/admin`, adminRoutes);
-app.use(`${apiPrefix}/billing`, billingRoutes);
+app.use(`${apiPrefix}/billing`, resolvePlatform, billingRoutes);
 app.use(`${apiPrefix}/user-credentials`, userCredentialsRoutes);
 
 // 404 handler
@@ -163,11 +198,42 @@ io.use((socket, next) => {
   }
 });
 
+const VALID_PLATFORMS = new Set(['telegram', 'instagram']);
+
 io.on('connection', (socket) => {
   logger.info(`User connected: ${socket.userId}`);
 
-  // Join user-specific room
+  // Join user-specific room (cross-platform notifications still flow here).
   socket.join(`user:${socket.userId}`);
+
+  // Per-platform rooms — services emit to `platform:<userId>:<platform>`
+  // for events that should be scoped to a single panel (e.g. IG warmup
+  // throttle decisions, TG group-invite progress). The frontend asks
+  // for the room it cares about via 'platform:subscribe' and will
+  // re-subscribe whenever the user toggles platforms.
+  const _joinPlatform = (platform) => {
+    if (!VALID_PLATFORMS.has(platform)) return;
+    socket.join(`platform:${socket.userId}:${platform}`);
+  };
+  const _leavePlatform = (platform) => {
+    if (!VALID_PLATFORMS.has(platform)) return;
+    socket.leave(`platform:${socket.userId}:${platform}`);
+  };
+
+  // Handshake-time platform (sent in io({ query: { platform } })). We
+  // join the room immediately so the very first event after connect is
+  // routed correctly.
+  const handshakePlatform = socket.handshake?.query?.platform;
+  if (handshakePlatform && VALID_PLATFORMS.has(handshakePlatform)) {
+    _joinPlatform(handshakePlatform);
+  }
+
+  socket.on('platform:subscribe', (data) => {
+    _joinPlatform(data?.platform);
+  });
+  socket.on('platform:unsubscribe', (data) => {
+    _leavePlatform(data?.platform);
+  });
 
   // Handle client events
   socket.on('scrape:cancel', async (data) => {
@@ -191,7 +257,7 @@ io.on('connection', (socket) => {
 global.io = io;
 
 // Initialize and start server
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 3003;
 
 async function start() {
   try {

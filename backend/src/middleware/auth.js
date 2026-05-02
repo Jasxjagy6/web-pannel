@@ -90,7 +90,13 @@ const requireAdmin = (req, _res, next) => {
  *   router.use(requireApproved)             // any feature
  *   router.use(requireApproved('scrape'))   // restricted feature
  */
-async function _gate(req, _res, feature) {
+const VALID_PLATFORMS = ['telegram', 'instagram'];
+
+function _isPlatform(s) {
+  return typeof s === 'string' && VALID_PLATFORMS.includes(s.toLowerCase());
+}
+
+async function _gate(req, _res, platform, feature) {
   if (!req.user) {
     throw new AppError('Auth required', 401, 'AUTH_REQUIRED');
   }
@@ -98,9 +104,6 @@ async function _gate(req, _res, feature) {
   if (req.user.status === 'banned') {
     throw new AppError('Account is banned', 403, 'ACCOUNT_BANNED');
   }
-  // Approval is now automatic on register (v8). Banned users land in
-  // 'banned' above. The remaining negative case is anyone an admin
-  // explicitly rolled back to 'pending' — keep that path working.
   if (req.user.status !== 'approved' || !req.user.isApproved) {
     throw new AppError(
       'Account is currently disabled. Please contact support.',
@@ -109,38 +112,51 @@ async function _gate(req, _res, feature) {
     );
   }
 
-  // Per-user Telegram API credentials gate (v8). The user MUST have at
-  // least one usable credential before they can use any feature route,
-  // including after they have an active subscription. The frontend
-  // uses this to render the "Set up your API ID and Hash in Settings"
-  // popup. Auth, billing, and the credentials CRUD itself are mounted
-  // outside this middleware so they remain reachable.
-  const userApiCredentials = require('../services/userApiCredentialsService');
-  const hasCreds = await userApiCredentials.userHasUsable(req.user.id);
-  if (!hasCreds) {
-    throw new AppError(
-      'Please set up your Telegram API ID and Hash in Settings before using the panel.',
-      412,
-      'API_CREDENTIALS_REQUIRED'
-    );
+  // Resolve the platform for this gate. Explicit arg wins; otherwise we
+  // use whatever parsePlatform / resolvePlatform set on req.platform; and
+  // fall back to 'telegram' for the legacy alias and any router that
+  // forgot to mount parsePlatform.
+  const effectivePlatform = (platform || req.platform || 'telegram').toLowerCase();
+
+  // Per-user Telegram API credentials gate (v8). Telegram needs the user
+  // to have provisioned a Telegram API ID/Hash; Instagram authenticates
+  // with the username + password the user enters at session-create time
+  // and doesn't need a per-user app credential, so we skip this check on
+  // the Instagram panel.
+  if (effectivePlatform === 'telegram') {
+    const userApiCredentials = require('../services/userApiCredentialsService');
+    const hasCreds = await userApiCredentials.userHasUsable(req.user.id);
+    if (!hasCreds) {
+      throw new AppError(
+        'Please set up your Telegram API ID and Hash in Settings before using the panel.',
+        412,
+        'API_CREDENTIALS_REQUIRED'
+      );
+    }
   }
 
-  // Subscription / trial gate.
+  // Subscription / trial gate scoped to the active platform.
   const subscriptionService = require('../services/subscriptionService');
-  const ent = await subscriptionService.entitlementFor(req.user._row || req.user, feature);
+  const ent = await subscriptionService.entitlementFor(
+    req.user._row || req.user,
+    effectivePlatform,
+    feature
+  );
   if (!ent.allowed) {
     if (ent.reason === 'trial_feature_not_allowed') {
       throw new AppError(
-        'This feature is not available on the free trial.',
+        `This feature is not available on the ${effectivePlatform} free trial.`,
         402,
         'TRIAL_FEATURE_NOT_ALLOWED'
       );
     }
-    throw new AppError(
-      'An active subscription is required to use this feature.',
+    const e = new AppError(
+      `An active ${effectivePlatform} subscription is required to use this feature.`,
       402,
       'SUBSCRIPTION_REQUIRED'
     );
+    e.platform = effectivePlatform;
+    throw e;
   }
   req.entitlement = ent;
 }
@@ -158,14 +174,35 @@ function _isExpressTriple(args) {
   );
 }
 
+/**
+ * Subscription / approval gate.
+ *
+ * Signatures:
+ *   router.use(requireApproved)                          // any feature, platform from req
+ *   router.use(requireApproved('scrape'))                // restricted feature, platform from req
+ *   router.use(requireApproved('telegram'))              // any feature on telegram
+ *   router.use(requireApproved('telegram', 'scrape'))    // feature + platform
+ *
+ * The platform comes from req.platform (set by parsePlatform / resolvePlatform)
+ * unless explicitly provided.
+ */
 const requireApproved = (...args) => {
   if (_isExpressTriple(args)) {
     const [req, res, next] = args;
-    return _gate(req, res, null).then(() => next()).catch(next);
+    return _gate(req, res, null, null).then(() => next()).catch(next);
   }
-  const feature = args[0] || null;
+  let platform = null;
+  let feature = null;
+  if (args.length >= 1) {
+    if (_isPlatform(args[0])) {
+      platform = args[0];
+      if (args.length >= 2 && typeof args[1] === 'string') feature = args[1];
+    } else if (typeof args[0] === 'string') {
+      feature = args[0];
+    }
+  }
   return (req, res, next) =>
-    _gate(req, res, feature).then(() => next()).catch(next);
+    _gate(req, res, platform, feature).then(() => next()).catch(next);
 };
 
 const optionalAuth = asyncHandler(async (req, _res, next) => {

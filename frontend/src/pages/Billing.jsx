@@ -6,8 +6,9 @@ import {
   History, ExternalLink, Hourglass, X,
 } from 'lucide-react';
 import { useAuth } from '@/hooks/useAuth';
+import { usePlatform, PLATFORM_LABELS } from '@/context/PlatformContext';
 import {
-  getBillingStatus, startTrial as apiStartTrial,
+  getBillingStatus, getBillingConfig, startTrial as apiStartTrial,
   createCheckout, listMyInvoices, refreshInvoice,
 } from '@/api/billing';
 import { useToast } from '@/components/common/Toast';
@@ -56,15 +57,20 @@ export default function Billing() {
   const toast = useToast();
   const navigate = useNavigate();
   const { refreshProfile } = useAuth();
+  const { platform } = usePlatform();
 
   const [status, setStatus] = useState(null);
   const [loading, setLoading] = useState(true);
   const [trialBusy, setTrialBusy] = useState(false);
-  const [checkoutBusy, setCheckoutBusy] = useState(false);
+  const [checkoutBusy, setCheckoutBusy] = useState({ telegram: false, instagram: false, bundle: false });
   const [pendingInvoice, setPendingInvoice] = useState(null);
 
   const [invoices, setInvoices] = useState([]);
   const [invoicesLoading, setInvoicesLoading] = useState(false);
+
+  // Per-platform billing config cards (TG / IG / bundle).
+  const [tgCfg, setTgCfg] = useState(null);
+  const [igCfg, setIgCfg] = useState(null);
 
   const [, forceTick] = useState(0);
   useEffect(() => {
@@ -74,14 +80,20 @@ export default function Billing() {
 
   const load = useCallback(async () => {
     try {
-      const r = await getBillingStatus();
-      setStatus(r.data?.data || null);
+      const [statusR, tgR, igR] = await Promise.all([
+        getBillingStatus(platform),
+        getBillingConfig('telegram').catch(() => null),
+        getBillingConfig('instagram').catch(() => null),
+      ]);
+      setStatus(statusR.data?.data || null);
+      setTgCfg(tgR?.data?.data || null);
+      setIgCfg(igR?.data?.data || null);
     } catch (e) {
       toast.error(parseApiError(e), 'Failed to load billing status');
     } finally {
       setLoading(false);
     }
-  }, [toast]);
+  }, [toast, platform]);
 
   const loadInvoices = useCallback(async () => {
     setInvoicesLoading(true);
@@ -132,11 +144,11 @@ export default function Billing() {
   const trialActive = trial.expiresAt && new Date(trial.expiresAt) > new Date();
   const trialUsed = !!trial.used;
 
-  const onTrial = async () => {
+  const onTrial = async (whichPlatform = platform) => {
     setTrialBusy(true);
     try {
-      await apiStartTrial();
-      toast.success('Free trial activated');
+      await apiStartTrial(whichPlatform);
+      toast.success(`Free trial activated for ${PLATFORM_LABELS[whichPlatform] || whichPlatform}`);
       await load();
       await refreshProfile();
     } catch (e) {
@@ -146,21 +158,29 @@ export default function Billing() {
     }
   };
 
-  const onCheckout = async () => {
-    setCheckoutBusy(true);
+  /**
+   * Open OxaPay checkout for the given billing rail:
+   *   { platform: 'telegram' }                 → TG-only
+   *   { platform: 'instagram' }                → IG-only
+   *   { platform: 'telegram', bundle: 'bundle' } → bundle (TG + IG)
+   */
+  const onCheckout = async (opts = {}) => {
+    const railKey = opts.bundle === 'bundle' ? 'bundle' : (opts.platform || platform);
+    setCheckoutBusy((s) => ({ ...s, [railKey]: true }));
     try {
-      const r = await createCheckout();
+      const r = await createCheckout({
+        platform: opts.platform || platform,
+        bundle: opts.bundle || 'none',
+      });
       const inv = r.data?.data?.invoice;
       if (!inv?.paymentUrl) throw new Error('No payment URL returned');
       setPendingInvoice(inv);
-      // Open the OxaPay payment page in a new tab so the user can keep
-      // the panel open and see the status flip live when payment lands.
       window.open(inv.paymentUrl, '_blank', 'noopener,noreferrer');
       await loadInvoices();
     } catch (e) {
       toast.error(parseApiError(e), 'Could not create invoice');
     } finally {
-      setCheckoutBusy(false);
+      setCheckoutBusy((s) => ({ ...s, [railKey]: false }));
     }
   };
 
@@ -210,7 +230,7 @@ export default function Billing() {
         isAdmin={isAdmin}
         priceUsd={priceUsd}
         periodDays={periodDays}
-        onGoApp={() => navigate('/dashboard')}
+        onGoApp={() => navigate(`/${platform}/dashboard`)}
       />
 
       {/* Pending payment banner */}
@@ -222,32 +242,34 @@ export default function Billing() {
         />
       )}
 
-      {/* Plans grid */}
-      {!subActive && !isAdmin && (
-        <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
-          <PlanCard
-            title="Premium subscription"
-            tagline={`${periodDays}-day full access`}
-            price={priceUsd}
-            currency="USD"
-            features={Object.keys(FEATURE_LABELS).map((k) => FEATURE_LABELS[k])}
-            ctaLabel={checkoutBusy ? 'Creating invoice…' : 'Pay with crypto (OxaPay)'}
-            ctaIcon={checkoutBusy ? Loader2 : Bitcoin}
-            ctaSpin={checkoutBusy}
-            onCta={onCheckout}
-            highlight
-            tone="primary"
-            disabled={checkoutBusy || !config}
+      {/* Per-platform plan grid + bundle. Each rail has its own price,
+          period, and trial state — entitlement is independent on each
+          platform so the user can subscribe to TG only, IG only, or both. */}
+      {!isAdmin && (
+        <div className="grid grid-cols-1 gap-4 lg:grid-cols-3">
+          <PlatformPlanCard
+            platform="telegram"
+            cfg={tgCfg}
+            busy={!!checkoutBusy.telegram}
+            trialBusy={trialBusy}
+            statusUser={status?.user}
+            onCheckout={onCheckout}
+            onTrial={onTrial}
           />
-          <TrialCard
-            enabled={trialEnabled}
-            durationMinutes={trialMin}
-            allowedFeatures={trialFeatures}
-            used={trialUsed}
-            active={trialActive}
-            expiresAt={trial.expiresAt}
-            busy={trialBusy}
-            onStart={onTrial}
+          <PlatformPlanCard
+            platform="instagram"
+            cfg={igCfg}
+            busy={!!checkoutBusy.instagram}
+            trialBusy={trialBusy}
+            statusUser={status?.user}
+            onCheckout={onCheckout}
+            onTrial={onTrial}
+          />
+          <BundlePlanCard
+            tgCfg={tgCfg}
+            igCfg={igCfg}
+            busy={!!checkoutBusy.bundle}
+            onCheckout={onCheckout}
           />
         </div>
       )}
@@ -557,6 +579,163 @@ function InvoiceHistory({ invoices, loading, onRefresh }) {
           </table>
         </div>
       )}
+    </div>
+  );
+}
+
+/**
+ * Per-platform plan card. Renders the price, period, "Pay with crypto"
+ * CTA, and a small "Start free trial" link if the user hasn't used the
+ * trial on this platform yet.
+ *
+ * The active subscription / trial state for THIS platform is sourced
+ * from the multi-platform entitlement map on `status.user.subscriptions`
+ * (post-v9 backend). Falls back gracefully when only the legacy single
+ * subscription mirror is present.
+ */
+function PlatformPlanCard({ platform, cfg, busy, trialBusy, statusUser, onCheckout, onTrial }) {
+  if (!cfg) {
+    return (
+      <div className="rounded-2xl border border-dark-700/70 bg-dark-900/60 p-5 text-sm text-dark-400">
+        Loading {PLATFORM_LABELS[platform]}…
+      </div>
+    );
+  }
+  const subsByPlatform = statusUser?.subscriptions || {};
+  const sub = subsByPlatform[platform] || (platform === 'telegram' ? statusUser?.subscription : null) || {};
+  const trial = sub.trial || (platform === 'telegram' ? statusUser?.trial : null) || {};
+  const subActive = sub.status === 'active' && sub.expiresAt && new Date(sub.expiresAt) > new Date();
+  const trialActive = trial?.expiresAt && new Date(trial.expiresAt) > new Date();
+  const trialUsed = !!trial?.used;
+
+  const isTG = platform === 'telegram';
+  return (
+    <div
+      className={`relative flex flex-col gap-4 rounded-2xl border p-6 ${
+        subActive
+          ? 'border-emerald-500/40 bg-gradient-to-br from-emerald-500/10 to-transparent'
+          : isTG
+            ? 'border-sky-500/30 bg-gradient-to-br from-sky-500/10 to-transparent'
+            : 'border-pink-500/30 bg-gradient-to-br from-pink-500/15 to-transparent'
+      }`}
+    >
+      <div className="flex items-center gap-2">
+        <span
+          className={`inline-flex h-8 w-8 items-center justify-center rounded-lg text-white shadow ${
+            isTG ? 'bg-sky-500' : 'bg-gradient-to-br from-fuchsia-500 to-orange-400'
+          }`}
+        >
+          {isTG ? '✈' : '📷'}
+        </span>
+        <h3 className="text-base font-semibold text-white">{PLATFORM_LABELS[platform]} Panel</h3>
+      </div>
+
+      <div>
+        <span className="text-3xl font-bold text-white">${Number(cfg.priceUsd).toFixed(2)}</span>
+        <span className="ml-1 text-sm text-dark-300">/ {cfg.periodDays}-day plan</span>
+      </div>
+
+      {subActive ? (
+        <div className="rounded-lg border border-emerald-500/30 bg-emerald-500/10 px-3 py-2 text-xs text-emerald-200">
+          <CheckCircle2 className="mr-1 inline h-3.5 w-3.5" />
+          Active — {fmtCountdown(sub.expiresAt)} remaining
+        </div>
+      ) : trialActive ? (
+        <div className="rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-200">
+          <Sparkles className="mr-1 inline h-3.5 w-3.5" />
+          Trial active — {fmtCountdown(trial.expiresAt)}
+        </div>
+      ) : null}
+
+      <button
+        onClick={() => onCheckout({ platform })}
+        disabled={busy}
+        className={`mt-auto inline-flex items-center justify-center gap-2 rounded-xl px-4 py-2.5 text-sm font-semibold text-white shadow transition disabled:opacity-50 ${
+          isTG
+            ? 'bg-sky-600 hover:bg-sky-700'
+            : 'bg-gradient-to-r from-fuchsia-600 via-rose-500 to-orange-400 hover:opacity-90'
+        }`}
+      >
+        {busy ? <Loader2 className="h-4 w-4 animate-spin" /> : <Bitcoin className="h-4 w-4" />}
+        {busy ? 'Creating invoice…' : `Pay $${Number(cfg.priceUsd).toFixed(2)} with crypto`}
+      </button>
+
+      {cfg.trial?.enabled && !trialActive && !trialUsed && !subActive && (
+        <button
+          onClick={() => onTrial(platform)}
+          disabled={trialBusy}
+          className="text-xs text-dark-300 hover:text-white disabled:opacity-50"
+        >
+          {trialBusy ? 'Starting…' : `Start free ${cfg.trial.durationMinutes}-min trial →`}
+        </button>
+      )}
+      {trialUsed && !trialActive && !subActive && (
+        <p className="text-xs text-dark-500">Free trial already used on this platform.</p>
+      )}
+    </div>
+  );
+}
+
+/**
+ * Bundle card — single payment unlocks both Telegram and Instagram for the
+ * shared bundle period. Rendered next to the per-platform cards so the
+ * user can compare $TG + $IG to $bundle at a glance.
+ */
+function BundlePlanCard({ tgCfg, igCfg, busy, onCheckout }) {
+  const bundle = tgCfg?.bundle || igCfg?.bundle;
+  if (!bundle?.enabled) {
+    return (
+      <div className="rounded-2xl border border-dark-700/70 bg-dark-900/60 p-5 text-sm text-dark-400">
+        Bundle plan disabled.
+      </div>
+    );
+  }
+  const tgPrice = Number(tgCfg?.priceUsd || 0);
+  const igPrice = Number(igCfg?.priceUsd || 0);
+  const bundlePrice = Number(bundle.priceUsd || 0);
+  const savings = Math.max(0, tgPrice + igPrice - bundlePrice);
+  return (
+    <div className="relative flex flex-col gap-4 rounded-2xl border border-violet-500/30 bg-gradient-to-br from-violet-600/15 via-violet-500/5 to-fuchsia-500/10 p-6 ring-1 ring-violet-500/20">
+      <div className="absolute right-4 top-4 inline-flex items-center gap-1 rounded-full bg-violet-500/20 px-2 py-0.5 text-[11px] font-medium text-violet-200">
+        <Sparkles className="h-3 w-3" /> Best value
+      </div>
+      <div className="flex items-center gap-2">
+        <span className="inline-flex h-8 w-8 items-center justify-center rounded-lg bg-gradient-to-br from-sky-500 to-fuchsia-500 text-white shadow">
+          ⚡
+        </span>
+        <h3 className="text-base font-semibold text-white">Telegram + Instagram bundle</h3>
+      </div>
+      <div>
+        <span className="text-3xl font-bold text-white">${bundlePrice.toFixed(2)}</span>
+        <span className="ml-1 text-sm text-dark-300">/ {bundle.periodDays}-day plan</span>
+        {savings > 0 && (
+          <span className="ml-2 rounded-full bg-emerald-500/20 px-2 py-0.5 text-[11px] font-semibold text-emerald-200">
+            Save ${savings.toFixed(2)}
+          </span>
+        )}
+      </div>
+      <ul className="space-y-1.5 text-xs text-dark-200">
+        <li className="flex items-center gap-2">
+          <CheckCircle2 className="h-3.5 w-3.5 text-emerald-400" />
+          Full Telegram panel access
+        </li>
+        <li className="flex items-center gap-2">
+          <CheckCircle2 className="h-3.5 w-3.5 text-emerald-400" />
+          Full Instagram panel access
+        </li>
+        <li className="flex items-center gap-2">
+          <CheckCircle2 className="h-3.5 w-3.5 text-emerald-400" />
+          One invoice, one payment
+        </li>
+      </ul>
+      <button
+        onClick={() => onCheckout({ platform: 'telegram', bundle: 'bundle' })}
+        disabled={busy}
+        className="mt-auto inline-flex items-center justify-center gap-2 rounded-xl bg-gradient-to-r from-violet-600 to-fuchsia-500 px-4 py-2.5 text-sm font-semibold text-white shadow hover:opacity-90 disabled:opacity-50"
+      >
+        {busy ? <Loader2 className="h-4 w-4 animate-spin" /> : <Bitcoin className="h-4 w-4" />}
+        {busy ? 'Creating invoice…' : `Pay $${bundlePrice.toFixed(2)} for both`}
+      </button>
     </div>
   );
 }

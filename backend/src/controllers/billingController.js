@@ -5,25 +5,73 @@ const settingsService = require('../services/systemSettingsService');
 const subscriptionService = require('../services/subscriptionService');
 const oxapayService = require('../services/oxapayService');
 
+const VALID_PLATFORMS = ['telegram', 'instagram'];
+const VALID_BUNDLES = ['none', 'bundle']; // 'bundle' = bundle (TG + IG combined plan)
+
+/**
+ * Pick the platform from the request — preference order:
+ *   - explicit ?platform=telegram|instagram in body / query
+ *   - req.platform set by parsePlatform middleware (URL prefix
+ *     /api/<platform>/* or X-Platform header)
+ *   - 'telegram' for legacy callers (always available + matches the
+ *     historic single-platform behaviour).
+ */
+function _resolvePlatform(req) {
+  const candidate =
+    req.body?.platform ||
+    req.query?.platform ||
+    req.platform ||
+    'telegram';
+  if (!VALID_PLATFORMS.includes(candidate)) return 'telegram';
+  return candidate;
+}
+
+function _resolveBundle(req) {
+  const b = req.body?.bundle || req.query?.bundle || 'none';
+  if (!VALID_BUNDLES.includes(b)) return 'none';
+  return b;
+}
+
 const billingController = {
   /**
-   * GET /api/billing/config
+   * GET /api/<platform>/billing/config (or /api/billing/config legacy)
    * Public-ish (must be authed but not necessarily approved/subscribed):
    * the user landing page calls this to render the subscribe / trial buttons.
+   *
+   * Now reads per-platform pricing keys (e.g.
+   *   billing.telegram.subscription_price_usd
+   *   billing.instagram.subscription_price_usd
+   *   billing.bundle.subscription_price_usd
+   * ) and falls back to the global billing.subscription_price_usd for
+   * platforms that don't have an override yet.
    */
-  getConfig: asyncHandler(async (_req, res) => {
+  getConfig: asyncHandler(async (req, res) => {
+    const platform = _resolvePlatform(req);
     const cfg = await settingsService.getBillingConfig();
+    const get = (k, fallback) => {
+      const perPlatform = cfg[`billing.${platform}.${k}`];
+      if (perPlatform !== undefined && perPlatform !== null && perPlatform !== '') {
+        return perPlatform;
+      }
+      return cfg[`billing.${k}`] !== undefined ? cfg[`billing.${k}`] : fallback;
+    };
     res.json({
       success: true,
       data: {
-        priceUsd: Number(cfg['billing.subscription_price_usd'] || 9.99),
-        periodDays: Number(cfg['billing.subscription_period_days'] || 30),
-        currency: cfg['billing.currency'] || 'USD',
+        platform,
+        priceUsd: Number(get('subscription_price_usd', 9.99)),
+        periodDays: Number(get('subscription_period_days', 30)),
+        currency: get('currency', 'USD'),
+        bundle: {
+          enabled: cfg['billing.bundle.enabled'] !== false,
+          priceUsd: Number(cfg['billing.bundle.subscription_price_usd'] || 14.99),
+          periodDays: Number(cfg['billing.bundle.subscription_period_days'] || 30),
+        },
         trial: {
-          enabled: !!cfg['billing.trial_enabled'],
-          durationMinutes: Number(cfg['billing.trial_duration_minutes'] || 5),
-          allowedFeatures: Array.isArray(cfg['billing.trial_allowed_features'])
-            ? cfg['billing.trial_allowed_features']
+          enabled: !!get('trial_enabled', cfg['billing.trial_enabled']),
+          durationMinutes: Number(get('trial_duration_minutes', cfg['billing.trial_duration_minutes'] || 5)),
+          allowedFeatures: Array.isArray(get('trial_allowed_features', cfg['billing.trial_allowed_features']))
+            ? get('trial_allowed_features', cfg['billing.trial_allowed_features'])
             : [],
         },
         oxapayConfigured: oxapayService.isConfigured(),
@@ -63,9 +111,10 @@ const billingController = {
     if (!req.user.isApproved) {
       throw new AppError('Your account is not yet approved', 403, 'NOT_APPROVED');
     }
+    const platform = _resolvePlatform(req);
     let snap;
     try {
-      snap = await subscriptionService.startTrial(req.user.id);
+      snap = await subscriptionService.startTrial(req.user.id, platform);
     } catch (err) {
       if (err.code === 'TRIAL_ALREADY_USED') {
         throw new AppError(err.message, 400, 'TRIAL_ALREADY_USED');
@@ -75,7 +124,7 @@ const billingController = {
       }
       throw err;
     }
-    res.json({ success: true, data: snap });
+    res.json({ success: true, data: { ...snap, platform } });
   }),
 
   /**
@@ -95,14 +144,19 @@ const billingController = {
         'OXAPAY_NOT_CONFIGURED'
       );
     }
+    const platform = _resolvePlatform(req);
+    const bundle = _resolveBundle(req);
     let invoice;
     try {
-      invoice = await subscriptionService.createInvoiceForUser(req.user.id);
+      invoice = await subscriptionService.createInvoiceForUser(req.user.id, {
+        platform,
+        bundle,
+      });
     } catch (err) {
       if (err.code === 'OXAPAY_NOT_CONFIGURED') {
         throw new AppError(err.message, 503, 'OXAPAY_NOT_CONFIGURED');
       }
-      logger.error('createCheckout failed', { err: err.message });
+      logger.error('createCheckout failed', { err: err.message, platform, bundle });
       throw new AppError(err.message || 'Could not create invoice', 502, 'OXAPAY_ERROR');
     }
     res.json({
@@ -110,6 +164,8 @@ const billingController = {
       data: {
         invoice: {
           id: invoice.id,
+          platform: invoice.platform || platform,
+          bundle: invoice.bundle || bundle,
           trackId: invoice.oxapay_track_id,
           paymentUrl: invoice.payment_url,
           amountUsd: Number(invoice.amount_usd),
@@ -225,13 +281,21 @@ const billingController = {
   }),
 
   adminSetSettings: asyncHandler(async (req, res) => {
-    const allowedKeys = [
+    const platforms = ['telegram', 'instagram', 'bundle'];
+    const baseKeys = [
       'billing.subscription_price_usd',
       'billing.subscription_period_days',
       'billing.currency',
       'billing.trial_enabled',
       'billing.trial_duration_minutes',
       'billing.trial_allowed_features',
+    ];
+    const allowedKeys = [
+      ...baseKeys,
+      // Per-platform overrides
+      ...platforms.flatMap((p) => baseKeys.map((k) => k.replace('billing.', `billing.${p}.`))),
+      // Bundle-specific
+      'billing.bundle.enabled',
     ];
     const patch = {};
     for (const k of allowedKeys) {

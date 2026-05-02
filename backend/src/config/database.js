@@ -8,7 +8,7 @@ require('dotenv').config();
 // OPS.md for the full scale-up procedure.
 const pool = new Pool({
   host: process.env.DB_HOST || 'localhost',
-  port: parseInt(process.env.DB_PORT || '5432'),
+  port: parseInt(process.env.DB_PORT || '5435'),
   database: process.env.DB_NAME || 'telegram_panel',
   user: process.env.DB_USER || 'postgres',
   password: process.env.DB_PASSWORD || 'your_secure_password',
@@ -49,6 +49,9 @@ const initDB = async () => {
       'migration_v6_scrape_monitor.sql',
       'migration_v7_billing.sql',
       'migration_v8_per_user_api_and_auto_approve.sql',
+      'migration_v9_multiplatform.sql',
+      'migration_v9_2_instagram_extras.sql',
+      'migration_v9_3_subscription_split.sql',
     ];
     for (const m of migrations) {
       const mPath = path.join(__dirname, m);
