@@ -1,6 +1,7 @@
 import React from 'react';
 import { Bell, Menu, User } from 'lucide-react';
 import { useAuth } from '@/hooks/useAuth';
+import PlatformToggle from './PlatformToggle';
 
 export default function Header({ onMenuClick, title }) {
   const { user } = useAuth();
@@ -25,15 +26,20 @@ export default function Header({ onMenuClick, title }) {
         </h1>
       </div>
 
-      {/* Right: notification bell icon, user avatar with email */}
+      {/* Right: platform toggle, notification bell, user avatar */}
       <div className="flex items-center gap-3">
+        {/* Platform toggle (TG / IG segmented control) */}
+        <div className="hidden sm:block">
+          <PlatformToggle />
+        </div>
+
         {/* Notification bell */}
         <button
           className="relative flex items-center justify-center h-9 w-9 rounded-lg text-gray-400 hover:text-white hover:bg-white/10 transition-colors"
           title="Notifications"
         >
           <Bell className="h-5 w-5" />
-          <span className="absolute top-1.5 right-1.5 h-2 w-2 rounded-full bg-primary-500 ring-2 ring-dark-800" />
+          <span className="absolute top-1.5 right-1.5 h-2 w-2 rounded-full bg-brand-500 ring-2 ring-dark-800" />
         </button>
 
         {/* Divider */}

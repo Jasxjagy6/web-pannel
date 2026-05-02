@@ -79,6 +79,23 @@ const capabilities = {
 
   // Behavior simulation
   behavior_simulate:      true,
+
+  // ---------------------------------------------------------------------
+  // Coarse rollups consumed by the sidebar / nav (mirror of
+  // telegram/index.js). Same key on both providers so the React
+  // Sidebar gate can stay simple.
+  // ---------------------------------------------------------------------
+  sessions_list:          true,
+  scrape_any:             true,   // followers || following || likers
+  messaging_bulk:         true,   // bulk_dm only on IG
+  lists:                  true,   // shared list service
+  reports:                true,   // shared report service
+  proxies:                true,
+  identity_device:        true,   // android uuid fingerprint
+  account_settings:       true,
+  privacy_set:            true,   // public/private toggle
+  twofa_change:           true,
+  otp_passive:            false,  // IG has no passive OTP inbox
 };
 
 // Lazy module loaders — keeps the IG runtime out of the cold-start path.

@@ -106,6 +106,23 @@ const capabilities = {
 
   // Behavior simulation
   behavior_simulate:      true,
+
+  // ---------------------------------------------------------------------
+  // Coarse rollups consumed by the sidebar / nav. Same key on both
+  // providers so the React Sidebar gate can stay simple. They're just
+  // ORs of the fine-grained flags above.
+  // ---------------------------------------------------------------------
+  sessions_list:          true,
+  scrape_any:             true,   // scrape_members || scrape_recent_msgs || scrape_active_users
+  messaging_bulk:         true,   // messaging_bulk_dm || messaging_bulk_to_group
+  lists:                  true,   // lists_crud || lists_import
+  reports:                true,   // reports_generate
+  proxies:                true,   // proxies_validate || proxies_assign
+  identity_device:        true,   // identity_device_model || identity_android_uuid
+  account_settings:       true,   // any account_set_*
+  privacy_set:            true,   // privacy_set_phone || privacy_set_account
+  twofa_change:           true,
+  otp_passive:            true,   // alias of otp_passive_listen
 };
 
 // ---------------------------------------------------------------------------
