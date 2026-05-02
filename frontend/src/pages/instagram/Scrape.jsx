@@ -13,6 +13,7 @@ import {
   X,
   Trash2,
   RefreshCw,
+  ListPlus,
 } from 'lucide-react';
 import {
   scrapeGroup,
@@ -23,6 +24,7 @@ import {
   deleteScrapeJob,
 } from '@/api/scrape';
 import { listSessions } from '@/api/sessions';
+import { listsAPI } from '@/api';
 import { useToast } from '../../components/common/Toast';
 import { formatNumber } from '@/utils/formatters';
 
@@ -185,6 +187,26 @@ export default function InstagramScrape() {
       setTimeout(() => URL.revokeObjectURL(url), 1000);
     } catch (err) {
       showToast(apiError(err), 'error');
+    }
+  }
+
+  async function doSaveToList(j) {
+    const targets = j.target_ids || (j.target_id ? [j.target_id] : []);
+    const defaultName = `IG ${j.target_type} of @${(targets[0] || 'unknown')} (#${j.id})`;
+    const name = window.prompt('List name', defaultName);
+    if (!name || !name.trim()) return;
+    try {
+      const r = await listsAPI.createFromScrape({
+        scrapeJobId: j.id,
+        listName: name.trim(),
+      });
+      const data = r.data?.data || r.data || {};
+      showToast(
+        `Saved list "${data.listName || name.trim()}" (#${data.listId || ''}) with ${data.totalItems ?? '?'} members`,
+        'success'
+      );
+    } catch (err) {
+      showToast(apiError(err, 'Failed to save list'), 'error');
     }
   }
 
@@ -362,9 +384,14 @@ export default function InstagramScrape() {
                         </button>
                       )}
                       {j.status === 'completed' && (
-                        <button onClick={() => doExport(j.id)} title="Download CSV" className="rounded-md border border-pink-200 bg-pink-50 p-1.5 text-pink-600 hover:bg-pink-100">
-                          <Download className="h-4 w-4" />
-                        </button>
+                        <>
+                          <button onClick={() => doExport(j.id)} title="Download CSV" className="rounded-md border border-pink-200 bg-pink-50 p-1.5 text-pink-600 hover:bg-pink-100">
+                            <Download className="h-4 w-4" />
+                          </button>
+                          <button onClick={() => doSaveToList(j)} title="Save to list" className="rounded-md border border-pink-200 bg-white p-1.5 text-pink-600 hover:bg-pink-50">
+                            <ListPlus className="h-4 w-4" />
+                          </button>
+                        </>
                       )}
                       <button onClick={() => doDelete(j.id)} title="Delete" className="rounded-md border border-red-200 p-1.5 text-red-500 hover:bg-red-50">
                         <Trash2 className="h-4 w-4" />

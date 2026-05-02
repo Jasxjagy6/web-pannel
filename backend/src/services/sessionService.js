@@ -2087,9 +2087,16 @@ class SessionService {
     let restored = 0;
     let failed = 0;
     try {
+      // Restoration here is Telegram-specific — it uses GramJS' session
+      // file format, the Telegram proxyService, and behaviour scheduling
+      // built around the Telegram client object. Instagram sessions are
+      // restored lazily on first use by the IG provider's getClient(),
+      // so don't pull them through this loop (otherwise the TG-only
+      // _loadSessionFromDB throws "path argument must be of type string").
       const result = await pool.query(
         `SELECT id FROM sessions
          WHERE is_logged_in = TRUE AND COALESCE(keep_alive, TRUE) = TRUE
+           AND platform = 'telegram'
          ORDER BY id ASC`
       );
       total = result.rows.length;
@@ -2207,8 +2214,15 @@ class SessionService {
     let failed = 0;
     let revoked = 0;
     try {
+      // Heartbeat is Telegram-specific — `_ensureConnected` and `getMe`
+      // talk to GramJS, not the IG provider. IG sessions stay valid as
+      // long as their cookies are valid; the IG client is recreated
+      // lazily per-request, so it doesn't need a heartbeat.
       const result = await pool.query(
-        `SELECT id FROM sessions WHERE is_logged_in = TRUE AND COALESCE(keep_alive, TRUE) = TRUE`
+        `SELECT id FROM sessions
+          WHERE is_logged_in = TRUE
+            AND COALESCE(keep_alive, TRUE) = TRUE
+            AND platform = 'telegram'`
       );
       for (const row of result.rows) {
         const sid = String(row.id);

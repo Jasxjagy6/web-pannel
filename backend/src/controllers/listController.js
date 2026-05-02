@@ -238,6 +238,11 @@ const listController = {
       limit,
       sort,
       order,
+      // Platform-bound routes (/api/instagram/lists, /api/telegram/lists)
+      // set req.platform via the parsePlatform middleware. The legacy
+      // /api/lists alias defaults to telegram. We pass it through as a
+      // filter so IG and TG sides see only their own lists.
+      platform: req.platform || null,
     });
 
     return res.status(200).json({

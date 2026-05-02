@@ -16,10 +16,57 @@ const { pool } = require('../../config/database');
 const logger = require('../../utils/logger');
 const igClient = require('./client');
 const systemSettings = require('../../services/systemSettingsService');
+const webScraper = require('./webScraper');
+const { decrypt } = require('../../utils/crypto');
 
 const PLATFORM = 'instagram';
 
 const VALID_TARGET_TYPES = ['followers', 'following', 'likers', 'commenters', 'tagged'];
+
+/**
+ * Sleep with random jitter — used between IG feed pages to stay
+ * under the throttle threshold. IG bans aggressive panels fast.
+ */
+function _jitterSleep(minMs = 1500, maxMs = 3000) {
+  const ms = Math.floor(minMs + Math.random() * Math.max(1, maxMs - minMs));
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+/**
+ * Map an instagram-private-api error to a clean { statusCode, message }
+ * pair so the caller can surface a friendly 4xx to the user instead of
+ * a 500. Mirrors the pattern in providers/instagram/create.js.
+ */
+function _mapIgError(err) {
+  if (!err) return { statusCode: 502, message: 'Unknown Instagram error' };
+  const ctor = err.constructor && err.constructor.name;
+  const msg = err.message || String(err);
+  // Authentication / session expiry
+  if (ctor === 'IgLoginRequiredError' || /login_required/i.test(msg)) {
+    return { statusCode: 401, message: 'Instagram session is no longer logged in. Re-upload a fresh session.' };
+  }
+  if (ctor === 'IgCheckpointError' || /checkpoint_required/i.test(msg)) {
+    return { statusCode: 401, message: 'Instagram is blocking this session with a checkpoint. Solve the checkpoint on a trusted device, then re-upload.' };
+  }
+  // Rate limit / spam guard
+  if (
+    ctor === 'IgActionSpamError' ||
+    /please wait a few minutes|action_blocked|too many requests|rate.?limit/i.test(msg)
+  ) {
+    return { statusCode: 429, message: 'Instagram is rate-limiting this session. Slow down and try again in a few minutes.' };
+  }
+  // User-not-found / target issues
+  if (ctor === 'IgUserHasNoFeedError' || /user not found|no feed/i.test(msg)) {
+    return { statusCode: 404, message: 'Target Instagram user has no public feed.' };
+  }
+  if (/getIdByUsername.*not found|not_found|user_not_found/i.test(msg)) {
+    return { statusCode: 404, message: 'Target Instagram username not found.' };
+  }
+  if (/private/i.test(msg) && /account|user/i.test(msg)) {
+    return { statusCode: 403, message: 'Target account is private — you must follow it from the session account first.' };
+  }
+  return { statusCode: 502, message: msg };
+}
 
 async function _getPageSize(targetType, fallback = 200) {
   const v = await systemSettings.getSetting(`scrape.instagram.${targetType}_page_size`);
@@ -168,63 +215,221 @@ async function _executeScrapeJob(jobId) {
   const limit = Number(job.options?.limit || job.options?.scrape_limit || 1000);
 
   const sessRows = await pool.query(
-    `SELECT id, user_id, username, proxy_url, session_data
+    `SELECT id, user_id, username, proxy_url, session_data, platform_state,
+            warmup_state
        FROM sessions
       WHERE id = ANY($1::int[]) AND platform = 'instagram'
-        AND is_logged_in = TRUE`,
+        AND is_logged_in = TRUE
+        AND COALESCE(warmup_state->>'state', 'active')
+            NOT IN ('needs_attention', 'dead')`,
     [sessionIds]
   );
   if (sessRows.rows.length === 0) {
-    await _setStatus(jobId, 'failed', { error: 'No usable IG sessions' });
+    // Distinguish "no sessions at all" from "all flagged" so the
+    // operator gets a clearer error in the job row.
+    const flaggedRows = await pool.query(
+      `SELECT id, warmup_state->>'state' AS state
+         FROM sessions
+        WHERE id = ANY($1::int[]) AND platform = 'instagram'`,
+      [sessionIds]
+    );
+    const hasFlagged = flaggedRows.rows.some((r) =>
+      ['needs_attention', 'dead'].includes(r.state || '')
+    );
+    await _setStatus(jobId, 'failed', {
+      error: hasFlagged
+        ? 'All selected IG sessions are currently flagged by Instagram (checkpoint or expired). Re-upload a fresh session and retry.'
+        : 'No usable IG sessions',
+    });
     return;
   }
 
+  const session = sessRows.rows[0];
+  // Browser-cookie sessions (uploaded via the cookieAdapter path) can't
+  // talk to the mobile API from a panel host without tripping
+  // checkpoint_required, but they CAN talk to the public web endpoints
+  // under www.instagram.com — so we route them through the web scraper.
+  const isCookieSession =
+    session.platform_state && session.platform_state.source === 'browser_cookies';
+
   let totalScraped = 0;
   try {
-    const session = sessRows.rows[0];
-    const client = await igClient.getClient(session);
-    const pageSize = Math.min(limit, await _getPageSize(job.target_type, 200));
-
-    for (const target of targets) {
-      if (totalScraped >= limit) break;
-
-      const targetUsername = String(target).replace(/^@/, '').toLowerCase();
-      const targetUserId = await client.user.getIdByUsername(targetUsername);
-
-      const feed = job.target_type === 'followers'
-        ? client.feed.accountFollowers(targetUserId)
-        : job.target_type === 'following'
-          ? client.feed.accountFollowing(targetUserId)
-          : null;
-
-      if (!feed) {
-        await _setStatus(jobId, 'failed', { error: `Target type ${job.target_type} not yet implemented for IG` });
-        return;
-      }
-
-      let receivedFromTarget = 0;
-      do {
-        const items = await feed.items();
-        const slice = items.slice(0, Math.max(0, limit - totalScraped));
-        const inserted = await _insertUsersBatch(jobId, slice);
-        totalScraped += inserted;
-        receivedFromTarget += slice.length;
-        await _setStatus(jobId, 'running', { total_found: totalScraped });
-        if (totalScraped >= limit) break;
-      } while (feed.isMoreAvailable() && receivedFromTarget < pageSize * 10);
+    if (isCookieSession) {
+      await _runWebScrape({ jobId, job, session, targets, limit });
+    } else {
+      totalScraped = await _runMobileScrape({ jobId, job, session, targets, limit });
     }
 
+    // _runWebScrape / _runMobileScrape both update job rows incrementally.
+    // Read the final total off the job row so the completed-progress
+    // check uses the value the inserts actually committed.
+    const finalRow = await _getJobRow(jobId);
     await _setStatus(jobId, 'completed', {
-      total_found: totalScraped,
+      total_found: finalRow?.total_found || totalScraped,
       progress: 100,
     });
   } catch (err) {
-    logger.error(`IG.scrape job ${jobId} failed: ${err.message}`);
+    const mapped = _mapIgError(err);
+    logger.error(`IG.scrape job ${jobId} failed (status=${mapped.statusCode}): ${mapped.message}`);
+    const finalRow = await _getJobRow(jobId);
     await _setStatus(jobId, 'failed', {
-      error: err.message,
-      total_found: totalScraped,
+      error: mapped.message,
+      total_found: finalRow?.total_found || totalScraped,
     });
+    // Cross-cutting health update: if the failure was caused by IG
+    // flagging the session (checkpoint / login_required / action
+    // blocked), flip the session row to `needs_attention` so the
+    // warm-up worker stops touching it and the operator sees the
+    // state in the UI. We pull `kind` off the underlying error so
+    // the classifier in igFetch is the single source of truth.
+    try {
+      const kind = err && (err.kind || (err.cause && err.cause.kind));
+      if (kind === 'checkpoint' || kind === 'login_required' || kind === 'action_blocked') {
+        // eslint-disable-next-line global-require
+        const { pool } = require('../../config/database');
+        const newState = kind === 'login_required' ? 'dead' : 'needs_attention';
+        const newStatus = kind === 'login_required' ? 'expired' : 'checkpoint';
+        await pool.query(
+          `UPDATE sessions
+              SET warmup_state = COALESCE(warmup_state, '{}'::jsonb)
+                                 || jsonb_build_object(
+                                      'state', $2::text,
+                                      'last_error', $3::text,
+                                      'last_error_kind', $4::text,
+                                      'last_failed_at', NOW()::text),
+                  status = $5,
+                  is_logged_in = CASE WHEN $4::text = 'login_required'
+                                      THEN FALSE ELSE is_logged_in END,
+                  updated_at = NOW()
+            WHERE id = $1`,
+          [session.id, newState, mapped.message, kind, newStatus]
+        );
+        logger.warn(
+          `IG.scrape: flipped session ${session.id} → ${newState} (${kind})`
+        );
+      }
+    } catch (flipErr) {
+      logger.warn(
+        `IG.scrape: failed to flip session ${session.id} health state: ${flipErr.message}`
+      );
+    }
   }
+}
+
+/**
+ * Cookie-uploaded session path — uses the public web endpoints under
+ * www.instagram.com, which only need the sessionid cookie and don't
+ * trigger the mobile API's "new device" checkpoint wall.
+ */
+async function _runWebScrape({ jobId, job, session, targets, limit }) {
+  if (!['followers', 'following'].includes(job.target_type)) {
+    await _setStatus(jobId, 'failed', {
+      error: `Target type ${job.target_type} is not yet implemented for cookie-uploaded sessions`,
+    });
+    return 0;
+  }
+
+  // Decrypt session_data into the canonical { cookies, ... } blob the
+  // web scraper can read.
+  let blob = null;
+  if (session.session_data) {
+    try {
+      const decrypted = decrypt(session.session_data);
+      blob = JSON.parse(decrypted);
+    } catch (err) {
+      const e = new Error(`Failed to decrypt session blob: ${err.message}`);
+      e.statusCode = 500;
+      throw e;
+    }
+  }
+  if (!blob) {
+    const e = new Error('Session has no decrypted blob');
+    e.statusCode = 500;
+    throw e;
+  }
+
+  let totalScraped = 0;
+  for (const target of targets) {
+    if (totalScraped >= limit) break;
+    const targetUsername = String(target).replace(/^@/, '').toLowerCase();
+    // Pass the full session row (not the bare blob) so the web scraper
+    // routes the request through the per-session proxy + browser-grade
+    // headers via igFetch.
+    const profile = await webScraper.getUserIdByUsername(session, targetUsername);
+
+    let received = 0;
+    const buffer = [];
+    for await (const u of webScraper.paginateFriendList(session, profile.pk, job.target_type, {
+      limit: limit - totalScraped,
+      pageSize: 50,
+      targetUsername,
+    })) {
+      buffer.push(u);
+      received += 1;
+      if (buffer.length >= 25) {
+        const inserted = await _insertUsersBatch(jobId, buffer.splice(0, buffer.length));
+        totalScraped += inserted;
+        await _setStatus(jobId, 'running', { total_found: totalScraped });
+      }
+      if (totalScraped + buffer.length >= limit) break;
+    }
+    if (buffer.length) {
+      const inserted = await _insertUsersBatch(jobId, buffer);
+      totalScraped += inserted;
+      await _setStatus(jobId, 'running', { total_found: totalScraped });
+    }
+    logger.info(`IG.webScrape job ${jobId}: target=${targetUsername} kind=${job.target_type} fetched=${received} inserted_total=${totalScraped}`);
+  }
+  return totalScraped;
+}
+
+/**
+ * Mobile-API session path (instagram-private-api). Used when the
+ * session was created by the panel's own login flow, not via cookie
+ * upload.
+ */
+async function _runMobileScrape({ jobId, job, session, targets, limit }) {
+  const client = await igClient.getClient(session);
+  const pageSize = Math.min(limit, await _getPageSize(job.target_type, 200));
+  let totalScraped = 0;
+
+  for (const target of targets) {
+    if (totalScraped >= limit) break;
+
+    const targetUsername = String(target).replace(/^@/, '').toLowerCase();
+    const targetUserId = await client.user.getIdByUsername(targetUsername);
+
+    const feed = job.target_type === 'followers'
+      ? client.feed.accountFollowers(targetUserId)
+      : job.target_type === 'following'
+        ? client.feed.accountFollowing(targetUserId)
+        : null;
+
+    if (!feed) {
+      await _setStatus(jobId, 'failed', { error: `Target type ${job.target_type} not yet implemented for IG` });
+      return totalScraped;
+    }
+
+    let receivedFromTarget = 0;
+    let firstPage = true;
+    do {
+      if (!firstPage) {
+        // Jittered backoff between feed pages to avoid IG's spam guard.
+        // Empirically 1.5-3s keeps a single session under the per-account
+        // throttle for followers/following endpoints.
+        await _jitterSleep(1500, 3000);
+      }
+      firstPage = false;
+      const items = await feed.items();
+      const slice = items.slice(0, Math.max(0, limit - totalScraped));
+      const inserted = await _insertUsersBatch(jobId, slice);
+      totalScraped += inserted;
+      receivedFromTarget += slice.length;
+      await _setStatus(jobId, 'running', { total_found: totalScraped });
+      if (totalScraped >= limit) break;
+    } while (feed.isMoreAvailable() && receivedFromTarget < pageSize * 10);
+  }
+  return totalScraped;
 }
 
 async function listJobs(userId, opts = {}) {

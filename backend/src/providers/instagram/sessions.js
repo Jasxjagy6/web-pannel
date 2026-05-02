@@ -17,6 +17,7 @@ const { pool } = require('../../config/database');
 const logger = require('../../utils/logger');
 const { encrypt, decrypt } = require('../../utils/crypto');
 const igClient = require('./client');
+const cookieAdapter = require('./cookieAdapter');
 
 const PLATFORM = 'instagram';
 
@@ -65,8 +66,25 @@ async function upload(files, userId, options = {}) {
       const buf = file.buffer || (file.path ? require('fs').readFileSync(file.path) : null);
       if (!buf) throw new Error('Empty upload');
       const text = buf.toString('utf8');
-      let parsed = JSON.parse(text);
-      if (!Array.isArray(parsed)) parsed = [parsed];
+      const parsedRaw = JSON.parse(text);
+
+      // Browser-cookie export shape (Cookie-Editor / EditThisCookie /
+      // Firefox JSON / { cookies: [...] }). Convert into a panel-shaped
+      // record by spinning up a temp IG client to resolve the username.
+      let parsed;
+      if (cookieAdapter.looksLikeBrowserCookies(parsedRaw)) {
+        const built = await cookieAdapter.buildSessionFromBrowserCookies(parsedRaw, {
+          proxyUrl: options.proxyUrl || null,
+        });
+        parsed = [{
+          username: built.username,
+          sessionBlob: built.sessionBlob,
+          proxyUrl: options.proxyUrl || null,
+          platformState: built.platformState,
+        }];
+      } else {
+        parsed = Array.isArray(parsedRaw) ? parsedRaw : [parsedRaw];
+      }
 
       for (const rec of parsed) {
         if (!rec.username || !rec.sessionBlob) {
@@ -139,7 +157,7 @@ async function listSessions(userId, opts = {}) {
   const sql = `
     SELECT id, user_id, platform, username, status, is_logged_in,
            proxy_url, last_login, last_used, created_at, updated_at,
-           platform_state
+           platform_state, warmup_state, last_warmup_at
       FROM sessions
      WHERE ${where.join(' AND ')}
      ORDER BY ${sortCol} ${sortDir}
@@ -162,6 +180,7 @@ async function get(sessionId, userId) {
   const result = await pool.query(
     `SELECT id, user_id, platform, username, status, is_logged_in,
             proxy_url, last_login, last_used, platform_state,
+            warmup_state, last_warmup_at,
             created_at, updated_at
        FROM sessions
       WHERE id = $1 AND user_id = $2 AND platform = 'instagram'`,

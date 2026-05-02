@@ -703,10 +703,10 @@ class ListService {
     // Verify that the scrape job belongs to the user
     // For multi-session jobs, check via the primary session_id
     const jobCheck = await pool.query(
-      `SELECT sj.id, sj.target_title, sj.target_id, sj.status, sj.session_id, s.user_id
+      `SELECT sj.id, sj.target_title, sj.target_id, sj.status, sj.session_id, sj.platform, sj.user_id AS job_user_id, s.user_id AS sess_user_id
        FROM scraping_jobs sj
        LEFT JOIN sessions s ON sj.session_id = s.id
-       WHERE sj.id = $1 AND (s.user_id = $2 OR sj.session_id IS NULL)`,
+       WHERE sj.id = $1 AND (s.user_id = $2 OR sj.session_id IS NULL OR sj.user_id = $2)`,
       [scrapeJobId, userId]
     );
 
@@ -720,13 +720,14 @@ class ListService {
 
     // If session_id exists, verify ownership through it
     const job = jobCheck.rows[0];
-    if (job.session_id && job.user_id !== userId) {
+    if (job.session_id && job.sess_user_id !== userId && job.job_user_id !== userId) {
       throw new AppError(
         `Scraping job not found or access denied: ${scrapeJobId}`,
         404,
         'SCRAPE_JOB_NOT_FOUND'
       );
     }
+    const platform = (job.platform || 'telegram').toLowerCase();
 
     // Count scraped users
     const countResult = await pool.query(
@@ -755,24 +756,38 @@ class ListService {
     try {
       await client.query('BEGIN');
 
-      // Create the list
+      // Create the list — carries the source platform so the IG and TG
+      // sides of the panel render their own lists separately.
       const listResult = await client.query(
-        `INSERT INTO lists (user_id, name, type, items_count, source, created_at)
-         VALUES ($1, $2, $3, $4, $5, NOW())
+        `INSERT INTO lists (user_id, name, type, items_count, source, platform, created_at)
+         VALUES ($1, $2, $3, $4, $5, $6::platform_type, NOW())
          RETURNING id`,
-        [userId, listName.trim(), 'scraped', itemCount, `job_${scrapeJobId}`]
+        [userId, listName.trim(), 'scraped', itemCount, `job_${scrapeJobId}`, platform]
       );
 
       const listId = listResult.rows[0].id;
 
-      // Copy users from scraped_users to list_items
-      await client.query(
-        `INSERT INTO list_items (list_id, telegram_id, username, first_name, last_name, phone, added_at)
-         SELECT $1, telegram_id, username, first_name, last_name, phone, NOW()
-         FROM scraped_users
-         WHERE job_id = $2`,
-        [listId, scrapeJobId]
-      );
+      // Copy users from scraped_users to list_items.
+      // For Instagram, scraped_users has NULL telegram_id and uses
+      // full_name + username; copy full_name into first_name so the
+      // existing list-items UI columns still render something useful.
+      if (platform === 'instagram') {
+        await client.query(
+          `INSERT INTO list_items (list_id, telegram_id, username, first_name, last_name, phone, platform, added_at)
+           SELECT $1, NULL, username, full_name, NULL, NULL, 'instagram'::platform_type, NOW()
+           FROM scraped_users
+           WHERE job_id = $2 AND platform = 'instagram'`,
+          [listId, scrapeJobId]
+        );
+      } else {
+        await client.query(
+          `INSERT INTO list_items (list_id, telegram_id, username, first_name, last_name, phone, added_at)
+           SELECT $1, telegram_id, username, first_name, last_name, phone, NOW()
+           FROM scraped_users
+           WHERE job_id = $2`,
+          [listId, scrapeJobId]
+        );
+      }
 
       await client.query('COMMIT');
 
@@ -1247,31 +1262,41 @@ class ListService {
    *   pagination: object
    * }>}
    */
-  async listLists(userId, { page = 1, limit = 20, sort = 'created_at', order = 'DESC' } = {}) {
-    logger.info(`Listing lists for user ${userId}`, { page, limit, sort, order });
+  async listLists(userId, { page = 1, limit = 20, sort = 'created_at', order = 'DESC', platform = null } = {}) {
+    logger.info(`Listing lists for user ${userId}`, { page, limit, sort, order, platform });
 
     const validSortFields = ['created_at', 'name', 'items_count', 'id', 'type'];
     const { field: sortField, order: sortOrder } = applySorting(sort, order, validSortFields);
     const { offset, limit: pageSize } = applyPagination(null, page, limit);
 
+    const where = ['user_id = $1'];
+    const params = [userId];
+    let p = 2;
+    if (platform) {
+      where.push(`platform = $${p++}::platform_type`);
+      params.push(platform);
+    }
+
     // Get total count
     const countResult = await pool.query(
-      'SELECT COUNT(*) as total FROM lists WHERE user_id = $1',
-      [userId]
+      `SELECT COUNT(*) as total FROM lists WHERE ${where.join(' AND ')}`,
+      params
     );
     const total = parseInt(countResult.rows[0].total, 10);
 
-    // Get paginated results with actual item counts from list_items
+    // Get paginated results with actual item counts from list_items.
+    // Platform filter is applied via the same WHERE clause to keep
+    // IG and TG sides isolated in the multi-tenant view.
     const listsResult = await pool.query(
-      `SELECT l.id, l.name, l.type, l.items_count, l.source, l.created_at,
+      `SELECT l.id, l.name, l.type, l.items_count, l.source, l.platform, l.created_at,
               COUNT(li.id) as actual_count
        FROM lists l
        LEFT JOIN list_items li ON l.id = li.list_id
-       WHERE l.user_id = $1
+       WHERE ${where.map((w) => `l.${w}`).join(' AND ')}
        GROUP BY l.id
        ORDER BY l.${sortField} ${sortOrder}
-       LIMIT $2 OFFSET $3`,
-      [userId, pageSize, offset]
+       LIMIT $${p++} OFFSET $${p++}`,
+      [...params, pageSize, offset]
     );
 
     const lists = listsResult.rows.map((row) => ({
@@ -1280,6 +1305,7 @@ class ListService {
       type: row.type,
       itemsCount: parseInt(row.actual_count, 10),
       source: row.source,
+      platform: row.platform,
       createdAt: row.created_at,
     }));
 

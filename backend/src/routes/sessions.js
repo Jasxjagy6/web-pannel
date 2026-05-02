@@ -48,4 +48,16 @@ router.get('/:id/status', sessionController.checkSessionStatus);
 // DELETE /api/sessions/:id - Delete session
 router.delete('/:id', sessionController.deleteSession);
 
+// --- Instagram-only session-health surface ---
+// These routes are mounted under both /api/sessions and /api/instagram/sessions
+// (the platform middleware filters non-IG calls 404). Telegram sessions
+// don't expose them.
+//
+// GET   /:id/health           — last warm-up state + recent log
+// POST  /:id/health/check     — run an on-demand probe via the bound proxy
+// PATCH /:id/proxy            — set/clear the per-session proxy URL
+router.get('/:id/health', sessionController.getSessionHealth);
+router.post('/:id/health/check', sessionController.runSessionHealthCheck);
+router.patch('/:id/proxy', sessionController.setSessionProxy);
+
 module.exports = router;

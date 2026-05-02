@@ -652,6 +652,127 @@ const sessionController = {
     );
     return res.sendFile(fullPath);
   }),
+
+  /**
+   * GET /api/instagram/sessions/:id/health
+   * Returns the most recent warm-up state, last error, last successful
+   * probe time and the last 10 behavior_log rows for an IG session.
+   * Returns 404 for non-IG sessions.
+   */
+  getSessionHealth: asyncHandler(async (req, res) => {
+    if (!_isInstagram(req)) {
+      throw new AppError(
+        'Session health is only tracked for Instagram sessions',
+        404,
+        'NOT_INSTAGRAM_SESSION'
+      );
+    }
+    const userId = req.user.id;
+    const sessionId = parseInt(req.params.id, 10);
+    if (!sessionId) {
+      throw new AppError('Session ID is required', 400, 'MISSING_SESSION_ID');
+    }
+    // eslint-disable-next-line global-require
+    const sessionHealth = require('../providers/instagram/sessionHealth');
+    const row = await sessionHealth.getSessionHealth(sessionId, userId);
+    if (!row) {
+      throw new AppError('Session not found', 404, 'SESSION_NOT_FOUND');
+    }
+    res.json({ success: true, data: row });
+  }),
+
+  /**
+   * POST /api/instagram/sessions/:id/health/check
+   * Runs an on-demand health probe for an IG session through its
+   * bound proxy. Returns the new state.
+   */
+  runSessionHealthCheck: asyncHandler(async (req, res) => {
+    if (!_isInstagram(req)) {
+      throw new AppError(
+        'Session health is only tracked for Instagram sessions',
+        404,
+        'NOT_INSTAGRAM_SESSION'
+      );
+    }
+    const userId = req.user.id;
+    const sessionId = parseInt(req.params.id, 10);
+    if (!sessionId) {
+      throw new AppError('Session ID is required', 400, 'MISSING_SESSION_ID');
+    }
+    // Confirm the user owns this session before the probe (the
+    // sessionHealth module is platform-scoped but doesn't take userId
+    // on runHealthCheck so we authorize here).
+    const owns = await pool.query(
+      `SELECT 1 FROM sessions
+        WHERE id = $1 AND user_id = $2 AND platform = 'instagram'`,
+      [sessionId, userId]
+    );
+    if (owns.rowCount === 0) {
+      throw new AppError('Session not found', 404, 'SESSION_NOT_FOUND');
+    }
+    // eslint-disable-next-line global-require
+    const sessionHealth = require('../providers/instagram/sessionHealth');
+    const result = await sessionHealth.runHealthCheck(sessionId, { verbose: true });
+    const fresh = await sessionHealth.getSessionHealth(sessionId, userId);
+    res.json({
+      success: result.ok,
+      data: { result, session: fresh },
+    });
+  }),
+
+  /**
+   * PATCH /api/instagram/sessions/:id/proxy
+   * Sets (or clears) the per-session proxy URL. Trims whitespace, treats
+   * an empty string as "remove proxy". Validates URL shape so the worker
+   * doesn't trip on bad input.
+   */
+  setSessionProxy: asyncHandler(async (req, res) => {
+    if (!_isInstagram(req)) {
+      throw new AppError(
+        'Per-session proxy is only configurable for Instagram sessions',
+        404,
+        'NOT_INSTAGRAM_SESSION'
+      );
+    }
+    const userId = req.user.id;
+    const sessionId = parseInt(req.params.id, 10);
+    if (!sessionId) {
+      throw new AppError('Session ID is required', 400, 'MISSING_SESSION_ID');
+    }
+    let { proxyUrl } = req.body || {};
+    if (typeof proxyUrl === 'string') proxyUrl = proxyUrl.trim();
+    if (proxyUrl) {
+      // Accept http(s)://, socks5://, socks4:// — the undici dispatcher
+      // we use for HTTP proxies only handles http(s) directly, but we
+      // allow socks here so a future provider switch is a one-line
+      // change. Reject anything else early.
+      if (!/^(https?|socks[45]?):\/\//i.test(proxyUrl)) {
+        throw new AppError(
+          'proxyUrl must start with http://, https://, socks5:// or socks4://',
+          400,
+          'INVALID_PROXY_URL'
+        );
+      }
+    } else {
+      proxyUrl = null;
+    }
+    const owns = await pool.query(
+      `UPDATE sessions
+          SET proxy_url = $3, updated_at = NOW()
+        WHERE id = $1 AND user_id = $2 AND platform = 'instagram'
+        RETURNING id, proxy_url`,
+      [sessionId, userId, proxyUrl]
+    );
+    if (owns.rowCount === 0) {
+      throw new AppError('Session not found', 404, 'SESSION_NOT_FOUND');
+    }
+    // Drop the cached dispatcher so the next request rebuilds it
+    // against the new proxy URL.
+    // eslint-disable-next-line global-require
+    const igFetch = require('../providers/instagram/igFetch');
+    igFetch.invalidateProxy(owns.rows[0].proxy_url || null);
+    res.json({ success: true, data: owns.rows[0] });
+  }),
 };
 
 module.exports = sessionController;
