@@ -2654,6 +2654,19 @@ class TelegramService {
     if (!entry) throw new Error(`Session ${sessionId} not found`);
     const { NewMessage } = require('telegram/events');
     const eventOptions = {};
+    // NOTE: We deliberately AVOID passing GramJS's `chats` filter here.
+    // GramJS resolves the filter lazily on the first matching event by
+    // calling `getInputEntity()` on every entry; for items that aren't
+    // already in the session's peer cache (URL forms, freshly-resolved
+    // usernames, transient FloodWaits) it makes a network call, and a
+    // single failure rejects the whole `_resolve()` — leaving
+    // `builder.resolved=false` so EVERY subsequent NewMessage event is
+    // dropped at the dispatcher. This was the dominant cause of the
+    // "5-minute job, 10 active users, only 2-3 captured" symptom.
+    //
+    // Callers who need to restrict which chats they listen to should
+    // filter inside their handler instead (see `_eventMatchesTarget`
+    // in scrapeMonitorService).
     if (options.chats && options.chats.length > 0) {
       eventOptions.chats = options.chats;
     }
@@ -2671,6 +2684,54 @@ class TelegramService {
         entry.client.removeEventHandler(wrapper, event);
       } catch (err) {
         logger.debug(`Failed to remove event handler: ${err.message}`);
+      }
+    };
+  }
+
+  /**
+   * Register a Raw update handler for a connected session.
+   *
+   * Unlike `addNewMessageHandler`, this delivers the raw GramJS update
+   * objects (`Api.UpdateChannelUserTyping`, `Api.UpdateMessageReactions`,
+   * `Api.UpdateChannelParticipant`, etc) so callers can capture user
+   * activity that doesn't surface as a NewMessage — typing, reactions,
+   * joins/leaves, MessageService events, and so on.
+   *
+   * GramJS's `Raw` builder has no chat filter and resolves to true on
+   * boot, so it is safe from the lazy-filter failure mode that
+   * `NewMessage`'s `chats` filter has.
+   *
+   * @param {string} sessionId
+   * @param {(update: object) => void|Promise<void>} handler
+   * @param {object} [options]
+   * @param {Array<Function>} [options.types] - Optional list of GramJS
+   *   `Api.*` constructors to filter to. When omitted every update is
+   *   delivered.
+   * @returns {Promise<() => void>} unsubscribe function
+   */
+  async addRawUpdateHandler(sessionId, handler, options = {}) {
+    await this._ensureConnected(sessionId);
+    const entry = this.clients.get(String(sessionId));
+    if (!entry) throw new Error(`Session ${sessionId} not found`);
+    const { Raw } = require('telegram/events');
+    const builderParams = {};
+    if (Array.isArray(options.types) && options.types.length > 0) {
+      builderParams.types = options.types;
+    }
+    const event = new Raw(builderParams);
+    const wrapper = async (update) => {
+      try {
+        await handler(update);
+      } catch (err) {
+        logger.warn(`raw update handler error for session ${sessionId}: ${err.message}`);
+      }
+    };
+    entry.client.addEventHandler(wrapper, event);
+    return () => {
+      try {
+        entry.client.removeEventHandler(wrapper, event);
+      } catch (err) {
+        logger.debug(`Failed to remove raw event handler: ${err.message}`);
       }
     };
   }
