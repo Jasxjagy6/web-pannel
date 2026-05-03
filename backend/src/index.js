@@ -27,6 +27,7 @@ const accountSettingsRoutes = require('./routes/accountSettings');
 const twoFAJobsRoutes = require('./routes/twoFAJobs');
 const otpRoutes = require('./routes/otp');
 const proxyRoutes = require('./routes/proxies');
+const userProxyRoutes = require('./routes/userProxies');
 const antiDetectRoutes = require('./routes/antiDetect');
 const privacyRoutes = require('./routes/privacy');
 const adminRoutes = require('./routes/admin');
@@ -155,6 +156,7 @@ const PLATFORM_ROUTERS = [
   ['/2fa-jobs',         twoFAJobsRoutes],
   ['/otp',              otpRoutes],
   ['/proxies',          proxyRoutes],
+  ['/me/proxies',       userProxyRoutes],
   ['/anti-detect',      antiDetectRoutes],
   ['/privacy',          privacyRoutes],
 ];

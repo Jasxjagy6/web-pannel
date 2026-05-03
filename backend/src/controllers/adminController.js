@@ -562,6 +562,74 @@ const adminController = {
     rows.sort((a, b) => b.score - a.score);
     return res.status(200).json({ success: true, data: { rows: rows.slice(0, 50) } });
   }),
+
+  // ----------------------------------------------------------------------
+  // BYO Proxy — admin (Phase 2/3 split). The admin panel keeps full
+  // visibility over the legacy shared pool (`user_id IS NULL`), while
+  // regular users only see their own rows via /api/me/proxies.
+  // ----------------------------------------------------------------------
+  /** GET /api/admin/proxies — list admin-pool rows (free + manual). */
+  listAdminProxies: asyncHandler(async (req, res) => {
+    const proxyService = require('../services/proxyService');
+    const filter = {};
+    if (req.query.source) filter.source = String(req.query.source);
+    if (req.query.working === 'true') filter.working = true;
+    if (req.query.working === 'false') filter.working = false;
+    const proxies = await proxyService.listAdminProxies(filter);
+    return res.json({
+      success: true,
+      data: { proxies, constants: proxyService.constants },
+    });
+  }),
+
+  /** POST /api/admin/proxies — admins can still add a shared-pool proxy. */
+  addAdminProxy: asyncHandler(async (req, res) => {
+    const proxyService = require('../services/proxyService');
+    const { host, port, protocol, username, password, secret, priority } = req.body || {};
+    if (!host || !port) throw new AppError('host and port required', 400, 'BAD_REQUEST');
+    const proxy = await proxyService.addManualProxy({
+      host: String(host),
+      port: Number(port),
+      protocol: protocol ? String(protocol) : undefined,
+      username: username ? String(username) : undefined,
+      password: password ? String(password) : undefined,
+      secret: secret ? String(secret) : undefined,
+      priority: priority != null ? Number(priority) : undefined,
+    });
+    return res.status(201).json({ success: true, data: { proxy } });
+  }),
+
+  /** DELETE /api/admin/proxies/:id — drop an admin-pool row. */
+  deleteAdminProxy: asyncHandler(async (req, res) => {
+    const proxyService = require('../services/proxyService');
+    const id = Number(req.params.id);
+    if (!id) throw new AppError('Invalid id', 400, 'BAD_ID');
+    const out = await proxyService.deleteProxy(id);
+    return res.json({ success: true, data: out });
+  }),
+
+  /** POST /api/admin/proxies/refresh — scrape free pool + revalidate. */
+  refreshAdminProxies: asyncHandler(async (req, res) => {
+    const proxyService = require('../services/proxyService');
+    const refreshed = await proxyService.refreshFreeProxies();
+    const revalidated = await proxyService.revalidateAll();
+    return res.json({ success: true, data: { refreshed, revalidated } });
+  }),
+
+  /** GET /api/admin/proxies/usage — per-row cross-user usage matrix. */
+  adminProxyUsage: asyncHandler(async (req, res) => {
+    const r = await pool.query(
+      `SELECT p.id AS proxy_id,
+              p.host, p.port, p.protocol, p.source, p.user_id, p.is_working,
+              s.id AS session_id, s.user_id AS session_user_id,
+              s.username AS session_username, s.platform
+         FROM proxies p
+         LEFT JOIN session_proxy_assignments a ON a.proxy_id = p.id
+         LEFT JOIN sessions s ON s.id = a.session_id
+        ORDER BY p.id ASC`
+    );
+    return res.json({ success: true, data: { rows: r.rows } });
+  }),
 };
 
 module.exports = adminController;

@@ -183,7 +183,7 @@ class SessionCreationService {
   // ---------------------------------------------------------------------------
   // Step 1: start — sendCode
   // ---------------------------------------------------------------------------
-  async start({ userId, phone, apiId, apiHash, country, platform }) {
+  async start({ userId, phone, apiId, apiHash, country, platform, proxyId, userRole }) {
     const normalizedPhone = this._normalizePhone(phone);
     const { apiId: id, apiHash: hash, credentialId } =
       await this._resolveApi(userId, apiId, apiHash);
@@ -221,16 +221,29 @@ class SessionCreationService {
     // session row yet, so we reserve a "virtual" slot keyed by tempId.
     let proxyConf = null;
     let reservedProxyId = null;
+    let proxyError = null;
     try {
       const proxyService = require('./proxyService');
-      const reserved = await proxyService.reserveAdHoc(`creation:${tempId}`);
+      const reserved = await proxyService.reserveAdHoc(
+        `creation:${tempId}`,
+        { userId, role: userRole || null, proxyId: proxyId || null }
+      );
       if (reserved) {
         reservedProxyId = reserved.id;
         proxyConf = proxyService.buildGramJSProxy(reserved);
       }
     } catch (err) {
-      logger.debug(`pre-create proxy reserve skipped: ${err.message}`);
+      // BYO Proxy (Phase 2): bubble up NO_USER_PROXY / PROXY_PIN_UNAVAILABLE
+      // so the controller returns 412 to the UI instead of leaking the
+      // direct VPS IP in a 200 response.
+      if (err && (err.code === 'NO_USER_PROXY' || err.code === 'PROXY_PIN_UNAVAILABLE')) {
+        proxyError = err;
+      } else {
+        logger.debug(`pre-create proxy reserve skipped: ${err.message}`);
+      }
     }
+
+    if (proxyError) throw proxyError;
 
     if (!proxyConf && STRICT_PROXY_ISOLATION) {
       throw new AppError(
@@ -569,6 +582,22 @@ class SessionCreationService {
         await proxyService.transferAdHocToSession(`creation:${tempId}`, sessionId);
       } else {
         await proxyService.assignProxyForSession(sessionId);
+      }
+      // BYO Proxy (Phase 2): now that the session is connected through
+      // this proxy, mark it as TG-validated so the user UI can render
+      // the green "validated for Telegram" chip immediately.
+      try {
+        const userIdForBind = entry && entry.userId;
+        if (userIdForBind && reservedProxyId) {
+          const owned = await proxyService.getMyProxy(userIdForBind, reservedProxyId);
+          if (owned) {
+            await proxyService.validateMyProxyForPlatform(
+              userIdForBind, reservedProxyId, 'telegram'
+            );
+          }
+        }
+      } catch (validateErr) {
+        logger.debug(`validateMyProxyForPlatform skipped: ${validateErr.message}`);
       }
     } catch (err) {
       logger.debug(`proxy assign post-creation skipped: ${err.message}`);
