@@ -18,6 +18,7 @@ const igClient = require('./client');
 const sessionLimiter = require('./sessionLimiter');
 const coldStart = require('./coldStart');
 const activeHours = require('./activeHours');
+const riskScore = require('./riskScore');
 const systemSettings = require('../../services/systemSettingsService');
 const webScraper = require('./webScraper');
 const { decrypt } = require('../../utils/crypto');
@@ -165,6 +166,37 @@ async function createScrapeJob({
     throw new Error('No usable Instagram sessions for this scrape');
   }
 
+  // Phase 3.B16 — refuse to enqueue scrape jobs against any session
+  // whose risk score exceeds the deny threshold. Filter the requested
+  // sessions down to "safe" rows; if none remain, throw 403 so the
+  // operator gets a clear error in the UI.
+  const safeSessionRows = [];
+  const blockedSessions = [];
+  for (const row of r.rows) {
+    try {
+      await riskScore.gateOnRisk({ id: row.id });
+      safeSessionRows.push(row);
+    } catch (gateErr) {
+      if (gateErr && gateErr.code === 'RISK_TOO_HIGH') {
+        blockedSessions.push({ id: row.id, username: row.username, error: gateErr.message });
+        logger.warn(`IG.scrape: refused session ${row.id} (${row.username}) — ${gateErr.message}`);
+        continue;
+      }
+      throw gateErr;
+    }
+  }
+  if (safeSessionRows.length === 0) {
+    const e = new Error(
+      `All requested Instagram sessions are above the risk-score deny threshold. ` +
+      `Resolve checkpoints / feedback errors and retry, or override via ` +
+      `risk.instagram.deny_threshold. Blocked: ${blockedSessions.map((b) => `#${b.id}`).join(', ')}`
+    );
+    e.statusCode = 403;
+    e.code = 'RISK_TOO_HIGH';
+    e.details = { blocked: blockedSessions };
+    throw e;
+  }
+
   const targets = (targetIdentifiers || []).map(String);
 
   const jobInsert = await pool.query(
@@ -178,12 +210,12 @@ async function createScrapeJob({
      RETURNING id, status, created_at, target_type`,
     [
       userId,
-      r.rows[0].id,
-      r.rows.map((x) => x.id),
+      safeSessionRows[0].id,
+      safeSessionRows.map((x) => x.id),
       targetType,
       targets[0] || null,
       targets,
-      JSON.stringify({ limit, ...options }),
+      JSON.stringify({ limit, ...options, _blocked_sessions: blockedSessions }),
     ]
   );
   const jobRow = jobInsert.rows[0];
@@ -341,6 +373,28 @@ async function _executeScrapeJob(jobId) {
         logger.warn(
           `IG.scrape: flipped session ${session.id} → ${newState} (${kind})`
         );
+        // Phase 3.B15 — record the detection event so the admin
+        // dashboard surfaces "IG flagged this session during a real
+        // scrape" with the kind that caused the flip.
+        try {
+          // eslint-disable-next-line global-require
+          const detectionEvents = require('./detectionEvents');
+          detectionEvents.record({
+            sessionId: session.id,
+            userId: session.user_id || null,
+            eventKind: kind,
+            apiPath: 'scrape._executeScrapeJob',
+            httpStatus: mapped.statusCode || null,
+            responseBody: mapped.message,
+            requestFingerprint: {
+              action_class: 'read',
+              api_mode:
+                (session.platform_state && session.platform_state.api_mode) ||
+                'mobile',
+              target_type: job && job.target_type,
+            },
+          }).catch(() => {});
+        } catch (_recErr) { /* swallow */ }
       }
     } catch (flipErr) {
       logger.warn(

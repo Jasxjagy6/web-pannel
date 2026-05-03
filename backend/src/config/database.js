@@ -54,6 +54,7 @@ const initDB = async () => {
       'migration_v9_3_subscription_split.sql',
       'migration_v10_monitor_dedup_toggle.sql',
       'migration_v11_instagram_session_columns.sql',
+      'migration_v12_ig_anti_ban.sql',
       'migration_v13_tg_anti_revoke.sql',
     ];
     for (const m of migrations) {

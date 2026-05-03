@@ -400,6 +400,24 @@ async function igFetch(ctx, url, opts = {}) {
     if (opts.logErrors !== false) {
       logger.warn(`IG fetch ${init.method} ${url} → ${res.status} (${e.kind})`);
     }
+    // Phase 3.B15 — record a structured detection event for every
+    // non-2xx web-API response. Best-effort, never throws.
+    try {
+      // eslint-disable-next-line global-require
+      const detectionEvents = require('./detectionEvents');
+      const fp = detectionEvents.fingerprintFromCtx(ctx, {
+        action_class: opts.limiterClass || 'read',
+      });
+      detectionEvents.record({
+        sessionId: ctx.sessionId || null,
+        userId: opts.userId || null,
+        eventKind: e.kind || 'network',
+        apiPath: url,
+        httpStatus: res.status,
+        responseBody: body,
+        requestFingerprint: fp,
+      }).catch(() => { /* swallow — already best-effort inside */ });
+    } catch (_recErr) { /* swallow */ }
     throw e;
   }
   if (opts.expectJson === false) return body;

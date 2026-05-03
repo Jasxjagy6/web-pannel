@@ -43,4 +43,13 @@ router.get('/tg-detection-events', ctrl.tgDetectionEvents);
 router.get('/tg-risk',             ctrl.tgRisk);
 router.get('/tg-session-health',   ctrl.tgSessionHealth);
 
+// ---------------------------------------------------------------------
+// Phase 3 — Instagram observability admin endpoints.
+// ig-detection-events surfaces every checkpoint / feedback_required /
+// action_blocked / cookie_missing event written by the IG provider.
+// ig-risk returns a per-session 0..1 risk score driven by those events.
+// ---------------------------------------------------------------------
+router.get('/ig-detection-events', ctrl.listIgDetectionEvents);
+router.get('/ig-risk',             ctrl.getIgRisk);
+
 module.exports = router;
