@@ -36,4 +36,13 @@ router.get('/billing/users/:id/invoices', billing.adminGetUserInvoices);
 router.post('/billing/users/:id/grant',  billing.adminGrantSubscription);
 router.post('/billing/users/:id/expire', billing.adminExpireSubscription);
 
+// ---------------------------------------------------------------------
+// Phase 3 — Instagram observability admin endpoints.
+// ig-detection-events surfaces every checkpoint / feedback_required /
+// action_blocked / cookie_missing event written by the IG provider.
+// ig-risk returns a per-session 0..1 risk score driven by those events.
+// ---------------------------------------------------------------------
+router.get('/ig-detection-events', ctrl.listIgDetectionEvents);
+router.get('/ig-risk',             ctrl.getIgRisk);
+
 module.exports = router;
