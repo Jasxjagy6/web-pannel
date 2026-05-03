@@ -17,6 +17,8 @@ const logger = require('../../utils/logger');
 const igClient = require('./client');
 const sessionLimiter = require('./sessionLimiter');
 const coldStart = require('./coldStart');
+const activeHours = require('./activeHours');
+const behaviorPacing = require('./behaviorPacing');
 const systemSettings = require('../../services/systemSettingsService');
 
 const PLATFORM = 'instagram';
@@ -108,18 +110,95 @@ async function _recordWarmupHistory({ sessionId, userId, decision, daily_sent, d
 }
 
 /**
+ * Phase 2.B13 — dynamic warmup caps based on account_age_days.
+ *
+ * IG flags accounts that send 30 DMs on day 1 just as hard as it
+ * flags brand-new accounts that send 5. Climb the cap over the
+ * first month so a new account looks like a normal new user, not
+ * a panel-spawned bot.
+ *
+ * Account age comes from sessions.created_at. If the operator has
+ * configured a custom default cap that's *lower* than the age-derived
+ * one we still honour it (operator floor wins).
+ */
+function _ageCappedDaily(session, configuredDaily) {
+  if (!session.created_at) return configuredDaily;
+  const ageDays = (Date.now() - new Date(session.created_at).getTime()) / 86400000;
+  let cap;
+  if (ageDays < 7) cap = 3;
+  else if (ageDays < 14) cap = 8;
+  else if (ageDays < 30) cap = 15;
+  else cap = configuredDaily;
+  return Math.min(configuredDaily, cap);
+}
+
+function _ageCappedHourly(ageCappedDaily, configuredHourly) {
+  // Hourly cap should never exceed 1/3 of daily for new accounts.
+  return Math.min(configuredHourly, Math.max(1, Math.ceil(ageCappedDaily / 3)));
+}
+
+/**
  * Check whether this account is allowed to send right now. Returns
  *   { allowed: true } or { allowed: false, reason: 'capped_daily' | ... }
+ *
+ * Phase 2 additions:
+ *   B10 — active-hours window (skip outside session-local 08:00–23:30)
+ *   B9  — feedback_required cooldown (skip while session is in 4h
+ *         penalty box)
+ *   B13 — dynamic warmup ladder by account age
  */
 async function _checkWarmup(session, dailyCap, hourlyCap) {
   const { warmup, platformState } = await _readWarmup(session.id);
-  if (warmup.daily_sent >= dailyCap) {
-    return { allowed: false, reason: 'capped_daily', warmup, platformState, dailyCap, hourlyCap };
+
+  // B10 — active-hours.
+  if (!activeHours.isWithinActiveHours(session)) {
+    return {
+      allowed: false,
+      reason: 'outside_active_hours',
+      warmup,
+      platformState,
+      dailyCap,
+      hourlyCap,
+    };
   }
-  if (warmup.hourly_sent >= hourlyCap) {
-    return { allowed: false, reason: 'capped_hourly', warmup, platformState, dailyCap, hourlyCap };
+
+  // B9 — feedback_required cooldown.
+  if (behaviorPacing.isInFeedbackCooldown(session)) {
+    return {
+      allowed: false,
+      reason: 'feedback_required_cooldown',
+      warmup,
+      platformState,
+      dailyCap,
+      hourlyCap,
+    };
   }
-  return { allowed: true, warmup, platformState, dailyCap, hourlyCap };
+
+  // B13 — dynamic ladder by account age.
+  const effDaily = _ageCappedDaily(session, dailyCap);
+  const effHourly = _ageCappedHourly(effDaily, hourlyCap);
+
+  if (warmup.daily_sent >= effDaily) {
+    return {
+      allowed: false,
+      reason: 'capped_daily',
+      warmup,
+      platformState,
+      dailyCap: effDaily,
+      hourlyCap: effHourly,
+    };
+  }
+  if (warmup.hourly_sent >= effHourly) {
+    return {
+      allowed: false,
+      reason: 'capped_hourly',
+      warmup,
+      platformState,
+      dailyCap: effDaily,
+      hourlyCap: effHourly,
+    };
+  }
+  return { allowed: true, warmup, platformState, dailyCap: effDaily, hourlyCap: effHourly };
 }
 
 async function _applySend(session, warmup, platformState) {
@@ -209,7 +288,7 @@ async function _executeMessagingJob(jobId) {
   const sessionIds = opts.session_ids || [job.session_id];
 
   const sessRows = await pool.query(
-    `SELECT id, user_id, username, proxy_url, session_data, platform_state
+    `SELECT id, user_id, username, proxy_url, session_data, platform_state, created_at
        FROM sessions
       WHERE id = ANY($1::int[]) AND platform = 'instagram'
         AND is_logged_in = TRUE`,
@@ -222,8 +301,17 @@ async function _executeMessagingJob(jobId) {
 
   const dailyCap = Number(await _setting('messaging.instagram.daily_cap_default', 30));
   const hourlyCap = Number(await _setting('messaging.instagram.hourly_cap_default', 10));
-  const jitterMin = Number(await _setting('messaging.instagram.send_jitter_ms_min', 4000));
-  const jitterMax = Number(await _setting('messaging.instagram.send_jitter_ms_max', 12000));
+  // Phase 2.B9 — the legacy 4–12s jitter is deliberately retired.
+  // Pacing now comes from behaviorPacing.dmPaceMs() (5–30 minutes
+  // between recipients) plus behaviorPacing.interSessionGapMs() (60–
+  // 180s when the next send rotates to a different account in the
+  // panel). The legacy settings keys are still read so an operator
+  // can override pacing if they explicitly want a faster panel.
+  const overrideJitterMin = await _setting('messaging.instagram.send_jitter_ms_min', null);
+  const overrideJitterMax = await _setting('messaging.instagram.send_jitter_ms_max', null);
+  const useLegacyJitter = overrideJitterMin != null && overrideJitterMax != null;
+  const legacyJitterMin = Number(overrideJitterMin);
+  const legacyJitterMax = Number(overrideJitterMax);
 
   const targets = job.target_list || [];
 
@@ -316,9 +404,22 @@ async function _executeMessagingJob(jobId) {
         });
 
         sent += 1;
+        const prevIdx = sessionIdx;
         sessionIdx = (sessionIdx + 1) % sessRows.rows.length;
         await _setJobStatus(jobId, 'running', { sent_count: sent, failed_count: failed, skipped_count: skipped });
-        await _sleep(_jitter(jitterMin, jitterMax));
+
+        // Phase 2.B9 + B14 — pacing.
+        // - dmPaceMs: 5–30 min between sends from the SAME session
+        //   to different recipients (the bulk-DM case).
+        // - interSessionGapMs: 60–180s extra when the next send is
+        //   from a DIFFERENT session (panel rotation), so account A
+        //   sending at t=0 isn't followed by account B at t=4s.
+        const switching = sessRows.rows.length > 1 && prevIdx !== sessionIdx;
+        const baseWait = useLegacyJitter
+          ? _jitter(legacyJitterMin, legacyJitterMax)
+          : behaviorPacing.dmPaceMs({ sameThread: false });
+        const interSessionExtra = switching ? behaviorPacing.interSessionGapMs() : 0;
+        await _sleep(baseWait + interSessionExtra);
       } catch (err) {
         failed += 1;
         await _logSend({
@@ -329,6 +430,28 @@ async function _executeMessagingJob(jobId) {
           error: err.message,
         });
         await _setJobStatus(jobId, 'running', { sent_count: sent, failed_count: failed, skipped_count: skipped });
+
+        // Phase 2.B9 — if IG returned feedback_required (or an
+        // equivalent 4xx), put this session in a 4-hour cooldown so
+        // subsequent jobs in the panel don't keep hammering it and
+        // turn the soft warning into a hard block.
+        const msg = (err && err.message) || '';
+        const ctor = err && err.constructor && err.constructor.name;
+        if (ctor === 'IgActionSpamError' || /feedback_required|action_blocked|please wait a few minutes/i.test(msg)) {
+          try {
+            const patch = behaviorPacing.buildFeedbackCooldownPatch();
+            const cur = await pool.query(`SELECT platform_state FROM sessions WHERE id = $1`, [session.id]);
+            const ps = (cur.rows[0] && cur.rows[0].platform_state) || {};
+            ps.cooldowns = Object.assign({}, ps.cooldowns, patch);
+            await pool.query(
+              `UPDATE sessions SET platform_state = $1::jsonb, updated_at = NOW() WHERE id = $2`,
+              [JSON.stringify(ps), session.id]
+            );
+            logger.warn(`IG.messaging: session ${session.id} placed in feedback_required cooldown until ${patch.feedback_required_until}`);
+          } catch (persistErr) {
+            logger.warn(`IG.messaging: failed to persist feedback cooldown for session ${session.id}: ${persistErr.message}`);
+          }
+        }
       }
     }
 

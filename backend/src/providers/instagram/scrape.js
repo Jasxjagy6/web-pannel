@@ -17,6 +17,7 @@ const logger = require('../../utils/logger');
 const igClient = require('./client');
 const sessionLimiter = require('./sessionLimiter');
 const coldStart = require('./coldStart');
+const activeHours = require('./activeHours');
 const systemSettings = require('../../services/systemSettingsService');
 const webScraper = require('./webScraper');
 const { decrypt } = require('../../utils/crypto');
@@ -256,6 +257,24 @@ async function _executeScrapeJob(jobId) {
     (session.platform_state && session.platform_state.api_mode) ||
     ((session.platform_state && session.platform_state.source === 'browser_cookies')
       ? 'web' : 'mobile');
+
+  // Phase 2.B10 — active-hours window. Scrape is a long-running
+  // foreground job; if the session is outside its active window we
+  // mark the job 'pending' and stamp next_open_at so the caller's
+  // scheduler can requeue precisely. We do NOT silently sleep for
+  // hours inside the worker — that would block the queue slot.
+  const ahGate = activeHours.gate(session);
+  if (!ahGate.allowed) {
+    logger.info(
+      `IG.scrape job ${jobId} session ${session.id} outside active-hours ` +
+      `(${ahGate.window.start}-${ahGate.window.end} ${ahGate.window.tz}); ` +
+      `postponing until ${ahGate.nextOpenAt.toISOString()}`
+    );
+    await _setStatus(jobId, 'pending', {
+      error: `Postponed: outside active-hours window (${ahGate.window.start}-${ahGate.window.end} ${ahGate.window.tz}). Will resume at ${ahGate.nextOpenAt.toISOString()}.`,
+    });
+    return;
+  }
 
   let totalScraped = 0;
   try {

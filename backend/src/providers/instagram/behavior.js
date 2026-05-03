@@ -13,6 +13,9 @@
 
 const { pool } = require('../../config/database');
 const igClient = require('./client');
+const sessionLimiter = require('./sessionLimiter');
+const activeHours = require('./activeHours');
+const behaviorPacing = require('./behaviorPacing');
 const logger = require('../../utils/logger');
 
 const _running = new Map(); // sessionId → interval handle
@@ -33,15 +36,82 @@ async function _session({ userId, sessionId }) {
   return r.rows[0];
 }
 
+/**
+ * Phase 2.B11 — execute one realistic action chosen from the
+ * weighted action mix. Each kind maps to a single IG read; the
+ * sessionLimiter keeps spacing honest, and activeHours keeps the
+ * loop quiet outside the session's waking window.
+ *
+ * Failures are logged-and-swallowed: the warmup loop must NOT throw
+ * and break the interval handle.
+ */
 async function _tick(session) {
+  // Respect the active-hours window; outside it, the warmup loop
+  // is a no-op so a session in the middle of the night doesn't
+  // generate egress.
+  if (!activeHours.isWithinActiveHours(session)) return;
+
+  // Respect feedback_required cooldown.
+  if (behaviorPacing.isInFeedbackCooldown(session)) return;
+
+  const action = behaviorPacing.pickAction();
+
   try {
+    await sessionLimiter.acquire(session.id, { class: 'read' });
     const client = await igClient.getClient(session);
-    // Browse a few feeds — non-mutating, harmless.
-    await client.feed.timeline().items();
-    await client.feed.directInbox().items();
-    await client.feed.news().items();
+
+    switch (action) {
+      case 'feed_timeline':
+        await client.feed.timeline().items();
+        break;
+      case 'feed_explore':
+        // Explore feed; falls back to timeline if not available on the
+        // version of instagram-private-api in use.
+        if (client.feed.discover) {
+          await client.feed.discover().items();
+        } else {
+          await client.feed.timeline().items();
+        }
+        break;
+      case 'view_story':
+        // Pull the story tray and stop there — opening a story is a
+        // separate write-class action we don't want from a passive
+        // pretender loop.
+        await client.feed.reelsTray().items?.();
+        break;
+      case 'feed_user_profile':
+        // Open the session-owner's own profile (no risk of accidental
+        // follow). Real users do this often.
+        try {
+          await client.account.currentUser();
+        } catch (_e) { /* private API may differ; ignore */ }
+        break;
+      case 'search':
+        // Search the session-owner's username — the cheapest
+        // search the API has.
+        if (session.username) {
+          try {
+            await client.user.searchExact(session.username);
+          } catch (_e) { /* ignore */ }
+        }
+        break;
+      case 'react_post':
+        // No-op for now — actually liking a post is a write and we
+        // don't want a passive loop touching writes. Burn a read
+        // instead so the slot is consumed.
+        await client.feed.timeline().items();
+        break;
+      case 'inbox_check':
+        await client.feed.directInbox().items();
+        break;
+      case 'notifications':
+        await client.feed.news().items();
+        break;
+      default:
+        await client.feed.timeline().items();
+    }
   } catch (err) {
-    logger.warn(`IG.behavior tick session=${session.id} failed: ${err.message}`);
+    logger.warn(`IG.behavior tick session=${session.id} action=${action} failed: ${err.message}`);
   }
 }
 

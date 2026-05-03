@@ -305,6 +305,14 @@ async function buildSessionFromBrowserCookies(parsed, opts = {}) {
       api_mode: 'web',
       appVersion,
       locale,
+      // Phase 2.B10 — seed the active-hours window from the locale's
+      // region hint at upload time so the warmup scheduler / scrape
+      // worker / messaging job have a sensible default (instead of
+      // always falling back to UTC 07:30–23:30). Operators can
+      // override per-session later via the Anti-Detect UI.
+      activeHours: (require('./activeHours')._defaultsFor(
+        (locale && locale.regionHint) || null
+      )),
       fingerprint: {
         seed,
         deviceId: client.state.deviceId,
