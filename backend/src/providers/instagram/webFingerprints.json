@@ -1,0 +1,78 @@
+{
+  "_doc": "Curated coherent web-browser fingerprints used by igFetch for cookie-uploaded IG sessions. Each entry is a complete, internally-consistent set: the User-Agent, sec-ch-ua hints, sec-ch-ua-platform, sec-ch-ua-mobile, and accept-language all match a real browser/OS pairing. Mixing values across entries (e.g. Mac UA with Windows sec-ch-ua-platform) is itself a detection signal. Sources: real Chrome/Edge/Firefox/Safari builds released within the last ~6 months. Update every ~90 days.",
+  "_curated_at": "2025-04",
+  "profiles": [
+    {
+      "id": "chrome_130_macos",
+      "userAgent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+      "secChUa": "\"Chromium\";v=\"130\", \"Google Chrome\";v=\"130\", \"Not?A_Brand\";v=\"99\"",
+      "secChUaMobile": "?0",
+      "secChUaPlatform": "\"macOS\"",
+      "acceptLanguage": "en-US,en;q=0.9"
+    },
+    {
+      "id": "chrome_129_windows",
+      "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36",
+      "secChUa": "\"Chromium\";v=\"129\", \"Not=A?Brand\";v=\"8\", \"Google Chrome\";v=\"129\"",
+      "secChUaMobile": "?0",
+      "secChUaPlatform": "\"Windows\"",
+      "acceptLanguage": "en-US,en;q=0.9"
+    },
+    {
+      "id": "chrome_128_windows",
+      "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
+      "secChUa": "\"Chromium\";v=\"128\", \"Not;A=Brand\";v=\"24\", \"Google Chrome\";v=\"128\"",
+      "secChUaMobile": "?0",
+      "secChUaPlatform": "\"Windows\"",
+      "acceptLanguage": "en-US,en;q=0.9"
+    },
+    {
+      "id": "edge_130_windows",
+      "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36 Edg/130.0.0.0",
+      "secChUa": "\"Chromium\";v=\"130\", \"Microsoft Edge\";v=\"130\", \"Not?A_Brand\";v=\"99\"",
+      "secChUaMobile": "?0",
+      "secChUaPlatform": "\"Windows\"",
+      "acceptLanguage": "en-US,en;q=0.9"
+    },
+    {
+      "id": "safari_17_macos",
+      "userAgent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4.1 Safari/605.1.15",
+      "secChUa": null,
+      "secChUaMobile": null,
+      "secChUaPlatform": null,
+      "acceptLanguage": "en-US,en;q=0.9"
+    },
+    {
+      "id": "chrome_130_linux",
+      "userAgent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+      "secChUa": "\"Chromium\";v=\"130\", \"Google Chrome\";v=\"130\", \"Not?A_Brand\";v=\"99\"",
+      "secChUaMobile": "?0",
+      "secChUaPlatform": "\"Linux\"",
+      "acceptLanguage": "en-US,en;q=0.9"
+    },
+    {
+      "id": "firefox_131_windows",
+      "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:131.0) Gecko/20100101 Firefox/131.0",
+      "secChUa": null,
+      "secChUaMobile": null,
+      "secChUaPlatform": null,
+      "acceptLanguage": "en-US,en;q=0.5"
+    },
+    {
+      "id": "chrome_130_android_mobile",
+      "userAgent": "Mozilla/5.0 (Linux; Android 14; SM-S928B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Mobile Safari/537.36",
+      "secChUa": "\"Chromium\";v=\"130\", \"Google Chrome\";v=\"130\", \"Not?A_Brand\";v=\"99\"",
+      "secChUaMobile": "?1",
+      "secChUaPlatform": "\"Android\"",
+      "acceptLanguage": "en-US,en;q=0.9"
+    },
+    {
+      "id": "safari_17_ios",
+      "userAgent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_4_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4.1 Mobile/15E148 Safari/604.1",
+      "secChUa": null,
+      "secChUaMobile": null,
+      "secChUaPlatform": null,
+      "acceptLanguage": "en-US,en;q=0.9"
+    }
+  ]
+}

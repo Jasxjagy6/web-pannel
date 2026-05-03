@@ -15,6 +15,8 @@
 const { pool } = require('../../config/database');
 const logger = require('../../utils/logger');
 const igClient = require('./client');
+const sessionLimiter = require('./sessionLimiter');
+const coldStart = require('./coldStart');
 const systemSettings = require('../../services/systemSettingsService');
 const webScraper = require('./webScraper');
 const { decrypt } = require('../../utils/crypto');
@@ -245,19 +247,32 @@ async function _executeScrapeJob(jobId) {
   }
 
   const session = sessRows.rows[0];
-  // Browser-cookie sessions (uploaded via the cookieAdapter path) can't
-  // talk to the mobile API from a panel host without tripping
-  // checkpoint_required, but they CAN talk to the public web endpoints
-  // under www.instagram.com — so we route them through the web scraper.
-  const isCookieSession =
-    session.platform_state && session.platform_state.source === 'browser_cookies';
+  // Phase 1.B5: api_mode is the source of truth for which API surface
+  // each session is allowed to talk to. Cookie-uploaded sessions are
+  // pinned api_mode='web' at upload time; interactive logins are
+  // pinned api_mode='mobile'. Falling back to source==='browser_cookies'
+  // for backward compatibility with rows uploaded before B5 landed.
+  const apiMode =
+    (session.platform_state && session.platform_state.api_mode) ||
+    ((session.platform_state && session.platform_state.source === 'browser_cookies')
+      ? 'web' : 'mobile');
 
   let totalScraped = 0;
   try {
-    if (isCookieSession) {
+    // Phase 1.B8 — cold-start simulation. First job after a process
+    // restart runs a small natural-feeling sequence of feed/inbox
+    // reads before the real work begins, so IG sees the session
+    // "open the app" first.
+    await coldStart.runIfCold(session);
+
+    if (apiMode === 'web') {
       await _runWebScrape({ jobId, job, session, targets, limit });
-    } else {
+    } else if (apiMode === 'mobile') {
       totalScraped = await _runMobileScrape({ jobId, job, session, targets, limit });
+    } else {
+      const e = new Error(`Unknown api_mode='${apiMode}' for IG session ${session.id}`);
+      e.statusCode = 500;
+      throw e;
     }
 
     // _runWebScrape / _runMobileScrape both update job rows incrementally.
@@ -397,6 +412,8 @@ async function _runMobileScrape({ jobId, job, session, targets, limit }) {
     if (totalScraped >= limit) break;
 
     const targetUsername = String(target).replace(/^@/, '').toLowerCase();
+    // Phase 1.B7 — read-class token before username lookup.
+    await sessionLimiter.acquire(session.id, { class: 'read' });
     const targetUserId = await client.user.getIdByUsername(targetUsername);
 
     const feed = job.target_type === 'followers'
@@ -413,11 +430,12 @@ async function _runMobileScrape({ jobId, job, session, targets, limit }) {
     let receivedFromTarget = 0;
     let firstPage = true;
     do {
+      // Phase 1.B7 — read-class token before each feed page. The
+      // limiter already enforces ~10s between reads; the legacy
+      // _jitterSleep is left in to add a tiny extra spread on top.
+      await sessionLimiter.acquire(session.id, { class: 'read' });
       if (!firstPage) {
-        // Jittered backoff between feed pages to avoid IG's spam guard.
-        // Empirically 1.5-3s keeps a single session under the per-account
-        // throttle for followers/following endpoints.
-        await _jitterSleep(1500, 3000);
+        await _jitterSleep(500, 1500);
       }
       firstPage = false;
       const items = await feed.items();

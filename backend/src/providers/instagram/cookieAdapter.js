@@ -163,91 +163,110 @@ async function buildSessionFromBrowserCookies(parsed, opts = {}) {
 
   const { jar, dsUserId } = browserCookiesToJar(cookieArr);
 
-  // eslint-disable-next-line global-require
-  const ig = require('instagram-private-api');
-  const client = new ig.IgApiClient();
-
-  // Stable device fingerprint per ds_user_id so reconnects don't reroll.
-  client.state.generateDevice(dsUserId ? `ig_${dsUserId}` : `ig_uploaded_${Date.now()}`);
-  if (opts.proxyUrl) client.state.proxyUrl = opts.proxyUrl;
-
+  // Phase 1 hardening: cookie-uploaded sessions are pinned api_mode='web'.
+  // We MUST NOT call the mobile API (`client.account.currentUser()`)
+  // during upload — that call goes to `i.instagram.com` with the
+  // bundled stale IG app UA, against a sessionid issued by a real
+  // browser, and reliably returns `checkpoint_required` from a panel
+  // host. Instead we resolve username via the web `/api/v1/users/<pk>/info/`
+  // endpoint, which trusts the sessionid cookie directly.
+  //
+  // We still build a temp IgApiClient (via clientFactory) to derive
+  // the per-session pinned device fingerprint fields (deviceString /
+  // deviceId / uuid / phoneId / adid / build) that are persisted in
+  // the session blob — those are needed later for any code path that
+  // does need device-flavoured headers, and they are deterministic
+  // from the seed so they stay stable across reconnects.
+  const seed = dsUserId ? `ig_${dsUserId}` : `ig_uploaded_${Date.now()}`;
+  const clientFactory = require('./clientFactory');
+  const webFingerprintsTable = require('./webFingerprints.json');
+  const crypto = require('crypto');
+  const { client, appVersion, locale } = clientFactory.createPinnedClient({
+    seed,
+    proxyUrl: opts.proxyUrl || null,
+  });
   await client.state.deserializeCookieJar(JSON.stringify(jar));
 
-  // Resolve username via the authenticated mobile API. This call also
-  // doubles as a "session is alive" probe — but it can fail with
-  // `checkpoint_required` when IG sees the panel host as a "new
-  // device from a data centre" (see prompts.txt §7). That doesn't
-  // necessarily mean the cookies are dead — public endpoints
-  // (web profile info, followers/following) often still work — so
-  // we degrade gracefully: warn, fall back to a ds_user_id-based
-  // placeholder username, and let the scrape path try the real API.
-  // Hard `login_required` is the only signal that the cookies are
-  // truly invalid.
+  // Pick a deterministic web fingerprint at upload time. If the
+  // browser-cookie export carries a `userAgent` sibling (Cookie-Editor
+  // does this), prefer that exact UA so the pinned headers match the
+  // browser the cookies were issued under. Otherwise fall back to a
+  // deterministic pick from `webFingerprints.json` based on the seed.
+  let pinnedWebFingerprint = null;
+  if (opts.sourceUserAgent && typeof opts.sourceUserAgent === 'string') {
+    pinnedWebFingerprint = {
+      id: 'cookie_source_ua',
+      userAgent: opts.sourceUserAgent,
+      secChUa: opts.sourceSecChUa || null,
+      secChUaMobile: opts.sourceSecChUaMobile || null,
+      secChUaPlatform: opts.sourceSecChUaPlatform || null,
+      acceptLanguage: opts.sourceAcceptLanguage || 'en-US,en;q=0.9',
+      pinned_at: new Date().toISOString(),
+    };
+  } else {
+    const profiles = webFingerprintsTable.profiles || [];
+    const h = crypto.createHash('sha256').update(seed).digest();
+    const idx = profiles.length === 0 ? 0 : h.readUInt32BE(0) % profiles.length;
+    pinnedWebFingerprint = Object.assign(
+      {},
+      profiles[idx] || {},
+      { pinned_at: new Date().toISOString() }
+    );
+  }
+
   let username = (opts.username || '').toLowerCase() || null;
   let igPk = dsUserId ? Number(dsUserId) : null;
   let probeWarning = null;
-  try {
-    const me = await client.account.currentUser();
-    if (me && me.username) username = String(me.username).toLowerCase();
-    if (me && me.pk) igPk = Number(me.pk);
-  } catch (err) {
-    const msg = (err && err.message) || 'currentUser() failed';
-    const isLoginRequired = /login_required|unauthor/i.test(msg)
-      && !/checkpoint/i.test(msg);
-    if (isLoginRequired) {
-      const e = new Error(
-        'Uploaded cookies are not a logged-in Instagram session. ' +
-        `Instagram replied: ${msg}`
+
+  // Resolve username via the web user-info endpoint. Uses the same
+  // pinned web fingerprint we'll use for every subsequent request,
+  // so IG sees one consistent client right from upload time.
+  if (!username && dsUserId) {
+    try {
+      const cookieHeader = cookieArr
+        .filter((c) => {
+          const dom = (c.domain || '').toLowerCase().replace(/^\./, '');
+          return !dom || dom.endsWith('instagram.com');
+        })
+        .map((c) => `${c.name}=${c.value}`)
+        .join('; ');
+      const csrfCookie = cookieArr.find((c) => c.name === 'csrftoken');
+      const headers = {
+        cookie: cookieHeader,
+        'x-ig-app-id': '936619743392459',
+        'x-csrftoken': (csrfCookie && csrfCookie.value) || '',
+        'user-agent': pinnedWebFingerprint.userAgent,
+        'accept-language': pinnedWebFingerprint.acceptLanguage,
+        referer: 'https://www.instagram.com/',
+      };
+      if (pinnedWebFingerprint.secChUa) headers['sec-ch-ua'] = pinnedWebFingerprint.secChUa;
+      if (pinnedWebFingerprint.secChUaMobile) headers['sec-ch-ua-mobile'] = pinnedWebFingerprint.secChUaMobile;
+      if (pinnedWebFingerprint.secChUaPlatform) headers['sec-ch-ua-platform'] = pinnedWebFingerprint.secChUaPlatform;
+
+      const r = await fetch(
+        `https://www.instagram.com/api/v1/users/${encodeURIComponent(dsUserId)}/info/`,
+        { headers }
       );
-      e.statusCode = 401;
-      throw e;
-    }
-    probeWarning = msg;
-    logger.warn(`IG.cookieAdapter: currentUser() probe failed (${msg}); falling back to web API user-info endpoint`);
-    // The mobile API can't get past the data-centre checkpoint, but
-    // the web `/api/v1/users/<pk>/info/` endpoint trusts cookies and
-    // returns the same username/full_name. Try that before falling
-    // back to a synthetic `ig_<pk>` placeholder.
-    if (!username && dsUserId) {
-      try {
-        const cookieHeader = cookieArr
-          .filter((c) => {
-            const dom = (c.domain || '').toLowerCase().replace(/^\./, '');
-            return !dom || dom.endsWith('instagram.com');
-          })
-          .map((c) => `${c.name}=${c.value}`)
-          .join('; ');
-        const csrfCookie = cookieArr.find((c) => c.name === 'csrftoken');
-        const r = await fetch(
-          `https://www.instagram.com/api/v1/users/${encodeURIComponent(dsUserId)}/info/`,
-          {
-            headers: {
-              cookie: cookieHeader,
-              'x-ig-app-id': '936619743392459',
-              'x-csrftoken': (csrfCookie && csrfCookie.value) || '',
-              'user-agent':
-                'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) ' +
-                'AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 ' +
-                'Safari/537.36',
-              referer: 'https://www.instagram.com/',
-            },
-          }
-        );
-        if (r.ok) {
-          const j = await r.json();
-          if (j && j.user && j.user.username) {
-            username = String(j.user.username).toLowerCase();
-            logger.info(`IG.cookieAdapter: resolved username via web API: ${username}`);
-          }
-        } else {
-          logger.warn(`IG.cookieAdapter: web user-info probe HTTP ${r.status}`);
+      if (r.ok) {
+        const j = await r.json();
+        if (j && j.user && j.user.username) {
+          username = String(j.user.username).toLowerCase();
+          if (j.user.pk) igPk = Number(j.user.pk);
+          logger.info(`IG.cookieAdapter: resolved username via web API: ${username}`);
         }
-      } catch (webErr) {
-        logger.warn(`IG.cookieAdapter: web user-info probe failed: ${webErr.message}`);
+      } else if (r.status === 401 || r.status === 403) {
+        probeWarning = `web user-info probe HTTP ${r.status}`;
+        logger.warn(`IG.cookieAdapter: ${probeWarning}`);
+      } else {
+        probeWarning = `web user-info probe HTTP ${r.status}`;
+        logger.warn(`IG.cookieAdapter: ${probeWarning}`);
       }
+    } catch (webErr) {
+      probeWarning = webErr.message;
+      logger.warn(`IG.cookieAdapter: web user-info probe failed: ${webErr.message}`);
     }
-    if (!username) username = dsUserId ? `ig_${dsUserId}` : `ig_uploaded_${Date.now()}`;
   }
+  if (!username) username = dsUserId ? `ig_${dsUserId}` : `ig_uploaded_${Date.now()}`;
 
   // Serialise the now-restored client state into the panel's canonical
   // sessionBlob shape. Going through the client (rather than embedding
@@ -280,6 +299,22 @@ async function buildSessionFromBrowserCookies(parsed, opts = {}) {
       source: 'browser_cookies',
       ig_pk: igPk,
       uploaded_at: new Date().toISOString(),
+      // Phase 1: pin api_mode, app version, locale, fingerprint seed
+      // and web fingerprint at upload time so getClient() / igFetch()
+      // / identity.getOrCreatePlatformState() never have to guess.
+      api_mode: 'web',
+      appVersion,
+      locale,
+      fingerprint: {
+        seed,
+        deviceId: client.state.deviceId,
+        uuid: client.state.uuid,
+        phoneId: client.state.phoneId,
+        adid: client.state.adid,
+        build: client.state.build,
+        created_at: new Date().toISOString(),
+      },
+      webFingerprint: pinnedWebFingerprint,
       ...(probeWarning ? { probe_warning: probeWarning } : {}),
     },
   };

@@ -136,7 +136,7 @@ async function start({ userId, username, password, proxyUrl = null }) {
       username,
       sessionBlob: blob,
       proxyUrl,
-      platformState: { fingerprint: { deviceId: blob.deviceId, build: blob.build } },
+      platformState: { source: 'login', api_mode: 'mobile', fingerprint: { deviceId: blob.deviceId, build: blob.build } },
     });
     _pending.delete(token);
     logger.info(`IG.create.start happy-path user=${userId} username=${username} sessionId=${row.id}`);
@@ -278,7 +278,7 @@ async function password({ sessionToken, code }) {
       username: ent.username,
       sessionBlob: blob,
       proxyUrl: ent.proxyUrl,
-      platformState: { fingerprint: { deviceId: blob.deviceId, build: blob.build } },
+      platformState: { source: 'login', api_mode: 'mobile', fingerprint: { deviceId: blob.deviceId, build: blob.build } },
     });
     _pending.delete(sessionToken);
     logger.info(`IG.create.password ok user=${ent.userId} username=${ent.username} sessionId=${row.id}`);
@@ -338,7 +338,7 @@ async function verify({ sessionToken, code }) {
         username: ent.username,
         sessionBlob: blob,
         proxyUrl: ent.proxyUrl,
-        platformState: { fingerprint: { deviceId: blob.deviceId, build: blob.build } },
+        platformState: { source: 'login', api_mode: 'mobile', fingerprint: { deviceId: blob.deviceId, build: blob.build } },
       });
       _pending.delete(sessionToken);
       logger.info(`IG.create.verify ok user=${ent.userId} username=${ent.username} sessionId=${row.id}`);

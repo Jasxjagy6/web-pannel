@@ -5,7 +5,10 @@
  * Instagram's risk model rejects requests on three orthogonal axes:
  *   1. IP reputation       — data-centre IPs trigger checkpoint_required
  *   2. Device fingerprint  — UA + sec-ch-ua + Accept-Language must look
- *                            like the browser the cookies came from
+ *                            like the browser the cookies came from AND
+ *                            must be IDENTICAL on every request from the
+ *                            same sessionid (the cookies remember the UA
+ *                            they were issued under)
  *   3. Request cadence     — bursts of identical calls flag as bot
  *
  * Every other module that talks to www.instagram.com (webScraper,
@@ -13,10 +16,28 @@
  * routes through `igFetch()` so all three axes are handled in one
  * place — including proxy egress, browser-grade headers and a tight
  * error-mapping pass.
+ *
+ * Phase 1 hardening (anti-ban):
+ *   - Per-session pinned web fingerprint (UA + sec-ch hints +
+ *     accept-language). Sourced from `platform_state.webFingerprint`
+ *     if set, otherwise a deterministic pick from
+ *     `webFingerprints.json` based on the session's device seed.
+ *     Persisted on first use so subsequent requests are identical.
+ *   - Per-session pinned locale → `accept-language` header.
+ *   - When `security.instagram.require_proxy` is true (default) and
+ *     the session has no proxy_url, igFetch throws PROXY_REQUIRED
+ *     instead of silently egressing through the panel host.
+ *   - Optional jittered pre-sleep stays — `sessionLimiter` (B7) is
+ *     the new global throttle; `preSleepMs` is now an additional
+ *     per-call hint.
  */
 
+'use strict';
+
+const crypto = require('crypto');
 const logger = require('../../utils/logger');
 const { decrypt } = require('../../utils/crypto');
+const webFingerprintsTable = require('./webFingerprints.json');
 
 let _undici = null;
 function _loadUndici() {
@@ -27,14 +48,20 @@ function _loadUndici() {
 }
 
 const WEB_APP_ID = '936619743392459';
+
+// Legacy fallbacks — only used if a session has no pinned fingerprint
+// AND `webFingerprints.json` is somehow empty. Kept in sync with one
+// of the table entries to avoid a silent UA flip on the first request.
 const DEFAULT_USER_AGENT =
   'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 ' +
-  '(KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36';
+  '(KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36';
 const DEFAULT_SEC_CH_UA =
-  '"Chromium";v="123", "Not:A-Brand";v="24", "Google Chrome";v="123"';
+  '"Chromium";v="130", "Google Chrome";v="130", "Not?A_Brand";v="99"';
 
-// Per-session cached ProxyAgent (undici dispatcher) so we don't pay
-// the connection-pool init cost on every request.
+// ---------------------------------------------------------------------
+// Per-session ProxyAgent cache
+// ---------------------------------------------------------------------
+
 const _dispatcherCache = new Map(); // proxyUrl -> ProxyAgent
 
 function _getDispatcher(proxyUrl) {
@@ -44,9 +71,6 @@ function _getDispatcher(proxyUrl) {
   const { ProxyAgent } = _loadUndici();
   agent = new ProxyAgent({
     uri: proxyUrl,
-    // 30s read timeout, 10s connect timeout — IG is fast and a slow
-    // proxy almost always means a dead one. Don't burn the whole job
-    // waiting on a dead exit.
     requestTls: { rejectUnauthorized: false },
     connectTimeout: 10_000,
     bodyTimeout: 30_000,
@@ -56,10 +80,6 @@ function _getDispatcher(proxyUrl) {
   return agent;
 }
 
-/**
- * Drop the cached dispatcher for a proxy URL — call this when the
- * operator rotates the proxy on a session row.
- */
 function invalidateProxy(proxyUrl) {
   if (!proxyUrl) return;
   const a = _dispatcherCache.get(proxyUrl);
@@ -67,12 +87,62 @@ function invalidateProxy(proxyUrl) {
   _dispatcherCache.delete(proxyUrl);
 }
 
+// ---------------------------------------------------------------------
+// Web fingerprint pinning (B3)
+// ---------------------------------------------------------------------
+
+function _pickWebFingerprint(seed) {
+  const profiles = (webFingerprintsTable && webFingerprintsTable.profiles) || [];
+  if (profiles.length === 0) {
+    return {
+      id: 'fallback',
+      userAgent: DEFAULT_USER_AGENT,
+      secChUa: DEFAULT_SEC_CH_UA,
+      secChUaMobile: '?0',
+      secChUaPlatform: '"macOS"',
+      acceptLanguage: 'en-US,en;q=0.9',
+    };
+  }
+  const h = crypto.createHash('sha256').update(String(seed || '')).digest();
+  const idx = h.readUInt32BE(0) % profiles.length;
+  return profiles[idx];
+}
+
+function pickWebFingerprint(seed) {
+  return _pickWebFingerprint(seed);
+}
+
 /**
- * Walk the panel's nested/flat session blob shapes and return:
- *   - cookies header string
- *   - csrftoken value (if present)
- *   - ds_user_id (own pk, useful for "self" warm-up calls)
+ * Build an `accept-language` value that respects the session's pinned
+ * locale (e.g. `en_IN` → `en-IN,en;q=0.9`).
  */
+function _acceptLanguageForLocale(locale, fingerprintDefault) {
+  if (!locale || !locale.language) return fingerprintDefault || 'en-US,en;q=0.9';
+  const tag = String(locale.language).replace('_', '-');
+  const base = tag.split('-')[0];
+  return `${tag},${base};q=0.9`;
+}
+
+// ---------------------------------------------------------------------
+// Proxy enforcement
+// ---------------------------------------------------------------------
+
+async function _isProxyRequired() {
+  // eslint-disable-next-line global-require
+  const settings = require('../../services/systemSettingsService');
+  try {
+    const v = await settings.getSetting('security.instagram.require_proxy');
+    if (v === false || v === 'false') return false;
+    return true; // default true — fail closed
+  } catch (_err) {
+    return true;
+  }
+}
+
+// ---------------------------------------------------------------------
+// Cookie / session blob helpers
+// ---------------------------------------------------------------------
+
 function cookieHeaderFromBlob(blob) {
   if (!blob) return { header: '', csrftoken: null, dsUserId: null };
   let raw = null;
@@ -102,10 +172,14 @@ function cookieHeaderFromBlob(blob) {
 /**
  * Build a session-context object that callers (webScraper, warm-up,
  * cookieAdapter) can hold onto for the duration of a job. Decrypts
- * the session_data once and stashes the resolved cookie / proxy data
+ * the session_data once, hydrates the per-session pinned web
+ * fingerprint + locale, and stashes the resolved cookie / proxy data
  * so we don't re-decrypt on every request.
+ *
+ * `await sessionContext(sessionRow)` — async because pinning a fresh
+ * web fingerprint is persisted to platform_state on first use.
  */
-function sessionContext(sessionRow) {
+async function sessionContext(sessionRow) {
   if (!sessionRow) throw new Error('sessionContext(): session row required');
   let blob = null;
   if (sessionRow.session_data) {
@@ -118,6 +192,36 @@ function sessionContext(sessionRow) {
     }
   }
   const { header, csrftoken, dsUserId } = cookieHeaderFromBlob(blob);
+
+  // Hydrate the pinned platform_state (seed, appVersion, locale,
+  // api_mode, webFingerprint). identity.getOrCreatePlatformState is
+  // idempotent and persists missing slots before returning.
+  // eslint-disable-next-line global-require
+  const identity = require('./identity');
+  const pinned = await identity.getOrCreatePlatformState(sessionRow);
+  let webFingerprint = (pinned.platformState && pinned.platformState.webFingerprint) || null;
+  if (!webFingerprint || !webFingerprint.userAgent) {
+    webFingerprint = _pickWebFingerprint(pinned.seed);
+    // Persist so the next request reads the same pinned fingerprint.
+    try {
+      const ps = pinned.platformState || {};
+      ps.webFingerprint = Object.assign({}, webFingerprint, {
+        pinned_at: new Date().toISOString(),
+      });
+      // eslint-disable-next-line global-require
+      const { pool } = require('../../config/database');
+      await pool.query(
+        `UPDATE sessions
+            SET platform_state = $1::jsonb,
+                updated_at = NOW()
+          WHERE id = $2`,
+        [JSON.stringify(ps), sessionRow.id]
+      );
+    } catch (err) {
+      logger.warn(`IG.igFetch: failed to persist pinned webFingerprint for sessionId=${sessionRow.id}: ${err.message}`);
+    }
+  }
+
   return {
     sessionId: sessionRow.id,
     username: sessionRow.username,
@@ -126,15 +230,17 @@ function sessionContext(sessionRow) {
     csrftoken,
     dsUserId,
     blob,
+    webFingerprint,
+    locale: pinned.locale,
+    apiMode: pinned.apiMode,
+    appVersion: pinned.appVersion,
   };
 }
 
-/**
- * Map an HTTP status / body to a clean classified error so callers
- * can branch on `e.kind` (checkpoint, login_required, rate_limited,
- * not_found, network) and so the session-health state machine knows
- * whether to flip the row to needs_attention.
- */
+// ---------------------------------------------------------------------
+// Error classification
+// ---------------------------------------------------------------------
+
 function classifyError(status, body) {
   const e = new Error();
   const lc = (body || '').toLowerCase();
@@ -180,53 +286,86 @@ function classifyError(status, body) {
   return e;
 }
 
+// ---------------------------------------------------------------------
+// Header builder + fetch wrapper
+// ---------------------------------------------------------------------
+
 /**
  * Browser-grade headers for IG web. Caller passes a `referer` that
  * matches the request (e.g. the target's profile URL) and we fill in
- * the rest. The sec-ch-* hints are what real Chromium sends and
- * IG's bot model leans on them heavily.
+ * the rest from the session's pinned web fingerprint.
  */
 function browserHeaders(ctx, opts = {}) {
-  return {
+  const fp = (ctx && ctx.webFingerprint) || _pickWebFingerprint(ctx && ctx.sessionId);
+  const acceptLanguage = _acceptLanguageForLocale(ctx && ctx.locale, fp.acceptLanguage);
+
+  const headers = {
     accept: 'application/json, text/plain, */*',
-    'accept-language': 'en-US,en;q=0.9',
+    'accept-language': acceptLanguage,
     'cache-control': 'no-cache',
     pragma: 'no-cache',
     referer: opts.referer || 'https://www.instagram.com/',
     origin: 'https://www.instagram.com',
-    'sec-ch-ua': DEFAULT_SEC_CH_UA,
-    'sec-ch-ua-mobile': '?0',
-    'sec-ch-ua-platform': '"macOS"',
     'sec-fetch-dest': 'empty',
     'sec-fetch-mode': 'cors',
     'sec-fetch-site': 'same-origin',
-    'user-agent': DEFAULT_USER_AGENT,
+    'user-agent': fp.userAgent || DEFAULT_USER_AGENT,
     'x-asbd-id': '129477',
-    'x-csrftoken': ctx.csrftoken || '',
+    'x-csrftoken': (ctx && ctx.csrftoken) || '',
     'x-ig-app-id': WEB_APP_ID,
     'x-ig-www-claim': '0',
     'x-requested-with': 'XMLHttpRequest',
-    cookie: ctx.cookieHeader || '',
-    ...(opts.extraHeaders || {}),
+    cookie: (ctx && ctx.cookieHeader) || '',
   };
+
+  // sec-ch-* headers — only emit them when the pinned fingerprint
+  // actually carries them (Chromium-family browsers do, Safari /
+  // Firefox don't). Adding them on a Safari UA is itself a bot tell.
+  if (fp.secChUa) headers['sec-ch-ua'] = fp.secChUa;
+  if (fp.secChUaMobile) headers['sec-ch-ua-mobile'] = fp.secChUaMobile;
+  if (fp.secChUaPlatform) headers['sec-ch-ua-platform'] = fp.secChUaPlatform;
+
+  return Object.assign(headers, opts.extraHeaders || {});
 }
 
 /**
  * Core fetch wrapper. Handles:
  *   - per-session ProxyAgent dispatcher (undici)
- *   - browser-grade headers (UA, sec-ch, x-ig-app-id, csrftoken)
+ *   - per-session pinned browser-grade headers
+ *   - proxy enforcement
  *   - jittered pre-request sleep to spread out burst calls
  *   - JSON parse + clean error classification
  *
  * Returns the parsed JSON on 2xx, throws a classified error otherwise.
- *
- * Caller can pass `opts.expectJson = false` to get the raw body string.
  */
 async function igFetch(ctx, url, opts = {}) {
   if (!ctx || !ctx.cookieHeader) {
     const e = new Error('Session has no cookies');
     e.kind = 'login_required';
     e.statusCode = 401;
+    throw e;
+  }
+
+  // Phase 1.B7 — per-session token bucket. Consumes a token of class
+  // `read` by default; callers performing writes/risky actions should
+  // pass `opts.limiterClass='write'` or `'risky'`.
+  if (ctx.sessionId && opts.skipLimiter !== true) {
+    // eslint-disable-next-line global-require
+    const sessionLimiter = require('./sessionLimiter');
+    await sessionLimiter.acquire(ctx.sessionId, {
+      class: opts.limiterClass || 'read',
+    });
+  }
+
+  if (!ctx.proxyUrl && (await _isProxyRequired())) {
+    const e = new Error(
+      `Instagram session ${ctx.sessionId || ''} has no proxy assigned. ` +
+      `Direct egress from the panel host trips Instagram's data-centre filter on the first request. ` +
+      `Assign a residential proxy or disable security.instagram.require_proxy in system_settings to override.`
+    );
+    e.kind = 'forbidden';
+    e.statusCode = 400;
+    e.code = 'PROXY_REQUIRED';
     throw e;
   }
 
@@ -240,7 +379,6 @@ async function igFetch(ctx, url, opts = {}) {
   if (opts.body) init.body = opts.body;
   if (dispatcher) init.dispatcher = dispatcher;
 
-  // Optional jittered pre-sleep so callers in tight loops don't burst.
   if (opts.preSleepMs) {
     const ms = Math.floor(opts.preSleepMs * (0.7 + Math.random() * 0.6));
     await new Promise((r) => setTimeout(r, ms));
@@ -281,6 +419,7 @@ module.exports = {
   browserHeaders,
   classifyError,
   invalidateProxy,
+  pickWebFingerprint,
   WEB_APP_ID,
   DEFAULT_USER_AGENT,
 };
