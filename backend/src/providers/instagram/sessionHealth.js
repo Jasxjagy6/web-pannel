@@ -219,6 +219,22 @@ async function runHealthCheck(sessionId, opts = {}) {
       }
     );
     await _logBehavior(sessionId, 'health_check', false, lastErr);
+    // Phase 3.B15 — detection-event with the warm-up probe context
+    // so the admin dashboard distinguishes "IG flagged this in a
+    // probe" from "IG flagged this in a real job".
+    try {
+      // eslint-disable-next-line global-require
+      const detectionEvents = require('./detectionEvents');
+      detectionEvents.record({
+        sessionId,
+        userId: session.user_id || null,
+        eventKind: kind,
+        apiPath: 'health_check',
+        httpStatus: lastErr && lastErr.statusCode ? lastErr.statusCode : null,
+        responseBody: lastErr && lastErr.message,
+        requestFingerprint: { action_class: 'read', source: 'sessionHealth' },
+      }).catch(() => {});
+    } catch (_recErr) { /* swallow */ }
     return { ok: false, kind, error: lastErr ? lastErr.message : 'Unknown error' };
   }
 
