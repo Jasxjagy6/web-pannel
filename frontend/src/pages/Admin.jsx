@@ -3,6 +3,7 @@ import {
   Users, Search, Loader2, ShieldCheck, Ban, RefreshCcw, Settings2, Trash2,
   CheckCircle2, X, ChevronDown, Filter,
   CreditCard, Sparkles, Wallet, DollarSign, Save, AlertCircle, ListChecks,
+  ShieldAlert, Activity,
 } from 'lucide-react';
 import {
   listUsers, approveUser, banUser, unbanUser, deleteUser,
@@ -10,6 +11,7 @@ import {
   getBillingSettings, updateBillingSettings, listAdminInvoices,
   grantUserSubscription, expireUserSubscription,
   listUserPlatformSubscriptions, setUserPlatformSubscription,
+  listTgDetectionEvents, getTgRiskOverview,
 } from '../api/admin';
 import { useToast } from '../components/common/Toast';
 import { parseApiError, formatDateTime, formatRelativeTime } from '../utils/formatters';
@@ -51,16 +53,18 @@ export default function Admin() {
         <AdminTabs tab={tab} onChange={setTab} />
       </div>
 
-      {tab === 'users'   && <UsersTab />}
-      {tab === 'billing' && <BillingAdminTab />}
+      {tab === 'users'    && <UsersTab />}
+      {tab === 'billing'  && <BillingAdminTab />}
+      {tab === 'antirevoke' && <AntiRevokeTab />}
     </div>
   );
 }
 
 function AdminTabs({ tab, onChange }) {
   const items = [
-    { key: 'users',   label: 'Users',           icon: Users },
-    { key: 'billing', label: 'Billing & Trial', icon: CreditCard },
+    { key: 'users',       label: 'Users',           icon: Users },
+    { key: 'billing',     label: 'Billing & Trial', icon: CreditCard },
+    { key: 'antirevoke',  label: 'Anti-revoke (TG)', icon: ShieldAlert },
   ];
   return (
     <div className="inline-flex rounded-xl border border-dark-700 bg-dark-900/60 p-1">
@@ -988,6 +992,238 @@ function InvoicesAdminCard({
           </table>
         </div>
       )}
+    </div>
+  );
+}
+
+// =========================================================================
+// Anti-revoke (Telegram) admin tab
+// =========================================================================
+function AntiRevokeTab() {
+  const toast = useToast();
+  const [eventsLoading, setEventsLoading] = useState(true);
+  const [riskLoading, setRiskLoading] = useState(true);
+  const [events, setEvents] = useState([]);
+  const [risks, setRisks] = useState([]);
+  const [counts, setCounts] = useState([]); // [{event_type, c}]
+  const [since, setSince] = useState('24h');
+  const [severity, setSeverity] = useState('');
+
+  // Map "1h"|"6h"|"24h"|"7d" → ISO timestamp the backend filter expects.
+  const sinceIso = useMemo(() => {
+    const m = String(since).match(/^(\d+)([hmd])$/i);
+    if (!m) return undefined;
+    const n = Number(m[1]);
+    const unit = m[2].toLowerCase();
+    const ms = unit === 'd' ? n * 86_400_000 : unit === 'h' ? n * 3_600_000 : n * 60_000;
+    return new Date(Date.now() - ms).toISOString();
+  }, [since]);
+
+  const reloadEvents = useCallback(async () => {
+    setEventsLoading(true);
+    try {
+      const r = await listTgDetectionEvents({
+        since: sinceIso,
+        severity: severity || undefined,
+        limit: 50,
+      });
+      const data = r.data?.data || r.data || {};
+      setEvents(Array.isArray(data.events) ? data.events : []);
+      setCounts(Array.isArray(data.counts) ? data.counts : []);
+    } catch (e) {
+      toast.error(parseApiError(e));
+    } finally {
+      setEventsLoading(false);
+    }
+  }, [sinceIso, severity, toast]);
+
+  const reloadRisks = useCallback(async () => {
+    setRiskLoading(true);
+    try {
+      const r = await getTgRiskOverview({ min_score: 0.4, limit: 25 });
+      const data = r.data?.data || r.data || {};
+      setRisks(Array.isArray(data.sessions) ? data.sessions : []);
+    } catch (e) {
+      toast.error(parseApiError(e));
+    } finally {
+      setRiskLoading(false);
+    }
+  }, [toast]);
+
+  useEffect(() => { reloadEvents(); }, [reloadEvents]);
+  useEffect(() => { reloadRisks(); }, [reloadRisks]);
+
+  const sevPill = (s) => {
+    const c =
+      s === 'critical' ? 'bg-red-500/20 text-red-300'
+      : s === 'warning' ? 'bg-amber-500/20 text-amber-300'
+      : 'bg-blue-500/20 text-blue-300';
+    return (
+      <span className={`inline-flex items-center rounded-full px-2 py-0.5 text-[11px] font-medium ${c}`}>
+        {s}
+      </span>
+    );
+  };
+
+  return (
+    <div className="space-y-6">
+      <div className="rounded-xl border border-white/5 bg-dark-900/60 p-4">
+        <div className="flex items-center gap-2 text-white">
+          <ShieldAlert className="w-4 h-4 text-amber-400" />
+          <h2 className="font-semibold">Anti-revoke posture</h2>
+        </div>
+        <p className="mt-1 text-xs text-dark-400">
+          Live detection events + risk scores from{' '}
+          <code className="text-amber-300">tg_detection_events</code> +{' '}
+          <code className="text-amber-300">tg_session_health</code>.
+          High risk (≥0.65) sessions are automatically gated from
+          scrape/messaging via <code className="text-amber-300">gateOnRisk</code>.
+        </p>
+      </div>
+
+      {/* Risk overview */}
+      <div className="rounded-xl border border-white/5 bg-dark-900/40 overflow-hidden">
+        <div className="flex items-center justify-between px-4 py-3 border-b border-white/5">
+          <div className="flex items-center gap-2 text-white">
+            <Activity className="w-4 h-4 text-rose-400" />
+            <h3 className="font-medium">Top-risk sessions</h3>
+          </div>
+          <button
+            onClick={reloadRisks}
+            disabled={riskLoading}
+            className="inline-flex items-center gap-1 rounded-lg border border-white/10 bg-dark-800 px-2.5 py-1 text-xs text-gray-300 hover:bg-dark-700 disabled:opacity-50"
+          >
+            {riskLoading ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <RefreshCcw className="w-3.5 h-3.5" />}
+            Refresh
+          </button>
+        </div>
+        <div className="overflow-x-auto">
+          <table className="w-full text-sm">
+            <thead className="bg-dark-900/80">
+              <tr className="text-left text-[11px] uppercase tracking-wider text-dark-400">
+                <th className="px-4 py-2">Session</th>
+                <th className="px-4 py-2">Phone</th>
+                <th className="px-4 py-2">Risk</th>
+                <th className="px-4 py-2 hidden md:table-cell">Floods</th>
+                <th className="px-4 py-2 hidden md:table-cell">Failed pings</th>
+                <th className="px-4 py-2 hidden lg:table-cell">DC migrate (24h)</th>
+                <th className="px-4 py-2 hidden lg:table-cell">Last reauth</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-white/5">
+              {riskLoading && (
+                <tr><td colSpan={7} className="px-4 py-8 text-center text-dark-400">Loading…</td></tr>
+              )}
+              {!riskLoading && risks.length === 0 && (
+                <tr><td colSpan={7} className="px-4 py-8 text-center text-emerald-300">No high-risk sessions. Posture is healthy.</td></tr>
+              )}
+              {!riskLoading && risks.map((s) => {
+                const score = Number(s.risk_score ?? s.score ?? 0) || 0;
+                const cls =
+                  score >= 0.65 ? 'bg-red-500/20 text-red-300'
+                  : score >= 0.4 ? 'bg-amber-500/20 text-amber-300'
+                  : 'bg-emerald-500/15 text-emerald-300';
+                return (
+                  <tr key={s.session_id || s.id} className="hover:bg-white/[0.02]">
+                    <td className="px-4 py-2 font-mono text-xs text-gray-300">#{s.session_id || s.id}</td>
+                    <td className="px-4 py-2 text-gray-300">{s.phone || '—'}</td>
+                    <td className="px-4 py-2">
+                      <span className={`inline-flex items-center rounded-full px-2 py-0.5 text-xs font-semibold ${cls}`}>
+                        {score.toFixed(3)}
+                      </span>
+                    </td>
+                    <td className="px-4 py-2 hidden md:table-cell text-gray-300">{s.consecutive_flood_waits ?? 0}</td>
+                    <td className="px-4 py-2 hidden md:table-cell text-gray-300">{s.consecutive_failed_pings ?? 0}</td>
+                    <td className="px-4 py-2 hidden lg:table-cell text-gray-300">{s.dc_migrate_count_24h ?? 0}</td>
+                    <td className="px-4 py-2 hidden lg:table-cell text-gray-400">
+                      {s.last_reauth_required_at ? formatRelativeTime(s.last_reauth_required_at) : '—'}
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      {/* Detection events */}
+      <div className="rounded-xl border border-white/5 bg-dark-900/40 overflow-hidden">
+        <div className="flex items-center justify-between px-4 py-3 border-b border-white/5 flex-wrap gap-2">
+          <div className="flex items-center gap-2 text-white">
+            <ListChecks className="w-4 h-4 text-amber-400" />
+            <h3 className="font-medium">Detection events</h3>
+            {counts.length > 0 && (
+              <span className="text-[11px] text-dark-400">
+                ({counts.map((c) => `${c.event_type}=${c.c}`).join(', ')})
+              </span>
+            )}
+          </div>
+          <div className="flex items-center gap-2">
+            <select
+              value={since}
+              onChange={(e) => setSince(e.target.value)}
+              className="rounded-lg border border-white/10 bg-dark-800 px-2 py-1 text-xs text-white"
+            >
+              <option value="1h">Last hour</option>
+              <option value="6h">Last 6h</option>
+              <option value="24h">Last 24h</option>
+              <option value="7d">Last 7d</option>
+            </select>
+            <select
+              value={severity}
+              onChange={(e) => setSeverity(e.target.value)}
+              className="rounded-lg border border-white/10 bg-dark-800 px-2 py-1 text-xs text-white"
+            >
+              <option value="">All severities</option>
+              <option value="info">Info</option>
+              <option value="warning">Warning</option>
+              <option value="critical">Critical</option>
+            </select>
+            <button
+              onClick={reloadEvents}
+              disabled={eventsLoading}
+              className="inline-flex items-center gap-1 rounded-lg border border-white/10 bg-dark-800 px-2.5 py-1 text-xs text-gray-300 hover:bg-dark-700 disabled:opacity-50"
+            >
+              {eventsLoading ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <RefreshCcw className="w-3.5 h-3.5" />}
+              Refresh
+            </button>
+          </div>
+        </div>
+        <div className="overflow-x-auto">
+          <table className="w-full text-sm">
+            <thead className="bg-dark-900/80">
+              <tr className="text-left text-[11px] uppercase tracking-wider text-dark-400">
+                <th className="px-4 py-2">When</th>
+                <th className="px-4 py-2">Session</th>
+                <th className="px-4 py-2">Type</th>
+                <th className="px-4 py-2">Severity</th>
+                <th className="px-4 py-2 hidden md:table-cell">API method</th>
+                <th className="px-4 py-2 hidden lg:table-cell">Excerpt</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-white/5">
+              {eventsLoading && (
+                <tr><td colSpan={6} className="px-4 py-8 text-center text-dark-400">Loading…</td></tr>
+              )}
+              {!eventsLoading && events.length === 0 && (
+                <tr><td colSpan={6} className="px-4 py-8 text-center text-dark-400">No events in window.</td></tr>
+              )}
+              {!eventsLoading && events.map((e) => (
+                <tr key={e.id} className="hover:bg-white/[0.02]">
+                  <td className="px-4 py-2 text-gray-400">{e.occurred_at ? formatRelativeTime(e.occurred_at) : '—'}</td>
+                  <td className="px-4 py-2 font-mono text-xs text-gray-300">#{e.session_id || '—'}</td>
+                  <td className="px-4 py-2 text-gray-200">{e.event_type}</td>
+                  <td className="px-4 py-2">{sevPill(e.severity)}</td>
+                  <td className="px-4 py-2 hidden md:table-cell text-gray-300 font-mono text-xs">{e.api_method || '—'}</td>
+                  <td className="px-4 py-2 hidden lg:table-cell text-gray-400 text-xs truncate max-w-[280px]" title={e.raw_excerpt || ''}>
+                    {e.raw_excerpt || '—'}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </div>
     </div>
   );
 }

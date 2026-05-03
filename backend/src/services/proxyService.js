@@ -499,11 +499,18 @@ class ProxyService {
       return existing;
     }
 
+    // Anti-revoke Phase 1 (B3): when STRICT_PROXY_ISOLATION is on,
+    // refuse to assign the `__direct__` row (panel-host hosting-ASN IP)
+    // for non-trivial accounts.
+    const cfg = require('../config/telegram');
+    const strictIsolation = !!cfg.STRICT_PROXY_ISOLATION;
+
     // Find first proxy with capacity, ordered priority desc.
     const r = await pool.query(
       `SELECT * FROM proxies
        WHERE is_working = TRUE
          AND active_assignments < $1
+         AND host <> '__direct__'
        ORDER BY priority DESC, last_latency_ms NULLS LAST
        LIMIT 1`,
       [MAX_SESSIONS_PER_PROXY]
@@ -511,7 +518,19 @@ class ProxyService {
     let proxy = r.rows[0];
 
     if (!proxy) {
-      // No capacity anywhere - fall back to direct VPS (overflow allowed).
+      if (strictIsolation) {
+        // Phase 1 — refuse the direct row, return null. Caller
+        // (sessionService.loginSession etc.) handles the fallout by
+        // logging a warning + keeping the session in `error` state
+        // until a proxy comes back.
+        logger.warn(
+          `assignProxyForSession(${sessionId}): no working proxy with capacity ` +
+            `(STRICT_PROXY_ISOLATION=true). Refusing direct VPS egress.`
+        );
+        return null;
+      }
+      // Legacy mode (STRICT_PROXY_ISOLATION=false): fall back to
+      // direct VPS so the panel still works in single-tenant dev.
       const direct = await pool.query(
         `SELECT * FROM proxies WHERE host='__direct__' LIMIT 1`
       );

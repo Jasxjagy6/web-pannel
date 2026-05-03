@@ -1737,7 +1737,8 @@ class TelegramService {
       
       const result = await pool.query(
         `SELECT id, session_file_path, api_id, api_hash, is_logged_in, status,
-                device_identity, bound_proxy_id, user_api_credential_id
+                device_identity, bound_proxy_id, user_api_credential_id,
+                dc_id, dc_ip, dc_port
          FROM sessions WHERE id = $1`,
         [sessionId]
       );
@@ -1826,6 +1827,24 @@ class TelegramService {
       }
 
       const stringSession = new StringSession(sessionString);
+      // Anti-revoke Phase 1 (B1): if STRICT_FINGERPRINT is on and we
+      // would otherwise leak the panel-default device row, refuse — the
+      // operator must persist a real identity first.
+      if (telegramConfig.STRICT_FINGERPRINT && telegramConfig.ANTI_REVOKE_PHASE_1_ENABLED) {
+        if (!idOpts.deviceModel || !idOpts.systemVersion || !idOpts.appVersion) {
+          throw new Error(
+            `Refusing to connect session ${sessionId}: no device identity bound (STRICT_FINGERPRINT). ` +
+              `Run identityService.loadOrCreate(${sessionId}) first.`
+          );
+        }
+      }
+      // Anti-revoke Phase 1 (B12): for Android / iOS / Desktop profiles,
+      // override useWSS=false (real apps use TCP MTProto). Web profiles
+      // keep WSS. The proxy override (TCP-only) still wins.
+      const transportPlatform = (identity && identity.platform) || '';
+      const wantsWss = ['web'].includes(transportPlatform)
+        ? telegramConfig.useWSS
+        : false;
       const client = new TelegramClient(stringSession, apiId, apiHash, {
         connectionRetries: telegramConfig.connectionRetries,
         timeout: telegramConfig.timeout,
@@ -1835,10 +1854,22 @@ class TelegramService {
         langCode: idOpts.langCode || telegramConfig.langCode,
         systemLangCode: idOpts.systemLangCode || idOpts.langCode || telegramConfig.langCode,
         baseLogger: telegramConfig.baseLogger,
-        useWSS: proxyConf ? false : telegramConfig.useWSS,
+        useWSS: proxyConf ? false : wantsWss,
         autoReconnect: true,
         proxy: proxyConf || undefined,
       });
+
+      // Anti-revoke Phase 1 (B4): if a DC pin is persisted, set it on
+      // the session BEFORE connect so the auth_key lands on its
+      // original DC and doesn't trigger an `auth.ImportAuthorization`
+      // round-trip.
+      try {
+        if (session.dc_id && client.session && typeof client.session.setDc === 'function') {
+          client.session.setDc(session.dc_id, session.dc_ip || '', session.dc_port || 443);
+        }
+      } catch (dcErr) {
+        logger.debug(`DC pin set failed for ${sessionId}: ${dcErr.message}`);
+      }
 
       await client.connect();
 
@@ -1851,6 +1882,10 @@ class TelegramService {
         proxy: proxyConf || null,
         identity: identity || null,
       });
+      // Anti-revoke Phase 1 (B4): persist whichever DC the auth_key
+      // ended up on (first connect on a fresh row, or roaming after a
+      // forced migrate). Cheap; idempotent.
+      try { await this.persistDcPinFromClient(sessionIdStr); } catch { /* noop */ }
 //      // DEBUG console.log('[F] Session stored, Map size after:', this.clients.size, 'keys:', Array.from(this.clients.keys()));
       
       logger.info(`Session ${sessionId} loaded from database`);
@@ -2414,6 +2449,31 @@ class TelegramService {
             `Flood wait detected for session ${sessionId}: ${waitSeconds}s (retry ${retries}/${maxRetries})`
           );
 
+          // Anti-revoke Phase 3 (B15): record long flood waits.
+          if (waitSeconds >= 30) {
+            try {
+              const cfg = require('../config/telegram');
+              if (cfg.ANTI_REVOKE_PHASE_3_ENABLED) {
+                const detectionEvents = require('../providers/telegram/detectionEvents');
+                await detectionEvents.recordFromError(error, {
+                  session_id: sessionId,
+                  fingerprint: { source: 'flood_retry', flood_wait_seconds: waitSeconds, retries },
+                });
+                const { pool } = require('../config/database');
+                await pool.query(
+                  `INSERT INTO tg_session_health (session_id, last_flood_seconds, last_flood_at, consecutive_flood_waits, updated_at)
+                   VALUES ($1, $2, NOW(), 1, NOW())
+                   ON CONFLICT (session_id) DO UPDATE SET
+                     last_flood_seconds = EXCLUDED.last_flood_seconds,
+                     last_flood_at = NOW(),
+                     consecutive_flood_waits = tg_session_health.consecutive_flood_waits + 1,
+                     updated_at = NOW()`,
+                  [sessionId, waitSeconds]
+                ).catch(() => {});
+              }
+            } catch { /* best-effort */ }
+          }
+
           await sleep(waitSeconds * 1000);
           continue;
         }
@@ -2426,6 +2486,16 @@ class TelegramService {
           logger.warn(
             `Peer flood detected for session ${sessionId}: waiting ${waitTime}s (retry ${retries}/${maxRetries})`
           );
+          try {
+            const cfg = require('../config/telegram');
+            if (cfg.ANTI_REVOKE_PHASE_3_ENABLED) {
+              const detectionEvents = require('../providers/telegram/detectionEvents');
+              await detectionEvents.recordFromError(error, {
+                session_id: sessionId,
+                fingerprint: { source: 'peer_flood', retries },
+              });
+            }
+          } catch { /* best-effort */ }
 
           await sleep(waitTime * 1000);
           continue;
@@ -2804,6 +2874,242 @@ class TelegramService {
         return { canScrape: false, isAdminOnly: true, info, reason: 'chat_admin_required' };
       }
       return { canScrape: false, isAdminOnly: true, info, reason: msg };
+    }
+  }
+
+  // ====================================================================
+  //  Anti-revoke: pinging, presence, DC pinning, GetAuthorizations probe
+  // ====================================================================
+
+  /**
+   * Send a transport-level MTProto Ping (with disconnect timer) — what
+   * real Telegram clients use as keepalive. Falls back to a lightweight
+   * `users.GetUsers([Self])` if the GramJS internals expose neither
+   * `_sender` nor `Api.PingDelayDisconnect`.
+   *
+   * @param {string|number} sessionId
+   * @returns {Promise<{ok:boolean, latencyMs:number, fallback:boolean}>}
+   */
+  async pingSession(sessionId) {
+    const sid = String(sessionId);
+    await this._ensureConnected(sid);
+    const entry = this.clients.get(sid);
+    if (!entry) throw new Error(`Session ${sid} not found`);
+    const t0 = Date.now();
+    let fallback = false;
+    try {
+      const PingDelayDisconnect = Api && Api.PingDelayDisconnect ? Api.PingDelayDisconnect : null;
+      if (PingDelayDisconnect && entry.client._sender && typeof entry.client._sender.send === 'function') {
+        const pingId = BigInt(Date.now()) * 1000n + BigInt(Math.floor(Math.random() * 1000));
+        await entry.client._sender.send(
+          new PingDelayDisconnect({ pingId, disconnectDelay: 75 })
+        );
+      } else if (entry.client.invoke && Api && Api.users && Api.users.GetUsers && Api.InputUserSelf) {
+        // Fallback: smallest possible RPC that exercises the auth_key.
+        await entry.client.invoke(new Api.users.GetUsers({ id: [new Api.InputUserSelf()] }));
+        fallback = true;
+      } else {
+        // Last resort: getMe (which the legacy heartbeat used).
+        await this.getMe(sid);
+        fallback = true;
+      }
+      try {
+        const { pool } = require('../config/database');
+        await pool.query(`UPDATE sessions SET last_ping_at = NOW() WHERE id = $1`, [sid]).catch(() => {});
+      } catch { /* ignore */ }
+      return { ok: true, latencyMs: Date.now() - t0, fallback };
+    } catch (err) {
+      throw err;
+    }
+  }
+
+  /**
+   * Broadcast online presence (`account.UpdateStatus(offline=false)`).
+   * Real clients call this on every (re)connect — its absence is one of
+   * the strongest "this is a script, not a phone" signals.
+   *
+   * @param {string|number} sessionId
+   * @returns {Promise<boolean>} true if the call was actually made
+   */
+  async setOnline(sessionId) {
+    const sid = String(sessionId);
+    const entry = this.clients.get(sid);
+    if (!entry || !entry.client) return false;
+    try {
+      if (Api && Api.account && Api.account.UpdateStatus) {
+        await entry.client.invoke(new Api.account.UpdateStatus({ offline: false }));
+        try {
+          const { pool } = require('../config/database');
+          await pool.query(`UPDATE sessions SET last_online_status_at = NOW() WHERE id = $1`, [sid]).catch(() => {});
+        } catch { /* ignore */ }
+        return true;
+      }
+    } catch (err) {
+      logger.debug(`setOnline failed for ${sid}: ${err.message}`);
+    }
+    return false;
+  }
+
+  /**
+   * Broadcast offline presence. Idempotent — safe to call repeatedly.
+   * Used after `OFFLINE_AFTER_IDLE_MS` of inactivity.
+   *
+   * @param {string|number} sessionId
+   * @returns {Promise<boolean>}
+   */
+  async setOffline(sessionId) {
+    const sid = String(sessionId);
+    const entry = this.clients.get(sid);
+    if (!entry || !entry.client) return false;
+    try {
+      if (Api && Api.account && Api.account.UpdateStatus) {
+        await entry.client.invoke(new Api.account.UpdateStatus({ offline: true }));
+        return true;
+      }
+    } catch (err) {
+      logger.debug(`setOffline failed for ${sid}: ${err.message}`);
+    }
+    return false;
+  }
+
+  /**
+   * Re-broadcast online presence only when the previous call is older
+   * than `OFFLINE_AFTER_IDLE_MS / 2` (roughly every 2.5 min by default).
+   * Cheap; used by the heartbeat loop.
+   */
+  async announceOnlineIfDue(sessionId) {
+    const sid = String(sessionId);
+    try {
+      const { pool } = require('../config/database');
+      const cfg = require('../config/telegram');
+      const cadence = Math.max(60_000, Math.floor((cfg.OFFLINE_AFTER_IDLE_MS || 300000) / 2));
+      const r = await pool.query(
+        `SELECT last_online_status_at FROM sessions WHERE id = $1`,
+        [sid]
+      );
+      const last = r.rows[0] && r.rows[0].last_online_status_at;
+      const ageMs = last ? Date.now() - new Date(last).getTime() : Number.POSITIVE_INFINITY;
+      if (ageMs < cadence) return false;
+      return await this.setOnline(sid);
+    } catch (err) {
+      logger.debug(`announceOnlineIfDue failed for ${sid}: ${err.message}`);
+      return false;
+    }
+  }
+
+  /**
+   * Persist the DC the auth key is currently bound to so subsequent
+   * reconnects pin to the same DC. GramJS's session object exposes
+   * `dcId`, `serverAddress`, and `port` once the connection is up.
+   * @param {string|number} sessionId
+   */
+  async persistDcPinFromClient(sessionId) {
+    const sid = String(sessionId);
+    const entry = this.clients.get(sid);
+    if (!entry || !entry.client) return null;
+    const sess = entry.client.session;
+    if (!sess) return null;
+    const dcId = typeof sess.dcId === 'number' ? sess.dcId : (sess._dcId || null);
+    const dcIp = sess.serverAddress || sess._serverAddress || null;
+    const dcPort = typeof sess.port === 'number' ? sess.port : (sess._port || null);
+    if (!dcId) return null;
+    try {
+      const { pool } = require('../config/database');
+      await pool.query(
+        `UPDATE sessions
+            SET dc_id = $1,
+                dc_ip = COALESCE($2, dc_ip),
+                dc_port = COALESCE($3, dc_port),
+                auth_key_first_seen_at = COALESCE(auth_key_first_seen_at, NOW())
+          WHERE id = $4`,
+        [dcId, dcIp, dcPort, sid]
+      );
+      return { dcId, dcIp, dcPort };
+    } catch (err) {
+      logger.debug(`persistDcPinFromClient failed for ${sid}: ${err.message}`);
+      return null;
+    }
+  }
+
+  /**
+   * Periodic GetAuthorizations probe — early-warning that an external
+   * "Terminate session" click in another Telegram client has marked our
+   * auth key for revocation. The auth_key keeps working for a brief
+   * grace window; surfacing the disappearance lets us avoid burning
+   * future API calls.
+   *
+   * Returns `{ checked: bool, revokedExternally: bool, count: int }` so
+   * the heartbeat caller can decide whether to mark the session revoked.
+   *
+   * Cadence is `AUTHORIZATIONS_PROBE_MS ± AUTHORIZATIONS_PROBE_JITTER_MS`
+   * per session; the function is idempotent and skips when not yet due.
+   */
+  async checkAuthorizationsIfDue(sessionId) {
+    const sid = String(sessionId);
+    try {
+      const { pool } = require('../config/database');
+      const cfg = require('../config/telegram');
+      const baseMs = Math.max(60_000, cfg.AUTHORIZATIONS_PROBE_MS || 14_400_000);
+      const jitterMs = Math.max(0, cfg.AUTHORIZATIONS_PROBE_JITTER_MS || 0);
+      const dueMs = baseMs + Math.floor((Math.random() * 2 - 1) * jitterMs);
+      const r = await pool.query(
+        `SELECT last_authorizations_check_at FROM sessions WHERE id = $1`,
+        [sid]
+      );
+      const last = r.rows[0] && r.rows[0].last_authorizations_check_at;
+      const ageMs = last ? Date.now() - new Date(last).getTime() : Number.POSITIVE_INFINITY;
+      if (ageMs < dueMs) return { checked: false };
+
+      const entry = this.clients.get(sid);
+      if (!entry || !entry.client) return { checked: false };
+      if (!Api || !Api.account || !Api.account.GetAuthorizations) return { checked: false };
+
+      const out = await entry.client.invoke(new Api.account.GetAuthorizations());
+      const authorizations = (out && out.authorizations) || [];
+      const current = authorizations.find((a) => a.current);
+      const revokedExternally = !current && authorizations.length > 0;
+
+      await pool.query(
+        `UPDATE sessions
+            SET last_authorizations_check_at = NOW()
+          WHERE id = $1`,
+        [sid]
+      );
+      try {
+        await pool.query(
+          `INSERT INTO tg_session_health (session_id, active_authorizations, last_authorizations_check_at, updated_at)
+           VALUES ($1, $2::jsonb, NOW(), NOW())
+           ON CONFLICT (session_id) DO UPDATE SET
+             active_authorizations = EXCLUDED.active_authorizations,
+             last_authorizations_check_at = NOW(),
+             updated_at = NOW()`,
+          [
+            sid,
+            JSON.stringify(
+              authorizations.map((a) => ({
+                hash: String(a.hash || ''),
+                current: !!a.current,
+                deviceModel: a.deviceModel || null,
+                platform: a.platform || null,
+                systemVersion: a.systemVersion || null,
+                appName: a.appName || null,
+                appVersion: a.appVersion || null,
+                country: a.country || null,
+                ip: a.ip || null,
+                dateActive: a.dateActive || null,
+                dateCreated: a.dateCreated || null,
+              })).slice(0, 20)
+            ),
+          ]
+        );
+      } catch { /* tg_session_health may not exist on dev DBs */ }
+      return { checked: true, count: authorizations.length, revokedExternally };
+    } catch (err) {
+      // If the auth_key is already dead this throws AUTH_KEY_UNREGISTERED;
+      // let the caller handle it via isPermanentAuthError().
+      if (this.isPermanentAuthError(err)) throw err;
+      logger.debug(`checkAuthorizationsIfDue failed for ${sid}: ${err.message}`);
+      return { checked: false };
     }
   }
 }

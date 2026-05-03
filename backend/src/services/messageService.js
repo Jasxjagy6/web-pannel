@@ -623,6 +623,19 @@ class MessageService {
     // Verify the session belongs to the user
     const session = await this._verifySessionOwnership(sessionId, userId);
 
+    // Anti-revoke Phase 3 (B17): refuse to send from a high-risk
+    // session. RISK_TOO_HIGH bubbles up as a 403 to the API client.
+    try {
+      const cfg = require('../config/telegram');
+      if (cfg.ANTI_REVOKE_PHASE_3_ENABLED) {
+        const tgRisk = require('../providers/telegram/riskScore');
+        await tgRisk.gateOnRisk(sessionId);
+      }
+    } catch (gateErr) {
+      if (gateErr && gateErr.code === 'RISK_TOO_HIGH') throw gateErr;
+      // Fall through on unexpected errors so messaging stays available.
+    }
+
     try {
       const result = await telegramService.sendMessage(
         String(sessionId),
@@ -731,7 +744,47 @@ class MessageService {
 
     // Verify all sessions belong to the user
     const verifiedSessions = await this._verifyMultipleSessionsOwnership(sessionIds, userId);
-    const verifiedSessionIds = verifiedSessions.map((s) => s.id);
+    let verifiedSessionIds = verifiedSessions.map((s) => s.id);
+
+    // Anti-revoke Phase 3 (B17): drop high-risk sessions from the bulk
+    // pool. We log which were dropped + why so the user can act.
+    try {
+      const cfg = require('../config/telegram');
+      if (cfg.ANTI_REVOKE_PHASE_3_ENABLED) {
+        const tgRisk = require('../providers/telegram/riskScore');
+        const safe = [];
+        const skipped = [];
+        for (const sid of verifiedSessionIds) {
+          try {
+            await tgRisk.gateOnRisk(sid);
+            safe.push(sid);
+          } catch (gateErr) {
+            if (gateErr && gateErr.code === 'RISK_TOO_HIGH') {
+              skipped.push({ sid, score: gateErr.riskScore, threshold: gateErr.threshold });
+            } else {
+              safe.push(sid);
+            }
+          }
+        }
+        if (skipped.length) {
+          logger.warn(
+            `sendBulkMessage: dropped ${skipped.length} high-risk session(s)`,
+            { skipped }
+          );
+        }
+        if (safe.length === 0) {
+          throw new AppError(
+            `All selected sessions exceed the anti-revoke risk threshold; refusing to send bulk.`,
+            403,
+            'RISK_TOO_HIGH'
+          );
+        }
+        verifiedSessionIds = safe;
+      }
+    } catch (gateChainErr) {
+      if (gateChainErr && gateChainErr.statusCode === 403) throw gateChainErr;
+      // unrelated error → keep the original list
+    }
 
     if (verifiedSessionIds.length === 0) {
       throw new AppError('No valid sessions found for this user', 404, 'NO_VALID_SESSIONS');

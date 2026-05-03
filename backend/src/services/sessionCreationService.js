@@ -183,7 +183,7 @@ class SessionCreationService {
   // ---------------------------------------------------------------------------
   // Step 1: start — sendCode
   // ---------------------------------------------------------------------------
-  async start({ userId, phone, apiId, apiHash }) {
+  async start({ userId, phone, apiId, apiHash, country, platform }) {
     const normalizedPhone = this._normalizePhone(phone);
     const { apiId: id, apiHash: hash, credentialId } =
       await this._resolveApi(userId, apiId, apiHash);
@@ -191,9 +191,29 @@ class SessionCreationService {
     // Anti-Detect: build the device identity that this account will use
     // for the rest of its life. The seed includes the phone so a re-tried
     // creation flow for the same phone keeps the same identity.
+    //
+    // Anti-revoke (Phase 1 §B2): the `country` field from the create
+    // form is forwarded so langCode + timezone match the proxy region.
+    // The `platform` filter (e.g. 'android'|'ios'|'desktop') lets the
+    // user opt for a specific device profile pool.
     const tempId = this._newTempId();
-    const identity = fingerprint.buildIdentity(null, {
+    const allProfiles = fingerprint.PROFILES || [];
+    let chosenProfile = null;
+    if (platform && allProfiles.length) {
+      const matches = allProfiles.filter(
+        (p) => String(p.platform).toLowerCase() === String(platform).toLowerCase()
+      );
+      if (matches.length) {
+        // Deterministic pick from the filtered pool (seed = phone).
+        const seed = `creation:${normalizedPhone}:${tempId}`;
+        chosenProfile = fingerprint.pickProfileForSeed
+          ? matches[Math.abs(seed.length) % matches.length]
+          : matches[0];
+      }
+    }
+    const identity = fingerprint.buildIdentity(chosenProfile, {
       seed: `creation:${normalizedPhone}:${tempId}`,
+      country: country ? String(country).toLowerCase() : null,
     });
 
     // Anti-Detect: try to allocate a proxy slot up-front so the SendCode

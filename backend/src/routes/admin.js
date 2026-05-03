@@ -36,4 +36,11 @@ router.get('/billing/users/:id/invoices', billing.adminGetUserInvoices);
 router.post('/billing/users/:id/grant',  billing.adminGrantSubscription);
 router.post('/billing/users/:id/expire', billing.adminExpireSubscription);
 
+// ---------------------------------------------------------------------
+// Telegram anti-revoke admin endpoints (Phase 3 §B17/B18)
+// ---------------------------------------------------------------------
+router.get('/tg-detection-events', ctrl.tgDetectionEvents);
+router.get('/tg-risk',             ctrl.tgRisk);
+router.get('/tg-session-health',   ctrl.tgSessionHealth);
+
 module.exports = router;

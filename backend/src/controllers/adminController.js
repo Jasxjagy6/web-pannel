@@ -409,6 +409,70 @@ const adminController = {
     );
     return res.status(200).json({ success: true, data: { actions: r.rows } });
   }),
+
+  // ===================================================================
+  //  Telegram anti-revoke endpoints (Phase 3 §B18)
+  // ===================================================================
+
+  /**
+   * GET /api/admin/tg-detection-events
+   *   ?since=<ISO>&session_id=&user_id=&event_type=&severity=&limit=&offset=
+   * Returns paginated revocation/flood/peer-flood/etc audit events.
+   */
+  tgDetectionEvents: asyncHandler(async (req, res) => {
+    const detectionEvents = require('../providers/telegram/detectionEvents');
+    const out = await detectionEvents.list({
+      since:      req.query.since      || null,
+      session_id: req.query.session_id || null,
+      user_id:    req.query.user_id    || null,
+      event_type: req.query.event_type || null,
+      severity:   req.query.severity   || null,
+      limit:      Number(req.query.limit)  || 50,
+      offset:     Number(req.query.offset) || 0,
+    });
+    return res.status(200).json({ success: true, data: out });
+  }),
+
+  /**
+   * GET /api/admin/tg-risk?session_id=  → single
+   *                       ?min_score=…&limit=… → top-N
+   * Returns risk score breakdowns.
+   */
+  tgRisk: asyncHandler(async (req, res) => {
+    const tgRisk = require('../providers/telegram/riskScore');
+    if (req.query.session_id) {
+      const out = await tgRisk.compute(req.query.session_id);
+      return res.status(200).json({ success: true, data: out });
+    }
+    const out = await tgRisk.topRisky({
+      minScore: Number(req.query.min_score) || 0.5,
+      limit:    Number(req.query.limit)     || 20,
+    });
+    return res.status(200).json({ success: true, data: out });
+  }),
+
+  /**
+   * GET /api/admin/tg-session-health
+   * Returns the per-session health joined with sessions metadata.
+   */
+  tgSessionHealth: asyncHandler(async (req, res) => {
+    const limit = Math.max(1, Math.min(500, Number(req.query.limit) || 100));
+    const r = await pool.query(
+      `SELECT tsh.*, s.user_id, s.phone, s.account_info, s.status, s.is_logged_in,
+              s.dc_id, s.dc_ip, s.dc_port,
+              s.last_online_status_at, s.last_ping_at, s.auth_key_first_seen_at
+       FROM tg_session_health tsh
+       JOIN sessions s ON s.id = tsh.session_id
+       WHERE s.platform = 'telegram'
+       ORDER BY tsh.risk_score DESC NULLS LAST, tsh.updated_at DESC
+       LIMIT $1`,
+      [limit]
+    );
+    return res.status(200).json({
+      success: true,
+      data: { count: r.rowCount, rows: r.rows },
+    });
+  }),
 };
 
 module.exports = adminController;

@@ -39,3 +39,19 @@ export const grantUserSubscription = (id, payload) =>
 
 export const expireUserSubscription = (id, payload) =>
   api.post(`/admin/billing/users/${id}/expire`, payload);
+
+// ---------------------------------------------------------------------
+// Anti-revoke (Telegram) — Phase 3 admin endpoints
+// ---------------------------------------------------------------------
+// /api/admin/tg-detection-events — recent revocation/flood/migrate events
+// /api/admin/tg-risk             — top-N highest-scoring sessions
+// /api/admin/tg-session-health   — single-session health detail
+//
+export const listTgDetectionEvents = (params) =>
+  api.get('/admin/tg-detection-events', { params });
+
+export const getTgRiskOverview = (params) =>
+  api.get('/admin/tg-risk', { params });
+
+export const getTgSessionHealth = (sessionId) =>
+  api.get(`/admin/tg-session-health/${sessionId}`);
