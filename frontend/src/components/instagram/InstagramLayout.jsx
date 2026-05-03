@@ -59,21 +59,29 @@ import { usePlatform, useCapabilities } from '../../context/PlatformContext';
 // Each entry is shown only when the active platform exposes the
 // `capability` (or the entry is platform-agnostic, capability=null).
 // `dock` flags the entries surfaced in the mobile bottom dock.
+//
+// `wip:true` items are kept in the sidebar so the layout matches the
+// Telegram panel, but the IG provider is not yet hardened for them.
+// Clicking such an item routes to /instagram/<path>, which the App.jsx
+// router redirects to the IG-themed WorkInProgress page.
+//
+// Currently working IG features: dashboard, sessions, create-session,
+// upload-session, scrape, admin (admin is rendered separately above).
 const IG_NAV = [
-  { path: 'dashboard',         label: 'Dashboard',     icon: LayoutDashboard, capability: null,                section: 'main',   dock: true },
-  { path: 'sessions',          label: 'Accounts',      icon: Users,           capability: 'sessions_list',     section: 'main',   dock: true },
-  { path: 'create-session',    label: 'Add account',   icon: UserPlus,        capability: 'sessions_create',   section: 'main' },
-  { path: 'upload-session',    label: 'Upload session',icon: Upload,          capability: 'sessions_create',   section: 'main' },
-  { path: 'scrape',            label: 'Scraping',      icon: Search,          capability: 'scrape_any',        section: 'main',   dock: true },
-  { path: 'lists',             label: 'Saved lists',   icon: ListIcon,        capability: 'lists',             section: 'engage' },
-  { path: 'reports',           label: 'Reports',       icon: BarChart3,       capability: 'reports',           section: 'engage', dock: true },
-  { path: 'proxies',           label: 'Proxies',       icon: Network,         capability: 'proxies',           section: 'safety' },
-  { path: 'anti-detect',       label: 'Identity',      icon: Fingerprint,     capability: 'identity_device',   section: 'safety' },
-  { path: 'privacy',           label: 'Privacy',       icon: Shield,          capability: 'privacy_set',       section: 'safety' },
-  { path: 'change-2fa',        label: '2FA',           icon: ShieldCheck,     capability: 'twofa_change',      section: 'safety' },
-  { path: 'account-settings',  label: 'Account',       icon: UserCog,         capability: 'account_settings',  section: 'system' },
-  { path: 'billing',           label: 'Billing',       icon: CreditCard,      capability: null,                section: 'system' },
-  { path: 'settings',          label: 'Settings',      icon: SettingsIcon,    capability: null,                section: 'system', dock: true },
+  { path: 'dashboard',         label: 'Dashboard',     icon: LayoutDashboard, capability: null,                section: 'main',   dock: true,  wip: false },
+  { path: 'sessions',          label: 'Accounts',      icon: Users,           capability: 'sessions_list',     section: 'main',   dock: true,  wip: false },
+  { path: 'create-session',    label: 'Add account',   icon: UserPlus,        capability: 'sessions_create',   section: 'main',   dock: true,  wip: false },
+  { path: 'upload-session',    label: 'Upload session',icon: Upload,          capability: 'sessions_create',   section: 'main',                 wip: false },
+  { path: 'scrape',            label: 'Scraping',      icon: Search,          capability: 'scrape_any',        section: 'main',   dock: true,  wip: false },
+  { path: 'lists',             label: 'Saved lists',   icon: ListIcon,        capability: 'lists',             section: 'engage',               wip: true  },
+  { path: 'reports',           label: 'Reports',       icon: BarChart3,       capability: 'reports',           section: 'engage',               wip: true  },
+  { path: 'proxies',           label: 'Proxies',       icon: Network,         capability: 'proxies',           section: 'safety',               wip: true  },
+  { path: 'anti-detect',       label: 'Identity',      icon: Fingerprint,     capability: 'identity_device',   section: 'safety',               wip: true  },
+  { path: 'privacy',           label: 'Privacy',       icon: Shield,          capability: 'privacy_set',       section: 'safety',               wip: true  },
+  { path: 'change-2fa',        label: '2FA',           icon: ShieldCheck,     capability: 'twofa_change',      section: 'safety',               wip: true  },
+  { path: 'account-settings',  label: 'Account',       icon: UserCog,         capability: 'account_settings',  section: 'system',               wip: true  },
+  { path: 'billing',           label: 'Billing',       icon: CreditCard,      capability: null,                section: 'system',               wip: true  },
+  { path: 'settings',          label: 'Settings',      icon: SettingsIcon,    capability: null,                section: 'system',               wip: true  },
 ];
 
 const SECTION_LABELS = {
@@ -141,7 +149,7 @@ function PlatformSwitch({ size = 'md' }) {
 /* Sidebar item                                                               */
 /* -------------------------------------------------------------------------- */
 
-function NavItem({ to, label, icon: Icon, active, collapsed, gradient }) {
+function NavItem({ to, label, icon: Icon, active, collapsed, gradient, wip }) {
   return (
     <Link
       to={to}
@@ -149,21 +157,40 @@ function NavItem({ to, label, icon: Icon, active, collapsed, gradient }) {
         'group relative flex items-center gap-3 rounded-xl px-3 py-2.5 text-sm font-medium transition-all duration-200',
         active
           ? `text-white shadow-lg shadow-pink-900/40 ring-1 ring-white/20 ${gradient || 'bg-gradient-to-r from-[#f09433] via-[#dc2743] to-[#bc1888]'}`
-          : 'text-pink-100/80 hover:text-white hover:bg-white/5 ring-1 ring-transparent hover:ring-white/10',
+          : wip
+            ? 'text-pink-100/55 hover:text-pink-100/85 hover:bg-white/5 ring-1 ring-transparent hover:ring-white/10'
+            : 'text-pink-100/80 hover:text-white hover:bg-white/5 ring-1 ring-transparent hover:ring-white/10',
         collapsed ? 'md:justify-center md:px-2' : '',
       ].join(' ')}
+      title={wip ? `${label} — Work in progress` : label}
+      aria-label={wip ? `${label} — work in progress` : label}
     >
       <Icon
         className={[
           'h-5 w-5 shrink-0 transition-colors',
-          active ? 'text-white' : 'text-pink-200/80 group-hover:text-pink-100',
+          active
+            ? 'text-white'
+            : wip
+              ? 'text-pink-200/55 group-hover:text-pink-200/80'
+              : 'text-pink-200/80 group-hover:text-pink-100',
         ].join(' ')}
       />
       <span className={['truncate', collapsed ? 'md:hidden' : ''].join(' ')}>
         {label}
       </span>
-      {active && !collapsed && (
+      {wip && !collapsed && (
+        <span className="ml-auto inline-flex items-center gap-0.5 rounded-full border border-amber-400/30 bg-amber-400/10 px-1.5 py-[1px] text-[9px] font-bold uppercase tracking-[0.18em] text-amber-200/85">
+          WIP
+        </span>
+      )}
+      {active && !collapsed && !wip && (
         <span className="ml-auto inline-block h-1.5 w-1.5 rounded-full bg-white/90 ring-2 ring-white/30" />
+      )}
+      {wip && collapsed && (
+        <span
+          aria-hidden="true"
+          className="md:absolute md:top-1 md:right-1 inline-block h-1.5 w-1.5 rounded-full bg-amber-300 ring-2 ring-[#0b0410]"
+        />
       )}
     </Link>
   );
@@ -267,7 +294,7 @@ function IGSidebar({ items, grouped, isAdmin, location, platform, collapsed, set
                 </div>
               )}
               <div className="space-y-1">
-                {list.map(({ path, label, icon: Icon }) => {
+                {list.map(({ path, label, icon: Icon, wip }) => {
                   const fullPath = `/${platform}/${path}`;
                   const isActive = location.pathname === fullPath;
                   return (
@@ -278,6 +305,7 @@ function IGSidebar({ items, grouped, isAdmin, location, platform, collapsed, set
                       icon={Icon}
                       active={isActive}
                       collapsed={collapsed}
+                      wip={!!wip && platform === 'instagram'}
                     />
                   );
                 })}

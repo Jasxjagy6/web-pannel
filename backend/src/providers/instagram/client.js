@@ -174,6 +174,23 @@ async function getClient(session) {
           [session.id]
         );
       } catch (_e) { /* swallow */ }
+      // Phase 3.B15 — record cookie_missing detection event so the
+      // admin dashboard surfaces this distinct from network errors.
+      try {
+        // eslint-disable-next-line global-require
+        const detectionEvents = require('./detectionEvents');
+        detectionEvents.record({
+          sessionId: session.id,
+          userId: session.user_id || null,
+          eventKind: 'cookie_missing',
+          apiPath: 'client.getClient',
+          httpStatus: 401,
+          requestFingerprint: {
+            api_mode: pinned.apiMode,
+            app_version: appVersion && appVersion.app_version,
+          },
+        }).catch(() => {});
+      } catch (_recErr) { /* swallow */ }
       throw e;
     }
 
@@ -194,6 +211,34 @@ async function getClient(session) {
       );
       e.kind = 'login_required';
       e.statusCode = 401;
+      // Phase 3.B17 — restore failure should mark the session
+      // needs_attention rather than continuing with a partially
+      // initialised cookie jar.
+      try {
+        await pool.query(
+          `UPDATE sessions
+              SET warmup_state = COALESCE(warmup_state, '{}'::jsonb)
+                                 || jsonb_build_object(
+                                      'state', 'needs_attention',
+                                      'last_error', 'cookie restore failed: ' || $2::text,
+                                      'last_failed_at', NOW()::text),
+                  updated_at = NOW()
+            WHERE id = $1`,
+          [session.id, String(err.message || '').slice(0, 240)]
+        );
+      } catch (_e) { /* swallow */ }
+      try {
+        // eslint-disable-next-line global-require
+        const detectionEvents = require('./detectionEvents');
+        detectionEvents.record({
+          sessionId: session.id,
+          userId: session.user_id || null,
+          eventKind: 'decrypt_failed',
+          apiPath: 'client.deserializeCookieJar',
+          httpStatus: 401,
+          responseBody: String(err.message || '').slice(0, 240),
+        }).catch(() => {});
+      } catch (_recErr) { /* swallow */ }
       throw e;
     }
   }

@@ -409,6 +409,94 @@ const adminController = {
     );
     return res.status(200).json({ success: true, data: { actions: r.rows } });
   }),
+
+  // ---------------------------------------------------------------------
+  // Phase 3.B15 — Instagram detection-event audit log.
+  // GET /api/admin/ig-detection-events?since=24h
+  //   &session_id=...&user_id=...&kind=...&limit=...&offset=...
+  // ---------------------------------------------------------------------
+  listIgDetectionEvents: asyncHandler(async (req, res) => {
+    // eslint-disable-next-line global-require
+    const detectionEvents = require('../providers/instagram/detectionEvents');
+    const sinceParam = String(req.query.since || '24h');
+    let sinceHours = 24;
+    const m = /^(\d+)([hd]?)$/.exec(sinceParam.trim());
+    if (m) {
+      const n = Number(m[1]);
+      sinceHours = m[2] === 'd' ? n * 24 : n;
+    }
+    const sessionId = req.query.session_id ? Number(req.query.session_id) : null;
+    const userId    = req.query.user_id    ? Number(req.query.user_id)    : null;
+    const eventKind = req.query.kind || null;
+    const limit  = req.query.limit  ? Number(req.query.limit)  : 200;
+    const offset = req.query.offset ? Number(req.query.offset) : 0;
+
+    const events = await detectionEvents.listEvents({
+      sinceHours, sessionId, userId, eventKind, limit, offset,
+    });
+    const conds = [`occurred_at > NOW() - ($1 || ' hours')::interval`];
+    const params = [String(sinceHours)];
+    let p = 2;
+    if (sessionId) { conds.push(`session_id = $${p++}`); params.push(sessionId); }
+    if (userId)    { conds.push(`user_id    = $${p++}`); params.push(userId);    }
+    if (eventKind) { conds.push(`event_kind = $${p++}`); params.push(eventKind); }
+    const agg = await pool.query(
+      `SELECT event_kind, COUNT(*)::int AS n
+         FROM ig_detection_events
+        WHERE ${conds.join(' AND ')}
+        GROUP BY event_kind
+        ORDER BY n DESC`,
+      params
+    );
+    const counts = {};
+    for (const row of agg.rows) counts[row.event_kind] = row.n;
+    return res.status(200).json({
+      success: true,
+      data: {
+        events,
+        counts,
+        since_hours: sinceHours,
+      },
+    });
+  }),
+
+  // ---------------------------------------------------------------------
+  // Phase 3.B16 — Instagram per-session risk-score read endpoint.
+  // GET /api/admin/ig-risk?session_id=...    -> single session (live recompute)
+  // GET /api/admin/ig-risk                   -> top-N highest scoring
+  // ---------------------------------------------------------------------
+  getIgRisk: asyncHandler(async (req, res) => {
+    // eslint-disable-next-line global-require
+    const riskScore = require('../providers/instagram/riskScore');
+    const sessionId = req.query.session_id ? Number(req.query.session_id) : null;
+    if (sessionId) {
+      const snapshot = await riskScore.computeAndPersist(sessionId);
+      return res.status(200).json({ success: true, data: { sessionId, ...snapshot } });
+    }
+    const candidates = await pool.query(
+      `SELECT DISTINCT s.id, s.username
+         FROM sessions s
+         LEFT JOIN ig_detection_events e ON e.session_id = s.id
+        WHERE s.platform = 'instagram'
+          AND (
+              e.occurred_at > NOW() - INTERVAL '7 days'
+              OR s.warmup_state->>'state' IN ('needs_attention', 'dead')
+          )
+        LIMIT 200`
+    );
+    const rows = [];
+    for (const c of candidates.rows) {
+      try {
+        const snap = await riskScore.compute(c.id);
+        rows.push({
+          session_id: c.id, username: c.username,
+          score: snap.score, components: snap.components,
+        });
+      } catch (_e) { /* ignore individual failures */ }
+    }
+    rows.sort((a, b) => b.score - a.score);
+    return res.status(200).json({ success: true, data: { rows: rows.slice(0, 50) } });
+  }),
 };
 
 module.exports = adminController;

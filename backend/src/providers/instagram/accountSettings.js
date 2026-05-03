@@ -15,6 +15,7 @@
 const { pool } = require('../../config/database');
 const igClient = require('./client');
 const sessionLimiter = require('./sessionLimiter');
+const riskScore = require('./riskScore');
 const logger = require('../../utils/logger');
 
 // Phase 2.B12 — high-risk action gating.
@@ -168,6 +169,15 @@ async function update({ userId, sessionId, patch = {} }) {
   // need to bypass the cooldowns can pass `_admin_override:true` in
   // the patch (typically used for de-anonymising a corrupted account).
   const override = patch._admin_override === true;
+
+  // Phase 3.B16 — refuse profile edits on a session whose risk score
+  // is above the deny threshold. Profile edits are exactly the
+  // category of action IG monitors most aggressively for newly-warmed
+  // bot accounts; running them on a flagged session is a fast track
+  // to a hard ban.
+  if (!override) {
+    await riskScore.gateOnRisk({ id: session.id });
+  }
 
   const client = await igClient.getClient(session);
   const out = {};

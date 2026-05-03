@@ -263,35 +263,46 @@ export default function InstagramSessions() {
 
   return (
     <div className="space-y-6">
-      <div className={`flex items-center justify-between rounded-xl ${IG_GRADIENT} px-6 py-5 text-white shadow-lg`}>
-        <div className="flex items-center gap-3">
-          <Instagram className="h-7 w-7" />
-          <div>
-            <div className="text-lg font-semibold">Instagram accounts</div>
-            <div className="text-sm text-white/85">
+      <div
+        className={[
+          'flex flex-col gap-4 rounded-xl px-4 py-4 text-white shadow-lg sm:flex-row sm:items-center sm:justify-between sm:px-6 sm:py-5',
+          IG_GRADIENT,
+        ].join(' ')}
+      >
+        <div className="flex items-center gap-3 min-w-0">
+          <Instagram className="h-7 w-7 shrink-0" />
+          <div className="min-w-0">
+            <div className="text-base sm:text-lg font-semibold truncate">Instagram accounts</div>
+            <div className="text-xs sm:text-sm text-white/85 truncate">
               {loading ? 'Loading sessions…' : `${sessions.length} session${sessions.length === 1 ? '' : 's'}`}
             </div>
           </div>
         </div>
-        <div className="flex items-center gap-2">
+        <div className="flex flex-wrap items-center gap-2">
           <button
             onClick={reload}
             disabled={loading}
-            className="flex items-center gap-1 rounded-lg border border-white/30 bg-white/10 px-3 py-2 text-sm font-medium text-white transition hover:bg-white/20"
+            className="inline-flex items-center gap-1 rounded-lg border border-white/30 bg-white/10 px-3 py-2 text-xs sm:text-sm font-medium text-white transition hover:bg-white/20"
           >
-            <RefreshCw className={`h-4 w-4 ${loading ? 'animate-spin' : ''}`} /> Refresh
+            <RefreshCw className={`h-4 w-4 ${loading ? 'animate-spin' : ''}`} />
+            <span className="hidden xs:inline">Refresh</span>
+            <span className="xs:hidden">Refresh</span>
           </button>
           <Link
             to="/instagram/upload-session"
-            className="flex items-center gap-1 rounded-lg border border-white/30 bg-white/10 px-3 py-2 text-sm font-medium text-white transition hover:bg-white/20"
+            className="inline-flex items-center gap-1 rounded-lg border border-white/30 bg-white/10 px-3 py-2 text-xs sm:text-sm font-medium text-white transition hover:bg-white/20"
           >
-            <Upload className="h-4 w-4" /> Upload session
+            <Upload className="h-4 w-4" />
+            <span className="hidden sm:inline">Upload session</span>
+            <span className="sm:hidden">Upload</span>
           </Link>
           <Link
             to="/instagram/create-session"
-            className="flex items-center gap-1 rounded-lg bg-white px-3 py-2 text-sm font-semibold text-[#dc2743] shadow transition hover:bg-pink-50"
+            className="inline-flex items-center gap-1 rounded-lg bg-white px-3 py-2 text-xs sm:text-sm font-semibold text-[#dc2743] shadow transition hover:bg-pink-50"
           >
-            <Plus className="h-4 w-4" /> Create session
+            <Plus className="h-4 w-4" />
+            <span className="hidden sm:inline">Create session</span>
+            <span className="sm:hidden">Create</span>
           </Link>
         </div>
       </div>
@@ -310,7 +321,143 @@ export default function InstagramSessions() {
         </div>
       )}
 
-      <div className="rounded-xl border border-pink-100 bg-white shadow-sm dark:border-pink-900/30 dark:bg-dark-800">
+      {/*
+        Mobile (< md): card-based layout — every row gets its own
+        card so the action buttons stack instead of overflowing the
+        viewport. Desktop (md+): the existing 6-column table.
+      */}
+      <div className="md:hidden space-y-3">
+        {loading && (
+          <div className="rounded-xl border border-pink-100 bg-white px-4 py-6 text-center text-sm text-gray-400 dark:border-pink-900/30 dark:bg-dark-800">
+            Loading…
+          </div>
+        )}
+        {!loading && sessions.length === 0 && (
+          <div className="rounded-xl border border-pink-100 bg-white px-4 py-8 text-center dark:border-pink-900/30 dark:bg-dark-800">
+            <div className="text-base font-semibold text-gray-700 dark:text-gray-200">
+              No Instagram sessions yet
+            </div>
+            <div className="mt-2 text-sm text-gray-500 dark:text-gray-400">
+              Tap <strong>Create</strong> to log in your first Instagram account.
+            </div>
+            <div className="mt-4 flex flex-col gap-2">
+              <button
+                onClick={() => navigate('/instagram/create-session')}
+                className={`inline-flex items-center justify-center gap-1 rounded-lg ${IG_GRADIENT} px-4 py-2 text-sm font-semibold text-white shadow`}
+              >
+                <Plus className="h-4 w-4" /> Create session
+              </button>
+              <button
+                onClick={() => navigate('/instagram/upload-session')}
+                className="inline-flex items-center justify-center gap-1 rounded-lg border border-pink-200 bg-white px-4 py-2 text-sm font-semibold text-[#dc2743] shadow-sm hover:bg-pink-50 dark:border-pink-900/30 dark:bg-dark-700 dark:text-pink-300 dark:hover:bg-dark-600"
+              >
+                <Upload className="h-4 w-4" /> Upload session
+              </button>
+            </div>
+          </div>
+        )}
+        {sessions.map((s) => (
+          <div
+            key={`m-${s.id}`}
+            className="rounded-xl border border-pink-100 bg-white p-4 shadow-sm dark:border-pink-900/30 dark:bg-dark-800"
+          >
+            <div className="flex items-start gap-3">
+              <input
+                type="checkbox"
+                checked={selected.has(s.id)}
+                onChange={() => toggleSelect(s.id)}
+                className="mt-1.5 shrink-0"
+              />
+              <div className={`flex h-10 w-10 shrink-0 items-center justify-center rounded-full text-white ${IG_GRADIENT}`}>
+                <Instagram className="h-5 w-5" />
+              </div>
+              <div className="min-w-0 flex-1">
+                <div className="font-semibold text-gray-900 dark:text-white truncate">
+                  @{s.username || '—'}
+                </div>
+                <div className="text-[11px] text-gray-400">id #{s.id}</div>
+                <div className="mt-2 flex flex-wrap gap-1">
+                  <StatusPill
+                    status={s.status}
+                    isLoggedIn={s.is_logged_in}
+                    warmupState={s.warmup_state}
+                  />
+                  <ProxyPill proxyUrl={s.proxy_url} />
+                </div>
+                {s.warmup_state?.last_error && (
+                  <div
+                    className="mt-1 text-[11px] text-amber-700 dark:text-amber-400 break-words"
+                    title={s.warmup_state.last_error}
+                  >
+                    {s.warmup_state.last_error}
+                  </div>
+                )}
+              </div>
+            </div>
+            <dl className="mt-3 grid grid-cols-2 gap-x-3 gap-y-1 text-[11px] text-gray-500 dark:text-gray-400">
+              <dt className="font-medium uppercase tracking-wide text-gray-400">
+                Last login
+              </dt>
+              <dt className="font-medium uppercase tracking-wide text-gray-400">
+                Last warm-up
+              </dt>
+              <dd className="truncate">
+                {s.last_login ? new Date(s.last_login).toLocaleString() : '—'}
+              </dd>
+              <dd className="truncate">
+                {s.last_warmup_at ? new Date(s.last_warmup_at).toLocaleString() : '—'}
+              </dd>
+            </dl>
+            <div className="mt-3 flex flex-wrap items-center gap-2">
+              <button
+                onClick={() => doHealthCheck(s.id)}
+                disabled={busyId === s.id}
+                title="Run health probe"
+                className="inline-flex items-center gap-1 rounded-md border border-blue-200 px-2.5 py-1.5 text-xs text-blue-600 hover:bg-blue-50 disabled:opacity-50 dark:border-blue-900/30"
+              >
+                <Activity className="h-3.5 w-3.5" /> Health
+              </button>
+              <button
+                onClick={() => openProxyModal(s)}
+                disabled={busyId === s.id}
+                title="Bind / clear residential proxy"
+                className="inline-flex items-center gap-1 rounded-md border border-emerald-200 px-2.5 py-1.5 text-xs text-emerald-700 hover:bg-emerald-50 disabled:opacity-50 dark:border-emerald-900/30"
+              >
+                <Shield className="h-3.5 w-3.5" /> Proxy
+              </button>
+              {s.is_logged_in ? (
+                <button
+                  onClick={() => doLogout(s.id)}
+                  disabled={busyId === s.id}
+                  title="Logout"
+                  className="inline-flex items-center gap-1 rounded-md border border-gray-200 px-2.5 py-1.5 text-xs text-gray-600 hover:bg-gray-50 disabled:opacity-50 dark:border-dark-600 dark:text-gray-300"
+                >
+                  <LogOut className="h-3.5 w-3.5" /> Logout
+                </button>
+              ) : (
+                <button
+                  onClick={() => doLogin(s.id)}
+                  disabled={busyId === s.id}
+                  title="Re-attach"
+                  className="inline-flex items-center gap-1 rounded-md border border-pink-200 bg-pink-50 px-2.5 py-1.5 text-xs text-pink-600 hover:bg-pink-100 disabled:opacity-50 dark:border-pink-900/30 dark:bg-pink-900/10"
+                >
+                  <LogIn className="h-3.5 w-3.5" /> Login
+                </button>
+              )}
+              <button
+                onClick={() => doDelete(s.id)}
+                disabled={busyId === s.id}
+                title="Delete"
+                className="ml-auto inline-flex items-center gap-1 rounded-md border border-red-200 px-2.5 py-1.5 text-xs text-red-500 hover:bg-red-50 disabled:opacity-50"
+              >
+                <Trash2 className="h-3.5 w-3.5" /> Delete
+              </button>
+            </div>
+          </div>
+        ))}
+      </div>
+
+      <div className="hidden md:block overflow-x-auto rounded-xl border border-pink-100 bg-white shadow-sm dark:border-pink-900/30 dark:bg-dark-800">
         <table className="min-w-full text-sm">
           <thead>
             <tr className="border-b border-pink-100 text-left text-xs uppercase tracking-wide text-gray-500 dark:border-pink-900/30 dark:text-gray-400">

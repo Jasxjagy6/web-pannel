@@ -19,6 +19,7 @@ const sessionLimiter = require('./sessionLimiter');
 const coldStart = require('./coldStart');
 const activeHours = require('./activeHours');
 const behaviorPacing = require('./behaviorPacing');
+const riskScore = require('./riskScore');
 const systemSettings = require('../../services/systemSettingsService');
 
 const PLATFORM = 'instagram';
@@ -236,6 +237,36 @@ async function sendBulk({
     throw new Error('messageContent required for text messages');
   }
 
+  // Phase 3.B16 — refuse to enqueue DM jobs against any session whose
+  // risk score is above the deny threshold. Filter the requested
+  // sessions down to safe ones; if none remain, throw 403 with the
+  // blocked list so the operator gets a clear error.
+  const safeSessionIds = [];
+  const blockedSessions = [];
+  for (const sid of sessionIds) {
+    try {
+      await riskScore.gateOnRisk({ id: sid });
+      safeSessionIds.push(sid);
+    } catch (gateErr) {
+      if (gateErr && gateErr.code === 'RISK_TOO_HIGH') {
+        blockedSessions.push({ id: sid, error: gateErr.message });
+        logger.warn(`IG.messaging: refused session ${sid} — ${gateErr.message}`);
+        continue;
+      }
+      throw gateErr;
+    }
+  }
+  if (safeSessionIds.length === 0) {
+    const e = new Error(
+      `All requested Instagram sessions are above the risk-score deny threshold. ` +
+      `Resolve checkpoints / feedback errors and retry. Blocked: ${blockedSessions.map((b) => `#${b.id}`).join(', ')}`
+    );
+    e.statusCode = 403;
+    e.code = 'RISK_TOO_HIGH';
+    e.details = { blocked: blockedSessions };
+    throw e;
+  }
+
   const totalTargets = targetList.length;
 
   const insert = await pool.query(
@@ -248,13 +279,13 @@ async function sendBulk({
      RETURNING id, status, created_at`,
     [
       userId,
-      sessionIds[0],
+      safeSessionIds[0],
       JSON.stringify(targetList),
       messageContent,
       messageType,
       mediaPath,
       totalTargets,
-      JSON.stringify({ session_ids: sessionIds, ...options }),
+      JSON.stringify({ session_ids: safeSessionIds, _blocked_sessions: blockedSessions, ...options }),
     ]
   );
   const jobRow = insert.rows[0];
@@ -437,7 +468,10 @@ async function _executeMessagingJob(jobId) {
         // turn the soft warning into a hard block.
         const msg = (err && err.message) || '';
         const ctor = err && err.constructor && err.constructor.name;
-        if (ctor === 'IgActionSpamError' || /feedback_required|action_blocked|please wait a few minutes/i.test(msg)) {
+        const isFeedback =
+          ctor === 'IgActionSpamError' ||
+          /feedback_required|action_blocked|please wait a few minutes/i.test(msg);
+        if (isFeedback) {
           try {
             const patch = behaviorPacing.buildFeedbackCooldownPatch();
             const cur = await pool.query(`SELECT platform_state FROM sessions WHERE id = $1`, [session.id]);
@@ -451,6 +485,27 @@ async function _executeMessagingJob(jobId) {
           } catch (persistErr) {
             logger.warn(`IG.messaging: failed to persist feedback cooldown for session ${session.id}: ${persistErr.message}`);
           }
+          // Phase 3.B15 — record a detection event so the admin
+          // dashboard can show "IG soft-blocked sessionId on a real
+          // DM send" with the action class.
+          try {
+            // eslint-disable-next-line global-require
+            const detectionEvents = require('./detectionEvents');
+            detectionEvents.record({
+              sessionId: session.id,
+              userId: session.user_id || null,
+              eventKind: /action_blocked/i.test(msg) ? 'action_blocked' : 'feedback_required',
+              apiPath: 'messaging.directThread.broadcastText',
+              httpStatus: err && err.statusCode ? err.statusCode : 429,
+              responseBody: msg,
+              requestFingerprint: {
+                action_class: 'write',
+                api_mode:
+                  (session.platform_state && session.platform_state.api_mode) ||
+                  'mobile',
+              },
+            }).catch(() => {});
+          } catch (_recErr) { /* swallow */ }
         }
       }
     }
