@@ -470,16 +470,37 @@ const sessionController = {
     const userId = req.user.id;
 
     if (_isInstagram(req)) {
-      const { username, password, proxyUrl } = req.body || {};
+      const { username, password, proxyUrl, proxyId } = req.body || {};
       if (!username || !password) {
         throw new AppError('username and password are required', 400, 'MISSING_FIELDS');
       }
+      // BYO Proxy (Phase 2): if the user picked a saved proxy, look it
+      // up + materialise the proxy_url IG expects. We don't trust the
+      // raw `proxyUrl` body field for BYO clients — it would let a user
+      // hand-roll an admin-pool URL and bypass the entitlement gate.
+      let resolvedProxyUrl = proxyUrl;
+      if (proxyId) {
+        const proxyService = require('../services/proxyService');
+        const owned = await proxyService.getMyProxy(userId, Number(proxyId));
+        if (!owned) {
+          throw new AppError('Proxy not found', 404, 'PROXY_NOT_FOUND');
+        }
+        resolvedProxyUrl = (proxyService.buildProxyUrl
+          ? proxyService.buildProxyUrl(owned)
+          : null) || resolvedProxyUrl;
+      }
       const provider = req.provider;
-      const result = await provider.create.start({ userId, username, password, proxyUrl });
+      const result = await provider.create.start({
+        userId,
+        username,
+        password,
+        proxyUrl: resolvedProxyUrl,
+        proxyId: proxyId ? Number(proxyId) : undefined,
+      });
       return res.status(200).json({ success: true, data: result });
     }
 
-    const { phone, apiId, apiHash, country, platform } = req.body || {};
+    const { phone, apiId, apiHash, country, platform, proxyId } = req.body || {};
     const result = await sessionCreationService.start({
       userId,
       phone,
@@ -487,6 +508,8 @@ const sessionController = {
       apiHash,
       country,
       platform,
+      proxyId: proxyId ? Number(proxyId) : undefined,
+      userRole: req.user && req.user.role,
     });
     return res.status(200).json({ success: true, data: result });
   }),

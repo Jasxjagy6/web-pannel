@@ -1164,14 +1164,29 @@ class SessionService {
               s.created_at, s.last_active,
               s.device_identity, s.dc_id, s.dc_ip, s.dc_port,
               s.last_online_status_at, s.last_ping_at, s.auth_key_first_seen_at,
+              s.bound_proxy_id,
               tsh.risk_score, tsh.consecutive_failed_pings,
               tsh.consecutive_flood_waits, tsh.last_flood_at,
               tsh.last_authorizations_check_at, tsh.last_reauth_required_at,
               tsh.dc_migrate_count_24h, tsh.ip_country_jumps_24h,
               tsh.bootstrapped_at, tsh.active_authorizations,
-              tsh.risk_score_updated_at
+              tsh.risk_score_updated_at,
+              -- BYO Proxy (Phase 3 §5.4): mirror the bound proxy's
+              -- per-session metadata so the table can render the
+              -- country-flag + label + egress + health-dot column
+              -- without an N+1 lookup.
+              p.host           AS proxy_host,
+              p.port           AS proxy_port,
+              p.protocol       AS proxy_protocol,
+              p.country_code   AS proxy_country_code,
+              p.label          AS proxy_label,
+              p.is_working     AS proxy_is_working,
+              p.last_health_check AS proxy_last_health_check,
+              p.last_health_ok    AS proxy_last_health_ok,
+              p.metadata          AS proxy_metadata
        FROM sessions s
        LEFT JOIN tg_session_health tsh ON tsh.session_id = s.id
+       LEFT JOIN proxies p              ON p.id          = s.bound_proxy_id
        WHERE ${whereClause}
        ORDER BY s.${sortField} ${sortOrder}
        LIMIT $${paramIndex} OFFSET $${paramIndex + 1}`,
@@ -1217,6 +1232,20 @@ class SessionService {
           bootstrapped_at: row.bootstrapped_at,
           active_authorizations: row.active_authorizations,
         },
+        // BYO Proxy (Phase 3 §5.4): per-session pinned proxy summary.
+        bound_proxy_id: row.bound_proxy_id || null,
+        proxy: row.bound_proxy_id ? {
+          id: row.bound_proxy_id,
+          host: row.proxy_host,
+          port: row.proxy_port,
+          protocol: row.proxy_protocol,
+          country_code: row.proxy_country_code,
+          label: row.proxy_label,
+          is_working: row.proxy_is_working,
+          last_health_check: row.proxy_last_health_check,
+          last_health_ok: row.proxy_last_health_ok,
+          egress_ip: row.proxy_metadata?.egress_ip || null,
+        } : null,
       };
     });
 

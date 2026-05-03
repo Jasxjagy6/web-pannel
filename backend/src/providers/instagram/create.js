@@ -79,10 +79,13 @@ async function _resolveChallenge(challengeId) {
  *   - IgLoginTwoFactorRequiredError → requires: '2fa'
  *   - IgCheckpointError → requires: 'challenge'
  */
-async function start({ userId, username, password, proxyUrl = null }) {
+async function start({ userId, username, password, proxyUrl = null, proxyId = null }) {
   if (!userId) throw new Error('userId required');
   if (!username) throw new Error('username required');
   if (!password) throw new Error('password required');
+  // BYO Proxy (Phase 2): we accept the BYO proxyId so happy-path login
+  // can pin the session to it after registration. The caller already
+  // resolved proxyUrl via proxyService.buildProxyUrl().
 
   // Build a fresh client; we don't reuse pool clients here because the
   // session row doesn't exist yet.
@@ -109,6 +112,7 @@ async function start({ userId, username, password, proxyUrl = null }) {
     userId,
     username: username.toLowerCase(),
     proxyUrl,
+    proxyId,
     client,
     twoFactorIdentifier: null,
     challengeId: null,
@@ -138,6 +142,15 @@ async function start({ userId, username, password, proxyUrl = null }) {
       proxyUrl,
       platformState: { source: 'login', api_mode: 'mobile', fingerprint: { deviceId: blob.deviceId, build: blob.build }, activeHours: require('./activeHours')._defaultsFor(null) },
     });
+    if (proxyId) {
+      try {
+        const proxyService = require('../../services/proxyService');
+        await proxyService.assignUserProxyToSession(userId, row.id, proxyId);
+        await proxyService.validateMyProxyForPlatform(userId, proxyId, 'instagram');
+      } catch (bindErr) {
+        logger.warn(`IG.create.start: failed to bind BYO proxy=${proxyId} session=${row.id}: ${bindErr.message}`);
+      }
+    }
     _pending.delete(token);
     logger.info(`IG.create.start happy-path user=${userId} username=${username} sessionId=${row.id}`);
     return {
@@ -280,6 +293,15 @@ async function password({ sessionToken, code }) {
       proxyUrl: ent.proxyUrl,
       platformState: { source: 'login', api_mode: 'mobile', fingerprint: { deviceId: blob.deviceId, build: blob.build }, activeHours: require('./activeHours')._defaultsFor(null) },
     });
+    if (ent.proxyId) {
+      try {
+        const proxyService = require('../../services/proxyService');
+        await proxyService.assignUserProxyToSession(ent.userId, row.id, ent.proxyId);
+        await proxyService.validateMyProxyForPlatform(ent.userId, ent.proxyId, 'instagram');
+      } catch (bindErr) {
+        logger.warn(`IG.create.password: failed to bind BYO proxy=${ent.proxyId} session=${row.id}: ${bindErr.message}`);
+      }
+    }
     _pending.delete(sessionToken);
     logger.info(`IG.create.password ok user=${ent.userId} username=${ent.username} sessionId=${row.id}`);
     return { sessionId: row.id, username: me.username };
@@ -340,6 +362,15 @@ async function verify({ sessionToken, code }) {
         proxyUrl: ent.proxyUrl,
         platformState: { source: 'login', api_mode: 'mobile', fingerprint: { deviceId: blob.deviceId, build: blob.build }, activeHours: require('./activeHours')._defaultsFor(null) },
       });
+      if (ent.proxyId) {
+        try {
+          const proxyService = require('../../services/proxyService');
+          await proxyService.assignUserProxyToSession(ent.userId, row.id, ent.proxyId);
+          await proxyService.validateMyProxyForPlatform(ent.userId, ent.proxyId, 'instagram');
+        } catch (bindErr) {
+          logger.warn(`IG.create.verify: failed to bind BYO proxy=${ent.proxyId} session=${row.id}: ${bindErr.message}`);
+        }
+      }
       _pending.delete(sessionToken);
       logger.info(`IG.create.verify ok user=${ent.userId} username=${ent.username} sessionId=${row.id}`);
       return { sessionId: row.id, username: reply.logged_in_user.username };
