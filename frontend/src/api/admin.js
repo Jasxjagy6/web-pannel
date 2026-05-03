@@ -55,3 +55,18 @@ export const getTgRiskOverview = (params) =>
 
 export const getTgSessionHealth = (sessionId) =>
   api.get(`/admin/tg-session-health/${sessionId}`);
+
+// ---------------------------------------------------------------------
+// BYO Proxy — admin (Phase 2/3). The legacy shared pool plus the
+// cross-user usage matrix.
+// ---------------------------------------------------------------------
+export const adminListProxies = (params) =>
+  api.get('/admin/proxies', { params });
+export const adminAddProxy = (payload) =>
+  api.post('/admin/proxies', payload);
+export const adminDeleteProxy = (id) =>
+  api.delete(`/admin/proxies/${id}`);
+export const adminRefreshProxies = () =>
+  api.post('/admin/proxies/refresh');
+export const adminProxyUsage = () =>
+  api.get('/admin/proxies/usage');

@@ -523,6 +523,53 @@ function DeviceDcCell({ session }) {
 }
 
 /**
+ * BYO Proxy (Phase 3 §5.4): per-session pinned proxy summary cell.
+ *
+ * - Country flag + label/host
+ * - Egress IP (from proxies.metadata.egress_ip)
+ * - Health dot:
+ *     green   → last_health_ok = true and last_health_check < 1h ago
+ *     yellow  → stale (last_health_check older than 1h)
+ *     red     → not bound or last_health_ok = false
+ */
+function ProxyCell({ session }) {
+  const proxy = session.proxy;
+  if (!proxy || !proxy.host) {
+    return (
+      <span className="inline-flex items-center gap-1 text-[11px] text-red-400">
+        <span className="inline-block w-1.5 h-1.5 rounded-full bg-red-500" />
+        no proxy
+      </span>
+    );
+  }
+  const cc = proxy.country_code || '';
+  const flag = cc && /^[a-zA-Z]{2}$/.test(cc)
+    ? String.fromCodePoint(...[...cc.toLowerCase()].map((c) => 0x1f1e6 + c.charCodeAt(0) - 97))
+    : '🌐';
+  const last = proxy.last_health_check ? new Date(proxy.last_health_check).getTime() : 0;
+  const ageMs = last ? Date.now() - last : Infinity;
+  let dot = 'bg-red-500';
+  if (proxy.is_working && proxy.last_health_ok && ageMs < 60 * 60 * 1000) dot = 'bg-green-500';
+  else if (proxy.is_working && proxy.last_health_ok) dot = 'bg-yellow-400';
+  return (
+    <div className="flex flex-col gap-0.5 min-w-0">
+      <div className="flex items-center gap-1.5">
+        <span className="inline-block w-1.5 h-1.5 rounded-full" style={{}}>
+          <span className={`inline-block w-1.5 h-1.5 rounded-full ${dot}`} />
+        </span>
+        <span className="text-base leading-none">{flag}</span>
+        <span className="text-xs text-gray-200 truncate max-w-[120px]" title={`${proxy.host}:${proxy.port}`}>
+          {proxy.label || `${proxy.host}:${proxy.port}`}
+        </span>
+      </div>
+      <span className="text-[10px] text-gray-500 font-mono truncate max-w-[140px]">
+        {proxy.protocol?.toUpperCase()}{proxy.egress_ip ? ` · ${proxy.egress_ip}` : ''}
+      </span>
+    </div>
+  );
+}
+
+/**
  * Compact risk pill driven by tg_session_health.risk_score.
  * Tooltip explains the color thresholds (matches the §B16 weights).
  */
@@ -966,6 +1013,9 @@ export default function Sessions() {
                 <th className="px-4 py-3 text-left text-xs font-semibold text-gray-400 uppercase tracking-wider hidden lg:table-cell">
                   Device · DC
                 </th>
+                <th className="px-4 py-3 text-left text-xs font-semibold text-gray-400 uppercase tracking-wider hidden xl:table-cell">
+                  Proxy
+                </th>
                 <th className="px-4 py-3 text-left text-xs font-semibold text-gray-400 uppercase tracking-wider">
                   Risk
                 </th>
@@ -983,7 +1033,7 @@ export default function Sessions() {
             <tbody className="divide-y divide-white/5">
               {loading ? (
                 <tr>
-                  <td colSpan={8} className="px-4 py-16">
+                  <td colSpan={9} className="px-4 py-16">
                     <div className="flex flex-col items-center justify-center">
                       <Loader2 className="w-8 h-8 text-primary-500 animate-spin mb-3" />
                       <p className="text-gray-400 text-sm">Loading sessions...</p>
@@ -992,7 +1042,7 @@ export default function Sessions() {
                 </tr>
               ) : paginatedSessions.length === 0 ? (
                 <tr>
-                  <td colSpan={8} className="px-4 py-16">
+                  <td colSpan={9} className="px-4 py-16">
                     <div className="flex flex-col items-center justify-center">
                       <div className="w-12 h-12 rounded-full bg-dark-900 flex items-center justify-center mb-3">
                         <PhoneIcon className="w-5 h-5 text-gray-600" />
@@ -1041,6 +1091,9 @@ export default function Sessions() {
                       </td>
                       <td className="px-4 py-3 hidden lg:table-cell">
                         <DeviceDcCell session={session} />
+                      </td>
+                      <td className="px-4 py-3 hidden xl:table-cell">
+                        <ProxyCell session={session} />
                       </td>
                       <td className="px-4 py-3">
                         <RiskPill session={session} />

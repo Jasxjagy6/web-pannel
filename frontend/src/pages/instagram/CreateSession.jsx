@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
 import {
   Instagram,
@@ -17,6 +17,7 @@ import {
   createSessionResend,
   createSessionCancel,
 } from '@/api/sessions';
+import { listMyProxies } from '@/api/userProxies';
 import { useToast } from '../../components/common/Toast';
 import { apiError } from '../../utils/apiError';
 
@@ -89,7 +90,31 @@ export default function InstagramCreateSession() {
 
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
-  const [proxyUrl, setProxyUrl] = useState('');
+  const [proxyId, setProxyId] = useState('');
+  const [proxies, setProxies] = useState([]);
+  const [proxyState, setProxyState] = useState('loading');
+
+  useEffect(() => {
+    let active = true;
+    (async () => {
+      try {
+        const r = await listMyProxies();
+        if (!active) return;
+        const rows = r.data?.data?.proxies || [];
+        setProxies(rows);
+        const auto = rows.find((p) => p.is_working && p.validated_for_instagram)
+          || rows.find((p) => p.is_working)
+          || rows[0];
+        if (auto) setProxyId(String(auto.id));
+        setProxyState('ready');
+      } catch (e) {
+        if (!active) return;
+        const code = e?.response?.data?.error?.code || e?.response?.data?.code;
+        setProxyState(code === 'TRIAL_FEATURE_NOT_ALLOWED' ? 'trial_blocked' : 'error');
+      }
+    })();
+    return () => { active = false; };
+  }, []);
 
   const [sessionToken, setSessionToken] = useState(null);
   const [twofaIdentifier, setTwofaIdentifier] = useState(null);
@@ -116,7 +141,7 @@ export default function InstagramCreateSession() {
       const r = await createSessionStart({
         username: username.trim(),
         password,
-        proxyUrl: proxyUrl.trim() || undefined,
+        proxyId: proxyId ? Number(proxyId) : undefined,
       });
       const data = r.data?.data || r.data;
       setSessionToken(data.sessionToken);
@@ -263,17 +288,39 @@ export default function InstagramCreateSession() {
             </Field>
 
             <Field
-              label="Proxy URL (optional)"
-              hint="Use a residential / mobile proxy when logging in from a new country to avoid IG flagging the login. Format: socks5://user:pass@host:port"
+              label="Egress proxy *"
+              hint="Required: every Instagram account is pinned to a proxy you own. Add proxies in the Proxies page."
             >
-              <input
-                type="text"
-                value={proxyUrl}
-                onChange={(e) => setProxyUrl(e.target.value)}
-                disabled={loading}
-                className="block w-full rounded-lg border border-gray-200 bg-white p-2.5 text-sm focus:border-pink-500 focus:outline-none focus:ring-2 focus:ring-pink-200 dark:border-dark-600 dark:bg-dark-700 dark:text-white"
-                placeholder="(optional) http(s) or socks5"
-              />
+              {proxyState === 'trial_blocked' ? (
+                <div className="rounded-lg border border-yellow-300 bg-yellow-50 p-3 text-xs text-yellow-700">
+                  Bring-your-own proxy is a paid feature. <a href="/billing" className="underline">Upgrade</a> to add a proxy.
+                </div>
+              ) : proxyState === 'loading' ? (
+                <div className="text-xs text-gray-500">Loading your proxies…</div>
+              ) : proxies.length === 0 ? (
+                <div className="rounded-lg border border-yellow-300 bg-yellow-50 p-3 text-xs text-yellow-700">
+                  You haven&apos;t added any proxies. <a href="/instagram/proxies" target="_blank" rel="noopener noreferrer" className="underline">Add one</a> first.
+                </div>
+              ) : (
+                <select
+                  value={proxyId}
+                  onChange={(e) => setProxyId(e.target.value)}
+                  disabled={loading}
+                  className="block w-full rounded-lg border border-gray-200 bg-white p-2.5 text-sm focus:border-pink-500 focus:outline-none focus:ring-2 focus:ring-pink-200 dark:border-dark-600 dark:bg-dark-700 dark:text-white"
+                >
+                  <option value="">— Pick a proxy —</option>
+                  {proxies.map((p) => {
+                    const cc = p.country_code ? ` ${p.country_code.toUpperCase()}` : '';
+                    const ig = p.validated_for_instagram ? ' · IG✓' : '';
+                    const dead = p.is_working ? '' : ' · ⚠ not working';
+                    return (
+                      <option key={p.id} value={p.id}>
+                        {(p.label || `${p.host}:${p.port}`)}{cc} · {p.protocol.toUpperCase()}{ig}{dead}
+                      </option>
+                    );
+                  })}
+                </select>
+              )}
             </Field>
 
             <div className="flex items-center justify-end gap-2">

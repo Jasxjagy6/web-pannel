@@ -19,6 +19,7 @@ import Register from './pages/Register';
 import Pending from './pages/Pending';
 
 const Admin = lazy(() => import('./pages/Admin'));
+const AdminProxies = lazy(() => import('./pages/admin/AdminProxies'));
 const Dashboard = lazy(() => import('./pages/Dashboard'));
 const Sessions = lazy(() => import('./pages/Sessions'));
 const Scrape = lazy(() => import('./pages/Scrape'));
@@ -283,6 +284,7 @@ export default function App() {
               <Route path="/register" element={<Register />} />
               <Route path="/pending" element={<PendingGate />} />
               <Route path="/admin" element={<ProtectedRoute title="Admin Panel" requireAdmin><Admin /></ProtectedRoute>} />
+              <Route path="/admin/proxies" element={<ProtectedRoute title="Admin Proxies" requireAdmin><AdminProxies /></ProtectedRoute>} />
 
               {/* Per-platform feature routes — :platform must be one of the
                   enabled set (validated by PlatformGate). */}
