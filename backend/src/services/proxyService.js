@@ -223,13 +223,91 @@ class ProxyService {
       `SELECT id, host, port, protocol, username, source, is_working, priority,
               active_assignments, total_assignments, last_checked_at,
               last_failed_at, last_latency_ms, consecutive_failures, metadata,
-              created_at
+              created_at,
+              user_id, label, country_code, notes,
+              last_health_check, last_health_ok, health_message
        FROM proxies
        ${where}
        ORDER BY priority DESC, last_latency_ms NULLS LAST, id ASC`,
       params
     );
     return result.rows.map((r) => ({ ...r, hasPassword: !!r.password_enc }));
+  }
+
+  // ===========================================================================
+  // BYO Proxy — Phase 1 (read-only stubs)
+  // ===========================================================================
+  // These two methods land in Phase 1 of the BYO_PROXY_PROPOSAL rollout. They
+  // expose user-scoped (`listMyProxies`) and admin-scoped (`listAdminProxies`)
+  // views over the same `proxies` table — backed by the new `user_id` column
+  // added in migration_v14_user_proxies.sql.
+  //
+  // Mutations stay on the existing global functions for now; full per-user
+  // CRUD + REQUIRE_USER_PROXY enforcement + entitlement gating land in Phase 2.
+  // See BYO_PROXY_PROPOSAL.md §4 (Phase 1) for the full design.
+
+  /**
+   * List proxies that belong to a specific user. NULL `user_id` rows
+   * (the shared admin pool) are deliberately excluded from this view —
+   * the user-facing UI must NEVER leak admin-pool entries into a
+   * regular user's account.
+   *
+   * @param {number} userId
+   * @returns {Promise<object[]>}
+   */
+  async listMyProxies(userId) {
+    if (!userId) {
+      throw new AppError('userId required', 400, 'PROXY_USER_ID_REQUIRED');
+    }
+    const r = await pool.query(
+      `SELECT id, host, port, protocol, username, source,
+              label, country_code, notes,
+              is_working, priority,
+              active_assignments, total_assignments,
+              last_checked_at, last_failed_at, last_latency_ms,
+              consecutive_failures,
+              last_health_check, last_health_ok, health_message,
+              validated_for_telegram, validated_for_instagram,
+              metadata, created_at
+         FROM proxies
+        WHERE user_id = $1
+        ORDER BY priority DESC, last_latency_ms NULLS LAST, id ASC`,
+      [userId]
+    );
+    return r.rows.map((p) => ({ ...p, hasPassword: !!p.password_enc }));
+  }
+
+  /**
+   * List the shared admin pool — rows with `user_id IS NULL`. Used by
+   * the admin-only `/admin/proxies` endpoint (Phase 2/3).
+   *
+   * @param {{source?:string, working?:boolean}} [filter]
+   */
+  async listAdminProxies(filter = {}) {
+    const conditions = ['user_id IS NULL'];
+    const params = [];
+    if (filter.source) {
+      params.push(filter.source);
+      conditions.push(`source = $${params.length}`);
+    }
+    if (typeof filter.working === 'boolean') {
+      params.push(filter.working);
+      conditions.push(`is_working = $${params.length}`);
+    }
+    const where = `WHERE ${conditions.join(' AND ')}`;
+    const result = await pool.query(
+      `SELECT id, host, port, protocol, username, source, is_working, priority,
+              active_assignments, total_assignments, last_checked_at,
+              last_failed_at, last_latency_ms, consecutive_failures, metadata,
+              created_at,
+              user_id, label, country_code, notes,
+              last_health_check, last_health_ok, health_message
+         FROM proxies
+        ${where}
+        ORDER BY priority DESC, last_latency_ms NULLS LAST, id ASC`,
+      params
+    );
+    return result.rows.map((p) => ({ ...p, hasPassword: !!p.password_enc }));
   }
 
   /**

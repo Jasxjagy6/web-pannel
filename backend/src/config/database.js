@@ -56,6 +56,7 @@ const initDB = async () => {
       'migration_v11_instagram_session_columns.sql',
       'migration_v12_ig_anti_ban.sql',
       'migration_v13_tg_anti_revoke.sql',
+      'migration_v14_user_proxies.sql',
     ];
     for (const m of migrations) {
       const mPath = path.join(__dirname, m);
