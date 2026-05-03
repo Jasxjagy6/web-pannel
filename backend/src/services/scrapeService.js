@@ -275,6 +275,41 @@ class ScrapeService {
         const sessionId = this._selectBestSession(sessionIds);
 
         try {
+          // Anti-revoke Phase 3 (B17): refuse to use a session whose
+          // anti-revoke risk score exceeds the configured threshold.
+          // The session stays alive — we just don't add fuel to the
+          // fire by hammering it with another scrape job.
+          try {
+            const cfg = require('../config/telegram');
+            if (cfg.ANTI_REVOKE_PHASE_3_ENABLED) {
+              const tgRisk = require('../providers/telegram/riskScore');
+              await tgRisk.gateOnRisk(sessionId);
+            }
+          } catch (gateErr) {
+            if (gateErr && gateErr.code === 'RISK_TOO_HIGH') {
+              logger.warn(
+                `Scrape job ${jobId} skipping target ${targetId}: ` +
+                `session ${sessionId} risk_score=${(gateErr.riskScore || 0).toFixed(3)}`
+              );
+              results.errors++;
+              results.targetsCompleted++;
+              results.targetResults.push({
+                target: targetId,
+                status: 'skipped_risk_too_high',
+                error: gateErr.message,
+                riskScore: gateErr.riskScore,
+                usersFound: 0,
+              });
+              await this._updateProgress(jobId, {
+                errors: results.errors,
+                lastError: gateErr.message,
+              });
+              continue;
+            }
+            // Non-RISK_TOO_HIGH errors fall through to normal handling.
+            throw gateErr;
+          }
+
           // Scrape the target
           const scrapeResult = await this._scrapeTarget(
             sessionId,

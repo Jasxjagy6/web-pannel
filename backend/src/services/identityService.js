@@ -68,11 +68,59 @@ class IdentityService {
 
   /**
    * Replace whatever identity is stored for the session with a fresh one.
-   * Use sparingly — Telegram notices when the same auth_key reports a
-   * brand new device, and a re-roll should normally only happen when the
-   * session is also re-bound to a different proxy.
+   *
+   * **Anti-revoke (Phase 1):** Telegram notices when the same auth_key
+   * reports a brand new device. A re-roll on a *live* auth_key is a
+   * near-guaranteed revocation trigger ("account-takeover detector"). So
+   * by default this method **refuses** to rotate the identity unless
+   * the session row's status is one of the dead states
+   * (`revoked`/`expired`/`error`). Callers who need to override (admin
+   * action on a live session, e.g. fresh proxy rebinding before manual
+   * re-login) must pass `{ allowLive: true }` explicitly.
+   *
+   * @param {number|string} sessionId
+   * @param {object} [opts]
+   * @param {boolean} [opts.allowLive] Skip the live-auth_key guard. Use
+   *   only from admin tooling that knows the session will be re-logged-in
+   *   on the same identity afterwards.
    */
   async rotate(sessionId, opts = {}) {
+    const allowLive =
+      opts && Object.prototype.hasOwnProperty.call(opts, 'allowLive')
+        ? !!opts.allowLive
+        : false;
+    if (!allowLive) {
+      try {
+        const r = await pool.query(
+          `SELECT status, is_logged_in FROM sessions WHERE id = $1`,
+          [sessionId]
+        );
+        const row = r.rows[0];
+        if (row) {
+          const dead = ['revoked', 'expired', 'error', 'inactive'];
+          const status = String(row.status || '').toLowerCase();
+          const stillAlive = !dead.includes(status) || row.is_logged_in === true;
+          if (stillAlive) {
+            const err = new Error(
+              `Refusing to rotate device identity for session ${sessionId} ` +
+                `while its auth key is still live (status=${status}, ` +
+                `is_logged_in=${row.is_logged_in}). Re-roll only after ` +
+                `Telegram has revoked the session, or pass {allowLive:true} ` +
+                `from an admin context.`
+            );
+            err.code = 'IDENTITY_ROTATE_LIVE_FORBIDDEN';
+            throw err;
+          }
+        }
+      } catch (err) {
+        if (err && err.code === 'IDENTITY_ROTATE_LIVE_FORBIDDEN') throw err;
+        // Fall through if the SELECT itself failed; we'd rather rotate
+        // than block on a flaky DB read.
+        logger.warn(
+          `identityService.rotate guard read failed for ${sessionId}: ${err.message}`
+        );
+      }
+    }
     return await this._generateAndStore(sessionId, opts, true);
   }
 
