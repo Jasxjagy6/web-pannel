@@ -133,6 +133,61 @@ function blankProfile(telegramId) {
 }
 
 /**
+ * True when a profile only carries telegramId — username/first_name/
+ * last_name/phone are all unknown. Used to decide whether to fire a
+ * background enrichment lookup so the row gets filled in before the
+ * CSV export.
+ */
+function isProfileBlank(profile) {
+  if (!profile) return true;
+  return (
+    !profile.username &&
+    !profile.firstName &&
+    !profile.lastName &&
+    !profile.phone
+  );
+}
+
+/**
+ * Try to harvest enriched user objects piggybacked on a raw GramJS
+ * update / event. GramJS attaches `_entities` / `users` / `chats` on
+ * the Updates envelope and on the dispatched event in a few places —
+ * not always, but often enough to spare us a getEntity round-trip.
+ *
+ * Returns a plain object map { telegramId: User } so callers can
+ * lookup by id.
+ */
+function harvestPiggybackedUsers(eventOrUpdate) {
+  const out = {};
+  if (!eventOrUpdate) return out;
+  const buckets = [
+    eventOrUpdate.users,            // Updates envelope
+    eventOrUpdate._entities,        // GramJS dispatcher
+    eventOrUpdate.message?._entities,
+    eventOrUpdate.update?.users,    // raw .update wrapper
+  ];
+  for (const b of buckets) {
+    if (!b) continue;
+    if (b instanceof Map) {
+      for (const [, u] of b) {
+        if (u && u.className === 'User' && u.id !== undefined) {
+          const id = bigToString(u.id);
+          if (id) out[id] = u;
+        }
+      }
+    } else if (Array.isArray(b)) {
+      for (const u of b) {
+        if (u && u.className === 'User' && u.id !== undefined) {
+          const id = bigToString(u.id);
+          if (id) out[id] = u;
+        }
+      }
+    }
+  }
+  return out;
+}
+
+/**
  * Best-effort: extract the sender user ID and basic profile from a GramJS
  * NewMessage event. Returns `null` when the message has no user sender
  * (channel posts on behalf of the channel, etc).
@@ -780,11 +835,235 @@ class ScrapeMonitorService {
       }
     }, TICK_INTERVAL_MS);
 
+    // Profile-enrichment context — see _enrichProfile().
+    //   profileCache:   telegramId → enriched profile (positive cache)
+    //   inflight:       Set<telegramId> currently being looked up
+    //   queue:          Array<{ telegramId, sessionId }> waiting for a slot
+    //   activeLookups:  current concurrent getEntity() calls
+    //   sessionIds:     the sessions attached to this job, in attach order
+    //                   (used as a round-robin fallback when the event-
+    //                   originating session can't resolve the entity).
+    const enrichCtx = {
+      profileCache: new Map(),
+      inflight: new Set(),
+      queue: [],
+      activeLookups: 0,
+      sessionIds: sessionIds.map(String),
+      participantCache: new Map(), // telegramId → User (prefetched)
+    };
     this._active.set(jobId, {
       unsubs, timer, ticker, userId, lastEmitAt: 0,
       dedupEnabled,
       allowedChatIds,
+      enrich: enrichCtx,
     });
+
+    // Best-effort: prime the participant cache. For chats where the
+    // session is an admin (or the chat is small enough that the
+    // server returns the participant list), this gives us a hot
+    // username/first_name/last_name/phone map keyed by telegram_id.
+    // For admin-only / very large supergroups this is a no-op and we
+    // fall back to per-event `client.getEntity()` lookups.
+    this._primeParticipantCache(jobId, sessionIds, rawTarget).catch((err) =>
+      logger.debug(`Monitor job ${jobId} participant prefetch error: ${err.message}`)
+    );
+  }
+
+  /**
+   * Best-effort prefetch of the target chat's participants — populates
+   * `ctx.enrich.participantCache` so blank profiles surfaced from
+   * typing / reactions / membership updates can be enriched without a
+   * round-trip. Failures are silent.
+   */
+  async _primeParticipantCache(jobId, sessionIds, rawTarget) {
+    const ctx = this._active.get(jobId);
+    if (!ctx) return;
+    for (const sid of sessionIds) {
+      try {
+        const sidStr = String(sid);
+        const entity = await telegramService._resolveEntity(sidStr, rawTarget);
+        if (!entity) continue;
+        const client = telegramService.clients.get(sidStr)?.client;
+        if (!client) continue;
+        // iterParticipants is async-iter. Cap to 5k to keep us bounded
+        // for very large groups; admin-only roster fetch will throw
+        // (CHAT_ADMIN_REQUIRED) and we just bail.
+        let count = 0;
+        try {
+          for await (const u of client.iterParticipants(entity, { limit: 5000 })) {
+            if (!u || u.className !== 'User' || u.id === undefined) continue;
+            const id = bigToString(u.id);
+            if (id && !ctx.enrich.participantCache.has(id)) {
+              ctx.enrich.participantCache.set(id, u);
+            }
+            count += 1;
+          }
+        } catch (innerErr) {
+          logger.debug(`Monitor job ${jobId} session ${sid} iterParticipants stopped: ${innerErr.message}`);
+        }
+        if (count > 0) {
+          logger.debug(`Monitor job ${jobId} primed ${count} participants from session ${sid}`);
+          // First successful prefetch is enough.
+          return;
+        }
+      } catch (err) {
+        logger.debug(`Monitor job ${jobId} prefetch via session ${sid} failed: ${err.message}`);
+      }
+    }
+  }
+
+  /**
+   * Inline (synchronous) enrichment from in-memory caches only — no
+   * network. Mutates the profile in-place. Used to fill in fields on
+   * the FIRST observation of a given telegram_id whenever we already
+   * have the User entity hot. Returns true when the profile was
+   * actually upgraded.
+   */
+  _enrichInline(jobId, profile, piggybacked) {
+    if (!profile || !profile.telegramId || !isProfileBlank(profile)) return false;
+    const ctx = this._active.get(jobId);
+    if (!ctx || !ctx.enrich) return false;
+    const ec = ctx.enrich;
+
+    // 1. Cached enriched profile from a previous lookup.
+    const cached = ec.profileCache.get(profile.telegramId);
+    if (cached) {
+      profile.username = cached.username || profile.username;
+      profile.firstName = cached.firstName || profile.firstName;
+      profile.lastName = cached.lastName || profile.lastName;
+      profile.phone = cached.phone || profile.phone;
+      profile.isBot = !!(cached.isBot || profile.isBot);
+      profile.isPremium = !!(cached.isPremium || profile.isPremium);
+      return !isProfileBlank(profile);
+    }
+
+    // 2. Piggybacked User entity on the originating event/update.
+    if (piggybacked && piggybacked[profile.telegramId]) {
+      applySenderEntity(profile, piggybacked[profile.telegramId]);
+      if (!isProfileBlank(profile)) {
+        ec.profileCache.set(profile.telegramId, { ...profile });
+        return true;
+      }
+    }
+
+    // 3. Pre-fetched participant cache.
+    const participant = ec.participantCache.get(profile.telegramId);
+    if (participant) {
+      applySenderEntity(profile, participant);
+      if (!isProfileBlank(profile)) {
+        ec.profileCache.set(profile.telegramId, { ...profile });
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /**
+   * Background enrichment. Looks up the user via
+   * `client.getEntity(telegramId)` on any of the job's attached
+   * sessions, then back-fills every existing `scrape_monitor_users`
+   * row for this job that's missing the basic fields. Concurrency-
+   * limited so a chat with thousands of unique typers can't hammer
+   * Telegram.
+   *
+   * The back-fill UPDATE works for both dedup-on (one row per user)
+   * and dedup-off (many rows per user) jobs.
+   */
+  async _enrichProfile(jobId, userId, sessionId, telegramId) {
+    if (!telegramId) return;
+    const ctx = this._active.get(jobId);
+    if (!ctx || !ctx.enrich) return;
+    const ec = ctx.enrich;
+
+    if (ec.profileCache.has(telegramId)) return;
+    if (ec.inflight.has(telegramId)) return;
+
+    const MAX_CONCURRENT_LOOKUPS = 2;
+    const QUEUE_CAP = 1000;
+
+    const runLookup = async () => {
+      ec.inflight.add(telegramId);
+      ec.activeLookups += 1;
+      try {
+        // Try originating session first, then every other attached
+        // session. Cold IDs without an access_hash will fail on
+        // most sessions; but any session that's seen the user in
+        // any cached dialog will resolve.
+        const order = [String(sessionId), ...ec.sessionIds.filter((s) => s !== String(sessionId))];
+        let entity = null;
+        for (const sid of order) {
+          try {
+            const e = await telegramService._resolveEntity(sid, telegramId);
+            if (e && e.className === 'User') {
+              entity = e;
+              ec.participantCache.set(telegramId, e);
+              break;
+            }
+          } catch (err) {
+            logger.debug(`Monitor job ${jobId} enrich ${telegramId} via ${sid}: ${err.message}`);
+          }
+        }
+        if (!entity) return;
+
+        const enriched = blankProfile(telegramId);
+        applySenderEntity(enriched, entity);
+        if (isProfileBlank(enriched)) return;
+
+        ec.profileCache.set(telegramId, enriched);
+
+        // Back-fill EVERY scrape_monitor_users row for this job
+        // that matches this telegram_id and is missing fields.
+        // COALESCE preserves any value already in the row.
+        await pool.query(
+          `UPDATE scrape_monitor_users
+              SET username   = COALESCE(username,   $3),
+                  first_name = COALESCE(first_name, $4),
+                  last_name  = COALESCE(last_name,  $5),
+                  phone      = COALESCE(phone,      $6),
+                  is_bot     = is_bot OR $7,
+                  is_premium = is_premium OR $8
+            WHERE monitor_job_id = $1
+              AND telegram_id = $2`,
+          [
+            jobId, telegramId,
+            enriched.username, enriched.firstName,
+            enriched.lastName, enriched.phone,
+            !!enriched.isBot, !!enriched.isPremium,
+          ]
+        );
+        // Tell the UI a known user got fleshed out — useful for the
+        // monitor table to refresh in place.
+        emit(userId, 'monitor:user-enriched', {
+          jobId,
+          telegramId,
+          username: enriched.username,
+          firstName: enriched.firstName,
+          lastName: enriched.lastName,
+        });
+      } finally {
+        ec.activeLookups -= 1;
+        ec.inflight.delete(telegramId);
+        const next = ec.queue.shift();
+        if (next) {
+          setImmediate(() =>
+            this._enrichProfile(jobId, userId, next.sessionId, next.telegramId)
+              .catch((err) => logger.debug(`enrich queue drain: ${err.message}`))
+          );
+        }
+      }
+    };
+
+    if (ec.activeLookups >= MAX_CONCURRENT_LOOKUPS) {
+      // Queued — drained when the next active lookup finishes.
+      ec.queue.push({ telegramId, sessionId });
+      if (ec.queue.length > QUEUE_CAP) {
+        ec.queue.splice(0, ec.queue.length - QUEUE_CAP);
+      }
+      return;
+    }
+    runLookup().catch((err) =>
+      logger.debug(`Monitor job ${jobId} runLookup ${telegramId}: ${err.message}`)
+    );
   }
 
   async _detach(jobId) {
@@ -1009,7 +1288,18 @@ class ScrapeMonitorService {
       const profile = await extractSenderProfile(event);
       if (!profile) return;
 
+      // Inline enrichment from hot caches (free, no network).
+      const piggy = harvestPiggybackedUsers(event);
+      this._enrichInline(jobId, profile, piggy);
+
       await this._recordProfile(jobId, userId, sessionId, profile, 'message');
+
+      // Still bare? Schedule a background lookup that back-fills the
+      // row(s) once the entity resolves. Works for dedup on/off.
+      if (isProfileBlank(profile)) {
+        this._enrichProfile(jobId, userId, sessionId, profile.telegramId)
+          .catch((err) => logger.debug(`enrich after _onEvent: ${err.message}`));
+      }
     } catch (err) {
       logger.warn(`Monitor job ${jobId} event error: ${err.message}`);
     }
@@ -1053,7 +1343,13 @@ class ScrapeMonitorService {
         }
         const profile = await extractSenderProfile({ message: m });
         if (!profile) return;
+        const piggyMsg = harvestPiggybackedUsers(update);
+        this._enrichInline(jobId, profile, piggyMsg);
         await this._recordProfile(jobId, userId, sessionId, profile, 'service');
+        if (isProfileBlank(profile)) {
+          this._enrichProfile(jobId, userId, sessionId, profile.telegramId)
+            .catch((err) => logger.debug(`enrich after service msg: ${err.message}`));
+        }
         return;
       }
 
@@ -1072,7 +1368,19 @@ class ScrapeMonitorService {
       else if (update.className.includes('Reaction')) kind = 'reaction';
       else if (update.className.includes('Participant')) kind = 'membership';
 
+      // Inline enrichment from hot caches first.
+      const piggy = harvestPiggybackedUsers(update);
+      this._enrichInline(jobId, profile, piggy);
+
       await this._recordProfile(jobId, userId, sessionId, profile, kind);
+
+      // Raw updates almost never carry the originating User object —
+      // schedule a background lookup that back-fills past + future
+      // rows for this user via UPDATE.
+      if (isProfileBlank(profile)) {
+        this._enrichProfile(jobId, userId, sessionId, profile.telegramId)
+          .catch((err) => logger.debug(`enrich after raw update: ${err.message}`));
+      }
     } catch (err) {
       logger.warn(`Monitor job ${jobId} raw update error: ${err.message}`);
     }
