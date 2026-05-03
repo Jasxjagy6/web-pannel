@@ -152,16 +152,34 @@ const PROFILES = [
  * makes the fingerprint look more cohesive.
  */
 const COUNTRY_LANG = {
-  ru: 'ru', ua: 'uk', by: 'ru', kz: 'ru', kg: 'ru',
-  in: 'en', us: 'en', gb: 'en', ca: 'en', au: 'en', nz: 'en',
-  br: 'pt-br', pt: 'pt', es: 'es', mx: 'es', ar: 'es', co: 'es', cl: 'es',
-  fr: 'fr', be: 'fr', ch: 'de', de: 'de', at: 'de',
-  it: 'it', nl: 'nl', se: 'sv', no: 'no', fi: 'fi', dk: 'da',
-  pl: 'pl', cz: 'cs', sk: 'sk', hu: 'hu', ro: 'ro', bg: 'bg',
-  tr: 'tr', ir: 'fa', ae: 'ar', sa: 'ar', eg: 'ar', iq: 'ar',
-  cn: 'zh-hans', tw: 'zh-hant', hk: 'zh-hant', jp: 'ja', kr: 'ko',
-  vn: 'vi', th: 'th', id: 'id', my: 'ms', ph: 'en', sg: 'en',
-  pk: 'en', bd: 'bn',
+  ru: 'ru-RU', ua: 'uk-UA', by: 'ru-BY', kz: 'ru-KZ', kg: 'ru-KG',
+  in: 'en-IN', us: 'en-US', gb: 'en-GB', ca: 'en-CA', au: 'en-AU', nz: 'en-NZ',
+  br: 'pt-BR', pt: 'pt-PT', es: 'es-ES', mx: 'es-MX', ar: 'es-AR', co: 'es-CO', cl: 'es-CL',
+  fr: 'fr-FR', be: 'fr-BE', ch: 'de-CH', de: 'de-DE', at: 'de-AT',
+  it: 'it-IT', nl: 'nl-NL', se: 'sv-SE', no: 'nb-NO', fi: 'fi-FI', dk: 'da-DK',
+  pl: 'pl-PL', cz: 'cs-CZ', sk: 'sk-SK', hu: 'hu-HU', ro: 'ro-RO', bg: 'bg-BG',
+  tr: 'tr-TR', ir: 'fa-IR', ae: 'ar-AE', sa: 'ar-SA', eg: 'ar-EG', iq: 'ar-IQ',
+  cn: 'zh-Hans-CN', tw: 'zh-Hant-TW', hk: 'zh-Hant-HK', jp: 'ja-JP', kr: 'ko-KR',
+  vn: 'vi-VN', th: 'th-TH', id: 'id-ID', my: 'ms-MY', ph: 'en-PH', sg: 'en-SG',
+  pk: 'en-PK', bd: 'bn-BD',
+};
+
+/**
+ * Country code → primary IANA timezone (used as a stable proxy for
+ * "local hour" decisions in the circadian-curfew). Always returns a
+ * valid IANA name; defaults to 'UTC' for unknown countries.
+ */
+const COUNTRY_TZ = {
+  ru: 'Europe/Moscow', ua: 'Europe/Kyiv', by: 'Europe/Minsk', kz: 'Asia/Almaty', kg: 'Asia/Bishkek',
+  in: 'Asia/Kolkata', us: 'America/New_York', gb: 'Europe/London', ca: 'America/Toronto', au: 'Australia/Sydney', nz: 'Pacific/Auckland',
+  br: 'America/Sao_Paulo', pt: 'Europe/Lisbon', es: 'Europe/Madrid', mx: 'America/Mexico_City', ar: 'America/Argentina/Buenos_Aires', co: 'America/Bogota', cl: 'America/Santiago',
+  fr: 'Europe/Paris', be: 'Europe/Brussels', ch: 'Europe/Zurich', de: 'Europe/Berlin', at: 'Europe/Vienna',
+  it: 'Europe/Rome', nl: 'Europe/Amsterdam', se: 'Europe/Stockholm', no: 'Europe/Oslo', fi: 'Europe/Helsinki', dk: 'Europe/Copenhagen',
+  pl: 'Europe/Warsaw', cz: 'Europe/Prague', sk: 'Europe/Bratislava', hu: 'Europe/Budapest', ro: 'Europe/Bucharest', bg: 'Europe/Sofia',
+  tr: 'Europe/Istanbul', ir: 'Asia/Tehran', ae: 'Asia/Dubai', sa: 'Asia/Riyadh', eg: 'Africa/Cairo', iq: 'Asia/Baghdad',
+  cn: 'Asia/Shanghai', tw: 'Asia/Taipei', hk: 'Asia/Hong_Kong', jp: 'Asia/Tokyo', kr: 'Asia/Seoul',
+  vn: 'Asia/Ho_Chi_Minh', th: 'Asia/Bangkok', id: 'Asia/Jakarta', my: 'Asia/Kuala_Lumpur', ph: 'Asia/Manila', sg: 'Asia/Singapore',
+  pk: 'Asia/Karachi', bd: 'Asia/Dhaka',
 };
 
 /**
@@ -233,6 +251,8 @@ function buildIdentity(profile, opts = {}) {
     appVersion: pick(p.appVersions, 'app'),
     langCode,
     systemLangCode: langCode,
+    country: opts.country ? String(opts.country).toLowerCase() : null,
+    timezone: opts.country ? tzFor(opts.country) : null,
     generatedAt: new Date().toISOString(),
   };
 }
@@ -241,9 +261,39 @@ function buildIdentity(profile, opts = {}) {
  * Map a country code (lowercase) to a Telegram lang_code.
  */
 function randomLangFor(country) {
-  if (!country) return 'en';
+  if (!country) return 'en-US';
   const c = String(country).toLowerCase();
   return COUNTRY_LANG[c] || 'en';
+}
+
+/**
+ * Map a country code (lowercase) to an IANA timezone. Defaults to 'UTC'
+ * for unknown countries.
+ */
+function tzFor(country) {
+  if (!country) return 'UTC';
+  const c = String(country).toLowerCase();
+  return COUNTRY_TZ[c] || 'UTC';
+}
+
+/**
+ * Return the current local hour (0-23) for a given country.
+ * Used by behaviorService for the circadian curfew.
+ */
+function localHourFor(country) {
+  const tz = tzFor(country);
+  try {
+    const fmt = new Intl.DateTimeFormat('en-US', { hour: 'numeric', hour12: false, timeZone: tz });
+    const parts = fmt.formatToParts(new Date());
+    const h = parts.find((p) => p.type === 'hour');
+    if (h) {
+      const n = parseInt(h.value, 10);
+      if (Number.isFinite(n)) return ((n % 24) + 24) % 24;
+    }
+  } catch {
+    /* ignore — fall through */
+  }
+  return new Date().getUTCHours();
 }
 
 /**
@@ -260,6 +310,8 @@ function sanitizeIdentity(raw) {
     appVersion: typeof raw.appVersion === 'string' && raw.appVersion ? raw.appVersion : null,
     langCode: typeof raw.langCode === 'string' && raw.langCode ? raw.langCode : 'en',
     systemLangCode: typeof raw.systemLangCode === 'string' && raw.systemLangCode ? raw.systemLangCode : 'en',
+    country: typeof raw.country === 'string' && raw.country ? raw.country.toLowerCase() : null,
+    timezone: typeof raw.timezone === 'string' && raw.timezone ? raw.timezone : null,
     generatedAt: typeof raw.generatedAt === 'string' ? raw.generatedAt : new Date().toISOString(),
   };
   // Reject if any of the four telegram-meaningful fields are missing.
@@ -282,10 +334,13 @@ function toClientOptions(identity) {
 module.exports = {
   PROFILES,
   COUNTRY_LANG,
+  COUNTRY_TZ,
   pickRandomProfile,
   pickProfileForSeed,
   buildIdentity,
   randomLangFor,
+  tzFor,
+  localHourFor,
   sanitizeIdentity,
   toClientOptions,
   listProfiles: () => PROFILES.slice(),

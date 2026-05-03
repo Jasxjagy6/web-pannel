@@ -78,7 +78,51 @@ function ErrorBanner({ message }) {
   );
 }
 
-function PhoneStep({ phone, setPhone, onSubmit, busy }) {
+// Anti-revoke (Phase 1 §B2): a small curated list of country codes
+// that map to a regionalised langCode + IANA timezone in the backend's
+// COUNTRY_LANG / COUNTRY_TZ tables. The backend gracefully falls back
+// to 'en'/'UTC' for anything not in this list, so it's safe to keep
+// the dropdown lean.
+const TG_COUNTRY_OPTIONS = [
+  { code: '', label: 'Auto (no override)' },
+  { code: 'in', label: 'India (en-IN, Asia/Kolkata)' },
+  { code: 'us', label: 'United States (en-US, America/New_York)' },
+  { code: 'gb', label: 'United Kingdom (en-GB, Europe/London)' },
+  { code: 'ca', label: 'Canada (en-CA, America/Toronto)' },
+  { code: 'au', label: 'Australia (en-AU, Australia/Sydney)' },
+  { code: 'de', label: 'Germany (de-DE, Europe/Berlin)' },
+  { code: 'fr', label: 'France (fr-FR, Europe/Paris)' },
+  { code: 'es', label: 'Spain (es-ES, Europe/Madrid)' },
+  { code: 'it', label: 'Italy (it-IT, Europe/Rome)' },
+  { code: 'br', label: 'Brazil (pt-BR, America/Sao_Paulo)' },
+  { code: 'mx', label: 'Mexico (es-MX, America/Mexico_City)' },
+  { code: 'tr', label: 'Turkey (tr-TR, Europe/Istanbul)' },
+  { code: 'ru', label: 'Russia (ru-RU, Europe/Moscow)' },
+  { code: 'ua', label: 'Ukraine (uk-UA, Europe/Kyiv)' },
+  { code: 'sa', label: 'Saudi Arabia (ar-SA, Asia/Riyadh)' },
+  { code: 'ae', label: 'UAE (ar-AE, Asia/Dubai)' },
+  { code: 'ir', label: 'Iran (fa-IR, Asia/Tehran)' },
+  { code: 'pk', label: 'Pakistan (en-PK, Asia/Karachi)' },
+  { code: 'bd', label: 'Bangladesh (bn-BD, Asia/Dhaka)' },
+  { code: 'id', label: 'Indonesia (id-ID, Asia/Jakarta)' },
+  { code: 'ph', label: 'Philippines (en-PH, Asia/Manila)' },
+  { code: 'th', label: 'Thailand (th-TH, Asia/Bangkok)' },
+  { code: 'vn', label: 'Vietnam (vi-VN, Asia/Ho_Chi_Minh)' },
+  { code: 'jp', label: 'Japan (ja-JP, Asia/Tokyo)' },
+  { code: 'kr', label: 'South Korea (ko-KR, Asia/Seoul)' },
+  { code: 'sg', label: 'Singapore (en-SG, Asia/Singapore)' },
+  { code: 'my', label: 'Malaysia (ms-MY, Asia/Kuala_Lumpur)' },
+];
+
+const TG_PLATFORM_OPTIONS = [
+  { code: '', label: 'Auto (any device profile)' },
+  { code: 'android', label: 'Android (Telegram Android)' },
+  { code: 'ios', label: 'iOS (Telegram iOS)' },
+  { code: 'desktop', label: 'Desktop (Telegram Desktop)' },
+  { code: 'web', label: 'Web (Telegram Web Z/K)' },
+];
+
+function PhoneStep({ phone, setPhone, country, setCountry, platform, setPlatform, onSubmit, busy }) {
   return (
     <form
       onSubmit={(e) => {
@@ -106,6 +150,45 @@ function PhoneStep({ phone, setPhone, onSubmit, busy }) {
           relays the code, never stores or shows it to other users.
         </p>
       </div>
+
+      {/* Anti-revoke (Phase 1 §B2 + §B1): country + platform pinning */}
+      <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+        <div>
+          <label className="block text-xs font-medium text-gray-400 mb-1.5">
+            Country (sets locale + timezone)
+          </label>
+          <select
+            value={country}
+            onChange={(e) => setCountry(e.target.value)}
+            className="w-full rounded-lg border border-white/10 bg-dark-900 px-3 py-2.5 text-sm text-white focus:border-primary-500 focus:outline-none focus:ring-1 focus:ring-primary-500"
+          >
+            {TG_COUNTRY_OPTIONS.map((o) => (
+              <option key={o.code} value={o.code}>{o.label}</option>
+            ))}
+          </select>
+          <p className="mt-1.5 text-[11px] text-gray-500">
+            Tells Telegram a consistent locale matching the proxy region.
+          </p>
+        </div>
+        <div>
+          <label className="block text-xs font-medium text-gray-400 mb-1.5">
+            Device profile (pinned for life of session)
+          </label>
+          <select
+            value={platform}
+            onChange={(e) => setPlatform(e.target.value)}
+            className="w-full rounded-lg border border-white/10 bg-dark-900 px-3 py-2.5 text-sm text-white focus:border-primary-500 focus:outline-none focus:ring-1 focus:ring-primary-500"
+          >
+            {TG_PLATFORM_OPTIONS.map((o) => (
+              <option key={o.code} value={o.code}>{o.label}</option>
+            ))}
+          </select>
+          <p className="mt-1.5 text-[11px] text-gray-500">
+            Pins device_model + system_version + app_version.
+          </p>
+        </div>
+      </div>
+
       <button
         type="submit"
         disabled={busy || !phone.trim()}
@@ -301,6 +384,8 @@ export default function CreateSession() {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState(null);
   const [phone, setPhone] = useState('');
+  const [country, setCountry] = useState('');
+  const [platform, setPlatform] = useState('');
   const [code, setCode] = useState('');
   const [password, setPassword] = useState('');
   const [tempId, setTempId] = useState(null);
@@ -336,7 +421,11 @@ export default function CreateSession() {
     setError(null);
     setBusy(true);
     try {
-      const r = await createSessionStart({ phone });
+      const r = await createSessionStart({
+        phone,
+        country: country || undefined,
+        platform: platform || undefined,
+      });
       const data = r.data?.data || r.data;
       setTempId(data.tempId);
       tempIdRef.current = data.tempId;
@@ -444,6 +533,10 @@ export default function CreateSession() {
             <PhoneStep
               phone={phone}
               setPhone={setPhone}
+              country={country}
+              setCountry={setCountry}
+              platform={platform}
+              setPlatform={setPlatform}
               onSubmit={handleStart}
               busy={busy}
             />

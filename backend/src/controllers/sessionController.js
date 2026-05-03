@@ -479,12 +479,14 @@ const sessionController = {
       return res.status(200).json({ success: true, data: result });
     }
 
-    const { phone, apiId, apiHash } = req.body || {};
+    const { phone, apiId, apiHash, country, platform } = req.body || {};
     const result = await sessionCreationService.start({
       userId,
       phone,
       apiId,
       apiHash,
+      country,
+      platform,
     });
     return res.status(200).json({ success: true, data: result });
   }),

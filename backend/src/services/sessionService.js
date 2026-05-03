@@ -1120,28 +1120,28 @@ class SessionService {
     // Hard-scope to a single platform when requested. Legacy callers
     // (no platform argument) keep their previous Telegram-only behaviour
     // because every TG row has platform='telegram' by default.
-    const queryConditions = ['user_id = $1'];
+    // NOTE: column refs are written with the `s.` alias because the
+    // paginated SELECT joins tg_session_health (`tsh`).
+    const queryConditions = ['s.user_id = $1'];
     const queryParams = [userId];
     let paramIndex = 2;
     if (platform === 'telegram' || platform === 'instagram') {
-      queryConditions.push(`platform = $${paramIndex}`);
+      queryConditions.push(`s.platform = $${paramIndex}`);
       queryParams.push(platform);
       paramIndex++;
     } else {
-      // No platform forced — default to Telegram so /api/sessions never
-      // surfaces an Instagram row in the legacy Telegram-only UI.
-      queryConditions.push("platform = 'telegram'");
+      queryConditions.push("s.platform = 'telegram'");
     }
 
     if (filter && filter !== 'all') {
       if (VALID_STATUSES.includes(filter)) {
-        queryConditions.push(`status = $${paramIndex}`);
+        queryConditions.push(`s.status = $${paramIndex}`);
         queryParams.push(filter);
         paramIndex++;
       } else if (filter === 'active') {
-        queryConditions.push("status IN ('active', 'uploaded') AND is_logged_in = true");
+        queryConditions.push("s.status IN ('active', 'uploaded') AND s.is_logged_in = true");
       } else if (filter === 'inactive') {
-        queryConditions.push("status IN ('inactive', 'error', 'revoked', 'expired') OR is_logged_in = false");
+        queryConditions.push("s.status IN ('inactive', 'error', 'revoked', 'expired') OR s.is_logged_in = false");
       }
     }
 
@@ -1149,19 +1149,31 @@ class SessionService {
 
     // Get total count
     const countResult = await pool.query(
-      `SELECT COUNT(*) as total FROM sessions WHERE ${whereClause}`,
+      `SELECT COUNT(*) as total FROM sessions s WHERE ${whereClause}`,
       queryParams
     );
     const total = parseInt(countResult.rows[0].total, 10);
 
-    // Get paginated results
+    // Get paginated results — joined with tg_session_health (Phase 2)
+    // for the per-row anti-revoke posture (risk score, ping age, etc.)
+    // so the Sessions UI can render device + DC + risk without an
+    // extra round-trip per session.
     const sessionsResult = await pool.query(
-      `SELECT id, user_id, phone, session_file_path, api_id, api_hash,
-              status, is_2fa_enabled, is_logged_in, account_info,
-              created_at, last_active
-       FROM sessions
+      `SELECT s.id, s.user_id, s.phone, s.session_file_path, s.api_id, s.api_hash,
+              s.status, s.is_2fa_enabled, s.is_logged_in, s.account_info,
+              s.created_at, s.last_active,
+              s.device_identity, s.dc_id, s.dc_ip, s.dc_port,
+              s.last_online_status_at, s.last_ping_at, s.auth_key_first_seen_at,
+              tsh.risk_score, tsh.consecutive_failed_pings,
+              tsh.consecutive_flood_waits, tsh.last_flood_at,
+              tsh.last_authorizations_check_at, tsh.last_reauth_required_at,
+              tsh.dc_migrate_count_24h, tsh.ip_country_jumps_24h,
+              tsh.bootstrapped_at, tsh.active_authorizations,
+              tsh.risk_score_updated_at
+       FROM sessions s
+       LEFT JOIN tg_session_health tsh ON tsh.session_id = s.id
        WHERE ${whereClause}
-       ORDER BY ${sortField} ${sortOrder}
+       ORDER BY s.${sortField} ${sortOrder}
        LIMIT $${paramIndex} OFFSET $${paramIndex + 1}`,
       [...queryParams, pageSize, offset]
     );
@@ -1182,6 +1194,29 @@ class SessionService {
         accountInfo,
         createdAt: row.created_at,
         lastActive: row.last_active,
+        // Anti-revoke fields (Phase 1 + 3) — read by the frontend
+        // SessionAntiRevokeBlock to render device + DC + risk.
+        device_identity: row.device_identity,
+        dc_id: row.dc_id,
+        dc_ip: row.dc_ip,
+        dc_port: row.dc_port,
+        last_online_status_at: row.last_online_status_at,
+        last_ping_at: row.last_ping_at,
+        auth_key_first_seen_at: row.auth_key_first_seen_at,
+        risk_score: row.risk_score != null ? Number(row.risk_score) : null,
+        risk_score_updated_at: row.risk_score_updated_at || null,
+        tg_health: row.risk_score == null ? null : {
+          risk_score: Number(row.risk_score),
+          consecutive_failed_pings: row.consecutive_failed_pings,
+          consecutive_flood_waits: row.consecutive_flood_waits,
+          last_flood_at: row.last_flood_at,
+          last_authorizations_check_at: row.last_authorizations_check_at,
+          last_reauth_required_at: row.last_reauth_required_at,
+          dc_migrate_count_24h: row.dc_migrate_count_24h,
+          ip_country_jumps_24h: row.ip_country_jumps_24h,
+          bootstrapped_at: row.bootstrapped_at,
+          active_authorizations: row.active_authorizations,
+        },
       };
     });
 
@@ -2100,8 +2135,16 @@ class SessionService {
          ORDER BY id ASC`
       );
       total = result.rows.length;
-      for (const row of result.rows) {
-        const sessionId = row.id;
+
+      // Anti-revoke Phase 1 (B5): stagger restores over a window so
+      // Telegram doesn't see a "data-centre sweep" of N reconnects from
+      // one IP in <1 s.
+      const telegramConfig = require('../config/telegram');
+      const restoreScheduler = require('../utils/restoreScheduler');
+      const windowMs = telegramConfig.RESTORE_WINDOW_MS || 0;
+      const perMinuteCap = telegramConfig.RESTORE_PER_IP_PER_MIN || 0;
+
+      const restoreOne = async (sessionId) => {
         try {
           // Try to (re)assign a proxy and load the client.
           let proxyConf = null;
@@ -2115,7 +2158,7 @@ class SessionService {
 
           if (tgService.isSessionActive(String(sessionId))) {
             restored++;
-            continue;
+            return;
           }
           // Use the lower-level loader and then reset proxy via _ensureConnected.
           await tgService._loadSessionFromDB(sessionId);
@@ -2139,6 +2182,21 @@ class SessionService {
               );
             }
           }
+
+          // Anti-revoke Phase 1 (B4): persist the DC the auth_key landed
+          // on so subsequent reconnects pin to the same DC.
+          try {
+            await tgService.persistDcPinFromClient(String(sessionId));
+          } catch (dcErr) {
+            logger.debug(`DC pin failed for ${sessionId}: ${dcErr.message}`);
+          }
+
+          // Anti-revoke Phase 2 (B9): announce online presence after
+          // reconnect (best-effort; ignore failures).
+          try {
+            await tgService.announceOnlineIfDue(String(sessionId)).catch(() => {});
+          } catch { /* non-fatal */ }
+
           // Confirm the session is actually authenticated; if Telegram
           // has revoked the auth key (AUTH_KEY_DUPLICATED, etc.) we want
           // to mark it logged-out NOW rather than letting the heartbeat
@@ -2149,7 +2207,7 @@ class SessionService {
             if (tgService.isPermanentAuthError(pingErr)) {
               await this._markSessionAuthRevoked(sessionId, pingErr).catch(() => {});
               failed++;
-              continue;
+              return;
             }
             // Transient ping failure — let the heartbeat retry.
             logger.debug(`restore getMe failed for ${sessionId}: ${pingErr.message}`);
@@ -2160,13 +2218,35 @@ class SessionService {
           if (tgService.isPermanentAuthError(err)) {
             await this._markSessionAuthRevoked(sessionId, err).catch(() => {});
             failed++;
-            continue;
+            return;
           }
           failed++;
           logger.warn(`Failed to restore session ${sessionId}: ${err.message}`);
-          // Per Upgrade 1: do NOT flip is_logged_in to false on transient
-          // failure; the heartbeat loop will retry on the next tick.
         }
+      };
+
+      const ids = result.rows.map((r) => r.id);
+      // If staggering is disabled (windowMs<=0), restore inline; otherwise
+      // delegate to the scheduler.
+      if (windowMs <= 0 || ids.length <= 1) {
+        for (const id of ids) {
+          // eslint-disable-next-line no-await-in-loop
+          await restoreOne(id);
+        }
+      } else {
+        await restoreScheduler.run({
+          items: ids,
+          windowMs,
+          perMinuteCap,
+          handler: (id) => restoreOne(id),
+          onProgress: (idx, t, ms) => {
+            if (idx === 0 || (idx + 1) % 10 === 0 || idx === t - 1) {
+              logger.debug(
+                `restoreScheduler tick ${idx + 1}/${t} (delay=${ms}ms)`
+              );
+            }
+          },
+        });
       }
     } catch (err) {
       logger.error('restoreAllLoggedInSessions failed', { error: err.message });
@@ -2230,20 +2310,48 @@ class SessionService {
           const wasActive = tgService.isSessionActive(sid);
           await tgService._ensureConnected(sid);
           if (!wasActive) revived++;
-          // Lightweight ping that exercises the connection. If Telegram
-          // reports a permanent auth failure (AUTH_KEY_DUPLICATED, etc.)
-          // we mark the session revoked instead of retrying every minute.
+          // Anti-revoke Phase 2 (B8): heartbeat uses MTProto Ping
+          // (transport-level keepalive that real clients send), not
+          // users.getFullUser. `pingSession` falls back to getMe only if
+          // the GramJS PingDelayDisconnect call fails (older client
+          // versions); the fallback path still records the same
+          // permanent-auth-error semantics.
           try {
-            await tgService.getMe(sid);
+            if (typeof tgService.pingSession === 'function') {
+              await tgService.pingSession(sid);
+            } else {
+              await tgService.getMe(sid);
+            }
           } catch (pingErr) {
             if (tgService.isPermanentAuthError(pingErr)) {
               await this._markSessionAuthRevoked(row.id, pingErr).catch(() => {});
               revoked++;
               continue;
             }
-            logger.debug(`heartbeat getMe failed for ${sid}: ${pingErr.message}`);
+            logger.debug(`heartbeat ping failed for ${sid}: ${pingErr.message}`);
           }
-          await pool.query(`UPDATE sessions SET last_heartbeat = NOW() WHERE id = $1`, [row.id]);
+          // Anti-revoke Phase 2 (B9): re-broadcast online presence on a
+          // long cadence (handled inside `announceOnlineIfDue`).
+          try {
+            if (typeof tgService.announceOnlineIfDue === 'function') {
+              await tgService.announceOnlineIfDue(sid).catch(() => {});
+            }
+          } catch { /* non-fatal */ }
+          // Anti-revoke Phase 2 (B12): periodic GetAuthorizations
+          // probe — early-warning if our session disappeared from
+          // Telegram's "Active Sessions" list.
+          try {
+            if (typeof tgService.checkAuthorizationsIfDue === 'function') {
+              const res = await tgService.checkAuthorizationsIfDue(sid).catch(() => null);
+              if (res && res.revokedExternally) {
+                await this._markSessionAuthRevoked(row.id, new Error('AUTH_KEY_REMOVED_BY_USER')).catch(() => {});
+                revoked++;
+                continue;
+              }
+            }
+          } catch { /* non-fatal */ }
+
+          await pool.query(`UPDATE sessions SET last_heartbeat = NOW(), last_ping_at = NOW() WHERE id = $1`, [row.id]);
           pinged++;
         } catch (err) {
           if (tgService.isPermanentAuthError(err)) {
@@ -2296,10 +2404,42 @@ class SessionService {
     } catch {
       // ignore — client may already be gone
     }
+    // Anti-revoke Phase 3 (B15): record the revocation in
+    // tg_detection_events so the admin dashboard can show what killed
+    // the session (and the post-mortem isn't dependent on log retention).
+    try {
+      const cfg = require('../config/telegram');
+      if (cfg.ANTI_REVOKE_PHASE_3_ENABLED) {
+        const detectionEvents = require('../providers/telegram/detectionEvents');
+        let userId = null;
+        try {
+          const ur = await pool.query(`SELECT user_id FROM sessions WHERE id = $1`, [sessionId]);
+          userId = ur.rows[0] ? ur.rows[0].user_id : null;
+        } catch { /* ignore */ }
+        await detectionEvents.recordFromError(error || new Error(reason), {
+          session_id: sessionId,
+          user_id: userId,
+          api_method: 'heartbeat',
+          fingerprint: { source: 'sessionService', reason },
+        });
+        try {
+          await pool.query(
+            `INSERT INTO tg_session_health (session_id, last_reauth_required_at, updated_at)
+             VALUES ($1, NOW(), NOW())
+             ON CONFLICT (session_id) DO UPDATE SET
+               last_reauth_required_at = NOW(),
+               updated_at = NOW()`,
+            [sessionId]
+          );
+        } catch { /* tg_session_health may not exist yet */ }
+      }
+    } catch (recErr) {
+      logger.debug(`detection_events insert (revoked) failed for ${sessionId}: ${recErr.message}`);
+    }
     logger.warn(
       `Session ${sessionId} auth key revoked by Telegram (${reason}); ` +
         `marked as logged-out so the heartbeat stops retrying. ` +
-        `User must re-upload or re-login the session.`
+        `User can click "Re-link" to re-authenticate with the same identity + proxy + DC.`
     );
   }
 }

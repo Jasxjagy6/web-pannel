@@ -382,8 +382,242 @@ function SessionDetailModal({ session, isOpen, onClose }) {
             </div>
           </div>
         </div>
+
+        {/* Anti-revoke Phase 1+3: device + DC + risk visibility */}
+        <SessionAntiRevokeBlock session={session} />
       </div>
     </Modal>
+  );
+}
+
+/**
+ * Anti-revoke (Telegram) — surfaces what device + DC + proxy country
+ * the session is bound to, plus the live risk score (Phase 3 §B16).
+ *
+ * Reads `device_identity` JSONB if present (set by identityService) +
+ * `dc_id`/`dc_ip`/`dc_port` (Phase 1 §B4) + `risk_score` from the
+ * tg_session_health row (joined into the GET /api/sessions response).
+ */
+function SessionAntiRevokeBlock({ session }) {
+  const id =
+    typeof session.device_identity === 'string'
+      ? safeParseJSON(session.device_identity)
+      : session.device_identity || null;
+
+  const platform = id?.platform || '—';
+  const deviceModel = id?.deviceModel || '—';
+  const systemVersion = id?.systemVersion || '—';
+  const appVersion = id?.appVersion || '—';
+  const langCode = id?.langCode || '—';
+  const country = id?.country ? String(id.country).toUpperCase() : '—';
+  const tz = id?.timezone || '—';
+
+  const dcText = session.dc_id
+    ? `DC${session.dc_id}${session.dc_ip ? ` (${session.dc_ip}:${session.dc_port || 443})` : ''}`
+    : 'unpinned';
+
+  const riskScore = Number(session.risk_score ?? session?.tg_health?.risk_score ?? 0) || 0;
+  const riskColor =
+    riskScore >= 0.65
+      ? 'text-red-400 bg-red-500/15'
+      : riskScore >= 0.4
+      ? 'text-amber-400 bg-amber-500/15'
+      : 'text-emerald-400 bg-emerald-500/15';
+  const riskLabel = riskScore >= 0.65 ? 'High' : riskScore >= 0.4 ? 'Watch' : 'Healthy';
+
+  const platformPill =
+    {
+      android: 'bg-emerald-500/15 text-emerald-300',
+      ios: 'bg-sky-500/15 text-sky-300',
+      desktop: 'bg-violet-500/15 text-violet-300',
+      web: 'bg-orange-500/15 text-orange-300',
+    }[platform] || 'bg-gray-500/15 text-gray-300';
+
+  return (
+    <div>
+      <h4 className="text-sm font-semibold text-gray-400 uppercase tracking-wider mb-3">
+        Anti-revoke posture
+      </h4>
+      <div className="rounded-lg border border-white/5 bg-dark-900 p-4 space-y-3">
+        <div className="flex flex-wrap items-center gap-2">
+          <span className={`inline-flex items-center rounded-full px-2.5 py-1 text-xs font-medium ${platformPill}`}>
+            {platform.toUpperCase()}
+          </span>
+          <span className="inline-flex items-center rounded-full px-2.5 py-1 text-xs bg-gray-700 text-gray-200">
+            {deviceModel}
+          </span>
+          <span className="inline-flex items-center rounded-full px-2.5 py-1 text-xs bg-gray-700 text-gray-200">
+            {systemVersion} · v{appVersion}
+          </span>
+          <span className={`inline-flex items-center rounded-full px-2.5 py-1 text-xs font-medium ${riskColor}`}>
+            Risk {riskScore.toFixed(2)} ({riskLabel})
+          </span>
+        </div>
+        <div className="grid grid-cols-2 gap-3 text-sm">
+          <div>
+            <div className="text-xs text-gray-500 uppercase tracking-wider">Locale</div>
+            <div className="text-gray-200">
+              {langCode}{country !== '—' ? ` · ${country}` : ''}
+            </div>
+          </div>
+          <div>
+            <div className="text-xs text-gray-500 uppercase tracking-wider">Timezone</div>
+            <div className="text-gray-200">{tz}</div>
+          </div>
+          <div>
+            <div className="text-xs text-gray-500 uppercase tracking-wider">Pinned DC</div>
+            <div className="text-gray-200 font-mono">{dcText}</div>
+          </div>
+          <div>
+            <div className="text-xs text-gray-500 uppercase tracking-wider">Last ping</div>
+            <div className="text-gray-200">
+              {session.last_ping_at ? formatRelativeTime(session.last_ping_at) : '—'}
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function safeParseJSON(s) {
+  try { return JSON.parse(s); } catch { return null; }
+}
+
+/**
+ * Compact device + DC cell for the desktop sessions table.
+ */
+function DeviceDcCell({ session }) {
+  const id =
+    typeof session.device_identity === 'string'
+      ? safeParseJSON(session.device_identity)
+      : session.device_identity || null;
+  if (!id) {
+    return <span className="text-xs text-gray-500">unknown</span>;
+  }
+  const platform = id.platform || '—';
+  const deviceModel = id.deviceModel || '—';
+  const dcText = session.dc_id
+    ? `DC${session.dc_id}`
+    : '—';
+  const platformPill =
+    {
+      android: 'bg-emerald-500/15 text-emerald-300',
+      ios: 'bg-sky-500/15 text-sky-300',
+      desktop: 'bg-violet-500/15 text-violet-300',
+      web: 'bg-orange-500/15 text-orange-300',
+    }[platform] || 'bg-gray-500/15 text-gray-300';
+  return (
+    <div className="flex flex-col gap-1">
+      <div className="flex items-center gap-1.5">
+        <span className={`text-[10px] font-medium uppercase tracking-wider rounded px-1.5 py-0.5 ${platformPill}`}>
+          {platform}
+        </span>
+        <span className="text-xs text-gray-300 truncate max-w-[140px]" title={deviceModel}>
+          {deviceModel}
+        </span>
+      </div>
+      <span className="text-[11px] text-gray-500 font-mono">{dcText}</span>
+    </div>
+  );
+}
+
+/**
+ * Compact risk pill driven by tg_session_health.risk_score.
+ * Tooltip explains the color thresholds (matches the §B16 weights).
+ */
+/**
+ * Anti-revoke summary banner shown at the top of the sessions page.
+ * Aggregates risk score + re-link state so operators see one number
+ * instead of having to scan every row.
+ */
+function AntiRevokeSummary({ sessions }) {
+  if (!Array.isArray(sessions) || sessions.length === 0) return null;
+  const total = sessions.length;
+  let highRisk = 0;
+  let watch = 0;
+  let needReauth = 0;
+  for (const s of sessions) {
+    const status = String(s.status || '').toLowerCase();
+    if (status === 'revoked' || s?.tg_health?.last_reauth_required_at) {
+      needReauth++;
+      continue;
+    }
+    const score = Number(s.risk_score ?? s?.tg_health?.risk_score ?? 0) || 0;
+    if (score >= 0.65) highRisk++;
+    else if (score >= 0.4) watch++;
+  }
+  if (highRisk === 0 && needReauth === 0 && watch === 0) {
+    return (
+      <div className="rounded-xl border border-emerald-500/20 bg-emerald-500/5 px-4 py-3 text-sm">
+        <div className="flex items-center gap-2 text-emerald-300">
+          <ShieldCheckIcon className="w-4 h-4" />
+          <span className="font-medium">Anti-revoke posture: healthy</span>
+        </div>
+        <div className="mt-1 text-xs text-emerald-200/70">
+          All {total} session{total === 1 ? '' : 's'} below the 0.65 risk gate. No re-link required.
+        </div>
+      </div>
+    );
+  }
+  const tone =
+    needReauth > 0 || highRisk > 0
+      ? 'border-red-500/30 bg-red-500/10 text-red-200'
+      : 'border-amber-500/30 bg-amber-500/10 text-amber-200';
+  return (
+    <div className={`rounded-xl border ${tone} px-4 py-3 text-sm`}>
+      <div className="flex items-center gap-2 font-medium">
+        <AlertTriangle className="w-4 h-4" />
+        Anti-revoke posture: action recommended
+      </div>
+      <div className="mt-1 grid grid-cols-1 sm:grid-cols-3 gap-2 text-xs">
+        <div>
+          <span className="font-semibold">{needReauth}</span>
+          <span className="opacity-80"> session{needReauth === 1 ? '' : 's'} need re-link (revoked).</span>
+        </div>
+        <div>
+          <span className="font-semibold">{highRisk}</span>
+          <span className="opacity-80"> high-risk (≥0.65) — scrape/messaging will be throttled.</span>
+        </div>
+        <div>
+          <span className="font-semibold">{watch}</span>
+          <span className="opacity-80"> watch-list (0.40–0.65) — still safe to use.</span>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function RiskPill({ session }) {
+  const score = Number(session.risk_score ?? session?.tg_health?.risk_score ?? 0) || 0;
+  const isReauth =
+    String(session.status || '').toLowerCase() === 'revoked' ||
+    !!session?.tg_health?.last_reauth_required_at;
+  if (isReauth) {
+    return (
+      <span
+        className="inline-flex items-center rounded-full px-2 py-0.5 text-xs font-semibold bg-red-500/20 text-red-300"
+        title="Telegram revoked or removed this session — re-link required."
+      >
+        Re-link
+      </span>
+    );
+  }
+  const cls =
+    score >= 0.65
+      ? 'bg-red-500/20 text-red-300'
+      : score >= 0.4
+      ? 'bg-amber-500/20 text-amber-300'
+      : 'bg-emerald-500/15 text-emerald-300';
+  const label = score >= 0.65 ? 'High' : score >= 0.4 ? 'Watch' : 'OK';
+  return (
+    <span
+      className={`inline-flex items-center rounded-full px-2 py-0.5 text-xs font-semibold ${cls}`}
+      title={`Anti-revoke risk score: ${score.toFixed(3)} — High≥0.65 throttles scrape/messaging.`}
+    >
+      {label}
+      <span className="ml-1 text-[10px] font-mono opacity-75">{score.toFixed(2)}</span>
+    </span>
   );
 }
 
@@ -620,6 +854,11 @@ export default function Sessions() {
         </div>
       </div>
 
+      {/* Anti-revoke summary banner (Phase 3 §B16/§B17): surfaces
+          high-risk sessions + revoked rows so the user can act before
+          opening individual modals. */}
+      <AntiRevokeSummary sessions={sessions} />
+
       {/* Upload Area */}
       <SessionUploadArea onUpload={handleUploadComplete} uploading={uploading} />
 
@@ -724,6 +963,12 @@ export default function Sessions() {
                 <th className="px-4 py-3 text-left text-xs font-semibold text-gray-400 uppercase tracking-wider">
                   Status
                 </th>
+                <th className="px-4 py-3 text-left text-xs font-semibold text-gray-400 uppercase tracking-wider hidden lg:table-cell">
+                  Device · DC
+                </th>
+                <th className="px-4 py-3 text-left text-xs font-semibold text-gray-400 uppercase tracking-wider">
+                  Risk
+                </th>
                 <th className="px-4 py-3 text-left text-xs font-semibold text-gray-400 uppercase tracking-wider">
                   2FA
                 </th>
@@ -738,7 +983,7 @@ export default function Sessions() {
             <tbody className="divide-y divide-white/5">
               {loading ? (
                 <tr>
-                  <td colSpan={6} className="px-4 py-16">
+                  <td colSpan={8} className="px-4 py-16">
                     <div className="flex flex-col items-center justify-center">
                       <Loader2 className="w-8 h-8 text-primary-500 animate-spin mb-3" />
                       <p className="text-gray-400 text-sm">Loading sessions...</p>
@@ -747,7 +992,7 @@ export default function Sessions() {
                 </tr>
               ) : paginatedSessions.length === 0 ? (
                 <tr>
-                  <td colSpan={6} className="px-4 py-16">
+                  <td colSpan={8} className="px-4 py-16">
                     <div className="flex flex-col items-center justify-center">
                       <div className="w-12 h-12 rounded-full bg-dark-900 flex items-center justify-center mb-3">
                         <PhoneIcon className="w-5 h-5 text-gray-600" />
@@ -793,6 +1038,12 @@ export default function Sessions() {
                           status={session.status || 'inactive'}
                           size="sm"
                         />
+                      </td>
+                      <td className="px-4 py-3 hidden lg:table-cell">
+                        <DeviceDcCell session={session} />
+                      </td>
+                      <td className="px-4 py-3">
+                        <RiskPill session={session} />
                       </td>
                       <td className="px-4 py-3">
                         {session.has_2fa ? (
