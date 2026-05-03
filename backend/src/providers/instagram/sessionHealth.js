@@ -273,6 +273,21 @@ async function _runOneDueProbe() {
     [WARMUP_STALE_MIN_MS]
   );
   if (r.rows.length === 0) return null;
+
+  // Phase 2.B10 — load full platform_state for each candidate so we
+  // can filter out sessions that are outside their active-hours window.
+  // Probing a session at 03:00 local time is a textbook automation tell.
+  // eslint-disable-next-line global-require
+  const activeHours = require('./activeHours');
+  // eslint-disable-next-line global-require
+  const behaviorPacing = require('./behaviorPacing');
+  const ids = r.rows.map((x) => x.id);
+  const detailRows = await pool.query(
+    `SELECT id, platform_state FROM sessions WHERE id = ANY($1::int[])`,
+    [ids]
+  );
+  const detailById = new Map(detailRows.rows.map((d) => [d.id, d]));
+
   // Pick a random row from the small candidate set so we don't always
   // probe the oldest one first (more human-looking spread).
   const candidates = r.rows.filter((row) => {
@@ -280,7 +295,14 @@ async function _runOneDueProbe() {
     const dueAfter =
       WARMUP_STALE_MIN_MS +
       Math.random() * (WARMUP_STALE_MAX_MS - WARMUP_STALE_MIN_MS);
-    return since >= dueAfter;
+    if (since < dueAfter) return false;
+
+    const detail = detailById.get(row.id);
+    if (detail) {
+      if (!activeHours.isWithinActiveHours(detail)) return false;
+      if (behaviorPacing.isInFeedbackCooldown(detail)) return false;
+    }
+    return true;
   });
   if (candidates.length === 0) return null;
   const pick = candidates[Math.floor(Math.random() * candidates.length)];

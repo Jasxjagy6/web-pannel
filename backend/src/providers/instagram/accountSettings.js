@@ -17,6 +17,94 @@ const igClient = require('./client');
 const sessionLimiter = require('./sessionLimiter');
 const logger = require('../../utils/logger');
 
+// Phase 2.B12 — high-risk action gating.
+// Hard limits to keep new / freshly-rotated accounts out of trouble.
+const _RENAME_MIN_AGE_DAYS = 30;            // username rename requires aged account
+const _RENAME_COOLDOWN_DAYS = 60;           // and at least 60 days since last rename
+const _PROFILE_TEXT_COOLDOWN_DAYS = 7;      // bio/full_name change ≥ once per week
+const _PFP_COOLDOWN_DAYS = 7;               // PFP change ≥ once per week
+
+function _accountAgeDays(session) {
+  if (!session.created_at) return null;
+  return (Date.now() - new Date(session.created_at).getTime()) / 86400000;
+}
+
+function _daysSince(iso) {
+  if (!iso) return Infinity;
+  const t = Date.parse(iso);
+  if (Number.isNaN(t)) return Infinity;
+  return (Date.now() - t) / 86400000;
+}
+
+async function _gateUsernameRename(session, override = false) {
+  if (override) return;
+  const age = _accountAgeDays(session);
+  if (age != null && age < _RENAME_MIN_AGE_DAYS) {
+    const e = new Error(
+      `Username rename refused: account age ${age.toFixed(1)}d < required ${_RENAME_MIN_AGE_DAYS}d. ` +
+      `Renaming a young account is one of the strongest automated-account flags Instagram tracks.`
+    );
+    e.statusCode = 403;
+    e.code = 'AGED_SESSION_REQUIRED';
+    throw e;
+  }
+  const ps = session.platform_state || {};
+  const lastRename = ps.cooldowns && ps.cooldowns.last_username_rename_at;
+  const sinceLast = _daysSince(lastRename);
+  if (sinceLast < _RENAME_COOLDOWN_DAYS) {
+    const e = new Error(
+      `Username rename refused: ${sinceLast.toFixed(1)}d since last rename < cooldown ${_RENAME_COOLDOWN_DAYS}d.`
+    );
+    e.statusCode = 429;
+    e.code = 'RENAME_COOLDOWN';
+    throw e;
+  }
+}
+
+async function _gateProfileTextEdit(session, override = false) {
+  if (override) return;
+  const ps = session.platform_state || {};
+  const last = ps.cooldowns && ps.cooldowns.last_profile_text_edit_at;
+  const sinceLast = _daysSince(last);
+  if (sinceLast < _PROFILE_TEXT_COOLDOWN_DAYS) {
+    const e = new Error(
+      `Profile text edit refused: ${sinceLast.toFixed(1)}d since last edit < cooldown ${_PROFILE_TEXT_COOLDOWN_DAYS}d.`
+    );
+    e.statusCode = 429;
+    e.code = 'PROFILE_TEXT_COOLDOWN';
+    throw e;
+  }
+}
+
+async function _gatePfpChange(session, override = false) {
+  if (override) return;
+  const ps = session.platform_state || {};
+  const last = ps.cooldowns && ps.cooldowns.last_pfp_change_at;
+  const sinceLast = _daysSince(last);
+  if (sinceLast < _PFP_COOLDOWN_DAYS) {
+    const e = new Error(
+      `Profile-picture change refused: ${sinceLast.toFixed(1)}d since last change < cooldown ${_PFP_COOLDOWN_DAYS}d.`
+    );
+    e.statusCode = 429;
+    e.code = 'PFP_COOLDOWN';
+    throw e;
+  }
+}
+
+async function _stampCooldown(sessionId, key) {
+  try {
+    const r = await pool.query(`SELECT platform_state FROM sessions WHERE id = $1`, [sessionId]);
+    const ps = (r.rows[0] && r.rows[0].platform_state) || {};
+    ps.cooldowns = Object.assign({}, ps.cooldowns, { [key]: new Date().toISOString() });
+    await pool.query(
+      `UPDATE sessions SET platform_state = $1::jsonb, updated_at = NOW() WHERE id = $2`,
+      [JSON.stringify(ps), sessionId]
+    );
+  } catch (err) {
+    logger.warn(`IG.accountSettings: failed to stamp cooldown ${key} for session ${sessionId}: ${err.message}`);
+  }
+}
+
 /**
  * Phase 1.B5 helper — only mobile-API sessions can use the IG private
  * API account.* methods. Cookie-uploaded (api_mode='web') sessions
@@ -40,7 +128,7 @@ function _assertMobileApi(session) {
 
 async function _session({ userId, sessionId }) {
   const r = await pool.query(
-    `SELECT id, user_id, username, proxy_url, session_data, platform_state
+    `SELECT id, user_id, username, proxy_url, session_data, platform_state, created_at
        FROM sessions
       WHERE id = $1 AND user_id = $2 AND platform = 'instagram'
         AND is_logged_in = TRUE`,
@@ -75,16 +163,25 @@ async function get({ userId, sessionId }) {
 async function update({ userId, sessionId, patch = {} }) {
   const session = await _session({ userId, sessionId });
   _assertMobileApi(session);
+
+  // Phase 2.B12 — admin override flag. Operators that explicitly
+  // need to bypass the cooldowns can pass `_admin_override:true` in
+  // the patch (typically used for de-anonymising a corrupted account).
+  const override = patch._admin_override === true;
+
   const client = await igClient.getClient(session);
   const out = {};
   if (patch.username) {
     try {
-      // Phase 1.B7 — username rename is the riskiest IG action; one
-      // every ~10 minutes max per session.
+      // Phase 2.B12 — reject if account is too young or recently renamed.
+      await _gateUsernameRename(session, override);
+      // Phase 1.B7 — risky-class token before the call.
       await sessionLimiter.acquire(session.id, { class: 'risky' });
       out.username = await client.account.editProfileUsername(String(patch.username));
+      await _stampCooldown(session.id, 'last_username_rename_at');
     } catch (err) {
       out.username_error = err.message;
+      if (err.code) out.username_error_code = err.code;
     }
   }
   // editProfile handles full_name / biography / phone / email / external_url / gender
@@ -92,6 +189,8 @@ async function update({ userId, sessionId, patch = {} }) {
       patch.phone_number !== undefined || patch.email !== undefined ||
       patch.external_url !== undefined || patch.gender !== undefined) {
     try {
+      // Phase 2.B12 — 7-day cooldown on profile-text edits.
+      await _gateProfileTextEdit(session, override);
       // Phase 1.B7 — risky-class token; profile-edit changes the
       // account in a way IG actively monitors for bot behaviour.
       await sessionLimiter.acquire(session.id, { class: 'risky' });
@@ -104,20 +203,26 @@ async function update({ userId, sessionId, patch = {} }) {
         gender:       patch.gender,
       });
       out.profile = ep;
+      await _stampCooldown(session.id, 'last_profile_text_edit_at');
     } catch (err) {
       out.profile_error = err.message;
+      if (err.code) out.profile_error_code = err.code;
     }
   }
   // Profile picture upload requires raw image bytes
   if (patch.profile_picture_buffer || patch.profile_picture_path) {
     try {
-      // Phase 1.B7 — PFP change is risky.
+      // Phase 2.B12 — 7-day cooldown on PFP changes.
+      await _gatePfpChange(session, override);
+      // Phase 1.B7 — risky-class token before the call.
       await sessionLimiter.acquire(session.id, { class: 'risky' });
       const buf = patch.profile_picture_buffer ||
         require('fs').readFileSync(patch.profile_picture_path);
       out.profile_picture = await client.account.changeProfilePicture(buf);
+      await _stampCooldown(session.id, 'last_pfp_change_at');
     } catch (err) {
       out.profile_picture_error = err.message;
+      if (err.code) out.profile_picture_error_code = err.code;
     }
   }
   logger.info(`IG.accountSettings.update user=${userId} session=${sessionId} keys=${Object.keys(patch).join(',')}`);
