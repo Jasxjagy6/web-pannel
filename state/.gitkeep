@@ -1,0 +1,3 @@
+# This directory holds runtime state for the upgrade orchestrator
+# (active-color.json, upgrade.lock). Contents are gitignored; this file
+# is committed only to ensure the directory exists on a fresh clone.
