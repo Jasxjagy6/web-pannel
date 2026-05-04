@@ -9,6 +9,7 @@
     "db:migrate": "node src/config/database.js --migrate"
   },
   "dependencies": {
+    "adm-zip": "^0.5.17",
     "bcrypt": "^5.1.1",
     "better-sqlite3": "^9.4.3",
     "bullmq": "^4.12.3",

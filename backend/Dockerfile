@@ -17,13 +17,25 @@ ENV GIT_SHA=${GIT_SHA} \
 # shells out to `bin/upgrade` (which in turn calls `docker compose`). They
 # are unused in the regular backend container and add ~30 MB. Worth it for
 # the operational simplicity of one image.
-RUN apk add --no-cache git bash docker-cli docker-compose
+#
+# python3 / make / g++ are required to build native deps (notably bcrypt)
+# from source against musl libc. The published bcrypt prebuilds target
+# glibc-based distros and segfault at runtime on alpine — see the
+# `napi_get_cb_info: symbol not found` errors that crash the backend on
+# boot when prebuilds are used. We build from source instead.
+RUN apk add --no-cache git bash docker-cli docker-compose python3 make g++
 
 WORKDIR /app
 
 COPY package*.json ./
 
-RUN npm install --production && npm cache clean --force
+# Force native bcrypt to compile against the local musl toolchain.
+# The published bcrypt prebuild is glibc-only and crashes with
+# `napi_get_cb_info: symbol not found` on alpine, so we replace it with a
+# locally-compiled binary using `npm rebuild --build-from-source`.
+RUN npm install --production && \
+    npm rebuild bcrypt --build-from-source && \
+    npm cache clean --force
 
 COPY . .
 

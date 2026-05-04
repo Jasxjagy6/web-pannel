@@ -57,6 +57,81 @@ function formatFileSize(bytes) {
   return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
 }
 
+/**
+ * Derive a human-friendly account-status descriptor from the row.
+ *
+ * The list endpoint returns the row in camelCase; older callers (and the
+ * detail modal that takes a single session via getSessionById) sometimes
+ * pass through the raw snake_case shape. Normalize both so this helper
+ * works regardless of where the session object came from.
+ *
+ * Returns one of:
+ *   - { tone: 'red',     icon: '⛔', label: 'Banned'     }   (status=revoked, USER_DEACTIVATED, etc.)
+ *   - { tone: 'red',     icon: '⛔', label: 'Auth revoked' } (Telegram revoked the auth key)
+ *   - { tone: 'amber',   icon: '⚠',  label: 'Restricted' }  (account_info.isRestricted)
+ *   - { tone: 'amber',   icon: '⚠',  label: 'Login error' } (status=error)
+ *   - { tone: 'sky',     icon: '★',  label: 'Premium'    }  (account_info.isPremium)
+ *   - { tone: 'emerald', icon: '✓',  label: 'Verified'   }  (account_info.isVerified)
+ *   - { tone: 'emerald', icon: '●',  label: 'Active'     }  (is_logged_in & status=active)
+ *   - { tone: 'gray',    icon: '○',  label: 'Uploaded'   }  (status=uploaded, never logged in)
+ *   - { tone: 'gray',    icon: '○',  label: 'Inactive'   }  (default)
+ */
+function deriveAccountState(session) {
+  if (!session) return { tone: 'gray', icon: '○', label: 'Unknown' };
+  const info =
+    (typeof session.accountInfo === 'string'
+      ? safeParseJSON(session.accountInfo)
+      : session.accountInfo) ||
+    (typeof session.account_info === 'string'
+      ? safeParseJSON(session.account_info)
+      : session.account_info) ||
+    {};
+  const status = (session.status || '').toLowerCase();
+  const loggedIn = session.isLoggedIn ?? session.is_logged_in ?? false;
+
+  if (status === 'revoked') {
+    const reason =
+      (info.lastErrorCode && /USER_DEACTIVATED/i.test(info.lastErrorCode)) ||
+      /USER_DEACTIVATED|BANNED/i.test(String(info.lastError || ''))
+        ? 'Banned'
+        : 'Auth revoked';
+    return { tone: 'red', icon: '⛔', label: reason };
+  }
+  if (status === 'expired') return { tone: 'red', icon: '⛔', label: 'Expired' };
+  if (info.isRestricted) return { tone: 'amber', icon: '⚠', label: 'Restricted' };
+  if (status === 'error') return { tone: 'amber', icon: '⚠', label: 'Login error' };
+  if (loggedIn) {
+    if (info.isPremium) return { tone: 'sky', icon: '★', label: 'Premium' };
+    if (info.isVerified) return { tone: 'emerald', icon: '✓', label: 'Verified' };
+    return { tone: 'emerald', icon: '●', label: 'Active' };
+  }
+  if (status === 'uploaded') return { tone: 'gray', icon: '○', label: 'Uploaded' };
+  return { tone: 'gray', icon: '○', label: 'Inactive' };
+}
+
+const ACCOUNT_TONE_CLASSES = {
+  red: 'text-red-400',
+  amber: 'text-amber-400',
+  sky: 'text-sky-400',
+  emerald: 'text-emerald-400',
+  gray: 'text-gray-500',
+};
+
+/**
+ * One-line account status indicator shown directly under each session
+ * row's phone+username. Compact (single line, no background pill) so it
+ * doesn't crowd the row layout but still clearly visible at a glance.
+ */
+function AccountStatusLine({ session }) {
+  const state = deriveAccountState(session);
+  return (
+    <p className={`mt-0.5 text-[11px] font-medium flex items-center gap-1 ${ACCOUNT_TONE_CLASSES[state.tone] || ACCOUNT_TONE_CLASSES.gray}`}>
+      <span aria-hidden>{state.icon}</span>
+      <span>{state.label}</span>
+    </p>
+  );
+}
+
 // --- Drag & Drop Upload Area ---
 function SessionUploadArea({ onUpload, uploading }) {
   const [isDragging, setIsDragging] = useState(false);
@@ -68,12 +143,12 @@ function SessionUploadArea({ onUpload, uploading }) {
   const processFiles = useCallback((fileList) => {
     const all = Array.from(fileList);
     const valid = all.filter(
-      (f) => /\.(session|txt|json)$/i.test(f.name)
+      (f) => /\.(session|txt|json|zip)$/i.test(f.name)
     );
     const skipped = all.length - valid.length;
     if (skipped > 0 && showWarning) {
       showWarning(
-        `${skipped} file${skipped === 1 ? '' : 's'} skipped (only .session, .txt, .json allowed).`
+        `${skipped} file${skipped === 1 ? '' : 's'} skipped (only .session, .txt, .json, .zip allowed).`
       );
     }
     setFiles(valid);
@@ -178,7 +253,10 @@ function SessionUploadArea({ onUpload, uploading }) {
           {isDragging ? 'Drop files here' : 'Drag & drop session files here'}
         </p>
         <p className="mt-1 text-xs text-gray-500">
-          or click to browse &middot; .session, .txt, .json
+          or click to browse &middot; .session, .txt, .json, .zip
+        </p>
+        <p className="mt-1 text-[11px] text-gray-600">
+          Drop a .zip and we'll auto-extract every session inside.
         </p>
       </div>
 
@@ -383,10 +461,113 @@ function SessionDetailModal({ session, isOpen, onClose }) {
           </div>
         </div>
 
+        {/* Account status (ban / premium / verified / restricted / etc.) */}
+        <SessionAccountStatusBlock session={session} />
+
         {/* Anti-revoke Phase 1+3: device + DC + risk visibility */}
         <SessionAntiRevokeBlock session={session} />
       </div>
     </Modal>
+  );
+}
+
+/**
+ * Account-status block shown when the eye icon is tapped.
+ *
+ * Pulls everything we know about the underlying Telegram account from
+ * the row + account_info JSONB and renders it as a key/value table:
+ *
+ *   - Health pill (Banned / Auth revoked / Restricted / Active / Premium / etc.)
+ *   - Telegram numeric ID, first/last name, username, phone
+ *   - Premium / verified / restricted booleans
+ *   - Last login attempt timestamp + outcome
+ *   - Last error code / message (if revoked or errored)
+ *
+ * This is the "tap the eye icon to see proper account status" surface
+ * the user asked for — read-only, dense, and tolerant of whichever shape
+ * the parent passed (camelCase from listSessions, or snake_case from
+ * getSessionById / SSE).
+ */
+function SessionAccountStatusBlock({ session }) {
+  const state = deriveAccountState(session);
+  const info =
+    (typeof session.accountInfo === 'string'
+      ? safeParseJSON(session.accountInfo)
+      : session.accountInfo) ||
+    (typeof session.account_info === 'string'
+      ? safeParseJSON(session.account_info)
+      : session.account_info) ||
+    {};
+
+  const tonePill = {
+    red: 'bg-red-500/15 text-red-400 border-red-500/30',
+    amber: 'bg-amber-500/15 text-amber-400 border-amber-500/30',
+    sky: 'bg-sky-500/15 text-sky-400 border-sky-500/30',
+    emerald: 'bg-emerald-500/15 text-emerald-400 border-emerald-500/30',
+    gray: 'bg-gray-500/15 text-gray-400 border-gray-500/30',
+  }[state.tone] || 'bg-gray-500/15 text-gray-400 border-gray-500/30';
+
+  const bool = (v, yes = 'Yes', no = 'No') => (v ? yes : no);
+  const truthy = (v) => v === true || v === 'true' || v === 1 || v === '1';
+
+  const rows = [
+    ['Telegram ID', info.telegramId ?? info.telegram_id ?? '—'],
+    ['First name', info.firstName ?? info.first_name ?? '—'],
+    ['Last name', info.lastName ?? info.last_name ?? '—'],
+    ['Username', info.username ? `@${info.username}` : '—'],
+    ['Phone', info.phone || session.phone || '—'],
+    ['Premium', bool(truthy(info.isPremium ?? info.is_premium))],
+    ['Verified', bool(truthy(info.isVerified ?? info.is_verified))],
+    ['Restricted', bool(truthy(info.isRestricted ?? info.is_restricted))],
+    [
+      'Last login attempt',
+      info.lastLoginAttempt
+        ? formatRelativeTime(info.lastLoginAttempt)
+        : '—',
+    ],
+    [
+      'Last login outcome',
+      info.lastLoginAttempt
+        ? truthy(info.loginSuccess ?? info.login_success)
+          ? 'Success'
+          : 'Failed'
+        : '—',
+    ],
+  ];
+  if (info.lastErrorCode || info.lastError) {
+    rows.push([
+      'Last error',
+      `${info.lastErrorCode || ''}${info.lastErrorCode && info.lastError ? ' — ' : ''}${info.lastError || ''}`,
+    ]);
+  }
+
+  return (
+    <div>
+      <h4 className="text-sm font-semibold text-gray-400 uppercase tracking-wider mb-3">
+        Account Status
+      </h4>
+      <div className="rounded-lg border border-white/5 bg-dark-900 p-4">
+        <div className="mb-3 flex items-center gap-2">
+          <span className={`inline-flex items-center gap-1 rounded-full border px-2.5 py-1 text-sm font-medium ${tonePill}`}>
+            <span aria-hidden>{state.icon}</span>
+            <span>{state.label}</span>
+          </span>
+          {(session.isLoggedIn ?? session.is_logged_in) ? (
+            <span className="text-xs text-gray-500">Logged in</span>
+          ) : (
+            <span className="text-xs text-gray-500">Not logged in</span>
+          )}
+        </div>
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-x-6 gap-y-2 text-sm">
+          {rows.map(([k, v]) => (
+            <div key={k} className="flex items-baseline justify-between gap-3">
+              <span className="text-xs uppercase tracking-wider text-gray-500">{k}</span>
+              <span className="text-gray-200 truncate text-right">{v ?? '—'}</span>
+            </div>
+          ))}
+        </div>
+      </div>
+    </div>
   );
 }
 
@@ -1081,6 +1262,13 @@ export default function Sessions() {
                           {session.username && (
                             <p className="text-xs text-gray-500">@{session.username}</p>
                           )}
+                          {/*
+                            Surface the account-level status (banned, premium,
+                            verified, restricted, etc.) under the phone number
+                            so operators can see at a glance which sessions are
+                            healthy without opening the detail modal.
+                          */}
+                          <AccountStatusLine session={session} />
                         </div>
                       </td>
                       <td className="px-4 py-3">
@@ -1141,7 +1329,23 @@ export default function Sessions() {
                           >
                             <Download className="w-4 h-4" />
                           </button>
-                          {session.status?.toLowerCase() === 'active' ? (
+                          {/*
+                            "Already logged in" is canonically tracked by the
+                            `is_logged_in` boolean, NOT by `status`. A session
+                            can be `is_logged_in=true` while `status` is
+                            transiently 'inactive' (e.g. between a heartbeat
+                            cycle), and we still must NOT offer to log in
+                            again — Telegram revokes the auth key when a
+                            second client connects with the same string.
+
+                            The list API returns the field as `isLoggedIn`
+                            (camelCase) but several legacy callers still
+                            pass through the raw `is_logged_in`; check both
+                            so this works regardless of upstream shape.
+                          */}
+                          {session.isLoggedIn ||
+                          session.is_logged_in ||
+                          session.status?.toLowerCase() === 'active' ? (
                             <button
                               onClick={() => handleLogout(session.id)}
                               disabled={isLoading === 'logout'}

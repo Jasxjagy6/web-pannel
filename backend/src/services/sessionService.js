@@ -1,5 +1,7 @@
 const fs = require('fs-extra');
+const os = require('os');
 const path = require('path');
+const AdmZip = require('adm-zip');
 const { v4: uuidv4 } = require('uuid');
 const { pool } = require('../config/database');
 const { encrypt, decrypt } = require('../utils/crypto');
@@ -17,8 +19,41 @@ const VALID_STATUSES = ['uploaded', 'active', 'inactive', 'error', 'revoked', 'e
 
 /**
  * Supported upload file extensions.
+ *
+ * `.zip` is handled by `_expandZipUploads` BEFORE the per-file loop runs,
+ * so it never reaches the main extension-validation gate. The contents of
+ * each zip are unpacked into virtual file entries that match the existing
+ * `.session` / `.json` / `.bin` / `.txt` shapes.
  */
 const SUPPORTED_EXTENSIONS = ['.session', '.json', '.bin', '.txt'];
+
+/**
+ * Extensions accepted as session entries inside an uploaded `.zip`.
+ *
+ * Anything else (READMEs, screenshots, .csv exports, OS metadata, etc.)
+ * is silently skipped so users can drop the unmodified zip they got from
+ * a Telethon → GramJS migration tool without having to clean it up first.
+ */
+const ZIP_ENTRY_EXTENSIONS = ['.session', '.json', '.bin', '.txt'];
+
+/**
+ * Hard ceiling on a single decompressed entry inside a zip. Independently
+ * enforced from the per-file MAX_SESSION_FILE_SIZE so a zip-bomb crafted
+ * to expand to many gigabytes can't OOM the backend before validation
+ * runs. 100MB matches the legacy per-file limit; the assumption is that
+ * a real GramJS string session is < 4KB even with metadata.
+ */
+const ZIP_ENTRY_MAX_BYTES = 100 * 1024 * 1024;
+
+/**
+ * Hard ceiling on the total decompressed payload of one zip. We cap at
+ * 1GB to prevent a multi-thousand-entry archive from filling disk during
+ * extraction. Operators can raise this via SESSION_ZIP_TOTAL_MAX_BYTES.
+ */
+const ZIP_TOTAL_MAX_BYTES = parseInt(
+  process.env.SESSION_ZIP_TOTAL_MAX_BYTES || String(1024 * 1024 * 1024),
+  10
+);
 
 /**
  * Maximum file size for individual session uploads (100MB).
@@ -26,9 +61,34 @@ const SUPPORTED_EXTENSIONS = ['.session', '.json', '.bin', '.txt'];
 const MAX_SESSION_FILE_SIZE = 100 * 1024 * 1024;
 
 /**
- * Timeout for Telegram connection during login (30 seconds).
+ * Timeout for Telegram connection during login.
+ *
+ * Sessions whose proxy/route to Telegram is slow (proxy reassignment, DC
+ * fallback after a TCP RST, MTProto auth-key handshake under packet loss)
+ * frequently take 25–45s to complete the connect+getMe round-trip. The
+ * legacy 30s ceiling tripped on those sessions and surfaced as the
+ * (frequently-reported) "max login time reached" / "Login timeout
+ * exceeded (30s)" error even though the session itself was perfectly
+ * valid.
+ *
+ * Default raised to 90s and made tunable via env so operators can dial it
+ * up further on slower VPS regions without a code change.
  */
-const LOGIN_TIMEOUT_MS = 30000;
+const LOGIN_TIMEOUT_MS = parseInt(
+  process.env.SESSION_LOGIN_TIMEOUT_MS || '90000',
+  10
+);
+
+/**
+ * Timeout for the per-call `getMe()` round-trip after the connect+handshake
+ * has completed. This is a separate budget from LOGIN_TIMEOUT_MS so a
+ * stalled getMe doesn't get conflated with a connect failure in the error
+ * message.
+ */
+const GET_ME_TIMEOUT_MS = parseInt(
+  process.env.SESSION_GET_ME_TIMEOUT_MS || '30000',
+  10
+);
 
 /**
  * SQLite magic header bytes used to detect Telethon session files.
@@ -153,7 +213,26 @@ class SessionService {
     let successfulCount = 0;
     let failedCount = 0;
 
-    for (const file of files) {
+    // Expand any uploaded `.zip` archives into virtual per-entry file
+    // objects BEFORE the main loop runs. This keeps the rest of the
+    // upload pipeline ignorant of the zip path entirely — every zip
+    // entry is processed by exactly the same code path that handles a
+    // directly-uploaded `.json` / `.session` / `.bin` / `.txt` file.
+    let expandedFiles;
+    const cleanupTempDirs = [];
+    try {
+      const expansion = await this._expandZipUploads(files, results);
+      expandedFiles = expansion.files;
+      cleanupTempDirs.push(...expansion.tempDirs);
+      // `results` already contains zip-level summary rows ('zip:foo.zip ok / X
+      // entries'); the entries themselves are now in `expandedFiles`.
+    } catch (zipErr) {
+      // Hard zip-level failures (e.g. corrupt archive) bubble up so the
+      // caller gets a clear 4xx instead of an opaque 'no entries' message.
+      throw zipErr;
+    }
+
+    for (const file of expandedFiles) {
       const fileResult = {
         filename: file.originalname,
         status: 'error',
@@ -231,22 +310,205 @@ class SessionService {
       }
     }
 
+    // Best-effort cleanup of any temp dirs we created while extracting
+    // zips. The actual session payloads have already been written to the
+    // user's permanent session dir by `_processJsonUpload` /
+    // `_processBinaryUpload`, so blowing away these temp scratch dirs is
+    // safe regardless of whether the loop above succeeded or failed.
+    for (const tmp of cleanupTempDirs) {
+      fs.remove(tmp).catch((cleanupErr) => {
+        logger.warn(`Failed to clean zip temp dir ${tmp}: ${cleanupErr.message}`);
+      });
+    }
+
     const duration = Date.now() - startTime;
+    const totalProcessed = expandedFiles.length;
 
     logger.info(`Bulk session upload complete for user ${userId}`, {
-      total: files.length,
+      uploadedItems: files.length,
+      processedItems: totalProcessed,
       successful: successfulCount,
       failed: failedCount,
       durationMs: duration,
     });
 
     return {
-      total: files.length,
+      total: totalProcessed,
       successful: successfulCount,
       failed: failedCount,
       results,
       duration,
     };
+  }
+
+  /**
+   * Expand any `.zip` files in the uploaded set into virtual per-entry
+   * file objects.
+   *
+   * Each zip is extracted to a fresh temp directory under the OS tmpdir,
+   * then each session-eligible entry is wrapped in a multer-shaped
+   * `{ originalname, path, size, mimetype }` object and added to the
+   * returned `files` array. Non-zip uploads pass through unchanged.
+   *
+   * Side effects:
+   *   - Pushes one summary row per zip into `results` so the caller's
+   *     batch report shows whether the archive was readable and how many
+   *     entries it produced.
+   *   - Returns a `tempDirs` array — the caller is responsible for
+   *     removing them after the per-file processing loop finishes.
+   *
+   * Safety:
+   *   - Per-entry decompressed size capped at ZIP_ENTRY_MAX_BYTES.
+   *   - Total decompressed size across all zips capped at
+   *     ZIP_TOTAL_MAX_BYTES (zip-bomb mitigation).
+   *   - Path traversal protected: any entry whose normalized path
+   *     escapes the temp dir is skipped with a warning.
+   *
+   * @param {object[]} files
+   * @param {object[]} results - mutated; one summary row pushed per zip
+   * @returns {Promise<{ files: object[], tempDirs: string[] }>}
+   * @private
+   */
+  async _expandZipUploads(files, results) {
+    const out = [];
+    const tempDirs = [];
+    let cumulative = 0;
+
+    for (const file of files) {
+      const ext = path.extname(file.originalname || '').toLowerCase();
+      const looksLikeZip =
+        ext === '.zip' ||
+        (file.mimetype &&
+          (file.mimetype === 'application/zip' ||
+            file.mimetype === 'application/x-zip' ||
+            file.mimetype === 'application/x-zip-compressed'));
+
+      if (!looksLikeZip) {
+        out.push(file);
+        continue;
+      }
+
+      const summary = {
+        filename: file.originalname,
+        status: 'error',
+        kind: 'zip',
+        entries: 0,
+      };
+
+      let zip;
+      try {
+        zip = new AdmZip(file.path);
+      } catch (err) {
+        summary.error = `Invalid zip archive: ${err.message}`;
+        results.push(summary);
+        // Best-effort delete of the corrupt upload.
+        fs.unlink(file.path).catch(() => {});
+        continue;
+      }
+
+      const tempDir = await fs.mkdtemp(
+        path.join(os.tmpdir(), `web-pannel-zip-${uuidv4()}-`)
+      );
+      tempDirs.push(tempDir);
+
+      const entries = zip.getEntries();
+      let extractedCount = 0;
+      let skippedCount = 0;
+
+      for (const entry of entries) {
+        if (entry.isDirectory) continue;
+
+        const entryName = entry.entryName.replace(/\\/g, '/');
+        const baseName = path.basename(entryName);
+        // Skip dotfiles and OS metadata (__MACOSX, .DS_Store, Thumbs.db).
+        if (
+          !baseName ||
+          baseName.startsWith('.') ||
+          entryName.startsWith('__MACOSX/') ||
+          /Thumbs\.db$/i.test(baseName)
+        ) {
+          skippedCount++;
+          continue;
+        }
+
+        const entryExt = path.extname(baseName).toLowerCase();
+        if (!ZIP_ENTRY_EXTENSIONS.includes(entryExt)) {
+          skippedCount++;
+          continue;
+        }
+
+        // Path-traversal guard: resolve where the entry would land and
+        // make sure it stays inside `tempDir`.
+        const safeName = `${uuidv4()}${entryExt}`;
+        const targetPath = path.join(tempDir, safeName);
+        const resolved = path.resolve(targetPath);
+        if (!resolved.startsWith(path.resolve(tempDir) + path.sep)) {
+          logger.warn(`Skipping zip entry with unsafe path: ${entryName}`);
+          skippedCount++;
+          continue;
+        }
+
+        let buf;
+        try {
+          buf = entry.getData();
+        } catch (err) {
+          logger.warn(`Failed to read zip entry ${entryName}: ${err.message}`);
+          skippedCount++;
+          continue;
+        }
+
+        if (buf.length > ZIP_ENTRY_MAX_BYTES) {
+          logger.warn(
+            `Zip entry ${entryName} exceeds per-entry cap (${buf.length} bytes); skipping`
+          );
+          skippedCount++;
+          continue;
+        }
+
+        cumulative += buf.length;
+        if (cumulative > ZIP_TOTAL_MAX_BYTES) {
+          summary.error =
+            `Aggregate decompressed size exceeded ${ZIP_TOTAL_MAX_BYTES} bytes — ` +
+            'aborting zip extraction (possible zip bomb).';
+          results.push(summary);
+          throw new AppError(summary.error, 400, 'ZIP_TOO_LARGE');
+        }
+
+        await fs.writeFile(targetPath, buf);
+        out.push({
+          originalname: baseName,
+          path: targetPath,
+          size: buf.length,
+          mimetype:
+            entryExt === '.json'
+              ? 'application/json'
+              : 'application/octet-stream',
+          // Trace back to the parent zip in case downstream callers want
+          // to log it; the existing pipeline ignores extra fields.
+          _zipSource: file.originalname,
+        });
+        extractedCount++;
+      }
+
+      summary.entries = extractedCount;
+      if (extractedCount > 0) {
+        summary.status = 'success';
+      } else {
+        summary.error =
+          skippedCount > 0
+            ? `Zip contained ${skippedCount} non-session file(s) and no eligible session entries`
+            : 'Zip is empty';
+      }
+      results.push(summary);
+
+      // Delete the original uploaded zip from the user's upload dir; we
+      // don't need it anymore and keeping it would clutter the per-user
+      // upload area with binary blobs that the rest of the app has no
+      // reason to look at.
+      fs.unlink(file.path).catch(() => {});
+    }
+
+    return { files: out, tempDirs };
   }
 
   /**
@@ -1434,6 +1696,9 @@ class SessionService {
     logger.info(`Logging in session`, { sessionId, userId });
 
     const client = await pool.connect();
+    // Hoisted so the outer catch can preserve any pre-existing fields
+    // (telegramId, firstName, etc.) while writing the failure metadata.
+    let accountInfo = {};
     try {
       await client.query('BEGIN');
 
@@ -1456,7 +1721,7 @@ class SessionService {
         throw new AppError('Session is already logged in', 409, 'SESSION_ALREADY_LOGGED_IN');
       }
 
-      const accountInfo = this._parseJsonField(session.account_info);
+      accountInfo = this._parseJsonField(session.account_info) || {};
 
       // Handle existing telethon_binary sessions - convert them on-the-fly
       if (accountInfo && accountInfo.sessionType === 'telethon_binary') {
@@ -1569,7 +1834,10 @@ class SessionService {
         [sessionId, userId]
       );
 
-      // Add timeout to prevent indefinite hanging
+      // Add a connect-only timeout to prevent indefinite hanging on a
+      // dead proxy or unreachable Telegram DC. The error here surfaces as
+      // a 504 to the UI so the operator can retry (often with a new proxy
+      // assignment) instead of being told the session is bad.
       const loginPromise = tgService.createSession(
         tgSessionId,
         fileData.session,
@@ -1577,19 +1845,65 @@ class SessionService {
         session.api_hash || undefined,
         { proxy: assignedProxy, identity }
       );
-      const timeoutPromise = new Promise((_, reject) =>
-        setTimeout(() => reject(new Error('Login timeout exceeded (30s)')), LOGIN_TIMEOUT_MS)
-      );
+      let connectTimer;
+      const connectTimeout = new Promise((_, reject) => {
+        connectTimer = setTimeout(
+          () => reject(new Error(
+            `Telegram connect timed out after ${Math.round(LOGIN_TIMEOUT_MS / 1000)}s ` +
+            `(proxy=${assignedProxy ? assignedProxy.host || 'set' : 'direct'}). ` +
+            `The DC route or proxy is unreachable; retry, switch proxy, or raise SESSION_LOGIN_TIMEOUT_MS.`
+          )),
+          LOGIN_TIMEOUT_MS
+        );
+      });
+      try {
+        await Promise.race([loginPromise, connectTimeout]);
+      } finally {
+        clearTimeout(connectTimer);
+      }
 
-      await Promise.race([loginPromise, timeoutPromise]);
-
-      // Get account info - this MUST succeed for login to be valid
+      // Get account info - this MUST succeed for login to be valid. The
+      // getMe timeout is intentionally separate from the connect timeout
+      // so we can give a precise error when the handshake worked but the
+      // RPC stalled (rare but happens during DC migration storms).
       let me;
       try {
-        me = await tgService.getMe(tgSessionId);
+        let getMeTimer;
+        const getMeTimeout = new Promise((_, reject) => {
+          getMeTimer = setTimeout(
+            () => reject(new Error(
+              `Telegram getMe() timed out after ${Math.round(GET_ME_TIMEOUT_MS / 1000)}s — connection alive but RPC stalled.`
+            )),
+            GET_ME_TIMEOUT_MS
+          );
+        });
+        try {
+          me = await Promise.race([
+            tgService.getMe(tgSessionId),
+            getMeTimeout,
+          ]);
+        } finally {
+          clearTimeout(getMeTimer);
+        }
       } catch (meError) {
         // If getMe fails, the session is NOT valid - disconnect and throw error
         await tgService.disconnectSession(tgSessionId).catch(() => {});
+        // Persist the failure metadata into account_info so the UI's
+        // SessionAccountStatusBlock can render an honest "Banned" /
+        // "Auth revoked" / "Login error" badge instead of looking like
+        // the session is healthy.
+        const failedAt = new Date().toISOString();
+        const errorCode =
+          meError.errorMessage ||
+          (typeof meError.code === 'string' ? meError.code : null) ||
+          'TELEGRAM_GET_ME_FAILED';
+        const failedInfo = {
+          ...accountInfo,
+          lastLoginAttempt: failedAt,
+          loginSuccess: false,
+          lastError: meError.message || String(meError),
+          lastErrorCode: errorCode,
+        };
         if (tgService.isPermanentAuthError(meError)) {
           // Roll the in-flight txn back, then persist the revoked status
           // in a fresh statement so the UI badge flips and the heartbeat
@@ -1599,9 +1913,10 @@ class SessionService {
             .query(
               `UPDATE sessions
                   SET is_logged_in = FALSE,
-                      status = 'revoked'
+                      status = 'revoked',
+                      account_info = $2
                 WHERE id = $1`,
-              [sessionId]
+              [sessionId, JSON.stringify(failedInfo)]
             )
             .catch(() => {});
           throw new AppError(
@@ -1612,7 +1927,20 @@ class SessionService {
             meError.code || 'AUTH_KEY_REVOKED'
           );
         }
-        await client.query('ROLLBACK');
+        // Non-permanent failures: set status='error' and record the same
+        // error metadata so the UI shows "Login error" with a code the
+        // operator can look up.
+        await client.query('ROLLBACK').catch(() => {});
+        await pool
+          .query(
+            `UPDATE sessions
+                SET is_logged_in = FALSE,
+                    status = 'error',
+                    account_info = $2
+              WHERE id = $1`,
+            [sessionId, JSON.stringify(failedInfo)]
+          )
+          .catch(() => {});
         throw new AppError(
           `Failed to verify session with Telegram API: ${meError.message}`,
           500,
@@ -1679,22 +2007,33 @@ class SessionService {
       // from getMe. Mark the session revoked and return a 401 with a
       // clear message so the user knows to re-upload or re-login.
       if (tgService.isPermanentAuthError(error)) {
+        const code =
+          error.errorMessage ||
+          (typeof error.code === 'string' ? error.code : null) ||
+          'AUTH_KEY_REVOKED';
+        // Persist the failure code into account_info so the UI shows
+        // "Banned" for USER_DEACTIVATED and "Auth revoked" for everything
+        // else, instead of a generic gray pill.
+        const failedInfo = {
+          ...(accountInfo || {}),
+          lastLoginAttempt: new Date().toISOString(),
+          loginSuccess: false,
+          lastError: error.message || String(error),
+          lastErrorCode: code,
+        };
         await pool
           .query(
             `UPDATE sessions
                 SET is_logged_in = FALSE,
-                    status = 'revoked'
+                    status = 'revoked',
+                    account_info = $2
               WHERE id = $1`,
-            [sessionId]
+            [sessionId, JSON.stringify(failedInfo)]
           )
           .catch(() => {});
         await tgService
           .disconnectSession(String(sessionId))
           .catch(() => {});
-        const code =
-          error.errorMessage ||
-          (typeof error.code === 'string' ? error.code : null) ||
-          'AUTH_KEY_REVOKED';
         throw new AppError(
           'Telegram revoked this session\'s auth key (' + code + '). ' +
             'The same session is in use by another connection. ' +

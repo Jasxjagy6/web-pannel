@@ -27,18 +27,26 @@ const storage = multer.diskStorage({
 });
 
 const fileFilter = (req, file, cb) => {
-  const allowedExtensions = /\.(session|json|bin|csv|txt)$/i;
+  const allowedExtensions = /\.(session|json|bin|csv|txt|zip)$/i;
   const allowedMimeTypes = [
     'application/octet-stream',
     'application/json',
     'text/plain',
     'text/csv',
+    'application/zip',
+    'application/x-zip',
+    'application/x-zip-compressed',
+    'multipart/x-zip',
   ];
 
   if (allowedExtensions.test(file.originalname) || allowedMimeTypes.includes(file.mimetype)) {
     cb(null, true);
   } else {
-    cb(new AppError('Invalid file type. Allowed: .session, .json, .bin, .csv, .txt', 400, 'INVALID_FILE_TYPE'), false);
+    cb(new AppError(
+      'Invalid file type. Allowed: .session, .json, .bin, .csv, .txt, .zip',
+      400,
+      'INVALID_FILE_TYPE'
+    ), false);
   }
 };
 

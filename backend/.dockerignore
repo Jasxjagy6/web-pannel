@@ -1,0 +1,33 @@
+# Skip host build artifacts so the COPY . . step doesn't shadow the
+# image's own node_modules (which were just freshly built against
+# alpine/musl). Without this, the host's glibc-prebuild binaries get
+# copied into the image and the backend crashes on boot with
+# `napi_get_cb_info: symbol not found` from bcrypt.
+node_modules
+npm-debug.log
+yarn-error.log
+
+# Test/dev caches and editor noise
+.cache
+.eslintcache
+coverage
+.nyc_output
+.vscode
+.idea
+
+# Local environment / secrets
+.env
+.env.local
+.env.*.local
+
+# Local logs / uploads / sessions — these get bind-mounted at runtime
+logs/*
+!logs/.gitkeep
+uploads/*
+!uploads/.gitkeep
+sessions/*
+!sessions/.gitkeep
+
+# Git metadata isn't needed inside the image
+.git
+.gitignore
