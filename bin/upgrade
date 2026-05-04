@@ -119,12 +119,17 @@ async function confirm(question) {
 }
 
 function dbEnv() {
+  // Migration containers run inside the Docker compose network where
+  // "postgres" is the service hostname.  backend/.env sets DB_HOST=localhost
+  // for direct (non-Docker) dev access, but localhost inside a --rm
+  // container resolves to the container's own loopback (::1 / 127.0.0.1),
+  // not the Postgres service.  Use MIGRATE_DB_HOST to override if needed.
   return {
-    host: process.env.DB_HOST || 'postgres',
+    host: process.env.MIGRATE_DB_HOST || 'postgres',
     port: parseInt(process.env.DB_PORT || '5435', 10),
     name: process.env.DB_NAME || 'telegram_panel',
     user: process.env.DB_USER || 'postgres',
-    password: process.env.DB_PASSWORD || 'your_secure_password',
+    password: process.env.DB_PASSWORD || process.env.POSTGRES_PASSWORD || 'your_secure_password',
   };
 }
 
