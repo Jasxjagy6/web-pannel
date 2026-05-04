@@ -1,3 +1,32 @@
+# =============================================================================
+# docker-compose.yml — web-pannel
+#
+# Topology (after the dynamic-upgrade work):
+#
+#   internet
+#       │
+#       ▼
+#    caddy        public-facing reverse proxy + admin API on :2019
+#     │ │
+#     │ └─ /            → frontend:83  (static SPA)
+#     │
+#     └─── /api/*       → backend-blue OR backend-green (one is "active")
+#          /socket.io/*
+#
+#   postgres :5435  named-vol postgres_data
+#   redis    :6382  named-vol redis_data
+#
+#   uploads          named-vol uploads_data  mounted at /app/uploads
+#   logs             named-vol logs_data     mounted at /app/logs
+#   sessions         named-vol sessions_data mounted at /app/sessions
+#   state            named-vol state_data    used by bin/upgrade for active-color.json
+#                                            and the deploy lock
+#
+# Only one of backend-blue / backend-green should normally be running. The
+# orchestrator (`bin/upgrade`) starts the inactive color, waits for it to
+# pass /health/ready, swings Caddy over, drains, then stops the old one.
+# =============================================================================
+
 services:
   postgres:
     image: postgres:15
@@ -7,7 +36,7 @@ services:
     environment:
       POSTGRES_DB: telegram_panel
       POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: Navneetbb1###@
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-Navneetbb1###@}
       PGPORT: 5435
     volumes:
       - postgres_data:/var/lib/postgresql/data
@@ -18,66 +47,244 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+    restart: unless-stopped
 
   redis:
     image: redis:7-alpine
     # Internal Redis port +3 (6379 -> 6382) so the whole stack is on
     # the +3 set. To revert, drop `--port 6382` and the `-p 6382` in
     # the healthcheck below.
-    command: redis-server --port 6382 --requirepass Navneetbb1###
+    command: redis-server --port 6382 --requirepass ${REDIS_PASSWORD:-Navneetbb1###} --appendonly yes
     volumes:
       - redis_data:/data
     ports:
       - "6392:6382"
     healthcheck:
-      test: ["CMD", "redis-cli", "-p", "6382", "-a", "Navneetbb1###", "ping"]
+      test: ["CMD", "redis-cli", "-p", "6382", "-a", "${REDIS_PASSWORD:-Navneetbb1###}", "ping"]
       interval: 10s
       timeout: 5s
       retries: 5
+    restart: unless-stopped
 
-  backend:
-    build: ./backend
-    # Backend HTTP/WebSocket port. Originally shifted +3 (3000 -> 3003);
-    # bumped further to 3005 to coexist with another local service
-    # already holding 3003.
-    ports:
-      - "3005:3005"
+  # ---------------------------------------------------------------------------
+  # Backend — BLUE
+  # ---------------------------------------------------------------------------
+  # Both colors share the same image and config; only the container name and
+  # internal port differ. The orchestrator picks which color to launch and
+  # which color Caddy points at.
+  backend-blue:
+    build:
+      context: ./backend
+      args:
+        GIT_SHA: ${GIT_SHA:-dev}
+        BUILD_TIME: ${BUILD_TIME:-unknown}
+    image: web-pannel-backend:${IMAGE_TAG:-dev}
+    container_name: web-pannel-backend-blue
     env_file:
       - ./backend/.env
     environment:
+      - DEPLOY_COLOR=blue
+      - GIT_SHA=${GIT_SHA:-dev}
+      - GIT_REF=${GIT_REF:-unknown}
+      - BUILD_TIME=${BUILD_TIME:-unknown}
+      - IMAGE_TAG=${IMAGE_TAG:-dev}
       - DB_HOST=postgres
       - DB_PORT=5435
       - DB_NAME=telegram_panel
       - DB_USER=postgres
-      - DB_PASSWORD=Navneetbb1###@
+      - DB_PASSWORD=${POSTGRES_PASSWORD:-Navneetbb1###@}
       - REDIS_HOST=redis
       - REDIS_PORT=6382
-      - REDIS_PASSWORD=Navneetbb1###
-      - JWT_SECRET=zI1zt20iQZ/uW+L+90SXj7QkGHTFwoEJOezPrUBJCgo4CvkEMpWaPHGh8YhFNtT9
+      - REDIS_PASSWORD=${REDIS_PASSWORD:-Navneetbb1###}
+      - JWT_SECRET=${JWT_SECRET:-zI1zt20iQZ/uW+L+90SXj7QkGHTFwoEJOezPrUBJCgo4CvkEMpWaPHGh8YhFNtT9}
       - JWT_EXPIRE=7d
       - PORT=3005
-      - NODE_ENV=development
+      - NODE_ENV=${NODE_ENV:-production}
       - RATE_LIMIT_WINDOW=15
       - RATE_LIMIT_MAX=5000
       - AUTH_RATE_LIMIT_MAX=100
       - UPLOAD_RATE_LIMIT_MAX=500
+      - SKIP_BOOT_MIGRATIONS=${SKIP_BOOT_MIGRATIONS:-false}
     depends_on:
       postgres:
         condition: service_healthy
       redis:
         condition: service_healthy
     volumes:
-      - ./backend/uploads:/app/uploads
-      - ./backend/logs:/app/logs
+      - uploads_data:/app/uploads
+      - logs_data:/app/logs
+      - sessions_data:/app/sessions
+    healthcheck:
+      test: ["CMD", "node", "-e", "require('http').get('http://127.0.0.1:3005/health',r=>process.exit(r.statusCode===200?0:1)).on('error',()=>process.exit(1))"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+    profiles: ["blue", "deploy"]
+
+  # ---------------------------------------------------------------------------
+  # Backend — GREEN (twin of BLUE, idle by default)
+  # ---------------------------------------------------------------------------
+  backend-green:
+    build:
+      context: ./backend
+      args:
+        GIT_SHA: ${GIT_SHA:-dev}
+        BUILD_TIME: ${BUILD_TIME:-unknown}
+    image: web-pannel-backend:${IMAGE_TAG:-dev}
+    container_name: web-pannel-backend-green
+    env_file:
+      - ./backend/.env
+    environment:
+      - DEPLOY_COLOR=green
+      - GIT_SHA=${GIT_SHA:-dev}
+      - GIT_REF=${GIT_REF:-unknown}
+      - BUILD_TIME=${BUILD_TIME:-unknown}
+      - IMAGE_TAG=${IMAGE_TAG:-dev}
+      - DB_HOST=postgres
+      - DB_PORT=5435
+      - DB_NAME=telegram_panel
+      - DB_USER=postgres
+      - DB_PASSWORD=${POSTGRES_PASSWORD:-Navneetbb1###@}
+      - REDIS_HOST=redis
+      - REDIS_PORT=6382
+      - REDIS_PASSWORD=${REDIS_PASSWORD:-Navneetbb1###}
+      - JWT_SECRET=${JWT_SECRET:-zI1zt20iQZ/uW+L+90SXj7QkGHTFwoEJOezPrUBJCgo4CvkEMpWaPHGh8YhFNtT9}
+      - JWT_EXPIRE=7d
+      - PORT=3005
+      - NODE_ENV=${NODE_ENV:-production}
+      - RATE_LIMIT_WINDOW=15
+      - RATE_LIMIT_MAX=5000
+      - AUTH_RATE_LIMIT_MAX=100
+      - UPLOAD_RATE_LIMIT_MAX=500
+      # Green never re-runs migrations — they were already applied by
+      # `bin/upgrade` against the DB before green was started.
+      - SKIP_BOOT_MIGRATIONS=true
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - uploads_data:/app/uploads
+      - logs_data:/app/logs
+      - sessions_data:/app/sessions
+    healthcheck:
+      test: ["CMD", "node", "-e", "require('http').get('http://127.0.0.1:3005/health',r=>process.exit(r.statusCode===200?0:1)).on('error',()=>process.exit(1))"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+    profiles: ["green", "deploy"]
 
   frontend:
     build: ./frontend
-    # Frontend nginx +3 inside (80 -> 83) and host-mapped 8080 -> 8083.
+    # The frontend nginx serves the SPA only — Caddy is the public proxy
+    # for /api/* and /socket.io/*.
+    expose:
+      - "83"
     ports:
       - "8083:83"
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # Caddy — public-facing reverse proxy. Exposes :80 (and :443 when
+  # PUBLIC_DOMAIN is set). Admin API on :2019 is only reachable inside the
+  # docker network so `bin/upgrade` (running on the host) pokes it through
+  # `docker exec` or via a published localhost-only port (see admin-api).
+  # ---------------------------------------------------------------------------
+  caddy:
+    image: caddy:2.7-alpine
+    restart: unless-stopped
+    ports:
+      - "${HTTP_PORT:-80}:80"
+      - "${HTTPS_PORT:-443}:443"
+      # 2019 is the admin API — bound to localhost ONLY on the host so an
+      # external attacker can't reconfigure routing. The orchestrator hits
+      # http://127.0.0.1:2019 from the VPS shell.
+      - "127.0.0.1:2019:2019"
+    environment:
+      - PUBLIC_DOMAIN=${PUBLIC_DOMAIN:-}
+      - ACME_EMAIL=${ACME_EMAIL:-}
+      - ACTIVE_BACKEND=${ACTIVE_BACKEND:-backend-blue:3005}
+    volumes:
+      - ./proxy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
     depends_on:
-      - backend
+      - frontend
+
+  # ---------------------------------------------------------------------------
+  # Telegram admin bot — long-poll, no inbound port. Reuses the backend
+  # image because it shares the orchestrator helpers in `bin/lib/`.
+  # Only runs when TELEGRAM_ADMIN_BOT_TOKEN is set.
+  # ---------------------------------------------------------------------------
+  admin-bot:
+    image: web-pannel-backend:${IMAGE_TAG:-dev}
+    container_name: web-pannel-admin-bot
+    command: ["node", "/app/src/bot/adminBot.js"]
+    env_file:
+      - ./backend/.env
+    environment:
+      - DEPLOY_COLOR=bot
+      - DB_HOST=postgres
+      - DB_PORT=5435
+      - DB_NAME=telegram_panel
+      - DB_USER=postgres
+      - DB_PASSWORD=${POSTGRES_PASSWORD:-Navneetbb1###@}
+      - REDIS_HOST=redis
+      - REDIS_PORT=6382
+      - REDIS_PASSWORD=${REDIS_PASSWORD:-Navneetbb1###}
+      - TELEGRAM_ADMIN_BOT_TOKEN=${TELEGRAM_ADMIN_BOT_TOKEN:-}
+      - TELEGRAM_ADMIN_IDS=${TELEGRAM_ADMIN_IDS:-}
+      - UPGRADE_CONFIRM_PIN=${UPGRADE_CONFIRM_PIN:-}
+      - DEPLOY_HOST_BIN=/host/bin/upgrade
+      - CADDY_ADMIN_HOST=caddy
+      - CADDY_ADMIN_PORT=2019
+    volumes:
+      - logs_data:/app/logs
+      - state_data:/app/state
+      # The bot runs the upgrade CLI on the host via docker socket. The
+      # operator can disable this by removing the volume mount; in that
+      # case the bot still answers /status, /health and /logs.
+      - /var/run/docker.sock:/var/run/docker.sock
+      # The repo is mounted RW because bin/upgrade writes state/active-color.json
+      # and appends to logs/upgrade-audit.log. The bot is locked down via
+      # TELEGRAM_ADMIN_IDS + UPGRADE_CONFIRM_PIN.
+      - .:/host
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    # Override the inherited backend HEALTHCHECK (which probes /health on
+    # :3005, but the bot has no HTTP server). Read the heartbeat file
+    # adminBot.js writes on every poll cycle; older than 90s = unhealthy.
+    healthcheck:
+      test: ["CMD", "node", "/app/src/bot/healthcheck.js"]
+      interval: 30s
+      timeout: 5s
+      start_period: 30s
+      retries: 5
+    profiles: ["bot", "deploy"]
 
 volumes:
   postgres_data:
+    name: web-pannel_postgres_data
   redis_data:
+    name: web-pannel_redis_data
+  uploads_data:
+    name: web-pannel_uploads_data
+  logs_data:
+    name: web-pannel_logs_data
+  sessions_data:
+    name: web-pannel_sessions_data
+  state_data:
+    name: web-pannel_state_data
+  caddy_data:
+    name: web-pannel_caddy_data
+  caddy_config:
+    name: web-pannel_caddy_config

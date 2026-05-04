@@ -2,6 +2,8 @@ const { Pool } = require('pg');
 const bcrypt = require('bcrypt');
 require('dotenv').config();
 
+const migrations = require('./migrations');
+
 // Pool sized for the 500-700 concurrent user target. With ~50 conns
 // per panel pod and ~150 max connections in Postgres, three panel
 // pods saturates the DB; tune `DB_POOL_MAX` per pod accordingly. See
@@ -27,47 +29,29 @@ pool.on('error', (err) => {
 
 const initDB = async () => {
   try {
-    const fs = require('fs');
-    const path = require('path');
+    // Apply base schema (idempotent, uses CREATE TABLE IF NOT EXISTS).
+    await migrations.applySchemaSql(pool);
 
-    // Apply base schema first.
-    const schemaPath = path.join(__dirname, 'schema.sql');
-    if (fs.existsSync(schemaPath)) {
-      const schema = fs.readFileSync(schemaPath, 'utf8');
-      await pool.query(schema);
-      console.log('Database schema initialized successfully');
-    }
+    // First contact with a database that pre-dates the migration runner:
+    // record every existing migration_*.sql as already applied so we don't
+    // try to re-run them. No-op on a fresh DB or on subsequent boots.
+    await migrations.seedHistoryIfPreExisting(pool);
 
-    // Apply additive migrations in order. Each migration is idempotent.
-    const migrations = [
-      'migration_scraping_upgrade.sql',
-      'migration_v2_upgrades.sql',
-      'migration_group_operations_ownership.sql',
-      'migration_v3_antidetect.sql',
-      'migration_v4_privacy.sql',
-      'migration_v5_multiuser.sql',
-      'migration_v6_scrape_monitor.sql',
-      'migration_v7_billing.sql',
-      'migration_v8_per_user_api_and_auto_approve.sql',
-      'migration_v9_multiplatform.sql',
-      'migration_v9_2_instagram_extras.sql',
-      'migration_v9_3_subscription_split.sql',
-      'migration_v10_monitor_dedup_toggle.sql',
-      'migration_v11_instagram_session_columns.sql',
-      'migration_v12_ig_anti_ban.sql',
-      'migration_v13_tg_anti_revoke.sql',
-      'migration_v14_user_proxies.sql',
-    ];
-    for (const m of migrations) {
-      const mPath = path.join(__dirname, m);
-      if (!fs.existsSync(mPath)) continue;
+    // Apply any pending migrations. Each runs in its own transaction.
+    // The orchestrator (`bin/upgrade`) also calls this path before flipping
+    // traffic, so on a normal deploy this loop is a no-op at boot time.
+    if (process.env.SKIP_BOOT_MIGRATIONS !== 'true') {
       try {
-        const sql = fs.readFileSync(mPath, 'utf8');
-        await pool.query(sql);
-        console.log(`Applied migration: ${m}`);
+        await migrations.applyPending(pool);
       } catch (err) {
-        console.error(`Failed migration ${m}:`, err.message);
+        // We deliberately don't throw — keeping the legacy boot semantics
+        // (the panel still comes up so the operator can investigate). The
+        // CLI / orchestrator path is strict and will refuse to flip traffic
+        // if migrations fail.
+        console.error('Migration apply failed at boot:', err.message);
       }
+    } else {
+      console.log('SKIP_BOOT_MIGRATIONS=true — skipping in-process migration apply.');
     }
 
     await ensureGroupOperationsSchema();

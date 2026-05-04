@@ -1,0 +1,537 @@
+#!/usr/bin/env node
+/**
+ * web-pannel upgrade orchestrator.
+ *
+ * Subcommands:
+ *   status                          show active color, recent deployments
+ *   deploy [--ref <r>] [...]        zero-downtime deploy (default ref = main)
+ *   rollback                        deploy the previous successful SHA
+ *   migrate [--check|--apply]       run the migration CLI inside the new image
+ *   health                          probe both colors
+ *   logs [--color X] [-n N]         tail backend logs
+ *
+ * Flags for `deploy`:
+ *   --ref <branch|tag|sha>          git ref to deploy (default: main)
+ *   --build local|registry          build the image locally vs. pull from
+ *                                   GHCR. Default: local. Set
+ *                                   UPGRADE_REGISTRY=ghcr.io/owner/repo
+ *                                   to use registry mode.
+ *   --skip-migrate                  do not apply pending migrations (rare)
+ *   --skip-backup                   do not run scripts/backup-now.sh
+ *   --no-confirm                    skip the interactive y/N prompt
+ *
+ * Environment knobs (also see docs/UPGRADES.md):
+ *   ROLLOUT_HEALTH_TIMEOUT_MS   default 120000 — how long to wait for the
+ *                               new color to pass /health/ready before
+ *                               aborting.
+ *   DRAIN_GRACE_MS              default 25000 — sleep after Caddy flip
+ *                               before stopping the old color, so WS
+ *                               clients can disconnect cleanly.
+ *   PUBLIC_DOMAIN, ACME_EMAIL   passed through to Caddy when set.
+ *   UPGRADE_REGISTRY            ghcr.io/owner/repo path for registry pulls.
+ */
+
+const path = require('path');
+const fs = require('fs');
+const readline = require('readline');
+
+const REPO_ROOT = path.join(__dirname, '..');
+
+// Load .env files into process.env. We deliberately don't depend on the
+// `dotenv` npm module here: this CLI runs on the host where there's no
+// guarantee `npm install` has been run, AND inside the admin-bot container
+// where dotenv IS installed. A tiny in-tree parser keeps both paths working
+// without an external dependency. Both files are loaded; values from the
+// process environment win, then root `.env`, then `backend/.env` (so
+// backend-specific overrides like DB_HOST stay scoped).
+function loadEnvFile(file) {
+  if (!fs.existsSync(file)) return;
+  const raw = fs.readFileSync(file, 'utf8');
+  for (const line of raw.split('\n')) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith('#')) continue;
+    const eq = trimmed.indexOf('=');
+    if (eq <= 0) continue;
+    const key = trimmed.slice(0, eq).trim();
+    let value = trimmed.slice(eq + 1).trim();
+    if (
+      (value.startsWith('"') && value.endsWith('"')) ||
+      (value.startsWith("'") && value.endsWith("'"))
+    ) {
+      value = value.slice(1, -1);
+    }
+    if (process.env[key] === undefined) process.env[key] = value;
+  }
+}
+loadEnvFile(path.join(REPO_ROOT, '.env'));
+loadEnvFile(path.join(REPO_ROOT, 'backend', '.env'));
+
+const stateMod = require(path.join(__dirname, 'lib', 'state'));
+const audit = require(path.join(__dirname, 'lib', 'audit'));
+const deploy = require(path.join(__dirname, 'lib', 'deploy'));
+const { run } = require(path.join(__dirname, 'lib', 'exec'));
+
+function parseFlags(argv) {
+  const out = { _: [] };
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (a.startsWith('--')) {
+      const key = a.slice(2);
+      const next = argv[i + 1];
+      if (next != null && !next.startsWith('--') && !key.startsWith('no-') && !key.startsWith('skip-')) {
+        out[key] = next;
+        i++;
+      } else {
+        out[key] = true;
+      }
+    } else if (a.startsWith('-') && a.length === 2) {
+      out[a.slice(1)] = argv[i + 1];
+      i++;
+    } else {
+      out._.push(a);
+    }
+  }
+  return out;
+}
+
+function colorize(text, kind) {
+  if (!process.stdout.isTTY) return text;
+  const map = { ok: 32, warn: 33, err: 31, info: 36, dim: 90 };
+  return `\x1b[${map[kind] || 0}m${text}\x1b[0m`;
+}
+
+function logger(prefix = '') {
+  return (msg) => {
+    const ts = new Date().toISOString().split('T')[1].split('.')[0];
+    process.stdout.write(`[${ts}] ${prefix}${msg}\n`);
+  };
+}
+
+async function confirm(question) {
+  if (!process.stdin.isTTY) return false;
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+  return new Promise((resolve) => {
+    rl.question(question, (ans) => {
+      rl.close();
+      resolve(/^y(es)?$/i.test(ans.trim()));
+    });
+  });
+}
+
+function dbEnv() {
+  return {
+    host: process.env.DB_HOST || 'postgres',
+    port: parseInt(process.env.DB_PORT || '5435', 10),
+    name: process.env.DB_NAME || 'telegram_panel',
+    user: process.env.DB_USER || 'postgres',
+    password: process.env.DB_PASSWORD || 'your_secure_password',
+  };
+}
+
+async function whoami() {
+  try {
+    const { stdout } = await run('whoami', [], { allowFail: true });
+    return `cli:${stdout.trim() || 'unknown'}`;
+  } catch (_) {
+    return 'cli:unknown';
+  }
+}
+
+/* -------------------------------------------------------------------------- */
+/* status                                                                     */
+/* -------------------------------------------------------------------------- */
+
+async function cmdStatus() {
+  const log = logger();
+  const state = stateMod.readState();
+  log(colorize('Active color: ', 'info') + colorize(state.color || 'unknown', 'ok'));
+  log(`  image:       ${state.image || '—'}`);
+  log(`  git_sha:     ${state.git_sha || '—'}`);
+  log(`  git_ref:     ${state.git_ref || '—'}`);
+  log(`  deployed_at: ${state.deployed_at || '—'}`);
+  log('');
+  log('Recent deployments (newest first):');
+  const rows = await audit.recentDeployments(10);
+  if (rows.length === 0) {
+    log(colorize('  (no deployment rows yet — run a deploy)', 'dim'));
+  }
+  for (const r of rows) {
+    log(
+      `  #${r.id}  ${r.started_at && r.started_at.toISOString().slice(0, 19)}  ` +
+      `${(r.status || '').padEnd(11)} ${(r.target_ref || '—').padEnd(8)} ` +
+      `${(r.target_sha || '').slice(0, 12).padEnd(12)} ` +
+      `→ ${r.color_promoted || '—'}  by ${r.initiated_by}`
+    );
+  }
+}
+
+/* -------------------------------------------------------------------------- */
+/* health                                                                     */
+/* -------------------------------------------------------------------------- */
+
+async function probeColor(color) {
+  const container = `web-pannel-backend-${color}`;
+  try {
+    const { stdout, code } = await run(
+      'docker',
+      ['exec', container, 'node', '-e',
+        `require('http').get('http://127.0.0.1:'+(process.env.PORT||3005)+'/health/ready',r=>{let b='';r.on('data',c=>b+=c);r.on('end',()=>{process.stdout.write(b);process.exit(r.statusCode===200?0:7)})}).on('error',()=>process.exit(8))`
+      ],
+      { allowFail: true }
+    );
+    return { color, alive: true, ready: code === 0, body: stdout };
+  } catch (err) {
+    return { color, alive: false, ready: false, body: err.message };
+  }
+}
+
+async function cmdHealth() {
+  const log = logger();
+  for (const color of ['blue', 'green']) {
+    const r = await probeColor(color);
+    const tag = r.ready ? colorize('READY', 'ok') : (r.alive ? colorize('NOT-READY', 'warn') : colorize('DOWN', 'err'));
+    log(`backend-${color.padEnd(5)} ${tag}`);
+    if (r.body) log(colorize(`  ${r.body.slice(0, 400)}`, 'dim'));
+  }
+}
+
+/* -------------------------------------------------------------------------- */
+/* logs                                                                       */
+/* -------------------------------------------------------------------------- */
+
+async function cmdLogs(args) {
+  const color = args.color || stateMod.readState().color;
+  const n = args.n || args.tail || '200';
+  const container = `web-pannel-backend-${color}`;
+  await run('docker', ['logs', '--tail', String(n), container], { allowFail: true })
+    .then((r) => process.stdout.write(r.stdout));
+}
+
+/* -------------------------------------------------------------------------- */
+/* migrate                                                                    */
+/* -------------------------------------------------------------------------- */
+
+async function cmdMigrate(args) {
+  const log = logger();
+  const mode = args.apply ? 'apply' : 'check';
+  const state = stateMod.readState();
+  const imageTag = state.image || `web-pannel-backend:dev`;
+  await deploy.runMigrations({ imageTag, sha: state.git_sha || 'dev', dbEnv: dbEnv(), log, mode });
+}
+
+/* -------------------------------------------------------------------------- */
+/* deploy                                                                     */
+/* -------------------------------------------------------------------------- */
+
+async function cmdDeploy(args) {
+  const log = logger();
+  const ref = args.ref || 'main';
+  const buildMode = args.build || (process.env.UPGRADE_REGISTRY ? 'registry' : 'local');
+  const registry = process.env.UPGRADE_REGISTRY || '';
+  if (buildMode === 'registry' && !registry) {
+    log(colorize('--build registry but UPGRADE_REGISTRY is not set', 'err'));
+    process.exit(2);
+  }
+
+  if (!args['no-confirm'] && !args.y) {
+    const ok = await confirm(`Deploy ref=${ref} via ${buildMode}? [y/N] `);
+    if (!ok) { log('aborted'); process.exit(1); }
+  }
+
+  let release = stateMod.acquireLock();
+  const state0 = stateMod.readState();
+  const newColor = stateMod.inactiveColor(state0.color || 'blue');
+  const oldColor = state0.color || 'blue';
+
+  // First-deploy seeding: when state/active-color.json was created with null
+  // image / git_sha (a fresh stack that came up before any orchestrator
+  // deploy), inspect the running container to learn what's actually serving
+  // so a future `bin/upgrade rollback` has a concrete image to roll back to.
+  if (!state0.image) {
+    const liveImage = await deploy.runningImageOf(oldColor);
+    if (liveImage) state0.image = liveImage;
+  }
+  const initiatedBy = process.env.INITIATED_BY || (await whoami());
+  const t0 = Date.now();
+  const deploymentId = await audit.startDeployment({
+    initiatedBy,
+    targetRef: ref,
+    prevSha: state0.git_sha,
+    color: newColor,
+  });
+  audit.appendFileLine({ event: 'deploy.start', ref, buildMode, oldColor, newColor, initiatedBy });
+
+  let imageTag = null;
+  let targetSha = null;
+  let healthMs = null;
+  let aborted = false;
+
+  try {
+    // Optional pre-deploy backup. Best-effort; controlled by BACKUP_REQUIRED.
+    if (!args['skip-backup']) {
+      const script = path.join(REPO_ROOT, 'scripts', 'backup-now.sh');
+      if (fs.existsSync(script)) {
+        log('running scripts/backup-now.sh');
+        try {
+          await run('bash', [script], { cwd: REPO_ROOT });
+        } catch (err) {
+          if ((process.env.BACKUP_REQUIRED || 'true').toLowerCase() !== 'false') {
+            throw err;
+          }
+          log(colorize(`backup failed (BACKUP_REQUIRED=false, continuing): ${err.message}`, 'warn'));
+        }
+      } else {
+        log(colorize('scripts/backup-now.sh not found, skipping backup', 'warn'));
+      }
+    }
+
+    // 1. git
+    targetSha = await deploy.gitFetchAndCheckout(ref, log);
+
+    // 2. build / pull image
+    imageTag = await deploy.buildOrPullImage({ buildMode, registry, sha: targetSha, log });
+
+    // 3. migrations — pre-flight check first
+    if (!args['skip-migrate']) {
+      await deploy.runMigrations({ imageTag, sha: targetSha, dbEnv: dbEnv(), log, mode: 'apply' });
+    } else {
+      log(colorize('--skip-migrate: not running migrations', 'warn'));
+    }
+
+    // 4. start the inactive color
+    await deploy.startColor({ color: newColor, sha: targetSha, log });
+
+    // 5. wait for /health/ready
+    const timeoutMs = parseInt(process.env.ROLLOUT_HEALTH_TIMEOUT_MS || '120000', 10);
+    healthMs = await deploy.waitForReady({
+      container: `web-pannel-backend-${newColor}`,
+      timeoutMs,
+      log,
+    });
+
+    // 6. flip Caddy
+    await deploy.flipCaddy({ color: newColor, log });
+
+    // 7. drain old color
+    const drainMs = parseInt(process.env.DRAIN_GRACE_MS || '25000', 10);
+    await deploy.drainOldColor({ color: oldColor, drainMs, log });
+
+    // 8. stop old color
+    await deploy.stopColor({ color: oldColor, log });
+
+    // 9. persist state
+    deploy.persistActiveState({
+      color: newColor,
+      sha: targetSha,
+      ref,
+      imageTag,
+      prev: {
+        color: oldColor,
+        image: state0.image,
+        git_sha: state0.git_sha,
+        git_ref: state0.git_ref,
+        deployed_at: state0.deployed_at,
+      },
+    });
+
+    const totalMs = Date.now() - t0;
+    audit.appendFileLine({ event: 'deploy.ok', ref, sha: targetSha, color: newColor, totalMs });
+    await audit.finishDeployment(deploymentId, {
+      status: 'healthy',
+      targetSha,
+      healthMs,
+      totalMs,
+      metadata: { image: imageTag, build_mode: buildMode },
+    });
+    log(colorize(`deploy OK in ${totalMs}ms — active color is now ${newColor} (${targetSha.slice(0, 12)})`, 'ok'));
+  } catch (err) {
+    aborted = true;
+    log(colorize(`deploy FAILED: ${err.message}`, 'err'));
+    audit.appendFileLine({ event: 'deploy.fail', error: err.message, ref, sha: targetSha });
+    // Cleanup: stop the staged color if we started it.
+    try {
+      await deploy.stopColor({ color: newColor, log });
+    } catch (_) { /* ignore */ }
+    await audit.finishDeployment(deploymentId, {
+      status: 'failed',
+      targetSha,
+      healthMs,
+      totalMs: Date.now() - t0,
+      errorMessage: err.message,
+      metadata: { image: imageTag, build_mode: buildMode, aborted: true },
+    });
+    process.exit(1);
+  } finally {
+    try { release(); } catch (_) {}
+  }
+}
+
+/* -------------------------------------------------------------------------- */
+/* rollback                                                                   */
+/* -------------------------------------------------------------------------- */
+
+async function cmdRollback(args) {
+  const log = logger();
+  const state = stateMod.readState();
+  const prev = state.previous;
+  if (!prev || (!prev.git_sha && !prev.image)) {
+    log(colorize('no previous deploy on file (state/active-color.json has no .previous). ' +
+      'Use `bin/upgrade deploy --ref <sha>` to deploy a specific SHA.', 'err'));
+    process.exit(2);
+  }
+  // Prefer SHA-based rollback (re-runs git fetch + build). Fall back to
+  // image-tag rollback when there's no SHA \u2014 happens on the very first
+  // orchestrator deploy where the previous state is the dev image with no
+  // git history. Image-tag rollback skips git/build/migrate and just flips
+  // Caddy back to a pre-built image.
+  if (prev.git_sha) {
+    log(`rolling back to ${prev.git_sha.slice(0, 12)} (${prev.git_ref || '?'})`);
+    return cmdDeploy({ ...args, ref: prev.git_sha, 'no-confirm': args['no-confirm'] || args.y });
+  }
+  log(`rolling back to image ${prev.image} (no git SHA recorded; using image-tag rollback)`);
+  return cmdImageRollback({ ...args, prev });
+}
+
+async function cmdImageRollback(args) {
+  const log = logger();
+  if (!args['no-confirm'] && !args.y) {
+    const ok = await confirm(`Image-tag rollback to ${args.prev.image}? [y/N] `);
+    if (!ok) { log('aborted'); process.exit(1); }
+  }
+
+  let release = stateMod.acquireLock();
+  const state0 = stateMod.readState();
+  const newColor = stateMod.inactiveColor(state0.color || 'blue');
+  const oldColor = state0.color || 'blue';
+  const initiatedBy = process.env.INITIATED_BY || (await whoami());
+  const t0 = Date.now();
+  const targetImage = args.prev.image;
+  const targetSha = (args.prev.git_sha || targetImage.split(':').pop()).slice(0, 40);
+
+  const deploymentId = await audit.startDeployment({
+    initiatedBy: initiatedBy + ' (image-rollback)',
+    targetRef: targetImage,
+    prevSha: state0.git_sha,
+    color: newColor,
+  });
+  audit.appendFileLine({ event: 'rollback.start', image: targetImage, oldColor, newColor, initiatedBy });
+
+  let healthMs = null;
+  try {
+    // Image must already exist locally (previous boot used it). If not,
+    // we'd need to docker pull, but for the first-deploy case the dev
+    // image is built locally and is guaranteed present.
+    log(`starting backend-${newColor} from ${targetImage}`);
+    const { spawn } = require('child_process');
+    await new Promise((resolve, reject) => {
+      const p = spawn('docker', [
+        'compose', '--profile', newColor, 'up', '-d', `backend-${newColor}`,
+      ], {
+        cwd: REPO_ROOT,
+        env: {
+          ...process.env,
+          IMAGE_TAG: targetImage.replace(/^.*:/, ''),
+          GIT_SHA: targetSha,
+          BUILD_TIME: new Date().toISOString(),
+        },
+        stdio: 'inherit',
+      });
+      p.on('exit', (c) => (c === 0 ? resolve() : reject(new Error(`compose up exit ${c}`))));
+    });
+
+    healthMs = await deploy.waitForReady({
+      container: `web-pannel-backend-${newColor}`,
+      timeoutMs: parseInt(process.env.ROLLOUT_HEALTH_TIMEOUT_MS || '120000', 10),
+      log,
+    });
+    await deploy.flipCaddy({ color: newColor, log });
+    await deploy.drainOldColor({
+      color: oldColor,
+      drainMs: parseInt(process.env.DRAIN_GRACE_MS || '25000', 10),
+      log,
+    });
+    await deploy.stopColor({ color: oldColor, log });
+
+    deploy.persistActiveState({
+      color: newColor,
+      sha: targetSha,
+      ref: 'rollback',
+      imageTag: targetImage,
+      prev: {
+        color: oldColor,
+        image: state0.image,
+        git_sha: state0.git_sha,
+        git_ref: state0.git_ref,
+        deployed_at: state0.deployed_at,
+      },
+    });
+
+    const totalMs = Date.now() - t0;
+    audit.appendFileLine({ event: 'rollback.ok', image: targetImage, color: newColor, totalMs });
+    await audit.finishDeployment(deploymentId, {
+      status: 'healthy',
+      targetSha,
+      healthMs,
+      totalMs,
+      metadata: { image: targetImage, mode: 'image-rollback' },
+    });
+    log(colorize(`rollback OK in ${totalMs}ms — active color is now ${newColor} (${targetImage})`, 'ok'));
+  } catch (err) {
+    audit.appendFileLine({ event: 'rollback.fail', image: targetImage, error: err.message });
+    await audit.finishDeployment(deploymentId, {
+      status: 'failed',
+      errorMessage: err.message,
+      totalMs: Date.now() - t0,
+    });
+    log(colorize(`rollback FAILED: ${err.message}`, 'err'));
+    process.exit(3);
+  } finally {
+    release();
+  }
+}
+
+/* -------------------------------------------------------------------------- */
+/* main                                                                       */
+/* -------------------------------------------------------------------------- */
+
+async function main() {
+  const args = parseFlags(process.argv.slice(2));
+  const sub = args._[0];
+  switch (sub) {
+    case 'status':
+      return cmdStatus();
+    case 'health':
+      return cmdHealth();
+    case 'logs':
+      return cmdLogs(args);
+    case 'migrate':
+      return cmdMigrate(args);
+    case 'deploy':
+      return cmdDeploy(args);
+    case 'rollback':
+      return cmdRollback(args);
+    case undefined:
+    case 'help':
+    case '--help':
+      process.stdout.write(`web-pannel upgrade orchestrator
+
+  upgrade status                       show active color + recent deploys
+  upgrade health                       probe blue and green
+  upgrade logs [--color X] [-n N]      tail backend logs
+  upgrade migrate [--check|--apply]    run schema migrations
+  upgrade deploy [--ref X] [--build local|registry] [--skip-migrate] [--no-confirm]
+  upgrade rollback [--no-confirm]      redeploy the previous SHA
+
+See docs/UPGRADES.md for the full runbook.
+`);
+      return;
+    default:
+      process.stderr.write(`unknown subcommand: ${sub}\n`);
+      process.exit(2);
+  }
+}
+
+main().catch((err) => {
+  process.stderr.write(`upgrade: ${err.stack || err.message}\n`);
+  process.exit(1);
+});

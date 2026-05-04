@@ -6,3 +6,9 @@ logs/
 uploads/
 dist/
 frontend/package-lock.json
+
+# Runtime state for the upgrade orchestrator.
+state/*
+!state/.gitkeep
+backups/
+

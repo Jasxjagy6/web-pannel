@@ -35,6 +35,8 @@ const billingRoutes = require('./routes/billing');
 const userCredentialsRoutes = require('./routes/userCredentials');
 const billingController = require('./controllers/billingController');
 const { parsePlatform, resolvePlatform } = require('./middleware/platform');
+const healthRoutes = require('./routes/health');
+const readiness = require('./utils/readiness');
 
 const app = express();
 const server = http.createServer(app);
@@ -114,12 +116,12 @@ app.use((req, res, next) => {
   next();
 });
 
-app.use(generalLimiter);
+// Health, readiness, version. Mounted BEFORE the rate limiter so an
+// overloaded panel doesn't make Caddy think the new color is dead during
+// a deploy. Each health endpoint is cheap (one ping per backend).
+app.use('/health', healthRoutes);
 
-// Health check
-app.get('/health', (req, res) => {
-  res.json({ status: 'ok', timestamp: new Date().toISOString() });
-});
+app.use(generalLimiter);
 
 // API Routes
 //
@@ -281,6 +283,7 @@ async function start() {
       logger.warn(`twoFAQueue init failed: ${err.message}`);
     }
     logger.info('Queues initialized');
+    readiness.markReady('queues');
 
     // Start server
     server.listen(PORT, () => {
@@ -304,8 +307,14 @@ async function start() {
         heartbeatMs
       );
       logger.info(`Session heartbeat scheduled every ${heartbeatMs}ms`);
+      readiness.markReady('sessions');
     } catch (err) {
       logger.error(`Session restore/heartbeat init failed: ${err.message}`);
+      // Mark ready anyway so the panel doesn't hold the readiness probe
+      // open forever if a single Telegram session fails to restore. The
+      // failure is logged and individual sessions will be retried on the
+      // next heartbeat tick.
+      readiness.markReady('sessions');
     }
 
     // 2. Resume any in-flight OTP scan jobs whose 5-minute window is open.
@@ -413,6 +422,15 @@ async function start() {
     } catch (err) {
       logger.warn(`subscription sweep init failed: ${err.message}`);
     }
+
+    // All background workers have been launched (or have failed
+    // soft and logged). Flip the readiness flag so the upgrade
+    // orchestrator can proceed with the cutover.
+    readiness.markReady('workers');
+    logger.info(
+      `Boot complete — color=${process.env.DEPLOY_COLOR || 'unknown'} ` +
+      `git_sha=${process.env.GIT_SHA || 'unknown'}`
+    );
   } catch (error) {
     logger.error('Failed to start server', error);
     process.exit(1);

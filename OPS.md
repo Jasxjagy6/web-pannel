@@ -9,6 +9,10 @@ when traffic grows further.
 If you make a change in production that is not documented here, add
 it. The document is part of the code.
 
+> **Deploys**: see **`docs/UPGRADES.md`** for the zero-downtime upgrade
+> runbook (Caddy + blue/green backend + Telegram admin bot). New
+> migrations must follow **`docs/MIGRATIONS.md`**.
+
 ---
 
 ## 1. Architecture summary (v8)
@@ -210,18 +214,36 @@ Caveats:
 
 ## 7. Database migrations
 
-All migrations live in `backend/src/config/` and are registered in
-`backend/src/config/database.js::migrations[]`. They run on boot
-inside a single transaction per migration. To add one:
+All migrations live in `backend/src/config/migration_*.sql`. The runner
+(`backend/src/config/migrations.js`) tracks applied migrations in a
+`schema_migrations(name, applied_at, checksum)` table. Each migration
+runs inside its own transaction.
 
-1. Create `migration_v<N>_<short_name>.sql`.
-2. Append `{ name, file }` to the `migrations` array in
-   `database.js`.
-3. Restart the backend. The migrator skips files that have already
-   been applied.
+Three ways to apply migrations:
+
+1. **Automatic at backend boot** — same as the legacy behaviour. Off
+   for the green color during a deploy (`SKIP_BOOT_MIGRATIONS=true`)
+   because the orchestrator already ran them.
+2. **From the orchestrator** — `./bin/upgrade migrate --apply` runs
+   `node bin/migrate.js --apply` inside a one-shot container of the
+   active image.
+3. **Manually inside a container** — `docker compose exec backend-blue
+   node bin/migrate.js --list` for diagnostics.
+
+To add a new migration:
+
+1. Create `backend/src/config/migration_v<N>_<short_name>.sql`. The
+   runner discovers files automatically — no registration is needed.
+2. Read **`docs/MIGRATIONS.md`** for the forward-compatibility rules.
+   In short: additive only, nullable / default-valued, never `DROP` /
+   `RENAME` in the same deploy as the code change that uses the new
+   column.
+3. Run `./bin/upgrade migrate --check` to confirm it parses, then
+   commit and ship the PR.
 
 Do NOT edit migrations after they ship. If a migration is wrong, add
-a new one that fixes it.
+a new one that fixes it. The runner records a checksum and emits a
+warning if the file changes after it was applied.
 
 ---
 
