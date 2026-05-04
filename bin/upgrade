@@ -124,7 +124,7 @@ function dbEnv() {
     port: parseInt(process.env.DB_PORT || '5435', 10),
     name: process.env.DB_NAME || 'telegram_panel',
     user: process.env.DB_USER || 'postgres',
-    password: process.env.DB_PASSWORD || 'your_secure_password',
+    password: process.env.DB_PASSWORD || process.env.POSTGRES_PASSWORD || 'your_secure_password',
   };
 }
 
