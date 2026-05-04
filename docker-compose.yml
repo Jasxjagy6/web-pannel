@@ -222,6 +222,18 @@ services:
   # Only runs when TELEGRAM_ADMIN_BOT_TOKEN is set.
   # ---------------------------------------------------------------------------
   admin-bot:
+    # Same image as backend-blue/green. Compose dedupes the build by image
+    # tag, so adding a `build:` here does NOT rebuild the layers — it just
+    # tells Compose to build the image locally instead of pulling from a
+    # registry on cold-start. Without this, `docker compose --profile bot
+    # up -d --build` fails with "pull access denied for web-pannel-backend"
+    # because admin-bot has no build context of its own and the image is
+    # not published to a registry yet.
+    build:
+      context: ./backend
+      args:
+        GIT_SHA: ${GIT_SHA:-dev}
+        BUILD_TIME: ${BUILD_TIME:-unknown}
     image: web-pannel-backend:${IMAGE_TAG:-dev}
     container_name: web-pannel-admin-bot
     command: ["node", "/app/src/bot/adminBot.js"]
