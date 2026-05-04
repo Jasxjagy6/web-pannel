@@ -25,14 +25,17 @@
 	# http://caddy:2019. Never exposed publicly.
 	admin 0.0.0.0:2019
 
-	# Auto-TLS via Let's Encrypt when PUBLIC_DOMAIN is set. For local /
-	# IP-only deployments the operator can keep this empty and Caddy
-	# will serve plain HTTP on :80.
-	email {$ACME_EMAIL:admin@localhost}
+	# Caddy auto-TLS is configured by the orchestrator at runtime via the
+	# admin API JSON config (see proxy/caddyClient.js). The seed file only
+	# binds :80 so that bringing the stack up never requires a public DNS
+	# name or ACME email. To use HTTPS, set PUBLIC_DOMAIN + ACME_EMAIL in
+	# .env, then run `./bin/upgrade deploy ...` once — the orchestrator
+	# will POST the TLS config and Caddy will start :443.
+	auto_https off
 }
 
-# Public site
-:80, {$PUBLIC_DOMAIN:localhost}:443 {
+# Public site (HTTP-only seed; orchestrator adds TLS when configured).
+:80 {
 	# /api/* and /socket.io/* go to the active backend color.
 	# DEFAULT seed: backend-blue. The orchestrator rewrites this on every
 	# deploy.
@@ -40,6 +43,11 @@
 		path /api/*
 		path /socket.io/*
 		path /socket.io/*/*
+		# Public health checks hit the backend through Caddy too — useful
+		# for external uptime monitors and for the operator to verify the
+		# active color from outside the docker network.
+		path /health
+		path /health/*
 	}
 	handle @api {
 		reverse_proxy {$ACTIVE_BACKEND:backend-blue:3005} {
@@ -59,10 +67,10 @@
 			health_timeout 2s
 			health_status 200
 
-			header_up X-Forwarded-Proto {scheme}
-			header_up X-Forwarded-For   {remote_host}
-			header_up X-Real-IP         {remote_host}
-			header_up Host              {host}
+			# Caddy already sets X-Forwarded-Proto, X-Forwarded-For, and
+			# Host on every reverse_proxy by default. We only need to add
+			# X-Real-IP because some downstream code paths look for it.
+			header_up X-Real-IP {remote_host}
 		}
 	}
 

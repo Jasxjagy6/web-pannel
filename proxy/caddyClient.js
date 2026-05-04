@@ -70,7 +70,7 @@ async function getConfig() {
  */
 function buildConfig({ backendUpstream, frontendUpstream, publicDomain, acmeEmail }) {
   const apiRoute = {
-    match: [{ path: ['/api/*', '/socket.io/*'] }],
+    match: [{ path: ['/api/*', '/socket.io/*', '/health', '/health/*'] }],
     handle: [
       {
         handler: 'reverse_proxy',
@@ -84,11 +84,12 @@ function buildConfig({ backendUpstream, frontendUpstream, publicDomain, acmeEmai
           },
         },
         headers: {
+          // Caddy's reverse_proxy already sets X-Forwarded-{Proto,For,Host} and
+          // forwards Host by default. We only need to add X-Real-IP for code
+          // paths that look at it specifically.
           request: {
             set: {
-              'X-Forwarded-Proto': ['{http.request.scheme}'],
-              'X-Forwarded-For':   ['{http.request.remote.host}'],
-              'X-Real-IP':         ['{http.request.remote.host}'],
+              'X-Real-IP': ['{http.request.remote.host}'],
             },
           },
         },
