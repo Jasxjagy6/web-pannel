@@ -1050,12 +1050,20 @@ class ProxyService {
 
     const passwordEnc = payload.password ? encrypt(String(payload.password)) : null;
 
+    // Migration v14 replaced the unconditional `proxies_host_port_protocol_key`
+    // unique constraint with two PARTIAL unique indexes — one for shared
+    // admin rows (`uniq_proxies_admin_host_port_protocol` WHERE user_id IS
+    // NULL) and one for per-user rows. Postgres requires ON CONFLICT to
+    // match the partial-index predicate exactly, so we have to repeat the
+    // `WHERE user_id IS NULL` here. Without it the insert raises
+    // "there is no unique or exclusion constraint matching the ON CONFLICT
+    // specification".
     const insert = await pool.query(
       `INSERT INTO proxies
         (host, port, protocol, username, password_enc, secret,
          source, priority, metadata)
        VALUES ($1,$2,$3,$4,$5,$6,'manual',$7,$8)
-       ON CONFLICT (host, port, protocol) DO UPDATE SET
+       ON CONFLICT (host, port, protocol) WHERE user_id IS NULL DO UPDATE SET
          username = EXCLUDED.username,
          password_enc = EXCLUDED.password_enc,
          secret = EXCLUDED.secret,
@@ -1196,12 +1204,15 @@ class ProxyService {
             rejected++;
             continue;
           }
+          // See addManualProxy for why this needs the partial-index
+          // predicate. Free-pool harvesting only writes admin rows
+          // (user_id IS NULL).
           await pool.query(
             `INSERT INTO proxies
               (host, port, protocol, source, is_working, priority,
                last_checked_at, last_latency_ms)
              VALUES ($1,$2,$3,'free',TRUE,100,NOW(),$4)
-             ON CONFLICT (host, port, protocol) DO NOTHING`,
+             ON CONFLICT (host, port, protocol) WHERE user_id IS NULL DO NOTHING`,
             [cand.host, cand.port, cand.protocol, probe.latencyMs]
           );
           added++;
