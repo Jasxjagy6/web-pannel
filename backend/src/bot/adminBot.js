@@ -45,8 +45,29 @@ const HOST_REPO_ROOT = process.env.DEPLOY_HOST_ROOT || '/host';
 
 const API = TOKEN ? `https://api.telegram.org/bot${TOKEN}` : null;
 
+// Docker HEALTHCHECK reads /app/state/admin-bot.heartbeat; a fresh mtime
+// means the long-poll loop is alive. We touch it on every poll iteration
+// (even when getUpdates returns no updates) so a healthy idle bot still
+// looks healthy.
+const HEARTBEAT_PATH = path.join(
+  process.env.STATE_DIR || '/app/state',
+  'admin-bot.heartbeat'
+);
+function touchHeartbeat() {
+  try {
+    fs.mkdirSync(path.dirname(HEARTBEAT_PATH), { recursive: true });
+    fs.writeFileSync(HEARTBEAT_PATH, String(Date.now()));
+  } catch (err) {
+    process.stderr.write(`bot: heartbeat write failed: ${err.message}\n`);
+  }
+}
+
 if (!TOKEN) {
   process.stdout.write('TELEGRAM_ADMIN_BOT_TOKEN not set; admin bot is disabled.\n');
+  // Touch the heartbeat so the docker healthcheck still passes \u2014 the
+  // container is "healthy", just intentionally idle.
+  touchHeartbeat();
+  setInterval(touchHeartbeat, 30000);
   // Sleep forever so docker compose doesn't restart-loop us.
   setInterval(() => {}, 1 << 30);
 }
@@ -262,6 +283,7 @@ async function checkPin(msg) {
 
 async function loop() {
   let offset = 0;
+  touchHeartbeat();
   while (true) {
     try {
       const updates = await tg('getUpdates', {
@@ -269,6 +291,9 @@ async function loop() {
         timeout: 30,
         allowed_updates: ['message'],
       });
+      // Touch every iteration so the Docker HEALTHCHECK reports healthy
+      // even during quiet periods when getUpdates just times out.
+      touchHeartbeat();
       for (const u of updates) {
         offset = Math.max(offset, u.update_id + 1);
         await handleUpdate(u).catch((err) => {

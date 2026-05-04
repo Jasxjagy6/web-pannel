@@ -152,6 +152,34 @@ async function composeNetworkName() {
 /* Step 4 — bring up staged color                                             */
 /* -------------------------------------------------------------------------- */
 
+/**
+ * Best-effort lookup of the image currently running for `backend-<color>`.
+ * Used to seed `previous` on the very first orchestrator deploy when
+ * `state/active-color.json` was created with null fields. Returns null when
+ * the container isn't running or docker is unavailable \u2014 the caller treats
+ * that as "no rollback target", which is correct.
+ */
+async function runningImageOf(color) {
+  try {
+    const { stdout: cid } = await run(
+      'docker',
+      ['compose', 'ps', '-q', `backend-${color}`],
+      { allowFail: true, cwd: REPO_ROOT }
+    );
+    const containerId = (cid || '').trim().split('\n')[0];
+    if (!containerId) return null;
+    const { stdout } = await run(
+      'docker',
+      ['inspect', '--format', '{{.Config.Image}}', containerId],
+      { allowFail: true }
+    );
+    const img = (stdout || '').trim();
+    return img || null;
+  } catch (_) {
+    return null;
+  }
+}
+
 async function startColor({ color, sha, log }) {
   log(`starting backend-${color}`);
   await composeStream(
@@ -261,5 +289,6 @@ module.exports = {
   drainOldColor,
   persistActiveState,
   composeNetworkName,
+  runningImageOf,
   REPO_ROOT,
 };

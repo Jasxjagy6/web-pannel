@@ -242,6 +242,15 @@ async function cmdDeploy(args) {
   const state0 = stateMod.readState();
   const newColor = stateMod.inactiveColor(state0.color || 'blue');
   const oldColor = state0.color || 'blue';
+
+  // First-deploy seeding: when state/active-color.json was created with null
+  // image / git_sha (a fresh stack that came up before any orchestrator
+  // deploy), inspect the running container to learn what's actually serving
+  // so a future `bin/upgrade rollback` has a concrete image to roll back to.
+  if (!state0.image) {
+    const liveImage = await deploy.runningImageOf(oldColor);
+    if (liveImage) state0.image = liveImage;
+  }
   const initiatedBy = process.env.INITIATED_BY || (await whoami());
   const t0 = Date.now();
   const deploymentId = await audit.startDeployment({
@@ -365,13 +374,120 @@ async function cmdRollback(args) {
   const log = logger();
   const state = stateMod.readState();
   const prev = state.previous;
-  if (!prev || !prev.git_sha) {
+  if (!prev || (!prev.git_sha && !prev.image)) {
     log(colorize('no previous deploy on file (state/active-color.json has no .previous). ' +
       'Use `bin/upgrade deploy --ref <sha>` to deploy a specific SHA.', 'err'));
     process.exit(2);
   }
-  log(`rolling back to ${prev.git_sha.slice(0, 12)} (${prev.git_ref || '?'})`);
-  return cmdDeploy({ ...args, ref: prev.git_sha, 'no-confirm': args['no-confirm'] || args.y });
+  // Prefer SHA-based rollback (re-runs git fetch + build). Fall back to
+  // image-tag rollback when there's no SHA \u2014 happens on the very first
+  // orchestrator deploy where the previous state is the dev image with no
+  // git history. Image-tag rollback skips git/build/migrate and just flips
+  // Caddy back to a pre-built image.
+  if (prev.git_sha) {
+    log(`rolling back to ${prev.git_sha.slice(0, 12)} (${prev.git_ref || '?'})`);
+    return cmdDeploy({ ...args, ref: prev.git_sha, 'no-confirm': args['no-confirm'] || args.y });
+  }
+  log(`rolling back to image ${prev.image} (no git SHA recorded; using image-tag rollback)`);
+  return cmdImageRollback({ ...args, prev });
+}
+
+async function cmdImageRollback(args) {
+  const log = logger();
+  if (!args['no-confirm'] && !args.y) {
+    const ok = await confirm(`Image-tag rollback to ${args.prev.image}? [y/N] `);
+    if (!ok) { log('aborted'); process.exit(1); }
+  }
+
+  let release = stateMod.acquireLock();
+  const state0 = stateMod.readState();
+  const newColor = stateMod.inactiveColor(state0.color || 'blue');
+  const oldColor = state0.color || 'blue';
+  const initiatedBy = process.env.INITIATED_BY || (await whoami());
+  const t0 = Date.now();
+  const targetImage = args.prev.image;
+  const targetSha = (args.prev.git_sha || targetImage.split(':').pop()).slice(0, 40);
+
+  const deploymentId = await audit.startDeployment({
+    initiatedBy: initiatedBy + ' (image-rollback)',
+    targetRef: targetImage,
+    prevSha: state0.git_sha,
+    color: newColor,
+  });
+  audit.appendFileLine({ event: 'rollback.start', image: targetImage, oldColor, newColor, initiatedBy });
+
+  let healthMs = null;
+  try {
+    // Image must already exist locally (previous boot used it). If not,
+    // we'd need to docker pull, but for the first-deploy case the dev
+    // image is built locally and is guaranteed present.
+    log(`starting backend-${newColor} from ${targetImage}`);
+    const { spawn } = require('child_process');
+    await new Promise((resolve, reject) => {
+      const p = spawn('docker', [
+        'compose', '--profile', newColor, 'up', '-d', `backend-${newColor}`,
+      ], {
+        cwd: REPO_ROOT,
+        env: {
+          ...process.env,
+          IMAGE_TAG: targetImage.replace(/^.*:/, ''),
+          GIT_SHA: targetSha,
+          BUILD_TIME: new Date().toISOString(),
+        },
+        stdio: 'inherit',
+      });
+      p.on('exit', (c) => (c === 0 ? resolve() : reject(new Error(`compose up exit ${c}`))));
+    });
+
+    healthMs = await deploy.waitForReady({
+      container: `web-pannel-backend-${newColor}`,
+      timeoutMs: parseInt(process.env.ROLLOUT_HEALTH_TIMEOUT_MS || '120000', 10),
+      log,
+    });
+    await deploy.flipCaddy({ color: newColor, log });
+    await deploy.drainOldColor({
+      color: oldColor,
+      drainMs: parseInt(process.env.DRAIN_GRACE_MS || '25000', 10),
+      log,
+    });
+    await deploy.stopColor({ color: oldColor, log });
+
+    deploy.persistActiveState({
+      color: newColor,
+      sha: targetSha,
+      ref: 'rollback',
+      imageTag: targetImage,
+      prev: {
+        color: oldColor,
+        image: state0.image,
+        git_sha: state0.git_sha,
+        git_ref: state0.git_ref,
+        deployed_at: state0.deployed_at,
+      },
+    });
+
+    const totalMs = Date.now() - t0;
+    audit.appendFileLine({ event: 'rollback.ok', image: targetImage, color: newColor, totalMs });
+    await audit.finishDeployment(deploymentId, {
+      status: 'healthy',
+      targetSha,
+      healthMs,
+      totalMs,
+      metadata: { image: targetImage, mode: 'image-rollback' },
+    });
+    log(colorize(`rollback OK in ${totalMs}ms — active color is now ${newColor} (${targetImage})`, 'ok'));
+  } catch (err) {
+    audit.appendFileLine({ event: 'rollback.fail', image: targetImage, error: err.message });
+    await audit.finishDeployment(deploymentId, {
+      status: 'failed',
+      errorMessage: err.message,
+      totalMs: Date.now() - t0,
+    });
+    log(colorize(`rollback FAILED: ${err.message}`, 'err'));
+    process.exit(3);
+  } finally {
+    release();
+  }
 }
 
 /* -------------------------------------------------------------------------- */

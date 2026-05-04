@@ -260,6 +260,15 @@ services:
       redis:
         condition: service_healthy
     restart: unless-stopped
+    # Override the inherited backend HEALTHCHECK (which probes /health on
+    # :3005, but the bot has no HTTP server). Read the heartbeat file
+    # adminBot.js writes on every poll cycle; older than 90s = unhealthy.
+    healthcheck:
+      test: ["CMD", "node", "/app/src/bot/healthcheck.js"]
+      interval: 30s
+      timeout: 5s
+      start_period: 30s
+      retries: 5
     profiles: ["bot", "deploy"]
 
 volumes:
