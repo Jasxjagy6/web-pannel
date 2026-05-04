@@ -27,7 +27,7 @@ CREATE TABLE IF NOT EXISTS sessions (
 -- Scraping jobs table
 CREATE TABLE IF NOT EXISTS scraping_jobs (
   id SERIAL PRIMARY KEY,
-  session_id INTEGER REFERENCES sessions(id),
+  session_id INTEGER REFERENCES sessions(id) ON DELETE CASCADE,
   target_type VARCHAR(20),
   target_id VARCHAR(50),
   target_title VARCHAR(255),
@@ -57,7 +57,7 @@ CREATE TABLE IF NOT EXISTS scraped_users (
 -- Messaging jobs table
 CREATE TABLE IF NOT EXISTS messaging_jobs (
   id SERIAL PRIMARY KEY,
-  session_id INTEGER REFERENCES sessions(id),
+  session_id INTEGER REFERENCES sessions(id) ON DELETE CASCADE,
   job_type VARCHAR(20),
   target_list JSONB,
   message_content TEXT,
@@ -76,8 +76,8 @@ CREATE TABLE IF NOT EXISTS messaging_jobs (
 -- Message logs
 CREATE TABLE IF NOT EXISTS message_logs (
   id SERIAL PRIMARY KEY,
-  job_id INTEGER REFERENCES messaging_jobs(id),
-  session_id INTEGER REFERENCES sessions(id),
+  job_id INTEGER REFERENCES messaging_jobs(id) ON DELETE SET NULL,
+  session_id INTEGER REFERENCES sessions(id) ON DELETE SET NULL,
   target_id BIGINT,
   status VARCHAR(20),
   error_message TEXT,
@@ -88,7 +88,7 @@ CREATE TABLE IF NOT EXISTS message_logs (
 CREATE TABLE IF NOT EXISTS group_operations (
   id SERIAL PRIMARY KEY,
   user_id INTEGER REFERENCES users(id),
-  session_id INTEGER REFERENCES sessions(id),
+  session_id INTEGER REFERENCES sessions(id) ON DELETE CASCADE,
   target_group_id VARCHAR(50),
   operation VARCHAR(20),
   operation_type VARCHAR(50),

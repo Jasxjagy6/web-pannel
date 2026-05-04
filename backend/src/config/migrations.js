@@ -50,6 +50,7 @@ const MIGRATION_ORDER = [
   'migration_v13_tg_anti_revoke.sql',
   'migration_v14_user_proxies.sql',
   'migration_v15_deployments.sql',
+  'migration_v16_session_fk_cascade.sql',
 ];
 
 function listMigrationFiles() {
@@ -211,6 +212,7 @@ async function seedHistoryIfPreExisting(pool, { logger = console } = {}) {
     if (!MIGRATION_ORDER.includes(file)) continue;
     if (file.startsWith('migration_v15_')) continue;
     if (file.startsWith('migration_v16_')) continue;
+    if (file.startsWith('migration_v17_')) continue;
     const sql = fs.readFileSync(path.join(MIGRATIONS_DIR, file), 'utf8');
     await pool.query(
       'INSERT INTO schema_migrations(name, checksum) VALUES ($1, $2) ON CONFLICT DO NOTHING',

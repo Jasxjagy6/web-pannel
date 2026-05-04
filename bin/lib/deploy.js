@@ -43,13 +43,81 @@ function composeStream(args, onLine, opts = {}) {
 async function gitFetchAndCheckout(ref, log) {
   log(`git fetch origin (ref=${ref})`);
   await run('git', ['fetch', 'origin', '--tags', '--prune'], { cwd: REPO_ROOT });
+
   // Resolve the ref to a SHA so we know exactly what we're deploying.
-  const { stdout: sha } = await run('git', ['rev-parse', `${ref}^{commit}`], {
-    cwd: REPO_ROOT,
-  });
-  const targetSha = sha.trim();
-  log(`resolved ${ref} → ${targetSha.slice(0, 12)}`);
+  //
+  // Prefer the remote-tracking ref over the local one: an operator running
+  // `bin/upgrade deploy --ref main` almost always means "the latest main on
+  // GitHub", not whatever stale commit their local main happens to be on.
+  // Local main is only updated by `git pull` / `git merge`; `git fetch`
+  // alone only moves `origin/main`. Without this, a user who pushed a fix
+  // to GitHub but didn't pull locally would silently re-deploy the OLD
+  // commit, then assume the upgrade system is broken when in fact the
+  // fix simply never reached the running container.
+  //
+  // We try in order: `origin/<ref>` (matches a remote-tracking branch),
+  // then `<ref>` (matches a tag, an explicit SHA, or a local branch that
+  // doesn't exist on origin). The `^{commit}` peel guards against
+  // resolving to an annotated tag object instead of a commit.
+  const candidates = [`origin/${ref}`, ref];
+  let targetSha = null;
+  let resolvedFrom = null;
+  for (const candidate of candidates) {
+    const r = await run('git', ['rev-parse', '--verify', '--quiet', `${candidate}^{commit}`], {
+      cwd: REPO_ROOT,
+      allowFail: true,
+    });
+    if (r.code === 0 && r.stdout && r.stdout.trim()) {
+      targetSha = r.stdout.trim();
+      resolvedFrom = candidate;
+      break;
+    }
+  }
+  if (!targetSha) {
+    throw new Error(
+      `unable to resolve ref="${ref}" to a commit SHA ` +
+      `(tried ${candidates.map((c) => `"${c}"`).join(', ')}). ` +
+      `Make sure the branch/tag exists on origin or pass an explicit SHA.`
+    );
+  }
+  log(`resolved ${resolvedFrom} → ${targetSha.slice(0, 12)}`);
+
+  // `git checkout <sha>` blows up with "Your local changes would be
+  // overwritten" when the working tree has uncommitted edits — even if
+  // those edits are completely unrelated to the upgrade. Operators iterate
+  // on configs/scripts in-place all the time, so this would routinely
+  // brick deploys with a confusing error. Stash any tracked-file changes
+  // before the checkout and restore them after, so the working tree
+  // round-trips cleanly. Untracked files are left alone (--keep-index
+  // would be wrong here — we want a clean checkout target).
+  const { stdout: dirtyStatus } = await run(
+    'git',
+    ['status', '--porcelain', '--untracked-files=no'],
+    { cwd: REPO_ROOT, allowFail: true }
+  );
+  let stashRef = null;
+  if (dirtyStatus && dirtyStatus.trim()) {
+    log('working tree has local changes — stashing before checkout');
+    const stashName = `bin/upgrade-${Date.now()}`;
+    const r = await run(
+      'git',
+      ['stash', 'push', '--include-untracked', '-m', stashName],
+      { cwd: REPO_ROOT, allowFail: true }
+    );
+    if (r.code === 0 && r.stdout && !r.stdout.includes('No local changes')) {
+      stashRef = stashName;
+    }
+  }
+
   await run('git', ['checkout', targetSha], { cwd: REPO_ROOT });
+
+  if (stashRef) {
+    log(`restoring stashed local changes (${stashRef})`);
+    // best-effort: don't abort the deploy if the stash pop runs into
+    // conflicts — those are the operator's to resolve after the fact.
+    await run('git', ['stash', 'pop'], { cwd: REPO_ROOT, allowFail: true });
+  }
+
   return targetSha;
 }
 
