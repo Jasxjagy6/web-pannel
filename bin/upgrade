@@ -37,21 +37,34 @@ const readline = require('readline');
 
 const REPO_ROOT = path.join(__dirname, '..');
 
-// dotenv is optional. The orchestrator runs both on the host (where dotenv
-// lives in backend/node_modules) AND inside the admin-bot container (where
-// it's already in node_modules). When neither has it, env vars are still
-// read from the host environment — the operator just needs to export them.
-try {
-  // Try backend/node_modules first.
-  require(path.join(REPO_ROOT, 'backend', 'node_modules', 'dotenv'))
-    .config({ path: path.join(REPO_ROOT, 'backend', '.env') });
-} catch (_) {
-  try {
-    require('dotenv').config({ path: path.join(REPO_ROOT, 'backend', '.env') });
-  } catch (_) {
-    // dotenv is unavailable; rely on the inherited environment.
+// Load .env files into process.env. We deliberately don't depend on the
+// `dotenv` npm module here: this CLI runs on the host where there's no
+// guarantee `npm install` has been run, AND inside the admin-bot container
+// where dotenv IS installed. A tiny in-tree parser keeps both paths working
+// without an external dependency. Both files are loaded; values from the
+// process environment win, then root `.env`, then `backend/.env` (so
+// backend-specific overrides like DB_HOST stay scoped).
+function loadEnvFile(file) {
+  if (!fs.existsSync(file)) return;
+  const raw = fs.readFileSync(file, 'utf8');
+  for (const line of raw.split('\n')) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith('#')) continue;
+    const eq = trimmed.indexOf('=');
+    if (eq <= 0) continue;
+    const key = trimmed.slice(0, eq).trim();
+    let value = trimmed.slice(eq + 1).trim();
+    if (
+      (value.startsWith('"') && value.endsWith('"')) ||
+      (value.startsWith("'") && value.endsWith("'"))
+    ) {
+      value = value.slice(1, -1);
+    }
+    if (process.env[key] === undefined) process.env[key] = value;
   }
 }
+loadEnvFile(path.join(REPO_ROOT, '.env'));
+loadEnvFile(path.join(REPO_ROOT, 'backend', '.env'));
 
 const stateMod = require(path.join(__dirname, 'lib', 'state'));
 const audit = require(path.join(__dirname, 'lib', 'audit'));
