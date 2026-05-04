@@ -2,14 +2,22 @@
  * Instagram scrape subsystem (provider.scrape.*).
  *
  * Targets (target_type column):
- *   - followers   → username's followers
- *   - following   → username's following
- *   - likers      → media's likers (mediaPk in target_ids)
+ *   - followers   → username's followers      (target_ids: [username])
+ *   - following   → username's following      (target_ids: [username])
+ *   - likers      → media's likers            (target_ids: [shortcode|url|pk])
+ *   - commenters  → media's commenters        (target_ids: [shortcode|url|pk])
+ *   - tagged      → posts tagging a user      (target_ids: [username])
+ *
+ * All five target types are routed through the cookie-based web
+ * scraper (`webScraper.js` → `igFetch`) when the session was
+ * uploaded as browser cookies (api_mode='web'). Followers/following
+ * additionally have a mobile-API fallback for sessions created via
+ * the panel's interactive login flow (api_mode='mobile').
  *
  * Persistence — uses the existing scraping_jobs / scraped_users tables
- * (now platform-aware via the v9 migration). Schema is shared with TG;
- * IG-specific columns include scraped_users.instagram_pk / full_name /
- * is_private / is_verified / thumbnail_url.
+ * (now platform-aware via the v9 migration). Schema is shared with
+ * Telegram; IG-specific columns include scraped_users.instagram_pk /
+ * full_name / is_private / is_verified / thumbnail_url.
  */
 
 const { pool } = require('../../config/database');
@@ -21,11 +29,16 @@ const activeHours = require('./activeHours');
 const riskScore = require('./riskScore');
 const systemSettings = require('../../services/systemSettingsService');
 const webScraper = require('./webScraper');
+const scrapeQuota = require('./scrapeQuota');
 const { decrypt } = require('../../utils/crypto');
 
 const PLATFORM = 'instagram';
 
 const VALID_TARGET_TYPES = ['followers', 'following', 'likers', 'commenters', 'tagged'];
+
+// Target types that take a media reference (shortcode/url/pk) instead
+// of a username. Anything not in this set is treated as a username.
+const _MEDIA_TARGET_TYPES = new Set(['likers', 'commenters']);
 
 /**
  * Sleep with random jitter — used between IG feed pages to stay
@@ -43,33 +56,39 @@ function _jitterSleep(minMs = 1500, maxMs = 3000) {
  */
 function _mapIgError(err) {
   if (!err) return { statusCode: 502, message: 'Unknown Instagram error' };
+  // Errors thrown by igFetch already carry .kind / .statusCode — pass
+  // them through unchanged so the per-target loop can decide whether
+  // to retry, pivot to another session, or hard-fail.
+  if (err.kind && err.statusCode) {
+    return { statusCode: err.statusCode, message: err.message || String(err), kind: err.kind };
+  }
   const ctor = err.constructor && err.constructor.name;
   const msg = err.message || String(err);
   // Authentication / session expiry
   if (ctor === 'IgLoginRequiredError' || /login_required/i.test(msg)) {
-    return { statusCode: 401, message: 'Instagram session is no longer logged in. Re-upload a fresh session.' };
+    return { statusCode: 401, message: 'Instagram session is no longer logged in. Re-upload a fresh session.', kind: 'login_required' };
   }
   if (ctor === 'IgCheckpointError' || /checkpoint_required/i.test(msg)) {
-    return { statusCode: 401, message: 'Instagram is blocking this session with a checkpoint. Solve the checkpoint on a trusted device, then re-upload.' };
+    return { statusCode: 401, message: 'Instagram is blocking this session with a checkpoint. Solve the checkpoint on a trusted device, then re-upload.', kind: 'checkpoint' };
   }
   // Rate limit / spam guard
   if (
     ctor === 'IgActionSpamError' ||
     /please wait a few minutes|action_blocked|too many requests|rate.?limit/i.test(msg)
   ) {
-    return { statusCode: 429, message: 'Instagram is rate-limiting this session. Slow down and try again in a few minutes.' };
+    return { statusCode: 429, message: 'Instagram is rate-limiting this session. Slow down and try again in a few minutes.', kind: 'rate_limited' };
   }
   // User-not-found / target issues
   if (ctor === 'IgUserHasNoFeedError' || /user not found|no feed/i.test(msg)) {
-    return { statusCode: 404, message: 'Target Instagram user has no public feed.' };
+    return { statusCode: 404, message: 'Target Instagram user has no public feed.', kind: 'not_found' };
   }
   if (/getIdByUsername.*not found|not_found|user_not_found/i.test(msg)) {
-    return { statusCode: 404, message: 'Target Instagram username not found.' };
+    return { statusCode: 404, message: 'Target Instagram username not found.', kind: 'not_found' };
   }
   if (/private/i.test(msg) && /account|user/i.test(msg)) {
-    return { statusCode: 403, message: 'Target account is private — you must follow it from the session account first.' };
+    return { statusCode: 403, message: 'Target account is private — you must follow it from the session account first.', kind: 'forbidden' };
   }
-  return { statusCode: 502, message: msg };
+  return { statusCode: 502, message: msg, kind: 'network' };
 }
 
 async function _getPageSize(targetType, fallback = 200) {
@@ -279,56 +298,45 @@ async function _executeScrapeJob(jobId) {
     return;
   }
 
-  const session = sessRows.rows[0];
-  // Phase 1.B5: api_mode is the source of truth for which API surface
-  // each session is allowed to talk to. Cookie-uploaded sessions are
-  // pinned api_mode='web' at upload time; interactive logins are
-  // pinned api_mode='mobile'. Falling back to source==='browser_cookies'
-  // for backward compatibility with rows uploaded before B5 landed.
-  const apiMode =
-    (session.platform_state && session.platform_state.api_mode) ||
-    ((session.platform_state && session.platform_state.source === 'browser_cookies')
-      ? 'web' : 'mobile');
-
-  // Phase 2.B10 — active-hours window. Scrape is a long-running
-  // foreground job; if the session is outside its active window we
-  // mark the job 'pending' and stamp next_open_at so the caller's
-  // scheduler can requeue precisely. We do NOT silently sleep for
-  // hours inside the worker — that would block the queue slot.
-  const ahGate = activeHours.gate(session);
-  if (!ahGate.allowed) {
+  // Active-hours gate: at least one session must be inside its
+  // active-hours window. We don't gate per-session here because
+  // multi-session jobs can pivot to a different session; the
+  // per-session pivot loop checks again.
+  const someAllowed = sessRows.rows.some((s) => activeHours.gate(s).allowed);
+  if (!someAllowed) {
+    const first = sessRows.rows[0];
+    const ahGate = activeHours.gate(first);
     logger.info(
-      `IG.scrape job ${jobId} session ${session.id} outside active-hours ` +
-      `(${ahGate.window.start}-${ahGate.window.end} ${ahGate.window.tz}); ` +
+      `IG.scrape job ${jobId}: every session outside active-hours; ` +
       `postponing until ${ahGate.nextOpenAt.toISOString()}`
     );
     await _setStatus(jobId, 'pending', {
-      error: `Postponed: outside active-hours window (${ahGate.window.start}-${ahGate.window.end} ${ahGate.window.tz}). Will resume at ${ahGate.nextOpenAt.toISOString()}.`,
+      error: `Postponed: all sessions outside active-hours window. Will resume at ${ahGate.nextOpenAt.toISOString()}.`,
     });
     return;
   }
 
   let totalScraped = 0;
+  let lastSessionUsed = sessRows.rows[0];
   try {
     // Phase 1.B8 — cold-start simulation. First job after a process
     // restart runs a small natural-feeling sequence of feed/inbox
     // reads before the real work begins, so IG sees the session
     // "open the app" first.
-    await coldStart.runIfCold(session);
+    await coldStart.runIfCold(sessRows.rows[0]);
 
-    if (apiMode === 'web') {
-      await _runWebScrape({ jobId, job, session, targets, limit });
-    } else if (apiMode === 'mobile') {
-      totalScraped = await _runMobileScrape({ jobId, job, session, targets, limit });
-    } else {
-      const e = new Error(`Unknown api_mode='${apiMode}' for IG session ${session.id}`);
-      e.statusCode = 500;
-      throw e;
-    }
+    totalScraped = await _runScrape({
+      jobId,
+      job,
+      sessions: sessRows.rows,
+      targets,
+      limit,
+      onSessionPick: (s) => { lastSessionUsed = s; },
+    });
 
-    // _runWebScrape / _runMobileScrape both update job rows incrementally.
-    // Read the final total off the job row so the completed-progress
-    // check uses the value the inserts actually committed.
+    // _runScrape updates job rows incrementally. Read the final total
+    // off the job row so the completed-progress check uses the value
+    // the inserts actually committed.
     const finalRow = await _getJobRow(jobId);
     await _setStatus(jobId, 'completed', {
       total_found: finalRow?.total_found || totalScraped,
@@ -346,13 +354,11 @@ async function _executeScrapeJob(jobId) {
     // flagging the session (checkpoint / login_required / action
     // blocked), flip the session row to `needs_attention` so the
     // warm-up worker stops touching it and the operator sees the
-    // state in the UI. We pull `kind` off the underlying error so
-    // the classifier in igFetch is the single source of truth.
+    // state in the UI.
     try {
-      const kind = err && (err.kind || (err.cause && err.cause.kind));
+      const kind = mapped.kind || (err && (err.kind || (err.cause && err.cause.kind)));
       if (kind === 'checkpoint' || kind === 'login_required' || kind === 'action_blocked') {
         // eslint-disable-next-line global-require
-        const { pool } = require('../../config/database');
         const newState = kind === 'login_required' ? 'dead' : 'needs_attention';
         const newStatus = kind === 'login_required' ? 'expired' : 'checkpoint';
         await pool.query(
@@ -368,10 +374,10 @@ async function _executeScrapeJob(jobId) {
                                       THEN FALSE ELSE is_logged_in END,
                   updated_at = NOW()
             WHERE id = $1`,
-          [session.id, newState, mapped.message, kind, newStatus]
+          [lastSessionUsed.id, newState, mapped.message, kind, newStatus]
         );
         logger.warn(
-          `IG.scrape: flipped session ${session.id} → ${newState} (${kind})`
+          `IG.scrape: flipped session ${lastSessionUsed.id} → ${newState} (${kind})`
         );
         // Phase 3.B15 — record the detection event so the admin
         // dashboard surfaces "IG flagged this session during a real
@@ -380,8 +386,8 @@ async function _executeScrapeJob(jobId) {
           // eslint-disable-next-line global-require
           const detectionEvents = require('./detectionEvents');
           detectionEvents.record({
-            sessionId: session.id,
-            userId: session.user_id || null,
+            sessionId: lastSessionUsed.id,
+            userId: lastSessionUsed.user_id || null,
             eventKind: kind,
             apiPath: 'scrape._executeScrapeJob',
             httpStatus: mapped.statusCode || null,
@@ -389,7 +395,7 @@ async function _executeScrapeJob(jobId) {
             requestFingerprint: {
               action_class: 'read',
               api_mode:
-                (session.platform_state && session.platform_state.api_mode) ||
+                (lastSessionUsed.platform_state && lastSessionUsed.platform_state.api_mode) ||
                 'mobile',
               target_type: job && job.target_type,
             },
@@ -398,129 +404,342 @@ async function _executeScrapeJob(jobId) {
       }
     } catch (flipErr) {
       logger.warn(
-        `IG.scrape: failed to flip session ${session.id} health state: ${flipErr.message}`
+        `IG.scrape: failed to flip session ${lastSessionUsed.id} health state: ${flipErr.message}`
       );
     }
   }
 }
 
+// ---------------------------------------------------------------------
+// Core scrape executor — handles all 5 target types, with multi-session
+// round-robin and per-target backoff/pivot on rate_limited errors.
+// ---------------------------------------------------------------------
+
 /**
- * Cookie-uploaded session path — uses the public web endpoints under
- * www.instagram.com, which only need the sessionid cookie and don't
- * trigger the mobile API's "new device" checkpoint wall.
+ * Run one scrape job end-to-end. Returns the total number of users
+ * inserted across all targets.
+ *
+ * Behaviour:
+ *   - For each target, picks the next session in round-robin order,
+ *     skipping any session that is in a feedback cooldown, has
+ *     breached its daily quota, or is outside active-hours.
+ *   - On `rate_limited` / `action_blocked` from a session, that
+ *     session is parked for the rest of the job and the next session
+ *     in the rotation is tried. If no sessions remain, the error is
+ *     re-thrown so `_executeScrapeJob` can record the flip.
+ *   - For followers/following the cookie-uploaded (web) and
+ *     interactive (mobile) sessions both work; for likers/commenters/
+ *     tagged we use the web path (cookie session) regardless of
+ *     api_mode because the mobile API doesn't expose a stable likers
+ *     pagination cursor and the web endpoints accept the same
+ *     sessionid cookie.
  */
-async function _runWebScrape({ jobId, job, session, targets, limit }) {
-  if (!['followers', 'following'].includes(job.target_type)) {
-    await _setStatus(jobId, 'failed', {
-      error: `Target type ${job.target_type} is not yet implemented for cookie-uploaded sessions`,
-    });
-    return 0;
-  }
-
-  // Decrypt session_data into the canonical { cookies, ... } blob the
-  // web scraper can read.
-  let blob = null;
-  if (session.session_data) {
-    try {
-      const decrypted = decrypt(session.session_data);
-      blob = JSON.parse(decrypted);
-    } catch (err) {
-      const e = new Error(`Failed to decrypt session blob: ${err.message}`);
-      e.statusCode = 500;
-      throw e;
-    }
-  }
-  if (!blob) {
-    const e = new Error('Session has no decrypted blob');
-    e.statusCode = 500;
-    throw e;
-  }
-
+async function _runScrape({ jobId, job, sessions, targets, limit, onSessionPick }) {
+  const targetType = job.target_type;
   let totalScraped = 0;
-  for (const target of targets) {
-    if (totalScraped >= limit) break;
-    const targetUsername = String(target).replace(/^@/, '').toLowerCase();
-    // Pass the full session row (not the bare blob) so the web scraper
-    // routes the request through the per-session proxy + browser-grade
-    // headers via igFetch.
-    const profile = await webScraper.getUserIdByUsername(session, targetUsername);
+  let cursor = 0; // round-robin pointer
 
-    let received = 0;
-    const buffer = [];
-    for await (const u of webScraper.paginateFriendList(session, profile.pk, job.target_type, {
-      limit: limit - totalScraped,
-      pageSize: 50,
-      targetUsername,
-    })) {
-      buffer.push(u);
-      received += 1;
-      if (buffer.length >= 25) {
-        const inserted = await _insertUsersBatch(jobId, buffer.splice(0, buffer.length));
-        totalScraped += inserted;
-        await _setStatus(jobId, 'running', { total_found: totalScraped });
+  // Pre-compute the canonical referer for each target type so each
+  // request matches the page a real user would have open.
+  for (const targetRaw of targets) {
+    if (totalScraped >= limit) break;
+
+    const remaining = limit - totalScraped;
+    const sessionPool = sessions.slice(); // mutable copy so we can park failed sessions
+
+    let parkedReasons = [];
+    let producedThisTarget = 0;
+    let lastError = null;
+
+    while (sessionPool.length && producedThisTarget < remaining) {
+      const session = sessionPool[cursor % sessionPool.length];
+      if (typeof onSessionPick === 'function') onSessionPick(session);
+
+      // Skip sessions that are out-of-window or capped.
+      const ah = activeHours.gate(session);
+      if (!ah.allowed) {
+        parkedReasons.push(`session ${session.id}: outside active-hours`);
+        sessionPool.splice(cursor % sessionPool.length, 1);
+        continue;
       }
-      if (totalScraped + buffer.length >= limit) break;
+      try {
+        await scrapeQuota.assertWithinCap(session.id, 1);
+      } catch (quotaErr) {
+        parkedReasons.push(`session ${session.id}: ${quotaErr.message}`);
+        sessionPool.splice(cursor % sessionPool.length, 1);
+        continue;
+      }
+
+      try {
+        const inserted = await _scrapeTargetWithSession({
+          jobId,
+          job,
+          session,
+          targetRaw,
+          targetType,
+          limit: remaining - producedThisTarget,
+          onProgress: (delta) => {
+            totalScraped += delta;
+            producedThisTarget += delta;
+          },
+        });
+        // _scrapeTargetWithSession returns the count it actually
+        // committed; we already updated totalScraped via onProgress.
+        // Advance the round-robin pointer so the next target prefers
+        // a different session, smoothing load across the pool.
+        cursor = (cursor + 1) % Math.max(1, sessionPool.length);
+        // We're done with this target.
+        break;
+      } catch (err) {
+        const mapped = _mapIgError(err);
+        lastError = mapped;
+        const isPivotable =
+          mapped.kind === 'rate_limited' ||
+          mapped.kind === 'action_blocked' ||
+          mapped.kind === 'forbidden';
+        if (isPivotable && sessionPool.length > 1) {
+          logger.warn(
+            `IG.scrape job ${jobId}: session ${session.id} hit ${mapped.kind} on target=${targetRaw}; ` +
+            `pivoting to next session.`
+          );
+          parkedReasons.push(`session ${session.id}: ${mapped.kind}`);
+          sessionPool.splice(cursor % sessionPool.length, 1);
+          continue;
+        }
+        // Non-pivotable error (login_required / checkpoint / 404 /
+        // network) — propagate so the outer handler records it and
+        // flips the session state if appropriate.
+        throw err;
+      }
     }
-    if (buffer.length) {
-      const inserted = await _insertUsersBatch(jobId, buffer);
-      totalScraped += inserted;
-      await _setStatus(jobId, 'running', { total_found: totalScraped });
+    if (parkedReasons.length) {
+      logger.info(
+        `IG.scrape job ${jobId}: target=${targetRaw} sessions parked → ${parkedReasons.join('; ')}`
+      );
     }
-    logger.info(`IG.webScrape job ${jobId}: target=${targetUsername} kind=${job.target_type} fetched=${received} inserted_total=${totalScraped}`);
+    if (producedThisTarget === 0 && lastError) {
+      // We couldn't get anything from any session for this target —
+      // skip but don't fail the whole job. The job record's
+      // error_message will reflect the last failure if every target
+      // hits this branch.
+      await _setStatus(jobId, 'running', {
+        total_found: totalScraped,
+        error: `Skipped target ${targetRaw}: ${lastError.message}`,
+      });
+    }
   }
+
   return totalScraped;
 }
 
 /**
- * Mobile-API session path (instagram-private-api). Used when the
- * session was created by the panel's own login flow, not via cookie
- * upload.
+ * Run a single (session, target) pair. Splits on api_mode (web vs
+ * mobile) and target_type. Returns the count of users actually
+ * inserted (post-dedupe by ON CONFLICT).
  */
-async function _runMobileScrape({ jobId, job, session, targets, limit }) {
-  const client = await igClient.getClient(session);
-  const pageSize = Math.min(limit, await _getPageSize(job.target_type, 200));
-  let totalScraped = 0;
+async function _scrapeTargetWithSession({
+  jobId,
+  job,
+  session,
+  targetRaw,
+  targetType,
+  limit,
+  onProgress,
+}) {
+  const apiMode =
+    (session.platform_state && session.platform_state.api_mode) ||
+    ((session.platform_state && session.platform_state.source === 'browser_cookies')
+      ? 'web' : 'mobile');
 
-  for (const target of targets) {
-    if (totalScraped >= limit) break;
-
-    const targetUsername = String(target).replace(/^@/, '').toLowerCase();
-    // Phase 1.B7 — read-class token before username lookup.
-    await sessionLimiter.acquire(session.id, { class: 'read' });
-    const targetUserId = await client.user.getIdByUsername(targetUsername);
-
-    const feed = job.target_type === 'followers'
-      ? client.feed.accountFollowers(targetUserId)
-      : job.target_type === 'following'
-        ? client.feed.accountFollowing(targetUserId)
-        : null;
-
-    if (!feed) {
-      await _setStatus(jobId, 'failed', { error: `Target type ${job.target_type} not yet implemented for IG` });
-      return totalScraped;
-    }
-
-    let receivedFromTarget = 0;
-    let firstPage = true;
-    do {
-      // Phase 1.B7 — read-class token before each feed page. The
-      // limiter already enforces ~10s between reads; the legacy
-      // _jitterSleep is left in to add a tiny extra spread on top.
-      await sessionLimiter.acquire(session.id, { class: 'read' });
-      if (!firstPage) {
-        await _jitterSleep(500, 1500);
-      }
-      firstPage = false;
-      const items = await feed.items();
-      const slice = items.slice(0, Math.max(0, limit - totalScraped));
-      const inserted = await _insertUsersBatch(jobId, slice);
-      totalScraped += inserted;
-      receivedFromTarget += slice.length;
-      await _setStatus(jobId, 'running', { total_found: totalScraped });
-      if (totalScraped >= limit) break;
-    } while (feed.isMoreAvailable() && receivedFromTarget < pageSize * 10);
+  // Cookie-uploaded (web) sessions support all five target types.
+  // Mobile-API sessions support followers/following natively; for the
+  // other three we transparently reuse the web surface because the
+  // mobile endpoints either don't expose a stable cursor (likers) or
+  // are gated behind device-binding checks that fail from the panel
+  // host (commenters, usertags). A mobile-mode session that lacks
+  // browser cookies will fail-fast inside webScraper with a clean
+  // 401 — caller catches and pivots.
+  if (apiMode === 'web' || _MEDIA_TARGET_TYPES.has(targetType) || targetType === 'tagged') {
+    return _runWebScrapeTarget({ jobId, job, session, targetRaw, targetType, limit, onProgress });
   }
-  return totalScraped;
+  return _runMobileScrapeTarget({ jobId, job, session, targetRaw, targetType, limit, onProgress });
+}
+
+// ---------------------------------------------------------------------
+// Web scrape executor (per-target)
+// ---------------------------------------------------------------------
+
+async function _runWebScrapeTarget({ jobId, job, session, targetRaw, targetType, limit, onProgress }) {
+  // Decrypt session_data — webScraper's _resolveCtx will redo this
+  // via igFetch.sessionContext; we just need to fail fast if the blob
+  // is missing so the per-target loop can pivot.
+  if (session.session_data) {
+    try {
+      const decrypted = decrypt(session.session_data);
+      JSON.parse(decrypted);
+    } catch (err) {
+      const e = new Error(`Failed to decrypt session blob: ${err.message}`);
+      e.statusCode = 500;
+      e.kind = 'network';
+      throw e;
+    }
+  } else {
+    const e = new Error('Session has no decrypted blob — cookie-based scrape requires an uploaded cookies session.');
+    e.statusCode = 401;
+    e.kind = 'login_required';
+    throw e;
+  }
+
+  if (targetType === 'followers' || targetType === 'following') {
+    return _scrapeWebFriendList({ jobId, session, targetRaw, kind: targetType, limit, onProgress });
+  }
+  if (targetType === 'likers') {
+    return _scrapeWebLikers({ jobId, session, targetRaw, limit, onProgress });
+  }
+  if (targetType === 'commenters') {
+    return _scrapeWebCommenters({ jobId, session, targetRaw, limit, onProgress });
+  }
+  if (targetType === 'tagged') {
+    return _scrapeWebTagged({ jobId, session, targetRaw, limit, onProgress });
+  }
+  const e = new Error(`Unsupported target_type='${targetType}' for web scrape`);
+  e.statusCode = 400;
+  throw e;
+}
+
+async function _streamUsers(generator, { jobId, session, limit, onProgress, batchSize = 25 }) {
+  let inserted = 0;
+  const buffer = [];
+  for await (const u of generator) {
+    if (!u) continue;
+    buffer.push(u);
+    if (buffer.length >= batchSize) {
+      const slice = buffer.splice(0, buffer.length);
+      const allowed = await scrapeQuota.consume(session.id, slice.length);
+      const finalSlice = allowed >= slice.length ? slice : slice.slice(0, allowed);
+      const n = await _insertUsersBatch(jobId, finalSlice);
+      inserted += n;
+      if (onProgress) onProgress(n);
+      await _setStatus(jobId, 'running', { total_found: await _readTotalFound(jobId) });
+      if (allowed < slice.length) {
+        const e = new Error(`Daily scrape cap reached for session ${session.id}; partial insert.`);
+        e.kind = 'daily_cap';
+        e.statusCode = 429;
+        throw e;
+      }
+      if (inserted >= limit) return inserted;
+    }
+  }
+  if (buffer.length) {
+    const allowed = await scrapeQuota.consume(session.id, buffer.length);
+    const finalSlice = allowed >= buffer.length ? buffer : buffer.slice(0, allowed);
+    const n = await _insertUsersBatch(jobId, finalSlice);
+    inserted += n;
+    if (onProgress) onProgress(n);
+    await _setStatus(jobId, 'running', { total_found: await _readTotalFound(jobId) });
+  }
+  return inserted;
+}
+
+async function _readTotalFound(jobId) {
+  const r = await pool.query(
+    `SELECT COUNT(*)::int AS n FROM scraped_users WHERE job_id = $1`,
+    [jobId]
+  );
+  return r.rows[0]?.n || 0;
+}
+
+async function _scrapeWebFriendList({ jobId, session, targetRaw, kind, limit, onProgress }) {
+  const targetUsername = String(targetRaw).replace(/^@/, '').toLowerCase();
+  // Pre-warm: a quick "view profile" request before paginating the
+  // friends list mirrors what a real human does (open the profile,
+  // tap Followers). The igFetch limiter will make sure this counts
+  // against the per-session bucket.
+  const profile = await webScraper.getUserIdByUsername(session, targetUsername);
+  const gen = webScraper.paginateFriendList(session, profile.pk, kind, {
+    limit,
+    pageSize: 50,
+    targetUsername,
+  });
+  return _streamUsers(gen, { jobId, session, limit, onProgress });
+}
+
+async function _scrapeWebLikers({ jobId, session, targetRaw, limit, onProgress }) {
+  const info = await webScraper.getMediaInfo(session, targetRaw);
+  const gen = webScraper.paginateMediaLikers(session, info.pk, {
+    limit,
+    urlPath: info.urlPath,
+  });
+  return _streamUsers(gen, { jobId, session, limit, onProgress });
+}
+
+async function _scrapeWebCommenters({ jobId, session, targetRaw, limit, onProgress }) {
+  const info = await webScraper.getMediaInfo(session, targetRaw);
+  const gen = webScraper.paginateMediaCommenters(session, info.pk, {
+    limit,
+    urlPath: info.urlPath,
+  });
+  return _streamUsers(gen, { jobId, session, limit, onProgress });
+}
+
+async function _scrapeWebTagged({ jobId, session, targetRaw, limit, onProgress }) {
+  const targetUsername = String(targetRaw).replace(/^@/, '').toLowerCase();
+  const profile = await webScraper.getUserIdByUsername(session, targetUsername);
+  const gen = webScraper.paginateUserTags(session, profile.pk, {
+    limit,
+    targetUsername,
+  });
+  return _streamUsers(gen, { jobId, session, limit, onProgress });
+}
+
+// ---------------------------------------------------------------------
+// Mobile-API scrape executor (per-target, followers/following only)
+// ---------------------------------------------------------------------
+
+async function _runMobileScrapeTarget({ jobId, job, session, targetRaw, targetType, limit, onProgress }) {
+  if (targetType !== 'followers' && targetType !== 'following') {
+    // The dispatcher in _scrapeTargetWithSession already rerouted the
+    // other types to web, but defend against future changes.
+    const e = new Error(`Mobile scrape only supports followers/following, got '${targetType}'`);
+    e.statusCode = 400;
+    throw e;
+  }
+  const client = await igClient.getClient(session);
+  const pageSize = Math.min(limit, await _getPageSize(targetType, 200));
+
+  const targetUsername = String(targetRaw).replace(/^@/, '').toLowerCase();
+  await sessionLimiter.acquire(session.id, { class: 'read' });
+  const targetUserId = await client.user.getIdByUsername(targetUsername);
+
+  const feed = targetType === 'followers'
+    ? client.feed.accountFollowers(targetUserId)
+    : client.feed.accountFollowing(targetUserId);
+
+  let received = 0;
+  let firstPage = true;
+  let inserted = 0;
+  do {
+    await sessionLimiter.acquire(session.id, { class: 'read' });
+    if (!firstPage) await _jitterSleep(500, 1500);
+    firstPage = false;
+    const items = await feed.items();
+    const slice = items.slice(0, Math.max(0, limit - received));
+    const allowed = await scrapeQuota.consume(session.id, slice.length);
+    const finalSlice = allowed >= slice.length ? slice : slice.slice(0, allowed);
+    const n = await _insertUsersBatch(jobId, finalSlice);
+    inserted += n;
+    received += finalSlice.length;
+    if (onProgress) onProgress(n);
+    await _setStatus(jobId, 'running', { total_found: await _readTotalFound(jobId) });
+    if (allowed < slice.length) {
+      const e = new Error(`Daily scrape cap reached for session ${session.id}; partial insert.`);
+      e.kind = 'daily_cap';
+      e.statusCode = 429;
+      throw e;
+    }
+    if (received >= limit) break;
+  } while (feed.isMoreAvailable() && received < pageSize * 10);
+  return inserted;
 }
 
 async function listJobs(userId, opts = {}) {

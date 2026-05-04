@@ -122,12 +122,20 @@ export default function InstagramScrape() {
 
   async function startJob(evt) {
     evt?.preventDefault();
+    const isMediaTarget = targetType === 'likers' || targetType === 'commenters';
+    // For username targets, strip a leading @. For media targets,
+    // preserve URLs / shortcodes / PKs verbatim — the backend's
+    // parseMediaInput accepts all three.
     const targets = targetUsernames
       .split(/[\s,;\n]+/)
-      .map((x) => x.trim().replace(/^@/, ''))
+      .map((x) => x.trim())
+      .map((x) => (isMediaTarget ? x : x.replace(/^@/, '')))
       .filter(Boolean);
     if (!targets.length) {
-      showToast('Enter at least one Instagram username (or media PK for likers)', 'error');
+      const what = isMediaTarget
+        ? 'media URL, shortcode, or PK'
+        : 'Instagram username';
+      showToast(`Enter at least one ${what}`, 'error');
       return;
     }
     if (!selectedSessions.length) {
@@ -212,7 +220,10 @@ export default function InstagramScrape() {
 
   const placeholderHint = useMemo(() => {
     if (targetType === 'likers' || targetType === 'commenters') {
-      return 'media PK (numeric, one per line) — e.g. 3092834593582345';
+      return 'Post URL, shortcode, or numeric PK — e.g. https://www.instagram.com/p/CwAU0X4MQQq/ or CwAU0X4MQQq';
+    }
+    if (targetType === 'tagged') {
+      return 'Instagram username whose tagged posts to scan — e.g. xjashan_';
     }
     return 'Instagram username (one per line) — e.g. instagram, nasa';
   }, [targetType]);
@@ -359,12 +370,26 @@ export default function InstagramScrape() {
               const total = Number(j.total_found || 0);
               const pct = limit > 0 ? Math.min(100, Math.round((total / limit) * 100)) : 0;
               const targets = j.target_ids || (j.target_id ? [j.target_id] : []);
+              const isMediaJob = j.target_type === 'likers' || j.target_type === 'commenters';
+              const formatTarget = (t) => {
+                const s = String(t);
+                if (isMediaJob) {
+                  // Likers/commenters take a media reference. Show a
+                  // shortcode-style label so a URL doesn't blow out the
+                  // table layout.
+                  const m = s.match(/instagram\.com\/(?:p|reel|tv|reels)\/([A-Za-z0-9_-]+)/i);
+                  if (m) return `/p/${m[1]}/`;
+                  if (/^\d{6,}$/.test(s)) return `pk:${s.slice(0, 8)}…`;
+                  return s.length > 16 ? `${s.slice(0, 14)}…` : s;
+                }
+                return `@${s}`;
+              };
               return (
                 <tr key={j.id} className="border-b border-pink-50 last:border-0 dark:border-pink-900/30">
                   <td className="px-3 py-2 font-mono text-xs text-gray-500">#{j.id}</td>
                   <td className="px-3 py-2">{j.target_type}</td>
                   <td className="px-3 py-2 text-xs text-gray-700 dark:text-gray-200">
-                    {targets.slice(0, 3).map((t) => `@${t}`).join(', ')}
+                    {targets.slice(0, 3).map(formatTarget).join(', ')}
                     {targets.length > 3 ? ` +${targets.length - 3}` : ''}
                   </td>
                   <td className="px-3 py-2">
