@@ -9,6 +9,7 @@
  * the operator (CLI stdout or Telegram chat).
  */
 
+const fs = require('fs');
 const path = require('path');
 const http = require('http');
 const { run, runStream } = require('./exec');
@@ -141,11 +142,35 @@ async function composeNetworkName() {
     } catch (_) { /* keep trying */ }
   }
 
+  // In-container fallback: when bin/upgrade runs from inside the admin-bot
+  // container, REPO_ROOT is /host (the bind-mounted host repo) and `docker
+  // compose ps` above silently returns nothing because compose derives the
+  // project name from the cwd basename ('host'), which doesn't match the
+  // host project ('web-pannel' or whatever the operator's clone dir is).
+  // The admin-bot is itself attached to the same compose default network as
+  // postgres/redis, so we can simply read our own networks.
+  if (isInsideContainer()) {
+    try {
+      const hostname = fs.readFileSync('/etc/hostname', 'utf8').trim();
+      const { stdout } = await run(
+        'docker',
+        ['inspect', '--format', '{{range $k, $v := .NetworkSettings.Networks}}{{$k}}\n{{end}}', hostname],
+        { allowFail: true }
+      );
+      const first = stdout.split('\n').map((s) => s.trim()).find((s) => s && s !== 'bridge');
+      if (first) return first;
+    } catch (_) { /* fall through */ }
+  }
+
   // Heuristic fallback: docker compose v2 default network = "<project>_default".
   // Compose v2 sanitises project names to lowercase + alphanumerics +
   // underscores + hyphens; hyphens are PRESERVED. Match that rule exactly.
   const dirName = path.basename(REPO_ROOT).toLowerCase().replace(/[^a-z0-9_-]/g, '');
   return `${dirName}_default`;
+}
+
+function isInsideContainer() {
+  try { return fs.existsSync('/.dockerenv'); } catch (_) { return false; }
 }
 
 /* -------------------------------------------------------------------------- */
