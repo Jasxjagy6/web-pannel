@@ -301,6 +301,13 @@ async function loop() {
         });
       }
     } catch (err) {
+      // Touch heartbeat on errors too: getUpdates can fail transiently
+      // (Telegram rate-limit, network blip, or a Conflict if the same bot
+      // token is being polled from another host during a rolling deploy).
+      // The poll loop is still alive — only the API call failed — so the
+      // Docker HEALTHCHECK should not flip us to unhealthy and trigger a
+      // restart loop on top of the API issue.
+      touchHeartbeat();
       process.stderr.write(`bot: getUpdates error: ${err.message}\n`);
       await sleep(5000);
     }
