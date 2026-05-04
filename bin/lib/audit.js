@@ -24,10 +24,18 @@ const REPO_ROOT = path.join(__dirname, '..', '..');
 // fall back to running psql inside the postgres container, which is always
 // reachable when the stack is up. The pool path is still used inside the
 // admin-bot container which has pg installed.
+//
+// REPO_ROOT inside the admin-bot container resolves to `/host` (the bind-
+// mounted host repo, which has no node_modules). The container's own
+// `/app/node_modules/pg` is the actually-installed module. Try that path
+// last so an operator-installed `<repo>/backend/node_modules/pg` on the
+// host still wins, and the host CLI without any node_modules still falls
+// through cleanly to the psql-via-docker fallback.
 function tryRequirePg() {
   const candidates = [
     path.join(REPO_ROOT, 'backend', 'node_modules', 'pg'),
     'pg',
+    '/app/node_modules/pg',
   ];
   for (const c of candidates) {
     try { return require(c); } catch (_) { /* keep trying */ }
