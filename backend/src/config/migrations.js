@@ -170,21 +170,38 @@ async function applyPending(pool, { logger = console } = {}) {
  * checksums so the new runner doesn't try to re-apply them. Safe to call
  * repeatedly — only inserts rows that don't already exist.
  *
- * We detect "pre-existing schema" by the presence of the `users` table,
- * since that's created by schema.sql which the legacy boot path runs first.
+ * Detection logic — we want this to fire on a *previously-deployed* database
+ * AND be a no-op on a *fresh* database, so we look for an artifact that
+ * could only have come from a pre-v15 migration actually executing. We pick
+ * `proxies.user_id` (added by `migration_v14_user_proxies.sql`) because:
+ *
+ *   - `proxies` is created by `migration_scraping_upgrade.sql`, NOT by
+ *     `schema.sql`; on a fresh DB it doesn't exist at all.
+ *   - The `user_id` column on `proxies` is added by the latest pre-v15
+ *     migration (v14). If it's present, the legacy boot loop has run all
+ *     historical migrations end-to-end, so they are effectively applied.
+ *   - Using a marker that ONLY a migration creates avoids the v15.0 bug
+ *     where the presence of `users` (created by schema.sql) was treated as
+ *     proof of pre-existing migrations, causing the seed to fire on every
+ *     fresh DB and skip every historical migration.
  */
 async function seedHistoryIfPreExisting(pool, { logger = console } = {}) {
   await ensureSchemaMigrationsTable(pool);
-  const { rows: usersExists } = await pool.query(
-    `SELECT to_regclass('public.users') IS NOT NULL AS exists`
-  );
-  const dbHasSchema = !!(usersExists[0] && usersExists[0].exists);
-  if (!dbHasSchema) return;
 
   const { rows: anyApplied } = await pool.query(
     'SELECT COUNT(*)::int AS n FROM schema_migrations'
   );
   if (anyApplied[0].n > 0) return;
+
+  const { rows: hasMarker } = await pool.query(`
+    SELECT EXISTS (
+      SELECT 1 FROM information_schema.columns
+       WHERE table_schema = 'public'
+         AND table_name   = 'proxies'
+         AND column_name  = 'user_id'
+    ) AS exists
+  `);
+  if (!hasMarker[0].exists) return;
 
   const files = listMigrationFiles();
   let seeded = 0;
