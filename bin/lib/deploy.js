@@ -117,13 +117,23 @@ async function runMigrations({ imageTag, sha, dbEnv, log, mode = 'apply' }) {
 async function composeNetworkName() {
   if (process.env.COMPOSE_NETWORK) return process.env.COMPOSE_NETWORK;
 
-  // Try to find the network of a running compose service (postgres preferred,
-  // then redis). Operators can override via COMPOSE_NETWORK.
+  // Ask docker compose itself which container backs the postgres service,
+  // then inspect that container's networks. Falls through to the next
+  // service / heuristic on any error. This is the most reliable path
+  // because it handles arbitrary COMPOSE_PROJECT_NAME settings, multi-
+  // network setups, and external networks.
   for (const svc of ['postgres', 'redis']) {
     try {
+      const { stdout: cid } = await run(
+        'docker',
+        ['compose', 'ps', '-q', svc],
+        { allowFail: true, cwd: REPO_ROOT }
+      );
+      const containerId = cid.trim().split('\n')[0];
+      if (!containerId) continue;
       const { stdout } = await run(
         'docker',
-        ['inspect', '--format', '{{range $k, $v := .NetworkSettings.Networks}}{{$k}}\n{{end}}', svc],
+        ['inspect', '--format', '{{range $k, $v := .NetworkSettings.Networks}}{{$k}}\n{{end}}', containerId],
         { allowFail: true }
       );
       const first = stdout.split('\n').map((s) => s.trim()).find((s) => s && s !== 'bridge');
@@ -131,8 +141,10 @@ async function composeNetworkName() {
     } catch (_) { /* keep trying */ }
   }
 
-  // Heuristic: docker compose v2 default network = "<projectdir>_default".
-  const dirName = path.basename(REPO_ROOT).toLowerCase().replace(/[^a-z0-9]/g, '');
+  // Heuristic fallback: docker compose v2 default network = "<project>_default".
+  // Compose v2 sanitises project names to lowercase + alphanumerics +
+  // underscores + hyphens; hyphens are PRESERVED. Match that rule exactly.
+  const dirName = path.basename(REPO_ROOT).toLowerCase().replace(/[^a-z0-9_-]/g, '');
   return `${dirName}_default`;
 }
 
