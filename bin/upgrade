@@ -156,13 +156,24 @@ async function cmdStatus() {
     log(colorize('  (no deployment rows yet — run a deploy)', 'dim'));
   }
   for (const r of rows) {
+    // started_at comes back as a Date when pg is loaded (admin-bot path or
+    // a host with backend/node_modules/pg available). When the audit
+    // module falls through to the psql-via-docker path, every column is a
+    // string. Normalise both shapes to "YYYY-MM-DDTHH:MM:SS".
     log(
-      `  #${r.id}  ${r.started_at && r.started_at.toISOString().slice(0, 19)}  ` +
+      `  #${r.id}  ${formatStartedAt(r.started_at)}  ` +
       `${(r.status || '').padEnd(11)} ${(r.target_ref || '—').padEnd(8)} ` +
       `${(r.target_sha || '').slice(0, 12).padEnd(12)} ` +
       `→ ${r.color_promoted || '—'}  by ${r.initiated_by}`
     );
   }
+}
+
+function formatStartedAt(v) {
+  if (!v) return '—';
+  if (v instanceof Date) return v.toISOString().slice(0, 19);
+  const d = new Date(v);
+  return Number.isNaN(d.getTime()) ? String(v).slice(0, 19) : d.toISOString().slice(0, 19);
 }
 
 /* -------------------------------------------------------------------------- */
