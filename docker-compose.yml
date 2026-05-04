@@ -199,6 +199,13 @@ services:
     image: caddy:2.7-alpine
     restart: unless-stopped
     ports:
+      # `${HOST_PORT:-default}:CONTAINER_PORT`. The right side (`:80` and
+      # `:443`) is the port Caddy listens on INSIDE the container — it is
+      # hardcoded to `:80` in proxy/Caddyfile and MUST stay 80/443. To
+      # publish on different host ports (because :80/:443 are already
+      # taken on the VPS), set HTTP_PORT / HTTPS_PORT in .env. Do NOT edit
+      # this file — touching the right side breaks the listener entirely
+      # and every request returns 502.
       - "${HTTP_PORT:-80}:80"
       - "${HTTPS_PORT:-443}:443"
       # 2019 is the admin API — bound to localhost ONLY on the host so an
