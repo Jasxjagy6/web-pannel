@@ -2671,19 +2671,53 @@ class SessionService {
       };
 
       const ids = result.rows.map((r) => r.id);
+      // Per-session hard timeout. If a single session hangs (DNS, slow
+      // proxy, AUTH_KEY_DUPLICATED that drags out the MTProto recv
+      // loop) the loop must not block on it indefinitely. The
+      // heartbeat retries the row on its next tick. Default 20 s,
+      // overridable via env. Set to 0 to disable.
+      const restoreTimeoutMs = parseInt(
+        process.env.SESSION_RESTORE_PER_SESSION_TIMEOUT_MS || '20000', 10
+      );
+      const restoreOneWithTimeout = (sessionId) => {
+        if (restoreTimeoutMs <= 0) return restoreOne(sessionId);
+        return new Promise((resolve) => {
+          let settled = false;
+          const t = setTimeout(() => {
+            if (settled) return;
+            settled = true;
+            failed++;
+            logger.warn(
+              `restore timeout for session ${sessionId} after ${restoreTimeoutMs}ms; will retry on heartbeat`
+            );
+            resolve();
+          }, restoreTimeoutMs);
+          restoreOne(sessionId).then(
+            () => { if (!settled) { settled = true; clearTimeout(t); resolve(); } },
+            (err) => {
+              if (!settled) {
+                settled = true; clearTimeout(t);
+                logger.warn(`restoreOne(${sessionId}) rejected: ${err.message}`);
+                resolve();
+              }
+            }
+          );
+        });
+      };
+
       // If staggering is disabled (windowMs<=0), restore inline; otherwise
       // delegate to the scheduler.
       if (windowMs <= 0 || ids.length <= 1) {
         for (const id of ids) {
           // eslint-disable-next-line no-await-in-loop
-          await restoreOne(id);
+          await restoreOneWithTimeout(id);
         }
       } else {
         await restoreScheduler.run({
           items: ids,
           windowMs,
           perMinuteCap,
-          handler: (id) => restoreOne(id),
+          handler: (id) => restoreOneWithTimeout(id),
           onProgress: (idx, t, ms) => {
             if (idx === 0 || (idx + 1) % 10 === 0 || idx === t - 1) {
               logger.debug(

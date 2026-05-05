@@ -303,9 +303,21 @@ async function start() {
     // ---------------------------------------------------------------------
     // 1. Restore previously logged-in sessions and start the heartbeat that
     //    keeps each Telegram client alive until manually logged out.
+    //
+    //    IMPORTANT: we do NOT await `restoreAllLoggedInSessions()`. With
+    //    Phase 4 enabled the loop does multiple Telegram round-trips per
+    //    session (DC pin probe, announceOnline, getMe, ChangeAuthSettings,
+    //    SetAccountTTL). A single session in a bad state (e.g.
+    //    AUTH_KEY_DUPLICATED, FloodWait) can take 30+ seconds to fail, so
+    //    awaiting the whole loop easily exceeds the orchestrator's
+    //    /health/ready timeout (default 120s) on accounts with several
+    //    sessions. Instead we kick the loop off as a background promise
+    //    and flip `markReady('sessions')` immediately — the panel can
+    //    serve admin/auth/HTTP traffic while sessions trickle in, and the
+    //    heartbeat below retries any session that isn't up yet on its
+    //    next tick.
     try {
       const sessionService = require('./services/sessionService');
-      await sessionService.restoreAllLoggedInSessions();
       const heartbeatMs = parseInt(process.env.SESSION_HEARTBEAT_INTERVAL_MS || '60000', 10);
       setInterval(
         () => sessionService.heartbeatLoggedInSessions().catch((e) =>
@@ -314,13 +326,19 @@ async function start() {
         heartbeatMs
       );
       logger.info(`Session heartbeat scheduled every ${heartbeatMs}ms`);
+      // Background restore — never awaited.
+      sessionService.restoreAllLoggedInSessions()
+        .then((r) => logger.info(
+          `Background restore complete: total=${r && r.total} ` +
+          `restored=${r && r.restored} failed=${r && r.failed}`
+        ))
+        .catch((e) => logger.error(`Background restore failed: ${e.message}`));
       readiness.markReady('sessions');
     } catch (err) {
-      logger.error(`Session restore/heartbeat init failed: ${err.message}`);
-      // Mark ready anyway so the panel doesn't hold the readiness probe
-      // open forever if a single Telegram session fails to restore. The
-      // failure is logged and individual sessions will be retried on the
-      // next heartbeat tick.
+      logger.error(`Session heartbeat init failed: ${err.message}`);
+      // Even if the heartbeat scheduling failed we mark sessions ready
+      // so the readiness probe doesn't stall the orchestrator. Restore
+      // and recovery still work via the per-request lazy connect path.
       readiness.markReady('sessions');
     }
 
