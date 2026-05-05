@@ -22,6 +22,7 @@ const userNavItems = [
   { path: 'lists',             label: 'Lists',            icon: List,            capability: 'lists' },
   { path: 'change-2fa',        label: 'Change 2FA',       icon: ShieldCheck,     capability: 'twofa_change' },
   { path: 'get-otp',           label: 'Get OTP',          icon: KeyRound,        capability: 'otp_passive' },
+  { path: 'otp-relay',         label: 'OTP Relay',        icon: ShieldCheck,     capability: 'otp_relay' },
   { path: 'proxies',           label: 'Proxies',          icon: Network,         capability: 'proxies' },
   { path: 'anti-detect',       label: 'Anti-Detect',      icon: Fingerprint,     capability: 'identity_device' },
   { path: 'reports',           label: 'Reports',          icon: BarChart3,       capability: 'reports' },

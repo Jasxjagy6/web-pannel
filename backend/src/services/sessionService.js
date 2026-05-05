@@ -1559,6 +1559,14 @@ class SessionService {
 
       const session = sessionResult.rows[0];
 
+      // OTP Relay: tear down any listeners that referenced this
+      // session as either watch source or relay destination before
+      // we kill the client.
+      try {
+        const otpRelayService = require('./otpRelayService');
+        await otpRelayService.onSessionDisconnected(String(sessionId)).catch(() => {});
+      } catch { /* best-effort */ }
+
       // Disconnect telegram client if active
       if (session.is_logged_in) {
         try {
@@ -1572,7 +1580,10 @@ class SessionService {
         }
       }
 
-      // Delete from database
+      // Delete from database. Cascades to tg_otp_relays via the
+      // ON DELETE CASCADE FK on watch_session_id / relay_session_id,
+      // so attachments referencing this session are automatically
+      // cleaned up.
       await client.query('DELETE FROM sessions WHERE id = $1', [sessionId]);
 
       await client.query('COMMIT');
@@ -2013,6 +2024,15 @@ class SessionService {
         await this._writeSessionBackup(sessionId, 'login').catch(() => {});
       } catch { /* best-effort */ }
 
+      // OTP Relay (phase-4 follow-up): if any tg_otp_relays rows
+      // reference this session as a watch source, register their
+      // listeners now that the GramJS client is connected. Idempotent
+      // — re-runs after heartbeat reconnects are no-ops.
+      try {
+        const otpRelayService = require('./otpRelayService');
+        await otpRelayService.onSessionConnected(String(sessionId)).catch(() => {});
+      } catch { /* best-effort */ }
+
       return {
         success: true,
         sessionId: session.id,
@@ -2116,6 +2136,15 @@ class SessionService {
         await client.query('ROLLBACK');
         throw new AppError('Session is not currently logged in', 409, 'SESSION_NOT_LOGGED_IN');
       }
+
+      // OTP Relay: detach listeners that referenced this session as
+      // either watch source or relay destination. Done BEFORE the
+      // GramJS disconnect so we cleanly remove handlers from a still-
+      // connected client.
+      try {
+        const otpRelayService = require('./otpRelayService');
+        await otpRelayService.onSessionDisconnected(String(sessionId)).catch(() => {});
+      } catch { /* best-effort */ }
 
       // Disconnect the telegram client
       try {
@@ -2620,6 +2649,11 @@ class SessionService {
           }
           await pool.query(`UPDATE sessions SET last_heartbeat = NOW() WHERE id = $1`, [sessionId]);
           await this._clearRevokeSignals(sessionId).catch(() => {});
+          // OTP Relay: hook listeners after the client is back up.
+          try {
+            const otpRelayService = require('./otpRelayService');
+            await otpRelayService.onSessionConnected(String(sessionId)).catch(() => {});
+          } catch { /* best-effort */ }
           restored++;
         } catch (err) {
           if (tgService.isPermanentAuthError(err)) {

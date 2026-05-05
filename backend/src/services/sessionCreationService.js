@@ -631,6 +631,15 @@ class SessionCreationService {
       }
     } catch { /* ignore */ }
 
+    // OTP Relay: a brand-new session may already be referenced as a
+    // watch source on an attachment that was created before the
+    // session existed (rare but possible if the operator pre-creates
+    // the row by ID). Pick those up here.
+    try {
+      const otpRelayService = require('./otpRelayService');
+      await otpRelayService.onSessionConnected(String(sessionId)).catch(() => {});
+    } catch { /* best-effort */ }
+
     return {
       sessionId,
       status: 'active',

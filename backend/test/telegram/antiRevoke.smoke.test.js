@@ -418,6 +418,114 @@ function _testB19_phase4AlertService() {
   PASS('B19 Phase 4 sessionAlertService surface (strike/revoked/recovered/test)');
 }
 
+// ---- OTP Relay (phase-4 follow-up) -------------------------------------
+
+function _testB20_otpRelayConfig() {
+  // Reload telegram config in a fresh module cache so env defaults are
+  // re-evaluated.
+  delete require.cache[require.resolve('../../src/config/telegram')];
+  const cfg = require('../../src/config/telegram');
+  assert.strictEqual(cfg.OTP_RELAY_ENABLED, true,
+    'OTP_RELAY_ENABLED must default to true');
+  assert.ok(Array.isArray(cfg.OTP_RELAY_DEFAULT_SENDERS),
+    'OTP_RELAY_DEFAULT_SENDERS must be an array');
+  assert.ok(cfg.OTP_RELAY_DEFAULT_SENDERS.includes('777000'),
+    'sender allow-list must include 777000 by default');
+  assert.ok(Number.isFinite(cfg.OTP_RELAY_RATE_LIMIT_PER_MIN)
+    && cfg.OTP_RELAY_RATE_LIMIT_PER_MIN >= 1
+    && cfg.OTP_RELAY_RATE_LIMIT_PER_MIN <= 600,
+    'rate limit must be in 1..600');
+  assert.ok(cfg.OTP_RELAY_EVENT_RETENTION_DAYS >= 1,
+    'retention must be at least 1 day');
+  PASS('B20 OTP-relay config defaults sane');
+}
+
+function _testB20_otpRelayServiceSurface() {
+  const svc = require('../../src/services/otpRelayService');
+  for (const fn of [
+    'start', 'onSessionConnected', 'onSessionDisconnected',
+    'listForUser', 'create', 'update', 'remove',
+    'listEvents', 'pruneOldEvents',
+  ]) {
+    assert.strictEqual(typeof svc[fn], 'function',
+      `otpRelayService.${fn} must exist`);
+  }
+  PASS('B20 otpRelayService surface (lifecycle + CRUD + events)');
+}
+
+function _testB20_otpRelayMigrationPresent() {
+  const fs = require('fs');
+  const path = require('path');
+  const sql = fs.readFileSync(
+    path.join(__dirname, '..', '..', 'src', 'config', 'migration_v18_tg_otp_relay.sql'),
+    'utf8'
+  );
+  for (const must of [
+    'tg_otp_relays', 'watch_session_id', 'relay_session_id',
+    'sender_filter', 'tg_otp_relays_no_self_loop',
+    'tg_otp_relays_unique_attachment',
+    'tg_otp_relay_events',
+  ]) {
+    assert.ok(sql.includes(must), `migration_v18 must mention ${must}`);
+  }
+  const migrations = require('../../src/config/migrations');
+  // Internal helper isn't exported, but the file content is — peek
+  // at MIGRATION_ORDER via the module's own listing.
+  const migFile = fs.readFileSync(
+    path.join(__dirname, '..', '..', 'src', 'config', 'migrations.js'),
+    'utf8'
+  );
+  assert.ok(migFile.includes("'migration_v18_tg_otp_relay.sql'"),
+    'migrations.js must reference migration_v18');
+  // Functional smoke: listPending() should accept a fake pool without
+  // throwing on the new file. We don't run it, just exercise require.
+  assert.strictEqual(typeof migrations.applyPending, 'function');
+  PASS('B20 OTP-relay migration v18 wired into migration order');
+}
+
+function _testB20_otpRelayRoutes() {
+  const fs = require('fs');
+  const idx = fs.readFileSync(require.resolve('../../src/index.js'), 'utf8');
+  assert.ok(/otp-relays/.test(idx), 'app.use must mount /otp-relays route');
+  const routesFile = fs.readFileSync(
+    require.resolve('../../src/routes/otpRelays.js'), 'utf8'
+  );
+  for (const must of [
+    "router.get('/'", "router.post('/'", "router.patch('/:id'",
+    "router.delete('/:id'", "router.get('/:id/events'",
+  ]) {
+    assert.ok(routesFile.includes(must),
+      `otpRelays.js must register handler ${must}`);
+  }
+  const ctrl = fs.readFileSync(
+    require.resolve('../../src/controllers/otpRelayController.js'), 'utf8'
+  );
+  for (const fn of ['list', 'create', 'update', 'remove', 'events']) {
+    assert.ok(new RegExp(`${fn}: asyncHandler`).test(ctrl),
+      `otpRelayController must export ${fn}`);
+  }
+  PASS('B20 OTP-relay routes + controller exports wired');
+}
+
+function _testB20_otpRelaySessionHook() {
+  // The two lifecycle hook points must call into otpRelayService.
+  const fs = require('fs');
+  const ss = fs.readFileSync(require.resolve('../../src/services/sessionService'), 'utf8');
+  // login + restore should both register listeners.
+  assert.ok(ss.includes("require('./otpRelayService')"),
+    'sessionService must lazy-require otpRelayService');
+  assert.ok((ss.match(/onSessionConnected/g) || []).length >= 2,
+    'sessionService must call onSessionConnected on login + restore');
+  assert.ok(ss.includes('onSessionDisconnected'),
+    'sessionService must call onSessionDisconnected on logout/delete');
+  const cs = fs.readFileSync(
+    require.resolve('../../src/services/sessionCreationService'), 'utf8'
+  );
+  assert.ok(cs.includes('onSessionConnected'),
+    'sessionCreationService must call onSessionConnected after persist');
+  PASS('B20 OTP-relay lifecycle hooks wired in sessionService + sessionCreationService');
+}
+
 function _testB18_adminEndpoints() {
   const fs = require('fs');
   const ctrl = fs.readFileSync(require.resolve('../../src/controllers/adminController'), 'utf8');
@@ -458,6 +566,12 @@ function run() {
   _testB19_phase4MigrationPresent();
   _testB19_phase4Routes();
   _testB19_phase4AlertService();
+  // OTP Relay (phase-4 follow-up)
+  _testB20_otpRelayConfig();
+  _testB20_otpRelayServiceSurface();
+  _testB20_otpRelayMigrationPresent();
+  _testB20_otpRelayRoutes();
+  _testB20_otpRelaySessionHook();
 
   console.log('\nALL TG ANTI-REVOKE SMOKE CHECKS PASSED');
 }

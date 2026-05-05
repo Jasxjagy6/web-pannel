@@ -96,6 +96,7 @@ const capabilities = {
   privacy_set:            true,   // public/private toggle
   twofa_change:           true,
   otp_passive:            false,  // IG has no passive OTP inbox
+  otp_relay:              false,  // Saved-Messages relay is Telegram-only
 };
 
 // Lazy module loaders — keeps the IG runtime out of the cold-start path.
