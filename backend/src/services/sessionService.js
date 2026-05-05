@@ -1985,6 +1985,34 @@ class SessionService {
         phone: me.phone,
       });
 
+      // Anti-revoke Phase 4: confirm the panel session against
+      // Telegram's "unconfirmed authorization" timer AND push the
+      // account TTL out to the protocol max so an idle account never
+      // auto-prunes all its sessions (including ours). Both calls
+      // swallow non-permanent errors — the login itself is already
+      // committed, so a transient Telegram-side flake here doesn't
+      // need to fail the whole flow.
+      try {
+        await tgService.hardenSessionAgainstRevocation(tgSessionId);
+      } catch (hardenErr) {
+        if (tgService.isPermanentAuthError(hardenErr)) {
+          // The auth_key just died between getMe and Phase-4. Mark
+          // revoked using the same path the heartbeat uses — but only
+          // after the consecutive-strike threshold (single transient
+          // doesn't kill the row).
+          await this._recordRevokeSignal(sessionId, hardenErr).catch(() => {});
+        } else {
+          logger.debug(`Phase-4 harden failed for ${sessionId}: ${hardenErr.message}`);
+        }
+      }
+
+      // Anti-revoke Phase 4: snapshot the encrypted session string to
+      // the off-DB backups directory so deleting the row never wipes
+      // the only copy of the auth_key.
+      try {
+        await this._writeSessionBackup(sessionId, 'login').catch(() => {});
+      } catch { /* best-effort */ }
+
       return {
         success: true,
         sessionId: session.id,
@@ -2573,7 +2601,17 @@ class SessionService {
             await tgService.getMe(String(sessionId));
           } catch (pingErr) {
             if (tgService.isPermanentAuthError(pingErr)) {
-              await this._markSessionAuthRevoked(sessionId, pingErr).catch(() => {});
+              // Anti-revoke Phase 4: don't kill on a single strike —
+              // record the signal and let the heartbeat threshold
+              // logic decide. Restore is also called on every backend
+              // boot, where transient connectivity issues are common.
+              const r = await this._recordRevokeSignal(sessionId, pingErr).catch(() => null);
+              if (r && r.revoked) {
+                failed++;
+                return;
+              }
+              // Below threshold — count this restore as failed but
+              // leave the row in a recoverable state.
               failed++;
               return;
             }
@@ -2581,10 +2619,15 @@ class SessionService {
             logger.debug(`restore getMe failed for ${sessionId}: ${pingErr.message}`);
           }
           await pool.query(`UPDATE sessions SET last_heartbeat = NOW() WHERE id = $1`, [sessionId]);
+          await this._clearRevokeSignals(sessionId).catch(() => {});
           restored++;
         } catch (err) {
           if (tgService.isPermanentAuthError(err)) {
-            await this._markSessionAuthRevoked(sessionId, err).catch(() => {});
+            const r = await this._recordRevokeSignal(sessionId, err).catch(() => null);
+            if (r && r.revoked) {
+              failed++;
+              return;
+            }
             failed++;
             return;
           }
@@ -2690,13 +2733,41 @@ class SessionService {
             } else {
               await tgService.getMe(sid);
             }
+            // Anti-revoke Phase 4: clear any in-flight strike streak
+            // — a successful ping means whatever transient glitch
+            // bumped the counter is over.
+            await this._clearRevokeSignals(row.id).catch(() => {});
           } catch (pingErr) {
             if (tgService.isPermanentAuthError(pingErr)) {
-              await this._markSessionAuthRevoked(row.id, pingErr).catch(() => {});
-              revoked++;
+              const r = await this._recordRevokeSignal(row.id, pingErr).catch(() => null);
+              if (r && r.revoked) {
+                revoked++;
+                continue;
+              }
+              // Below threshold — count this tick as a failure but
+              // keep iterating; future ticks will either confirm the
+              // permanent revocation or let the streak reset.
+              failed++;
               continue;
             }
             logger.debug(`heartbeat ping failed for ${sid}: ${pingErr.message}`);
+          }
+          // Anti-revoke Phase 4: re-confirm the authorization + push
+          // the account TTL out on a slow cadence (handled inside
+          // reaffirmHardeningIfDue). Cheap; uses the cadence
+          // bookkeeping in tg_session_health.
+          try {
+            if (typeof tgService.reaffirmHardeningIfDue === 'function') {
+              await tgService.reaffirmHardeningIfDue(sid).catch(() => {});
+            }
+          } catch (rErr) {
+            if (tgService.isPermanentAuthError(rErr)) {
+              const r = await this._recordRevokeSignal(row.id, rErr).catch(() => null);
+              if (r && r.revoked) {
+                revoked++;
+                continue;
+              }
+            }
           }
           // Anti-revoke Phase 2 (B9): re-broadcast online presence on a
           // long cadence (handled inside `announceOnlineIfDue`).
@@ -2712,8 +2783,18 @@ class SessionService {
             if (typeof tgService.checkAuthorizationsIfDue === 'function') {
               const res = await tgService.checkAuthorizationsIfDue(sid).catch(() => null);
               if (res && res.revokedExternally) {
-                await this._markSessionAuthRevoked(row.id, new Error('AUTH_KEY_REMOVED_BY_USER')).catch(() => {});
-                revoked++;
+                // Anti-revoke Phase 4: require N consecutive
+                // "missing-from-active-sessions" probes before flipping.
+                // GetAuthorizations occasionally returns stale lists,
+                // and we don't want a single bad probe to wipe a row
+                // that's otherwise responding to pings just fine.
+                const r = await this._recordExternalRevokeSignal(row.id).catch(() => null);
+                if (r && r.revoked) {
+                  revoked++;
+                  continue;
+                }
+                // Below threshold — keep the row alive; alert was
+                // already sent inside _recordExternalRevokeSignal.
                 continue;
               }
             }
@@ -2809,6 +2890,444 @@ class SessionService {
         `marked as logged-out so the heartbeat stops retrying. ` +
         `User can click "Re-link" to re-authenticate with the same identity + proxy + DC.`
     );
+    // Anti-revoke Phase 4 — push a real-time alert via the admin bot
+    // and reset the strike counter so a future recover() doesn't get
+    // immediately re-marked.
+    try {
+      const sessionAlertService = require('./sessionAlertService');
+      await sessionAlertService.alertRevoked(sessionId, reason).catch(() => {});
+    } catch { /* alert service may be unavailable */ }
+    try {
+      await pool.query(
+        `UPDATE tg_session_health
+            SET consecutive_revoke_signals = 0,
+                first_revoke_signal_at     = NULL,
+                last_revoke_signal_code    = $2,
+                updated_at                 = NOW()
+          WHERE session_id = $1`,
+        [sessionId, reason]
+      );
+    } catch { /* tg_session_health optional */ }
+  }
+
+  /**
+   * Anti-revoke Phase 4: record a permanent-auth strike against a
+   * session WITHOUT immediately marking it revoked. Increments the
+   * tg_session_health.consecutive_revoke_signals counter; only when
+   * the counter reaches ANTI_REVOKE_PHASE_4_CONSECUTIVE_REVOKE_THRESHOLD
+   * AND the first strike is at least
+   * ANTI_REVOKE_PHASE_4_REVOKE_CONFIRM_WINDOW_MS old does the row get
+   * flipped to status='revoked'. Single-strike transient errors no
+   * longer kill the row.
+   *
+   * Falls back to the legacy "mark immediately" behaviour when Phase 4
+   * is disabled, when the strike row is missing, or when the streak
+   * was started so long ago we should give up retrying.
+   *
+   * @param {number|string} sessionId
+   * @param {Error}         error
+   * @returns {Promise<{revoked:boolean, streak:number, ageMs:number}>}
+   * @private
+   */
+  async _recordRevokeSignal(sessionId, error) {
+    const cfg = require('../config/telegram');
+    const code =
+      (error && (error.errorMessage || (typeof error.code === 'string' ? error.code : null))) ||
+      (error && error.message) ||
+      'auth_error';
+    if (!cfg.ANTI_REVOKE_PHASE_4_ENABLED) {
+      await this._markSessionAuthRevoked(sessionId, error);
+      return { revoked: true, streak: 1, ageMs: 0 };
+    }
+    let streak = 1;
+    let ageMs = 0;
+    try {
+      const upd = await pool.query(
+        `INSERT INTO tg_session_health
+           (session_id, consecutive_revoke_signals, first_revoke_signal_at,
+            last_revoke_signal_code, updated_at)
+         VALUES ($1, 1, NOW(), $2, NOW())
+         ON CONFLICT (session_id) DO UPDATE SET
+           consecutive_revoke_signals = tg_session_health.consecutive_revoke_signals + 1,
+           first_revoke_signal_at     = COALESCE(tg_session_health.first_revoke_signal_at, NOW()),
+           last_revoke_signal_code    = EXCLUDED.last_revoke_signal_code,
+           updated_at                 = NOW()
+         RETURNING consecutive_revoke_signals, first_revoke_signal_at`,
+        [sessionId, code]
+      );
+      const row = upd.rows[0];
+      if (row) {
+        streak = row.consecutive_revoke_signals;
+        ageMs = row.first_revoke_signal_at
+          ? Date.now() - new Date(row.first_revoke_signal_at).getTime()
+          : 0;
+      }
+    } catch (dbErr) {
+      logger.debug(
+        `_recordRevokeSignal: tg_session_health update failed for ${sessionId}: ${dbErr.message}`
+      );
+      // tg_session_health is optional — fall back to immediate revoke
+      // so the heartbeat doesn't keep banging on a clearly dead key.
+      await this._markSessionAuthRevoked(sessionId, error);
+      return { revoked: true, streak: 1, ageMs: 0 };
+    }
+    const threshold = Math.max(1, cfg.ANTI_REVOKE_PHASE_4_CONSECUTIVE_REVOKE_THRESHOLD || 2);
+    const window = Math.max(0, cfg.ANTI_REVOKE_PHASE_4_REVOKE_CONFIRM_WINDOW_MS || 0);
+    if (streak >= threshold && ageMs >= window) {
+      await this._markSessionAuthRevoked(sessionId, error);
+      return { revoked: true, streak, ageMs };
+    }
+    // Below threshold — alert the user once that we saw a strike, but
+    // keep the row alive. The cooldown inside sessionAlertService
+    // prevents spam.
+    try {
+      const sessionAlertService = require('./sessionAlertService');
+      await sessionAlertService.alertStrike(sessionId, { code, streak, ageMs, threshold }).catch(() => {});
+    } catch { /* best-effort */ }
+    logger.info(
+      `[anti-revoke phase4] session ${sessionId} strike ${streak}/${threshold} ` +
+        `(code=${code}, ageMs=${ageMs}); not yet flipped to 'revoked'.`
+    );
+    return { revoked: false, streak, ageMs };
+  }
+
+  /**
+   * Anti-revoke Phase 4: clear the consecutive-strike counters on a
+   * successful protocol round-trip. Called from the heartbeat after a
+   * successful pingSession so a single later strike doesn't get
+   * confused with an in-progress streak.
+   *
+   * @param {number|string} sessionId
+   * @private
+   */
+  async _clearRevokeSignals(sessionId) {
+    try {
+      await pool.query(
+        `UPDATE tg_session_health
+            SET consecutive_revoke_signals          = 0,
+                first_revoke_signal_at              = NULL,
+                consecutive_external_revoke_signals = 0,
+                updated_at                          = NOW()
+          WHERE session_id = $1
+            AND (consecutive_revoke_signals > 0
+                 OR consecutive_external_revoke_signals > 0)`,
+        [sessionId]
+      );
+    } catch { /* tg_session_health optional */ }
+  }
+
+  /**
+   * Anti-revoke Phase 4: same N-strike rule, but for the
+   * GetAuthorizations probe ("we're not in the active-sessions list
+   * any more"). Two consecutive missing-current responses required
+   * before flipping the row.
+   *
+   * @param {number|string} sessionId
+   * @returns {Promise<{revoked:boolean, streak:number}>}
+   * @private
+   */
+  async _recordExternalRevokeSignal(sessionId) {
+    const cfg = require('../config/telegram');
+    if (!cfg.ANTI_REVOKE_PHASE_4_ENABLED) {
+      await this._markSessionAuthRevoked(sessionId, new Error('AUTH_KEY_REMOVED_BY_USER'));
+      return { revoked: true, streak: 1 };
+    }
+    let streak = 1;
+    try {
+      const upd = await pool.query(
+        `INSERT INTO tg_session_health
+           (session_id, consecutive_external_revoke_signals, updated_at)
+         VALUES ($1, 1, NOW())
+         ON CONFLICT (session_id) DO UPDATE SET
+           consecutive_external_revoke_signals = tg_session_health.consecutive_external_revoke_signals + 1,
+           updated_at                          = NOW()
+         RETURNING consecutive_external_revoke_signals`,
+        [sessionId]
+      );
+      streak = (upd.rows[0] && upd.rows[0].consecutive_external_revoke_signals) || 1;
+    } catch {
+      await this._markSessionAuthRevoked(sessionId, new Error('AUTH_KEY_REMOVED_BY_USER'));
+      return { revoked: true, streak: 1 };
+    }
+    const threshold = Math.max(1, cfg.ANTI_REVOKE_PHASE_4_CONSECUTIVE_EXTERNAL_REVOKE_THRESHOLD || 2);
+    if (streak >= threshold) {
+      await this._markSessionAuthRevoked(sessionId, new Error('AUTH_KEY_REMOVED_BY_USER'));
+      return { revoked: true, streak };
+    }
+    try {
+      const sessionAlertService = require('./sessionAlertService');
+      await sessionAlertService.alertStrike(sessionId, {
+        code: 'AUTH_KEY_REMOVED_BY_USER',
+        streak,
+        threshold,
+        kind: 'external',
+      }).catch(() => {});
+    } catch { /* best-effort */ }
+    logger.info(
+      `[anti-revoke phase4] session ${sessionId} external-strike ${streak}/${threshold}; ` +
+        `not yet flipped to 'revoked'.`
+    );
+    return { revoked: false, streak };
+  }
+
+  /**
+   * Anti-revoke Phase 4: snapshot the encrypted session string +
+   * api_id/api_hash from the live session row to the off-DB backups
+   * directory. Called on session creation, every successful login, and
+   * lazily by the heartbeat once a week so an operator-error DELETE
+   * never wipes the only copy of the auth_key.
+   *
+   * Backup format mirrors the on-disk session JSON:
+   *   {
+   *     session: <encrypted gramjs string>,   // unchanged
+   *     apiId,
+   *     apiHash,
+   *     phone,
+   *     savedAt: ISO8601,
+   *     reason,                               // 'created' | 'login' | 'periodic' | 'manual'
+   *   }
+   *
+   * Dedupe key is sha256(encryptedSession). Identical bodies on
+   * subsequent calls return immediately without writing or inserting.
+   *
+   * @param {number|string} sessionId
+   * @param {string} reason - one of 'created' | 'login' | 'periodic' | 'manual'
+   * @returns {Promise<{written:boolean, backupId?:number, deduped?:boolean}>}
+   * @private
+   */
+  async _writeSessionBackup(sessionId, reason = 'manual') {
+    const cfg = require('../config/telegram');
+    if (!cfg.ANTI_REVOKE_PHASE_4_ENABLED) return { written: false };
+    const crypto = require('crypto');
+    try {
+      const r = await pool.query(
+        `SELECT user_id, phone, session_file_path, api_id, api_hash
+           FROM sessions WHERE id = $1`,
+        [sessionId]
+      );
+      const row = r.rows[0];
+      if (!row || !row.session_file_path) return { written: false };
+      const fullPath = path.join(uploadDir, row.session_file_path);
+      if (!await fs.pathExists(fullPath)) return { written: false };
+      const data = JSON.parse(await fs.readFile(fullPath, 'utf8'));
+      if (!data.session) return { written: false };
+      const sha = crypto
+        .createHash('sha256')
+        .update(typeof data.session === 'string' ? data.session : JSON.stringify(data.session))
+        .digest('hex');
+
+      // Dedupe — if we've already saved this exact ciphertext for this
+      // session, just bump retain_until on the existing row and return.
+      const retentionDays = Math.max(
+        1,
+        cfg.ANTI_REVOKE_PHASE_4_BACKUP_RETENTION_DAYS || 90
+      );
+      const dup = await pool.query(
+        `UPDATE session_backups
+            SET retain_until = NOW() + ($3::int || ' days')::interval
+          WHERE session_id = $1 AND content_sha256 = $2
+          RETURNING id`,
+        [sessionId, sha, retentionDays]
+      );
+      if (dup.rows[0]) {
+        return { written: false, deduped: true, backupId: dup.rows[0].id };
+      }
+
+      const userId = row.user_id;
+      const tsSlug = new Date().toISOString().replace(/[:.]/g, '-');
+      const relativePath = path.posix.join(
+        'backups',
+        String(userId || 'system'),
+        String(sessionId),
+        `${sha.slice(0, 16)}-${tsSlug}.enc`
+      );
+      const absPath = path.join(uploadDir, relativePath);
+      await fs.ensureDir(path.dirname(absPath));
+      const payload = JSON.stringify({
+        session: data.session,
+        apiId: row.api_id,
+        apiHash: row.api_hash,
+        phone: row.phone,
+        savedAt: new Date().toISOString(),
+        reason,
+      });
+      await fs.writeFile(absPath, payload, 'utf8');
+      const ins = await pool.query(
+        `INSERT INTO session_backups
+           (session_id, user_id, phone, api_id, api_hash, content_sha256,
+            backup_path, backup_bytes, reason, retain_until)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9,
+                 NOW() + ($10::int || ' days')::interval)
+         ON CONFLICT (session_id, content_sha256) DO UPDATE SET
+           retain_until = EXCLUDED.retain_until
+         RETURNING id`,
+        [
+          sessionId,
+          userId || null,
+          row.phone || null,
+          row.api_id || null,
+          row.api_hash || null,
+          sha,
+          relativePath,
+          Buffer.byteLength(payload, 'utf8'),
+          reason,
+          retentionDays,
+        ]
+      );
+      return { written: true, backupId: ins.rows[0].id };
+    } catch (err) {
+      logger.warn(`_writeSessionBackup failed for ${sessionId}: ${err.message}`);
+      return { written: false };
+    }
+  }
+
+  /**
+   * Anti-revoke Phase 4: attempt to bring a session row that was
+   * marked status='revoked' back to life by re-loading the encrypted
+   * session file + running getMe. If Telegram still accepts the
+   * auth_key (false-positive revocation), the row flips back to
+   * status='active' / is_logged_in=TRUE and the heartbeat resumes. If
+   * Telegram really has killed the key, the function returns
+   * `{ recovered: false, reason: <code> }` and leaves the row
+   * untouched.
+   *
+   * Fallback chain when the on-disk session file is missing or
+   * unparseable: try the most recent session_backups row for the same
+   * session_id (newest first) until one succeeds.
+   *
+   * @param {number|string} sessionId
+   * @param {number|string} userId  - for ownership check
+   * @returns {Promise<{recovered:boolean, status?:string, accountInfo?:object, reason?:string}>}
+   */
+  async recoverSession(sessionId, userId) {
+    const cfg = require('../config/telegram');
+    if (!cfg.ANTI_REVOKE_PHASE_4_ENABLED) {
+      throw new AppError(
+        'Session recovery is disabled (ANTI_REVOKE_PHASE_4_ENABLED=false)',
+        503,
+        'PHASE_4_DISABLED'
+      );
+    }
+    const r = await pool.query(
+      `SELECT id, user_id, phone, session_file_path, api_id, api_hash, status, is_logged_in
+         FROM sessions
+        WHERE id = $1 AND user_id = $2 AND platform = 'telegram'`,
+      [sessionId, userId]
+    );
+    const session = r.rows[0];
+    if (!session) {
+      throw new AppError(`Session not found: ${sessionId}`, 404, 'SESSION_NOT_FOUND');
+    }
+    // Try the on-disk live file first, then walk the backup ledger.
+    const candidates = [];
+    if (session.session_file_path) {
+      candidates.push({
+        kind: 'live',
+        absPath: path.join(uploadDir, session.session_file_path),
+        apiId: session.api_id,
+        apiHash: session.api_hash,
+      });
+    }
+    const bk = await pool.query(
+      `SELECT backup_path, api_id, api_hash
+         FROM session_backups
+        WHERE session_id = $1
+        ORDER BY created_at DESC
+        LIMIT 5`,
+      [sessionId]
+    );
+    for (const row of bk.rows) {
+      candidates.push({
+        kind: 'backup',
+        absPath: path.join(uploadDir, row.backup_path),
+        apiId: row.api_id || session.api_id,
+        apiHash: row.api_hash || session.api_hash,
+      });
+    }
+
+    let lastError = null;
+    for (const cand of candidates) {
+      try {
+        if (!await fs.pathExists(cand.absPath)) continue;
+        const data = JSON.parse(await fs.readFile(cand.absPath, 'utf8'));
+        if (!data.session) continue;
+        // Tear down any half-dead client first so we get a clean slot.
+        await tgService.disconnectSession(String(sessionId)).catch(() => {});
+        await tgService.createSession(
+          String(sessionId),
+          data.session,
+          cand.apiId,
+          cand.apiHash,
+          {}
+        );
+        const me = await tgService.getMe(String(sessionId));
+        // Flip the row back to active + clear the strike counters so
+        // the heartbeat doesn't immediately re-revoke us.
+        await pool.query(
+          `UPDATE sessions
+              SET is_logged_in = TRUE,
+                  status       = 'active',
+                  last_active  = NOW(),
+                  last_heartbeat = NOW()
+            WHERE id = $1`,
+          [sessionId]
+        );
+        await pool.query(
+          `UPDATE tg_session_health
+              SET consecutive_revoke_signals          = 0,
+                  first_revoke_signal_at              = NULL,
+                  consecutive_external_revoke_signals = 0,
+                  last_recovered_at                   = NOW(),
+                  updated_at                          = NOW()
+            WHERE session_id = $1`,
+          [sessionId]
+        ).catch(() => {});
+        // If we recovered from a backup, persist the still-working
+        // copy back into the live slot so subsequent restores skip
+        // the backup-walk path.
+        if (cand.kind === 'backup' && session.session_file_path) {
+          try {
+            const livePath = path.join(uploadDir, session.session_file_path);
+            await fs.ensureDir(path.dirname(livePath));
+            await fs.writeFile(livePath, JSON.stringify(data), 'utf8');
+          } catch (writeErr) {
+            logger.debug(`recoverSession: live-file rewrite failed: ${writeErr.message}`);
+          }
+        }
+        // Re-harden — confirm the auth + push the TTL back out.
+        try { await tgService.hardenSessionAgainstRevocation(String(sessionId)); } catch {}
+        try {
+          const sessionAlertService = require('./sessionAlertService');
+          await sessionAlertService.alertRecovered(sessionId, cand.kind).catch(() => {});
+        } catch { /* best-effort */ }
+        logger.info(
+          `Session ${sessionId} recovered via ${cand.kind} (${path.basename(cand.absPath)})`
+        );
+        return {
+          recovered: true,
+          status: 'active',
+          accountInfo: me ? {
+            telegramId: me.id,
+            username: me.username,
+            firstName: me.firstName,
+            lastName: me.lastName,
+            phone: me.phone,
+          } : null,
+        };
+      } catch (err) {
+        lastError = err;
+        logger.debug(
+          `Recovery attempt failed for ${sessionId} via ${cand.kind} ${cand.absPath}: ${err.message}`
+        );
+        // Permanent auth errors mean THIS particular session string is
+        // dead — but a later backup might still work, so keep walking.
+        continue;
+      }
+    }
+    return {
+      recovered: false,
+      reason: (lastError && (lastError.errorMessage || lastError.message)) || 'no_valid_backup',
+    };
   }
 }
 

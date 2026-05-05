@@ -26,6 +26,7 @@ const PASS = (n) => console.log(`PASS  ${n}`);
 process.env.ANTI_REVOKE_PHASE_1_ENABLED = 'true';
 process.env.ANTI_REVOKE_PHASE_2_ENABLED = 'true';
 process.env.ANTI_REVOKE_PHASE_3_ENABLED = 'true';
+process.env.ANTI_REVOKE_PHASE_4_ENABLED = 'true';
 process.env.ANTI_REVOKE_STRICT_FINGERPRINT = 'true';
 process.env.STRICT_PROXY_ISOLATION = 'true';
 process.env.SESSION_HEARTBEAT_INTERVAL_MS = '120000';
@@ -318,6 +319,105 @@ function _testB17_gateSurface() {
   PASS('B17 gateOnRisk wired into scrape + messaging entry points (RISK_TOO_HIGH/403)');
 }
 
+// ---- Phase 4 (anti-revoke bulletproof sessions) -----------------------
+
+function _testB19_phase4ConfigKnobs() {
+  const cfg = require('../../src/config/telegram');
+  assert.strictEqual(cfg.ANTI_REVOKE_PHASE_4_ENABLED, true,
+    'ANTI_REVOKE_PHASE_4_ENABLED must be true in default+test config');
+  assert.ok(cfg.ANTI_REVOKE_PHASE_4_CONSECUTIVE_REVOKE_THRESHOLD >= 1,
+    'consecutive revoke threshold must be >= 1');
+  assert.ok(cfg.ANTI_REVOKE_PHASE_4_REVOKE_CONFIRM_WINDOW_MS >= 0,
+    'revoke confirm window must be >= 0');
+  assert.ok(cfg.ANTI_REVOKE_PHASE_4_ACCOUNT_TTL_DAYS >= 30
+            && cfg.ANTI_REVOKE_PHASE_4_ACCOUNT_TTL_DAYS <= 730,
+    'account TTL days must be in [30, 730] (Telegram protocol bounds)');
+  assert.ok(cfg.ANTI_REVOKE_PHASE_4_BACKUP_RETENTION_DAYS >= 1,
+    'backup retention must be >= 1 day');
+  PASS('B19 Phase 4 config knobs present + within protocol bounds');
+}
+
+function _testB19_phase4Helpers() {
+  // The helpers are instance methods on the singleton telegramService.
+  // We can't easily exercise them without GramJS + a live client, but
+  // we can at least verify the surface so a refactor that removes them
+  // is caught by CI.
+  const tg = require('../../src/services/telegramService');
+  assert.strictEqual(typeof tg.confirmCurrentAuthorization, 'function',
+    'telegramService.confirmCurrentAuthorization must exist');
+  assert.strictEqual(typeof tg.maximizeAccountTTL, 'function',
+    'telegramService.maximizeAccountTTL must exist');
+  assert.strictEqual(typeof tg.hardenSessionAgainstRevocation, 'function',
+    'telegramService.hardenSessionAgainstRevocation must exist');
+  assert.strictEqual(typeof tg.reaffirmHardeningIfDue, 'function',
+    'telegramService.reaffirmHardeningIfDue must exist');
+  PASS('B19 Phase 4 telegramService helpers exposed (confirm/ttl/harden/reaffirm)');
+}
+
+function _testB19_phase4SessionServiceSurface() {
+  const ss = require('../../src/services/sessionService');
+  assert.strictEqual(typeof ss._recordRevokeSignal, 'function',
+    'sessionService._recordRevokeSignal must exist');
+  assert.strictEqual(typeof ss._recordExternalRevokeSignal, 'function',
+    'sessionService._recordExternalRevokeSignal must exist');
+  assert.strictEqual(typeof ss._clearRevokeSignals, 'function',
+    'sessionService._clearRevokeSignals must exist');
+  assert.strictEqual(typeof ss._writeSessionBackup, 'function',
+    'sessionService._writeSessionBackup must exist');
+  assert.strictEqual(typeof ss.recoverSession, 'function',
+    'sessionService.recoverSession must exist');
+  PASS('B19 Phase 4 sessionService surface (strikes / backups / recover)');
+}
+
+function _testB19_phase4MigrationPresent() {
+  const fs = require('fs');
+  const path = require('path');
+  const migPath = path.join(
+    __dirname, '..', '..', 'src', 'config',
+    'migration_v17_tg_anti_revoke_phase4.sql'
+  );
+  assert.ok(fs.existsSync(migPath), 'Phase 4 migration file missing');
+  const sql = fs.readFileSync(migPath, 'utf8');
+  for (const col of [
+    'confirmed_at',
+    'account_ttl_set_at',
+    'consecutive_revoke_signals',
+    'first_revoke_signal_at',
+    'consecutive_external_revoke_signals',
+    'last_recovered_at',
+    'alert_chat_id',
+  ]) {
+    assert.ok(sql.includes(col), `migration must add ${col} column`);
+  }
+  assert.ok(/CREATE TABLE IF NOT EXISTS session_backups/.test(sql),
+    'migration must create session_backups table');
+  // Order list must include the new file.
+  const ordSrc = fs.readFileSync(require.resolve('../../src/config/migrations'), 'utf8');
+  assert.ok(/migration_v17_tg_anti_revoke_phase4\.sql/.test(ordSrc),
+    'migration order list must reference the v17 migration');
+  PASS('B19 Phase 4 migration v17 present + listed in MIGRATION_ORDER');
+}
+
+function _testB19_phase4Routes() {
+  const fs = require('fs');
+  const r = fs.readFileSync(require.resolve('../../src/routes/sessions'), 'utf8');
+  assert.ok(/\/:id\/recover/.test(r),
+    'sessions router must expose POST /:id/recover');
+  const c = fs.readFileSync(require.resolve('../../src/controllers/sessionController'), 'utf8');
+  assert.ok(/recoverSession:/.test(c),
+    'sessionController must export recoverSession handler');
+  PASS('B19 Phase 4 POST /sessions/:id/recover wired through router + controller');
+}
+
+function _testB19_phase4AlertService() {
+  const svc = require('../../src/services/sessionAlertService');
+  for (const fn of ['alertStrike', 'alertRevoked', 'alertRecovered', 'sendTest']) {
+    assert.strictEqual(typeof svc[fn], 'function',
+      `sessionAlertService.${fn} must exist`);
+  }
+  PASS('B19 Phase 4 sessionAlertService surface (strike/revoked/recovered/test)');
+}
+
 function _testB18_adminEndpoints() {
   const fs = require('fs');
   const ctrl = fs.readFileSync(require.resolve('../../src/controllers/adminController'), 'utf8');
@@ -351,6 +451,13 @@ function run() {
   _testB16_riskScoreWeights();
   _testB17_gateSurface();
   _testB18_adminEndpoints();
+  // Phase 4
+  _testB19_phase4ConfigKnobs();
+  _testB19_phase4Helpers();
+  _testB19_phase4SessionServiceSurface();
+  _testB19_phase4MigrationPresent();
+  _testB19_phase4Routes();
+  _testB19_phase4AlertService();
 
   console.log('\nALL TG ANTI-REVOKE SMOKE CHECKS PASSED');
 }

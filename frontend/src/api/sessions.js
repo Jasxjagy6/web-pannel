@@ -13,6 +13,12 @@ export const loginSession = (id) => api.post(`/sessions/${id}/login`);
 
 export const logoutSession = (id) => api.post(`/sessions/${id}/logout`);
 
+// Anti-revoke Phase 4 — re-import a session that's been marked
+// status='revoked' if its encrypted on-disk file (or one of the
+// recent session_backups rows) is still accepted by Telegram.
+// Telegram-only.
+export const recoverSession = (id) => api.post(`/sessions/${id}/recover`);
+
 export const deleteSession = (id) => api.delete(`/sessions/${id}`);
 
 export const bulkDeleteSessions = (ids) =>

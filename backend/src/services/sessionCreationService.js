@@ -606,6 +606,31 @@ class SessionCreationService {
     this.pending.delete(tempId);
     logger.info(`Session creation finished: sessionId=${sessionId} phone=${phone}`);
 
+    // Anti-revoke Phase 4: a brand-new session is by definition in the
+    // 24h "unconfirmed" window, so this is the most important call of
+    // the whole flow — without it the very next login from the user's
+    // phone can wipe the panel session via Telegram's
+    // "Terminate other sessions" prompt. We also push the account
+    // TTL out so an idle account doesn't auto-prune. Both are
+    // best-effort: any non-permanent error is logged and swallowed.
+    try {
+      await telegramService.hardenSessionAgainstRevocation(String(sessionId));
+    } catch (hardenErr) {
+      logger.debug(
+        `Phase-4 harden failed for new session ${sessionId}: ${hardenErr.message}`
+      );
+    }
+
+    // Anti-revoke Phase 4: snapshot the encrypted session string to
+    // the off-DB backups directory so deleting the row never wipes
+    // the only copy of the auth_key. Best-effort.
+    try {
+      const sessionService = require('./sessionService');
+      if (typeof sessionService._writeSessionBackup === 'function') {
+        await sessionService._writeSessionBackup(sessionId, 'created').catch(() => {});
+      }
+    } catch { /* ignore */ }
+
     return {
       sessionId,
       status: 'active',

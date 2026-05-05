@@ -251,6 +251,61 @@ const sessionController = {
   }),
 
   /**
+   * Anti-revoke Phase 4 — recover a session that was marked
+   * status='revoked'. Re-loads the encrypted session file (live first,
+   * then falls back through the most recent session_backups rows), runs
+   * getMe, and if Telegram still accepts the auth key, flips the row
+   * back to status='active' / is_logged_in=TRUE so the heartbeat
+   * resumes without forcing the operator to receive a new SMS.
+   *
+   * Returns 200 + recovery details on success; 200 + recovered=false +
+   * reason on failure (so the UI can show a meaningful message).
+   * Returns 503 if Phase 4 is disabled and 404 if the session doesn't
+   * exist or doesn't belong to this user.
+   */
+  recoverSession: asyncHandler(async (req, res) => {
+    const userId = req.user.id;
+    const sessionId = req.params.id;
+    if (!sessionId) {
+      throw new AppError('Session ID is required', 400, 'MISSING_SESSION_ID');
+    }
+    if (_isInstagram(req)) {
+      throw new AppError(
+        'Recovery is currently Telegram-only',
+        400,
+        'RECOVERY_NOT_SUPPORTED'
+      );
+    }
+    const result = await sessionService.recoverSession(sessionId, userId);
+    await reportService.logActivity(
+      userId,
+      'session_recover',
+      'session',
+      sessionId,
+      {
+        platform: 'telegram',
+        recovered: !!result.recovered,
+        reason: result.reason || null,
+      }
+    );
+    logger.info(`Session recovery by user ${userId}`, {
+      sessionId,
+      recovered: !!result.recovered,
+      reason: result.reason || null,
+    });
+    return res.status(200).json({
+      success: true,
+      data: {
+        sessionId,
+        recovered: !!result.recovered,
+        status: result.status || null,
+        accountInfo: result.accountInfo || null,
+        reason: result.reason || null,
+      },
+    });
+  }),
+
+  /**
    * Logout (deactivate) a session.
    */
   logoutSession: asyncHandler(async (req, res) => {

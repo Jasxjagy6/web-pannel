@@ -8,6 +8,7 @@ import {
   deleteSession,
   bulkDeleteSessions,
   downloadSession,
+  recoverSession,
 } from '../api/sessions';
 import { parseApiError, formatRelativeTime, formatNumber } from '../utils/formatters';
 import { useToast } from '../components/common/Toast';
@@ -46,6 +47,8 @@ import {
   FileText,
   AlertTriangle,
   Download,
+  LifeBuoy,
+  ShieldAlert,
 } from 'lucide-react';
 
 // --- Helper: format file size ---
@@ -940,6 +943,33 @@ export default function Sessions() {
     }
   };
 
+  // Anti-revoke Phase 4 — try to bring a session marked status='revoked'
+  // back to life. The backend re-loads the encrypted session file (or
+  // the most recent backup), runs getMe, and flips the row back to
+  // active if Telegram still accepts the auth_key. Useful for the
+  // "the panel said revoked but I'm still logged in on my phone"
+  // false-positive scenario.
+  const handleRecover = async (id) => {
+    setActionLoading((prev) => ({ ...prev, [id]: 'recover' }));
+    try {
+      const resp = await recoverSession(id);
+      if (resp.data?.data?.recovered) {
+        showSuccess('Session recovered. Heartbeat resumed.', 'Recover');
+      } else {
+        const reason = resp.data?.data?.reason || 'auth key no longer valid';
+        showError(
+          `Recovery failed: ${reason}. The Telegram-side auth_key is genuinely dead — re-link the session via Create Session.`,
+          'Recover Failed'
+        );
+      }
+      await fetchSessions();
+    } catch (err) {
+      showError(parseApiError(err), 'Recover Failed');
+    } finally {
+      setActionLoading((prev) => ({ ...prev, [id]: null }));
+    }
+  };
+
   const handleDelete = async (id) => {
     setActionLoading((prev) => ({ ...prev, [id]: 'delete' }));
     try {
@@ -1086,6 +1116,57 @@ export default function Sessions() {
           high-risk sessions + revoked rows so the user can act before
           opening individual modals. */}
       <AntiRevokeSummary sessions={sessions} />
+
+      {/* Anti-revoke Phase 4 — operator education banner. The single
+          biggest cause of the panel losing a session is the user
+          tapping "Terminate all other sessions" on their phone, which
+          Telegram treats as an explicit instruction to wipe every
+          other authorization including ours. We can't override that
+          tap, but we CAN make sure the user knows what NOT to do. */}
+      <div
+        className="rounded-xl border border-amber-500/30 bg-amber-500/5 p-4 text-sm text-amber-100"
+        role="region"
+        aria-label="Keep your panel sessions alive"
+      >
+        <div className="flex items-start gap-3">
+          <ShieldAlert className="mt-0.5 h-5 w-5 flex-shrink-0 text-amber-400" />
+          <div className="space-y-2 leading-relaxed">
+            <p className="font-semibold text-amber-200">
+              Keep your panel sessions alive — read this once.
+            </p>
+            <ul className="list-disc space-y-1 pl-5 text-amber-100/90">
+              <li>
+                <span className="font-semibold text-amber-200">DO NOT</span>{' '}
+                tap <em>Settings &rarr; Devices &rarr; Terminate all
+                other sessions</em> on your phone. That command is a
+                global wipe; Telegram will kill the panel session along
+                with everything else, and no panel-side code can prevent
+                it.
+              </li>
+              <li>
+                <span className="font-semibold text-amber-200">DO</span>{' '}
+                terminate individual unfamiliar sessions one at a time
+                if you see something suspicious.
+              </li>
+              <li>
+                <span className="font-semibold text-amber-200">DO</span>{' '}
+                enable a 2FA Cloud Password (Settings &rarr; Privacy &amp;
+                Security &rarr; Two-Step Verification). Without it,
+                anyone with your SIM can wipe every session — panel
+                included.
+              </li>
+              <li>
+                If a session does get marked{' '}
+                <code className="rounded bg-amber-500/10 px-1">revoked</code>,
+                click <span className="font-semibold">Recover</span> on
+                its row first — if Telegram still accepts the auth_key
+                (false-positive case) the panel will rejoin without a
+                new SMS.
+              </li>
+            </ul>
+          </div>
+        </div>
+      </div>
 
       {/* Upload Area */}
       <SessionUploadArea onUpload={handleUploadComplete} uploading={uploading} />
@@ -1356,6 +1437,24 @@ export default function Sessions() {
                                 <Loader2 className="w-4 h-4 animate-spin" />
                               ) : (
                                 <LogOut className="w-4 h-4" />
+                              )}
+                            </button>
+                          ) : session.status?.toLowerCase() === 'revoked' ? (
+                            // Anti-revoke Phase 4 — Recover button replaces
+                            // Login for revoked rows. We never let the user
+                            // hit /login on a revoked row anyway (the
+                            // backend will fail it), and Recover is the
+                            // mode-appropriate primary action.
+                            <button
+                              onClick={() => handleRecover(session.id)}
+                              disabled={isLoading === 'recover'}
+                              className="p-1.5 rounded-lg text-gray-400 hover:text-emerald-400 hover:bg-emerald-500/10 transition disabled:opacity-50"
+                              title="Recover (re-import the encrypted session string and re-run getMe)"
+                            >
+                              {isLoading === 'recover' ? (
+                                <Loader2 className="w-4 h-4 animate-spin" />
+                              ) : (
+                                <LifeBuoy className="w-4 h-4" />
                               )}
                             </button>
                           ) : (
