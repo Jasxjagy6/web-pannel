@@ -183,12 +183,24 @@ class SessionCreationService {
   // ---------------------------------------------------------------------------
   // Step 1: start — sendCode
   // ---------------------------------------------------------------------------
-  async start({ userId, phone, apiId, apiHash, country, platform, proxyId, userRole, useProxy }) {
+  async start({ userId, phone, apiId, apiHash, country, platform, proxyId, userRole, useProxy, loginOnPanel }) {
     // BYO Proxy — opt-out: when the operator explicitly unchecks the
     // "Use a proxy" box we skip every proxy primitive in the create
     // flow. Default keeps Phase 3 behaviour intact (proxy required for
     // BYO users) so existing flows are unaffected.
     const wantsProxy = useProxy === false ? false : true;
+    // "Login on panel" opt-out: when the operator unchecks the box, the
+    // panel still completes the OTP/2FA handshake (so we can hand the
+    // session string back as a download), but it does NOT adopt the
+    // live client into telegramService, does NOT bind a long-lived
+    // proxy slot, and persists the row with is_logged_in=FALSE +
+    // keep_alive=FALSE + status='inactive'. Default true preserves the
+    // legacy behaviour. The flag also gates wantsProxy: if the user is
+    // not keeping the session logged in there is no reason to reserve
+    // a long-lived proxy slot for it (we still go through the proxy
+    // for the SendCode/SignIn so the egress IP is consistent during
+    // the handshake when the user did pick one).
+    const wantsLogin = loginOnPanel === false ? false : true;
     const normalizedPhone = this._normalizePhone(phone);
     const { apiId: id, apiHash: hash, credentialId } =
       await this._resolveApi(userId, apiId, apiHash);
@@ -305,6 +317,7 @@ class SessionCreationService {
         proxyConf,
         reservedProxyId,
         useProxy: wantsProxy,
+        loginOnPanel: wantsLogin,
       });
 
       logger.info(`Session creation start: tempId=${tempId} phone=${normalizedPhone} platform=${identity.platform}`);
@@ -494,8 +507,9 @@ class SessionCreationService {
   // ---------------------------------------------------------------------------
   async _persistAndFinish(userId, tempId, hadTwoFA) {
     const entry = this._mustGet(userId, tempId);
-    const { client, phone, apiId, apiHash, credentialId, identity, reservedProxyId, proxyConf, useProxy } = entry;
+    const { client, phone, apiId, apiHash, credentialId, identity, reservedProxyId, proxyConf, useProxy, loginOnPanel } = entry;
     const wantsProxy = useProxy === false ? false : true;
+    const wantsLogin = loginOnPanel === false ? false : true;
 
     // Pull user info + session string before we hand the client off.
     let me = null;
@@ -539,6 +553,14 @@ class SessionCreationService {
         }
       : { phone: phone.replace(/^\+/, '') };
 
+    // When the operator opts out of "login on panel" we persist the
+    // row in a parked state: status='inactive', is_logged_in=FALSE,
+    // keep_alive=FALSE. This stops the heartbeat loop from picking it
+    // up, the restoreAllLoggedInSessions() boot path from reconnecting
+    // it, and any per-platform feature gates from treating it as a
+    // working account. The user can promote it later via POST
+    // /sessions/:id/login (handled by sessionService.loginSession).
+    const sessionStatus = wantsLogin ? 'active' : 'inactive';
     const insert = await pool.query(
       `INSERT INTO sessions (
          user_id, phone, session_file_path, api_id, api_hash,
@@ -546,7 +568,7 @@ class SessionCreationService {
          status, is_2fa_enabled, is_logged_in, keep_alive, account_info,
          device_identity, bound_proxy_id,
          last_heartbeat, last_active, created_at
-       ) VALUES ($1, $2, $3, $4, $5, $6, 'active', $7, TRUE, TRUE, $8, $9::jsonb, $10, NOW(), NOW(), NOW())
+       ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12::jsonb, $13, NOW(), NOW(), NOW())
        RETURNING id`,
       [
         userId,
@@ -555,15 +577,19 @@ class SessionCreationService {
         apiId,
         apiHash,
         credentialId || null,
+        sessionStatus,
         hadTwoFA,
+        wantsLogin,
+        wantsLogin,
         JSON.stringify({
           ...accountInfo,
           sessionType: 'string',
           createdVia: 'panel',
           createdAt: new Date().toISOString(),
+          loginOnPanel: wantsLogin,
         }),
         identity ? JSON.stringify(identity) : null,
-        reservedProxyId || null,
+        wantsLogin ? (reservedProxyId || null) : null,
       ]
     );
     const sessionId = insert.rows[0].id;
@@ -571,32 +597,59 @@ class SessionCreationService {
     // Adopt the live, already-connected client into telegramService so we
     // don't immediately reconnect. If adoption fails we just disconnect and
     // let the next heartbeat / login restore it from disk.
-    try {
-      telegramService.clients.set(String(sessionId), {
-        client,
-        connected: true,
-        apiId,
-        apiHash,
-        proxy: proxyConf || null,
-        identity: identity || null,
-      });
-      telegramService.sessionStore.set(String(sessionId), encryptedSession);
-    } catch (err) {
-      logger.warn(`adoptClient failed for new session ${sessionId}: ${err.message}`);
+    //
+    // "loginOnPanel=false" path: the operator only wants the session
+    // string downloaded — never adopt, never keep the live client. We
+    // disconnect immediately so the panel doesn't sit on an idle
+    // MTProto socket for a session it isn't supposed to keep online.
+    if (wantsLogin) {
+      try {
+        telegramService.clients.set(String(sessionId), {
+          client,
+          connected: true,
+          apiId,
+          apiHash,
+          proxy: proxyConf || null,
+          identity: identity || null,
+        });
+        telegramService.sessionStore.set(String(sessionId), encryptedSession);
+      } catch (err) {
+        logger.warn(`adoptClient failed for new session ${sessionId}: ${err.message}`);
+        try { await client.disconnect(); } catch (_) {}
+      }
+    } else {
+      logger.info(
+        `Session ${sessionId} created with loginOnPanel=false; disconnecting live client.`
+      );
       try { await client.disconnect(); } catch (_) {}
+      try { await client.destroy(); } catch (_) {}
+      // Release any ad-hoc proxy slot reserved during start() — we
+      // don't want a parked, never-logged-in session to keep a slot
+      // out of rotation for the proxy pool.
+      if (reservedProxyId) {
+        try {
+          const proxyService = require('./proxyService');
+          await proxyService.releaseAdHoc(`creation:${tempId}`);
+        } catch (_) {}
+      }
     }
 
     // Bind the proxy slot to the new session ID so future reconnects
     // resolve through the same pool. If the start() flow already
     // reserved one we just transfer that reservation; otherwise we let
     // proxyService pick — except when the operator explicitly opted
-    // out of proxies on this create flow, in which case we leave
-    // bound_proxy_id NULL and never call assignProxyForSession (which
-    // would otherwise try to reserve from the pool, defeating the
-    // opt-out).
+    // out of proxies on this create flow OR opted out of login-on-panel
+    // (parked sessions don't need a long-lived proxy slot), in which
+    // case we leave bound_proxy_id NULL and never call
+    // assignProxyForSession (which would otherwise try to reserve from
+    // the pool, defeating the opt-out).
     try {
       const proxyService = require('./proxyService');
-      if (!wantsProxy) {
+      if (!wantsLogin) {
+        logger.info(
+          `Session ${sessionId} created with loginOnPanel=false; skipping proxy bind.`
+        );
+      } else if (!wantsProxy) {
         logger.info(
           `Session ${sessionId} created with useProxy=false; skipping proxy bind.`
         );
@@ -626,45 +679,65 @@ class SessionCreationService {
     }
 
     this.pending.delete(tempId);
-    logger.info(`Session creation finished: sessionId=${sessionId} phone=${phone}`);
+    logger.info(
+      `Session creation finished: sessionId=${sessionId} phone=${phone} ` +
+      `loginOnPanel=${wantsLogin}`
+    );
 
-    // Anti-revoke Phase 4: a brand-new session is by definition in the
-    // 24h "unconfirmed" window, so this is the most important call of
-    // the whole flow — without it the very next login from the user's
-    // phone can wipe the panel session via Telegram's
-    // "Terminate other sessions" prompt. We also push the account
-    // TTL out so an idle account doesn't auto-prune. Both are
-    // best-effort: any non-permanent error is logged and swallowed.
-    try {
-      await telegramService.hardenSessionAgainstRevocation(String(sessionId));
-    } catch (hardenErr) {
-      logger.debug(
-        `Phase-4 harden failed for new session ${sessionId}: ${hardenErr.message}`
-      );
-    }
-
-    // Anti-revoke Phase 4: snapshot the encrypted session string to
-    // the off-DB backups directory so deleting the row never wipes
-    // the only copy of the auth_key. Best-effort.
-    try {
-      const sessionService = require('./sessionService');
-      if (typeof sessionService._writeSessionBackup === 'function') {
-        await sessionService._writeSessionBackup(sessionId, 'created').catch(() => {});
+    // Phase-4 hardening, session backup, and OTP-relay wiring all
+    // require an adopted, logged-in client. Skip them entirely when
+    // the operator parked the session — they'll run later, on demand,
+    // when the user calls POST /sessions/:id/login.
+    if (wantsLogin) {
+      // Anti-revoke Phase 4: a brand-new session is by definition in the
+      // 24h "unconfirmed" window, so this is the most important call of
+      // the whole flow — without it the very next login from the user's
+      // phone can wipe the panel session via Telegram's
+      // "Terminate other sessions" prompt. We also push the account
+      // TTL out so an idle account doesn't auto-prune. Both are
+      // best-effort: any non-permanent error is logged and swallowed.
+      try {
+        await telegramService.hardenSessionAgainstRevocation(String(sessionId));
+      } catch (hardenErr) {
+        logger.debug(
+          `Phase-4 harden failed for new session ${sessionId}: ${hardenErr.message}`
+        );
       }
-    } catch { /* ignore */ }
 
-    // OTP Relay: a brand-new session may already be referenced as a
-    // watch source on an attachment that was created before the
-    // session existed (rare but possible if the operator pre-creates
-    // the row by ID). Pick those up here.
-    try {
-      const otpRelayService = require('./otpRelayService');
-      await otpRelayService.onSessionConnected(String(sessionId)).catch(() => {});
-    } catch { /* best-effort */ }
+      // Anti-revoke Phase 4: snapshot the encrypted session string to
+      // the off-DB backups directory so deleting the row never wipes
+      // the only copy of the auth_key. Best-effort.
+      try {
+        const sessionService = require('./sessionService');
+        if (typeof sessionService._writeSessionBackup === 'function') {
+          await sessionService._writeSessionBackup(sessionId, 'created').catch(() => {});
+        }
+      } catch { /* ignore */ }
+
+      // OTP Relay: a brand-new session may already be referenced as a
+      // watch source on an attachment that was created before the
+      // session existed (rare but possible if the operator pre-creates
+      // the row by ID). Pick those up here.
+      try {
+        const otpRelayService = require('./otpRelayService');
+        await otpRelayService.onSessionConnected(String(sessionId)).catch(() => {});
+      } catch { /* best-effort */ }
+    } else {
+      // Even for parked sessions we still snapshot the encrypted
+      // string to the off-DB backups dir — it's the only copy of the
+      // auth_key and the user might want to recover the session later.
+      try {
+        const sessionService = require('./sessionService');
+        if (typeof sessionService._writeSessionBackup === 'function') {
+          await sessionService._writeSessionBackup(sessionId, 'created').catch(() => {});
+        }
+      } catch { /* ignore */ }
+    }
 
     return {
       sessionId,
-      status: 'active',
+      status: wantsLogin ? 'active' : 'inactive',
+      loginOnPanel: wantsLogin,
       phone,
       accountInfo,
     };

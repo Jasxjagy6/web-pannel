@@ -295,6 +295,171 @@ async function stopColor({ color, log }) {
 }
 
 /* -------------------------------------------------------------------------- */
+/* Frontend blue/green                                                        */
+/* -------------------------------------------------------------------------- */
+/*                                                                            */
+/* The frontend is a static SPA bundle served by nginx — there's no DB, no    */
+/* Redis, no live MTProto state to preserve. We still run it blue/green for   */
+/* the same reason as the backend: the public URL must never serve a stale    */
+/* or half-built bundle during a deploy. Each color's container holds a       */
+/* snapshot of the SPA built from the deploy's git SHA.                       */
+
+/**
+ * Build the frontend SPA image. Always builds locally — the frontend's
+ * dependency graph is small (no native modules, no migrations) so a cold
+ * `npm install` + Vite build runs in well under a minute on the deploy
+ * host. We also don't push frontend images to GHCR, so there's no
+ * `--build registry` mode to support.
+ *
+ * Returns the image tag so the orchestrator can persist it in
+ * state/active-color.json for later reference / rollback.
+ */
+async function buildFrontendImage({ sha, log }) {
+  const tag = `web-pannel-frontend:${sha.slice(0, 12)}`;
+  log(`building ${tag} (frontend SPA)…`);
+  await composeStream(
+    [
+      'build',
+      '--build-arg', `GIT_SHA=${sha}`,
+      '--build-arg', `BUILD_TIME=${new Date().toISOString()}`,
+      'frontend-blue', // either color works — same image
+    ],
+    (line) => log(`  build: ${line}`),
+    {
+      env: {
+        ...process.env,
+        FRONTEND_IMAGE_TAG: sha.slice(0, 12),
+        IMAGE_TAG: process.env.IMAGE_TAG || sha.slice(0, 12),
+        GIT_SHA: sha,
+      },
+    }
+  );
+  return tag;
+}
+
+/**
+ * One-time migration: stop the legacy single-`frontend` container that
+ * pre-dates the blue/green frontend topology. The new docker-compose.yml
+ * removes the `frontend` service entirely, so `docker compose up` for the
+ * blue/green services leaves the old container running side-by-side with
+ * the new ones — Caddy's seed config still hard-codes `frontend:83` until
+ * the orchestrator pushes a new admin config, and meanwhile both colors
+ * try to bind port 83 inside their own network alias.
+ *
+ * Detect by container NAME (compose default = `<project>_frontend_<idx>`
+ * or `<project>-frontend-<idx>`) and best-effort `docker rm -f`. We don't
+ * call `docker compose down frontend` because compose v2 raises on
+ * "service not in compose file" once the service block is gone.
+ */
+async function stopLegacyFrontend({ log }) {
+  try {
+    const { stdout } = await run(
+      'docker',
+      ['ps', '-a', '--filter', 'name=frontend', '--format', '{{.Names}}'],
+      { allowFail: true }
+    );
+    const names = (stdout || '')
+      .split('\n')
+      .map((s) => s.trim())
+      .filter((s) =>
+        s &&
+        // Match the compose-default names but EXCLUDE the new blue/green
+        // container_names, which are explicitly `web-pannel-frontend-blue`
+        // and `web-pannel-frontend-green`.
+        s !== 'web-pannel-frontend-blue' &&
+        s !== 'web-pannel-frontend-green' &&
+        /(^|[-_])frontend([-_]\d+)?$/.test(s)
+      );
+    for (const name of names) {
+      log(`removing legacy frontend container "${name}"`);
+      await run('docker', ['rm', '-f', name], { allowFail: true });
+    }
+  } catch (err) {
+    log(`legacy frontend cleanup skipped: ${err.message}`);
+  }
+}
+
+async function startFrontendColor({ color, sha, log }) {
+  log(`starting frontend-${color}`);
+  await composeStream(
+    ['--profile', color, 'up', '-d', `frontend-${color}`],
+    (line) => log(`  compose: ${line}`),
+    {
+      env: {
+        ...process.env,
+        FRONTEND_IMAGE_TAG: sha.slice(0, 12),
+        IMAGE_TAG: process.env.IMAGE_TAG || sha.slice(0, 12),
+        GIT_SHA: sha,
+        BUILD_TIME: new Date().toISOString(),
+      },
+    }
+  );
+}
+
+async function stopFrontendColor({ color, log }) {
+  log(`stopping frontend-${color}`);
+  await compose(['stop', `frontend-${color}`], { allowFail: true });
+}
+
+/**
+ * Wait for the frontend container to serve "/" with a 200. nginx is
+ * essentially instant once mounted, but the docker healthcheck still
+ * has a start_period — we poll it directly so the orchestrator only
+ * flips Caddy after the new color is actually answering HTTP.
+ */
+async function waitForFrontendReady({ container, timeoutMs, log }) {
+  const start = Date.now();
+  let lastErr = '';
+  while (Date.now() - start < timeoutMs) {
+    try {
+      // wget is in the alpine nginx image; the busybox build is trivially
+      // small, so an exec-based probe avoids opening a host port.
+      const { code, stdout } = await run(
+        'docker',
+        ['exec', container, 'wget', '-q', '--spider', '--tries=1',
+          '--timeout=2', 'http://127.0.0.1:83/'],
+        { allowFail: true }
+      );
+      if (code === 0) {
+        const ms = Date.now() - start;
+        log(`  frontend "/" 200 in ${ms}ms`);
+        return ms;
+      }
+      lastErr = stdout || lastErr;
+    } catch (err) {
+      lastErr = err.message;
+    }
+    await sleep(500);
+  }
+  throw new Error(`frontend ready timeout after ${timeoutMs}ms; last response: ${(lastErr || '').slice(0, 400)}`);
+}
+
+/**
+ * Best-effort lookup of the frontend image currently running for a color.
+ * Used to seed `previous.frontend_image` for rollback.
+ */
+async function runningFrontendImageOf(color) {
+  try {
+    const { stdout: cid } = await run(
+      'docker',
+      ['compose', 'ps', '-q', `frontend-${color}`],
+      { allowFail: true, cwd: REPO_ROOT }
+    );
+    const containerId = (cid || '').trim().split('\n')[0];
+    if (!containerId) return null;
+    const { stdout } = await run(
+      'docker',
+      ['inspect', '--format', '{{.Config.Image}}', containerId],
+      { allowFail: true }
+    );
+    const img = (stdout || '').trim();
+    return img || null;
+  } catch (_) {
+    return null;
+  }
+}
+
+/* -------------------------------------------------------------------------- */
 /* Step 5 — wait for /health/ready                                            */
 /* -------------------------------------------------------------------------- */
 
@@ -332,16 +497,21 @@ function sleep(ms) {
 /* Step 6 — flip Caddy upstream                                               */
 /* -------------------------------------------------------------------------- */
 
-async function flipCaddy({ color, log }) {
+async function flipCaddy({ color, frontendColor, log }) {
   const caddyClient = require(path.join(PROXY_DIR, 'caddyClient'));
-  const upstream = `backend-${color}:3005`;
+  const backendUpstream = `backend-${color}:3005`;
+  // Default the frontend color to track the backend color so deployments
+  // that don't explicitly stage the frontend still publish a sane Caddy
+  // config (matches the legacy single-frontend topology).
+  const fColor = frontendColor || color;
+  const frontendUpstream = `frontend-${fColor}:83`;
   const cfg = caddyClient.buildConfig({
-    backendUpstream: upstream,
-    frontendUpstream: 'frontend:83',
+    backendUpstream,
+    frontendUpstream,
     publicDomain: process.env.PUBLIC_DOMAIN || '',
     acmeEmail: process.env.ACME_EMAIL || '',
   });
-  log(`pushing Caddy config → ${upstream}`);
+  log(`pushing Caddy config → backend=${backendUpstream}, frontend=${frontendUpstream}`);
   await caddyClient.loadConfig(cfg);
 }
 
@@ -358,10 +528,16 @@ async function drainOldColor({ color, drainMs, log }) {
 /* Persist state                                                              */
 /* -------------------------------------------------------------------------- */
 
-function persistActiveState({ color, sha, ref, imageTag, prev }) {
+function persistActiveState({
+  color, sha, ref, imageTag, prev,
+  frontendColor, frontendImageTag,
+}) {
   const next = {
-    color,
+    color, // legacy alias for backend_color
+    backend_color: color,
+    frontend_color: frontendColor || color,
     image: imageTag,
+    frontend_image: frontendImageTag || null,
     git_sha: sha,
     git_ref: ref,
     deployed_at: new Date().toISOString(),
@@ -383,5 +559,12 @@ module.exports = {
   persistActiveState,
   composeNetworkName,
   runningImageOf,
+  // Frontend blue/green
+  buildFrontendImage,
+  startFrontendColor,
+  stopFrontendColor,
+  waitForFrontendReady,
+  runningFrontendImageOf,
+  stopLegacyFrontend,
   REPO_ROOT,
 };

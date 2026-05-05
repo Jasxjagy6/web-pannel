@@ -15,6 +15,10 @@ import {
   Copy,
   ArrowRight,
   Network,
+  PauseCircle,
+  PlugZap,
+  FileJson,
+  FileArchive,
 } from 'lucide-react';
 import { useNavigate } from 'react-router-dom';
 import { useToast } from '../components/common/Toast';
@@ -25,6 +29,7 @@ import {
   createSessionResend,
   createSessionCancel,
   downloadSession,
+  loginSession,
 } from '../api/sessions';
 import { listMyProxies } from '../api/userProxies';
 import { parseApiError } from '../utils/formatters';
@@ -128,6 +133,7 @@ function PhoneStep({
   phone, setPhone, country, setCountry, platform, setPlatform,
   proxyId, setProxyId, proxies, proxyState,
   useProxy, setUseProxy,
+  loginOnPanel, setLoginOnPanel,
   onSubmit, busy,
 }) {
   const noProxies = proxyState === 'ready' && proxies.length === 0;
@@ -277,6 +283,36 @@ function PhoneStep({
         </div>
       )}
 
+      {/* Login-on-panel toggle: when off, the panel completes the OTP
+          handshake (so the operator can download the session string)
+          but does NOT keep the live MTProto client adopted. The row is
+          persisted as inactive / is_logged_in=FALSE / keep_alive=FALSE
+          and is invisible to the heartbeat/restore loops. The user can
+          still promote it later with the existing Login button on the
+          Sessions page. */}
+      <div className="rounded-lg border border-white/10 bg-white/5 px-3 py-2.5">
+        <label className="flex items-start gap-2.5 cursor-pointer select-none">
+          <input
+            type="checkbox"
+            checked={loginOnPanel}
+            onChange={(e) => setLoginOnPanel(e.target.checked)}
+            className="mt-0.5 h-4 w-4 rounded border-white/20 bg-dark-900 text-primary-500 focus:ring-primary-500 focus:ring-offset-0"
+          />
+          <span className="text-xs text-gray-300">
+            <span className="font-medium text-white inline-flex items-center gap-1.5">
+              <PlugZap className="w-3.5 h-3.5" /> Keep this session logged in on the panel
+            </span>
+            <span className="block mt-0.5 text-[11px] text-gray-500">
+              Recommended. When off, the panel finishes login so you can
+              download the session, then disconnects — the account stays
+              parked (inactive) on this panel and won&apos;t use any
+              proxy slot or be touched by the heartbeat. You can still
+              promote it later from Sessions → Login.
+            </span>
+          </span>
+        </label>
+      </div>
+
       <button
         type="submit"
         disabled={
@@ -417,22 +453,49 @@ function PasswordStep({ password, setPassword, onSubmit, onCancel, busy }) {
   );
 }
 
-function DoneStep({ result, onDownload, onRestart, onGoToSessions }) {
+function DoneStep({
+  result,
+  onDownload,
+  onRestart,
+  onGoToSessions,
+  onLoginOnPanel,
+  loggedInOnPanel,
+  loginBusy,
+  downloadBusy,
+}) {
   const acc = result?.accountInfo || {};
   return (
     <div className="space-y-4">
-      <div className="rounded-lg border border-emerald-500/30 bg-emerald-500/10 px-4 py-3 flex items-start gap-3">
-        <CheckCircle2 className="w-5 h-5 text-emerald-400 mt-0.5 shrink-0" />
-        <div className="text-sm">
-          <div className="font-medium text-emerald-200">
-            Session #{result.sessionId} is active and kept alive.
-          </div>
-          <div className="text-xs text-emerald-300/80 mt-0.5">
-            The panel will heartbeat this client every minute and restore it
-            automatically across backend restarts.
+      {loggedInOnPanel ? (
+        <div className="rounded-lg border border-emerald-500/30 bg-emerald-500/10 px-4 py-3 flex items-start gap-3">
+          <CheckCircle2 className="w-5 h-5 text-emerald-400 mt-0.5 shrink-0" />
+          <div className="text-sm">
+            <div className="font-medium text-emerald-200">
+              Session #{result.sessionId} is active and kept alive.
+            </div>
+            <div className="text-xs text-emerald-300/80 mt-0.5">
+              The panel will heartbeat this client every minute and restore
+              it automatically across backend restarts — including
+              zero-downtime upgrades.
+            </div>
           </div>
         </div>
-      </div>
+      ) : (
+        <div className="rounded-lg border border-amber-500/30 bg-amber-500/10 px-4 py-3 flex items-start gap-3">
+          <PauseCircle className="w-5 h-5 text-amber-300 mt-0.5 shrink-0" />
+          <div className="text-sm">
+            <div className="font-medium text-amber-100">
+              Session #{result.sessionId} created but not logged in on the panel.
+            </div>
+            <div className="text-xs text-amber-200/80 mt-0.5">
+              Download the session below in the format you need. The panel
+              is not keeping a live MTProto client for this account; click
+              <span className="font-medium"> Login on panel </span> if you
+              change your mind.
+            </div>
+          </div>
+        </div>
+      )}
       <div className="rounded-lg border border-white/10 bg-white/5 p-4 text-sm text-gray-300 space-y-2">
         <div className="grid grid-cols-2 gap-y-2 gap-x-4">
           <span className="text-gray-500">Phone</span>
@@ -445,22 +508,74 @@ function DoneStep({ result, onDownload, onRestart, onGoToSessions }) {
           <span>{[acc.firstName, acc.lastName].filter(Boolean).join(' ') || '—'}</span>
         </div>
       </div>
+
+      {/* Two-format download. .session is a Telethon-native SQLite file
+          built from the GramJS auth_key on the server; .json is the
+          legacy panel envelope (encrypted GramJS string + metadata). */}
+      <div>
+        <div className="text-xs font-medium text-gray-400 mb-1.5 inline-flex items-center gap-1.5">
+          <Download className="w-3.5 h-3.5" /> Download session
+        </div>
+        <div className="flex flex-col sm:flex-row gap-2">
+          <button
+            onClick={() => onDownload('session')}
+            disabled={downloadBusy}
+            className="flex-1 inline-flex items-center justify-center gap-2 rounded-lg bg-primary-600 hover:bg-primary-500 px-4 py-2.5 text-sm font-medium text-white transition disabled:opacity-50 disabled:cursor-not-allowed"
+          >
+            <FileArchive className="w-4 h-4" /> .session (Telethon)
+          </button>
+          <button
+            onClick={() => onDownload('json')}
+            disabled={downloadBusy}
+            className="flex-1 inline-flex items-center justify-center gap-2 rounded-lg border border-white/15 hover:bg-white/5 px-4 py-2.5 text-sm font-medium text-gray-100 transition disabled:opacity-50 disabled:cursor-not-allowed"
+          >
+            <FileJson className="w-4 h-4" /> .json (GramJS)
+          </button>
+        </div>
+        <p className="mt-1.5 text-[11px] text-gray-500">
+          .session works directly with Python <span className="font-mono">Telethon</span>;
+          .json is the panel&apos;s native format and what the importer here expects.
+        </p>
+      </div>
+
+      {/* Login-on-panel toggle, exposed underneath the download buttons
+          so the operator can promote a parked session without leaving
+          the create flow. Hidden once the session is already logged in
+          (the success banner above already covers that case). */}
+      {!loggedInOnPanel && (
+        <div className="rounded-lg border border-white/10 bg-white/5 px-3 py-2.5 flex items-start gap-3">
+          <PlugZap className="w-4 h-4 text-primary-300 mt-0.5" />
+          <div className="flex-1">
+            <div className="text-sm font-medium text-white">
+              Login this session on the panel?
+            </div>
+            <div className="text-[11px] text-gray-500 mt-0.5">
+              Adopts the live MTProto client into the panel’s heartbeat
+              loop. The session keeps an open connection and is
+              auto-restored across deploys.
+            </div>
+          </div>
+          <button
+            onClick={onLoginOnPanel}
+            disabled={loginBusy}
+            className="inline-flex items-center justify-center gap-2 rounded-lg bg-emerald-600 hover:bg-emerald-500 px-3 py-2 text-xs font-medium text-white transition disabled:opacity-50 disabled:cursor-not-allowed"
+          >
+            {loginBusy ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <PlugZap className="w-3.5 h-3.5" />}
+            Login on panel
+          </button>
+        </div>
+      )}
+
       <div className="flex flex-col sm:flex-row gap-2">
         <button
-          onClick={onDownload}
-          className="flex-1 inline-flex items-center justify-center gap-2 rounded-lg bg-primary-600 hover:bg-primary-500 px-4 py-2.5 text-sm font-medium text-white transition"
-        >
-          <Download className="w-4 h-4" /> Download session file
-        </button>
-        <button
           onClick={onGoToSessions}
-          className="inline-flex items-center justify-center gap-2 rounded-lg border border-white/10 hover:bg-white/5 px-4 py-2.5 text-sm text-gray-200 transition"
+          className="flex-1 inline-flex items-center justify-center gap-2 rounded-lg border border-white/10 hover:bg-white/5 px-4 py-2.5 text-sm text-gray-200 transition"
         >
           Open Sessions
         </button>
         <button
           onClick={onRestart}
-          className="inline-flex items-center justify-center gap-2 rounded-lg border border-white/10 hover:bg-white/5 px-4 py-2.5 text-sm text-gray-300 transition"
+          className="flex-1 inline-flex items-center justify-center gap-2 rounded-lg border border-white/10 hover:bg-white/5 px-4 py-2.5 text-sm text-gray-300 transition"
         >
           Create another
         </button>
@@ -491,6 +606,15 @@ export default function CreateSession() {
   // Proxy-optional: tickbox to opt out of binding a proxy at create
   // time. Defaults to ON so existing flows work unchanged.
   const [useProxy, setUseProxy] = useState(true);
+  // Login-on-panel toggle. Default ON so the session is auto-adopted
+  // into the heartbeat/restore loops once OTP/2FA finishes — the user
+  // can untick it to download the session string and have the panel
+  // park the row as inactive (no live MTProto client, no proxy slot).
+  const [loginOnPanel, setLoginOnPanel] = useState(true);
+  // After-the-fact promotion: tracks whether a parked session has been
+  // promoted to logged-in via the Done-step "Login on panel" button.
+  const [postLoginInFlight, setPostLoginInFlight] = useState(false);
+  const [downloadInFlight, setDownloadInFlight] = useState(false);
 
   const loadProxies = useCallback(async () => {
     setProxyState('loading');
@@ -550,6 +674,7 @@ export default function CreateSession() {
         // ignores proxyId in that case anyway.
         proxyId: useProxy && proxyId ? Number(proxyId) : undefined,
         useProxy,
+        loginOnPanel,
       });
       const data = r.data?.data || r.data;
       setTempId(data.tempId);
@@ -578,7 +703,11 @@ export default function CreateSession() {
       if (data.status === 'awaiting_password') {
         setStep('password');
         toast.info('2FA password required');
-      } else if (data.status === 'active') {
+      } else if (data.status === 'active' || data.status === 'inactive') {
+        // Both `active` (loginOnPanel=true) and `inactive`
+        // (loginOnPanel=false) are successful end-states for the
+        // creation flow. The Done step decides what UI to show based
+        // on `loginOnPanel` / `status`.
         setResult(data);
         setStep('done');
         tempIdRef.current = null;
@@ -632,13 +761,47 @@ export default function CreateSession() {
     toast.info('Cancelled');
   };
 
-  const handleDownload = async () => {
+  const handleDownload = async (format = 'json') => {
     if (!result?.sessionId) return;
+    setDownloadInFlight(true);
     try {
-      const fileName = `${(result.phone || 'session').replace(/[^A-Za-z0-9+_-]/g, '')}.json`;
-      await downloadSession(result.sessionId, fileName);
+      const fmt = format === 'session' ? 'session' : 'json';
+      const fileName = `${(result.phone || 'session').replace(/[^A-Za-z0-9+_-]/g, '')}.${fmt}`;
+      await downloadSession(result.sessionId, fileName, { format: fmt });
+      toast.success(
+        fmt === 'session'
+          ? 'Telethon .session file downloaded'
+          : 'Session JSON downloaded'
+      );
     } catch (e) {
       toast.error(parseApiError(e));
+    } finally {
+      setDownloadInFlight(false);
+    }
+  };
+
+  // Promote a parked session (loginOnPanel=false at create time) into
+  // the panel's heartbeat loop. Reuses the existing /sessions/:id/login
+  // endpoint so the resulting state is indistinguishable from a session
+  // that was created with loginOnPanel=true from the start.
+  const handlePostLogin = async () => {
+    if (!result?.sessionId) return;
+    setPostLoginInFlight(true);
+    try {
+      const r = await loginSession(result.sessionId);
+      const data = r.data?.data || r.data;
+      // Reflect the new active state in the local result so the Done
+      // banner switches from "parked" to "active".
+      setResult((prev) => prev && {
+        ...prev,
+        status: data?.status || 'active',
+        loginOnPanel: true,
+      });
+      toast.success(`Session #${result.sessionId} is now logged in on the panel`);
+    } catch (e) {
+      toast.error(parseApiError(e));
+    } finally {
+      setPostLoginInFlight(false);
     }
   };
 
@@ -673,6 +836,8 @@ export default function CreateSession() {
               proxyState={proxyState}
               useProxy={useProxy}
               setUseProxy={setUseProxy}
+              loginOnPanel={loginOnPanel}
+              setLoginOnPanel={setLoginOnPanel}
               onSubmit={handleStart}
               busy={busy}
             />
@@ -704,6 +869,12 @@ export default function CreateSession() {
               onDownload={handleDownload}
               onRestart={reset}
               onGoToSessions={() => navigate('/sessions')}
+              onLoginOnPanel={handlePostLogin}
+              loggedInOnPanel={
+                result.loginOnPanel === true || result.status === 'active'
+              }
+              loginBusy={postLoginInFlight}
+              downloadBusy={downloadInFlight}
             />
           )}
         </div>

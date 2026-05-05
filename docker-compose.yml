@@ -8,9 +8,9 @@
 #       ▼
 #    caddy        public-facing reverse proxy + admin API on :2019
 #     │ │
-#     │ └─ /            → frontend:83  (static SPA)
+#     │ └─ /            → frontend-blue OR frontend-green (one is "active")
 #     │
-#     └─── /api/*       → backend-blue OR backend-green (one is "active")
+#     └─── /api/*       → backend-blue  OR backend-green  (one is "active")
 #          /socket.io/*
 #
 #   postgres :5435  named-vol postgres_data
@@ -179,15 +179,65 @@ services:
     restart: unless-stopped
     profiles: ["green", "deploy"]
 
-  frontend:
-    build: ./frontend
-    # The frontend nginx serves the SPA only — Caddy is the public proxy
-    # for /api/* and /socket.io/*.
+  # ---------------------------------------------------------------------------
+  # Frontend — BLUE
+  # ---------------------------------------------------------------------------
+  # Same blue/green pattern as the backend. The orchestrator builds the SPA
+  # bundle into a versioned image and brings up the inactive color BEFORE
+  # flipping Caddy, so the public URL never serves a stale or missing
+  # build during a deploy. Only one color is normally running.
+  frontend-blue:
+    build:
+      context: ./frontend
+      args:
+        GIT_SHA: ${GIT_SHA:-dev}
+        BUILD_TIME: ${BUILD_TIME:-unknown}
+    image: web-pannel-frontend:${FRONTEND_IMAGE_TAG:-${IMAGE_TAG:-dev}}
+    container_name: web-pannel-frontend-blue
+    environment:
+      - DEPLOY_COLOR=blue
+      - GIT_SHA=${GIT_SHA:-dev}
+      - GIT_REF=${GIT_REF:-unknown}
     expose:
       - "83"
-    ports:
-      - "8083:83"
+    healthcheck:
+      # The nginx config serves the SPA shell at "/", so a 200 there is
+      # enough to declare the container ready. We don't check /api or
+      # /socket.io because those return 502 by design (Caddy fans them
+      # out to the backend, not the frontend).
+      test: ["CMD-SHELL", "wget -q --spider --tries=1 --timeout=2 http://127.0.0.1:83/ || exit 1"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
     restart: unless-stopped
+    profiles: ["blue", "deploy"]
+
+  # ---------------------------------------------------------------------------
+  # Frontend — GREEN (twin of BLUE, idle by default)
+  # ---------------------------------------------------------------------------
+  frontend-green:
+    build:
+      context: ./frontend
+      args:
+        GIT_SHA: ${GIT_SHA:-dev}
+        BUILD_TIME: ${BUILD_TIME:-unknown}
+    image: web-pannel-frontend:${FRONTEND_IMAGE_TAG:-${IMAGE_TAG:-dev}}
+    container_name: web-pannel-frontend-green
+    environment:
+      - DEPLOY_COLOR=green
+      - GIT_SHA=${GIT_SHA:-dev}
+      - GIT_REF=${GIT_REF:-unknown}
+    expose:
+      - "83"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider --tries=1 --timeout=2 http://127.0.0.1:83/ || exit 1"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+    profiles: ["green", "deploy"]
 
   # ---------------------------------------------------------------------------
   # Caddy — public-facing reverse proxy. Exposes :80 (and :443 when
@@ -216,12 +266,17 @@ services:
       - PUBLIC_DOMAIN=${PUBLIC_DOMAIN:-}
       - ACME_EMAIL=${ACME_EMAIL:-}
       - ACTIVE_BACKEND=${ACTIVE_BACKEND:-backend-blue:3005}
+      - ACTIVE_FRONTEND=${ACTIVE_FRONTEND:-frontend-blue:83}
     volumes:
       - ./proxy/Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy_data:/data
       - caddy_config:/config
-    depends_on:
-      - frontend
+    # No `depends_on:` for the frontend colors — at boot only the active
+    # color is started by `docker compose --profile <color> up -d`, and
+    # the orchestrator manages frontend lifecycle in lockstep with the
+    # backend during `bin/upgrade deploy`. Caddy gracefully degrades to
+    # 502 if the upstream is missing, and the active health check
+    # picks the upstream back up once it appears.
 
   # ---------------------------------------------------------------------------
   # Telegram admin bot — long-poll, no inbound port. Reuses the backend

@@ -57,15 +57,37 @@ export const runSessionHealthCheck = (id) =>
 export const setSessionProxy = (id, proxyUrl) =>
   api.patch(`/sessions/${id}/proxy`, { proxyUrl });
 
-export const downloadSession = async (id, suggestedName = 'session.json') => {
+/**
+ * Trigger a session download in the requested format.
+ *
+ * @param {number|string} id            session id
+ * @param {string}        suggestedName filename hint (extension is overridden
+ *                                      to match `format` so the operator
+ *                                      always gets a correctly-typed file)
+ * @param {object}        [opts]
+ * @param {'json'|'session'} [opts.format='json'] download format. `json` is
+ *   the legacy GramJS envelope; `session` is a Telethon-native SQLite
+ *   .session file (built server-side from the GramJS auth_key).
+ */
+export const downloadSession = async (
+  id,
+  suggestedName = 'session.json',
+  opts = {},
+) => {
+  const format = opts.format === 'session' ? 'session' : 'json';
   const response = await api.get(`/sessions/${id}/download`, {
     responseType: 'blob',
+    params: { format },
   });
   const blob = response.data;
   const url = URL.createObjectURL(blob);
+  // Force the file extension to match the chosen format so users don't
+  // end up with foo.json that's actually a SQLite blob (or vice versa).
+  const baseName = String(suggestedName).replace(/\.(session|json)$/i, '');
+  const finalName = `${baseName}.${format}`;
   const a = document.createElement('a');
   a.href = url;
-  a.download = suggestedName;
+  a.download = finalName;
   document.body.appendChild(a);
   a.click();
   a.remove();

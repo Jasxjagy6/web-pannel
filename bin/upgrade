@@ -149,11 +149,13 @@ async function whoami() {
 async function cmdStatus() {
   const log = logger();
   const state = stateMod.readState();
-  log(colorize('Active color: ', 'info') + colorize(state.color || 'unknown', 'ok'));
-  log(`  image:       ${state.image || '—'}`);
-  log(`  git_sha:     ${state.git_sha || '—'}`);
-  log(`  git_ref:     ${state.git_ref || '—'}`);
-  log(`  deployed_at: ${state.deployed_at || '—'}`);
+  log(colorize('Active backend color:  ', 'info') + colorize(state.backend_color || state.color || 'unknown', 'ok'));
+  log(colorize('Active frontend color: ', 'info') + colorize(state.frontend_color || state.backend_color || state.color || 'unknown', 'ok'));
+  log(`  backend image:    ${state.image || '—'}`);
+  log(`  frontend image:   ${state.frontend_image || '—'}`);
+  log(`  git_sha:          ${state.git_sha || '—'}`);
+  log(`  git_ref:          ${state.git_ref || '—'}`);
+  log(`  deployed_at:      ${state.deployed_at || '—'}`);
   log('');
   log('Recent deployments (newest first):');
   const rows = await audit.recentDeployments(10);
@@ -258,6 +260,12 @@ async function cmdDeploy(args) {
   const state0 = stateMod.readState();
   const newColor = stateMod.inactiveColor(state0.color || 'blue');
   const oldColor = state0.color || 'blue';
+  // Frontend tracks the backend color so a single Caddy flip swings both
+  // upstream pools in lockstep. We could decouple them, but that would
+  // mean shipping a new bundle that talks to an older API or vice
+  // versa — only painful, never useful for this codebase.
+  const newFrontendColor = newColor;
+  const oldFrontendColor = state0.frontend_color || oldColor;
 
   // First-deploy seeding: when state/active-color.json was created with null
   // image / git_sha (a fresh stack that came up before any orchestrator
@@ -266,6 +274,10 @@ async function cmdDeploy(args) {
   if (!state0.image) {
     const liveImage = await deploy.runningImageOf(oldColor);
     if (liveImage) state0.image = liveImage;
+  }
+  if (!state0.frontend_image) {
+    const liveFrontendImage = await deploy.runningFrontendImageOf(oldFrontendColor);
+    if (liveFrontendImage) state0.frontend_image = liveFrontendImage;
   }
   const initiatedBy = process.env.INITIATED_BY || (await whoami());
   const t0 = Date.now();
@@ -278,8 +290,10 @@ async function cmdDeploy(args) {
   audit.appendFileLine({ event: 'deploy.start', ref, buildMode, oldColor, newColor, initiatedBy });
 
   let imageTag = null;
+  let frontendImageTag = null;
   let targetSha = null;
   let healthMs = null;
+  let frontendHealthMs = null;
   let aborted = false;
 
   try {
@@ -314,10 +328,10 @@ async function cmdDeploy(args) {
       log(colorize('--skip-migrate: not running migrations', 'warn'));
     }
 
-    // 4. start the inactive color
+    // 4. start the inactive backend color
     await deploy.startColor({ color: newColor, sha: targetSha, log });
 
-    // 5. wait for /health/ready
+    // 5. wait for backend /health/ready
     const timeoutMs = parseInt(process.env.ROLLOUT_HEALTH_TIMEOUT_MS || '120000', 10);
     healthMs = await deploy.waitForReady({
       container: `web-pannel-backend-${newColor}`,
@@ -325,25 +339,73 @@ async function cmdDeploy(args) {
       log,
     });
 
-    // 6. flip Caddy
-    await deploy.flipCaddy({ color: newColor, log });
+    // 6. build + start the inactive FRONTEND color
+    //
+    // Frontend gets built AFTER the backend is healthy: building the SPA
+    // takes 30-90 seconds and we don't want to block readiness probes on
+    // the backend just because nginx is still bundling assets. The
+    // frontend build is decoupled from the backend image, so this order
+    // doesn't risk a code skew — both still come from the same git SHA.
+    if (process.env.UPGRADE_SKIP_FRONTEND === 'true') {
+      log(colorize('UPGRADE_SKIP_FRONTEND=true — leaving frontend on the old color', 'warn'));
+    } else {
+      // First-run migration: clean up the legacy single-`frontend`
+      // container if the previous compose file still spawned one.
+      // No-op once the migration has run successfully on this host.
+      await deploy.stopLegacyFrontend({ log });
 
-    // 7. drain old color
+      frontendImageTag = await deploy.buildFrontendImage({ sha: targetSha, log });
+      await deploy.startFrontendColor({
+        color: newFrontendColor,
+        sha: targetSha,
+        log,
+      });
+      const frontendTimeoutMs = parseInt(
+        process.env.FRONTEND_HEALTH_TIMEOUT_MS || '60000', 10
+      );
+      frontendHealthMs = await deploy.waitForFrontendReady({
+        container: `web-pannel-frontend-${newFrontendColor}`,
+        timeoutMs: frontendTimeoutMs,
+        log,
+      });
+    }
+
+    // 7. flip Caddy — backend AND frontend in a single admin POST
+    await deploy.flipCaddy({
+      color: newColor,
+      frontendColor:
+        process.env.UPGRADE_SKIP_FRONTEND === 'true' ? oldFrontendColor : newFrontendColor,
+      log,
+    });
+
+    // 8. drain old color (lets in-flight WS/HTTP requests finish on
+    //    the previous backend before we kill it)
     const drainMs = parseInt(process.env.DRAIN_GRACE_MS || '25000', 10);
     await deploy.drainOldColor({ color: oldColor, drainMs, log });
 
-    // 8. stop old color
+    // 9. stop old colors
     await deploy.stopColor({ color: oldColor, log });
+    if (
+      process.env.UPGRADE_SKIP_FRONTEND !== 'true' &&
+      oldFrontendColor !== newFrontendColor
+    ) {
+      await deploy.stopFrontendColor({ color: oldFrontendColor, log });
+    }
 
-    // 9. persist state
+    // 10. persist state
     deploy.persistActiveState({
       color: newColor,
+      frontendColor:
+        process.env.UPGRADE_SKIP_FRONTEND === 'true' ? oldFrontendColor : newFrontendColor,
       sha: targetSha,
       ref,
       imageTag,
+      frontendImageTag: frontendImageTag || state0.frontend_image,
       prev: {
         color: oldColor,
+        frontend_color: oldFrontendColor,
         image: state0.image,
+        frontend_image: state0.frontend_image,
         git_sha: state0.git_sha,
         git_ref: state0.git_ref,
         deployed_at: state0.deployed_at,
@@ -351,30 +413,55 @@ async function cmdDeploy(args) {
     });
 
     const totalMs = Date.now() - t0;
-    audit.appendFileLine({ event: 'deploy.ok', ref, sha: targetSha, color: newColor, totalMs });
+    audit.appendFileLine({
+      event: 'deploy.ok',
+      ref,
+      sha: targetSha,
+      color: newColor,
+      frontendColor: newFrontendColor,
+      totalMs,
+    });
     await audit.finishDeployment(deploymentId, {
       status: 'healthy',
       targetSha,
       healthMs,
       totalMs,
-      metadata: { image: imageTag, build_mode: buildMode },
+      metadata: {
+        image: imageTag,
+        frontend_image: frontendImageTag,
+        frontend_health_ms: frontendHealthMs,
+        build_mode: buildMode,
+      },
     });
     log(colorize(`deploy OK in ${totalMs}ms — active color is now ${newColor} (${targetSha.slice(0, 12)})`, 'ok'));
   } catch (err) {
     aborted = true;
     log(colorize(`deploy FAILED: ${err.message}`, 'err'));
     audit.appendFileLine({ event: 'deploy.fail', error: err.message, ref, sha: targetSha });
-    // Cleanup: stop the staged color if we started it.
+    // Cleanup: stop the staged colors if we started them.
     try {
       await deploy.stopColor({ color: newColor, log });
     } catch (_) { /* ignore */ }
+    if (
+      process.env.UPGRADE_SKIP_FRONTEND !== 'true' &&
+      newFrontendColor !== oldFrontendColor
+    ) {
+      try {
+        await deploy.stopFrontendColor({ color: newFrontendColor, log });
+      } catch (_) { /* ignore */ }
+    }
     await audit.finishDeployment(deploymentId, {
       status: 'failed',
       targetSha,
       healthMs,
       totalMs: Date.now() - t0,
       errorMessage: err.message,
-      metadata: { image: imageTag, build_mode: buildMode, aborted: true },
+      metadata: {
+        image: imageTag,
+        frontend_image: frontendImageTag,
+        build_mode: buildMode,
+        aborted: true,
+      },
     });
     process.exit(1);
   } finally {

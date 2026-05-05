@@ -1,6 +1,16 @@
 # Stage 1: Build the React app with Vite
 FROM node:18-alpine AS build
 
+# Build args passed by the orchestrator (`bin/upgrade deploy`). Declared
+# here so docker doesn't warn "ARG was not consumed". The SPA itself
+# doesn't need them at runtime, but we surface them in the image meta so
+# `docker inspect web-pannel-frontend:<tag>` reveals which commit is on
+# disk — useful for blue/green debugging.
+ARG GIT_SHA=unknown
+ARG BUILD_TIME=unknown
+ENV VITE_GIT_SHA=${GIT_SHA}
+ENV VITE_BUILD_TIME=${BUILD_TIME}
+
 WORKDIR /app
 
 COPY package*.json ./
