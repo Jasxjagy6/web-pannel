@@ -183,7 +183,12 @@ class SessionCreationService {
   // ---------------------------------------------------------------------------
   // Step 1: start — sendCode
   // ---------------------------------------------------------------------------
-  async start({ userId, phone, apiId, apiHash, country, platform, proxyId, userRole }) {
+  async start({ userId, phone, apiId, apiHash, country, platform, proxyId, userRole, useProxy }) {
+    // BYO Proxy — opt-out: when the operator explicitly unchecks the
+    // "Use a proxy" box we skip every proxy primitive in the create
+    // flow. Default keeps Phase 3 behaviour intact (proxy required for
+    // BYO users) so existing flows are unaffected.
+    const wantsProxy = useProxy === false ? false : true;
     const normalizedPhone = this._normalizePhone(phone);
     const { apiId: id, apiHash: hash, credentialId } =
       await this._resolveApi(userId, apiId, apiHash);
@@ -222,35 +227,42 @@ class SessionCreationService {
     let proxyConf = null;
     let reservedProxyId = null;
     let proxyError = null;
-    try {
-      const proxyService = require('./proxyService');
-      const reserved = await proxyService.reserveAdHoc(
-        `creation:${tempId}`,
-        { userId, role: userRole || null, proxyId: proxyId || null }
-      );
-      if (reserved) {
-        reservedProxyId = reserved.id;
-        proxyConf = proxyService.buildGramJSProxy(reserved);
+    if (wantsProxy) {
+      try {
+        const proxyService = require('./proxyService');
+        const reserved = await proxyService.reserveAdHoc(
+          `creation:${tempId}`,
+          { userId, role: userRole || null, proxyId: proxyId || null }
+        );
+        if (reserved) {
+          reservedProxyId = reserved.id;
+          proxyConf = proxyService.buildGramJSProxy(reserved);
+        }
+      } catch (err) {
+        // BYO Proxy (Phase 2): bubble up NO_USER_PROXY / PROXY_PIN_UNAVAILABLE
+        // so the controller returns 412 to the UI instead of leaking the
+        // direct VPS IP in a 200 response.
+        if (err && (err.code === 'NO_USER_PROXY' || err.code === 'PROXY_PIN_UNAVAILABLE')) {
+          proxyError = err;
+        } else {
+          logger.debug(`pre-create proxy reserve skipped: ${err.message}`);
+        }
       }
-    } catch (err) {
-      // BYO Proxy (Phase 2): bubble up NO_USER_PROXY / PROXY_PIN_UNAVAILABLE
-      // so the controller returns 412 to the UI instead of leaking the
-      // direct VPS IP in a 200 response.
-      if (err && (err.code === 'NO_USER_PROXY' || err.code === 'PROXY_PIN_UNAVAILABLE')) {
-        proxyError = err;
-      } else {
-        logger.debug(`pre-create proxy reserve skipped: ${err.message}`);
+
+      if (proxyError) throw proxyError;
+
+      if (!proxyConf && STRICT_PROXY_ISOLATION) {
+        throw new AppError(
+          'No proxy available for new session (STRICT_PROXY_ISOLATION=true). ' +
+            'Add a working proxy in the Proxies page first.',
+          503,
+          'NO_PROXY_AVAILABLE'
+        );
       }
-    }
-
-    if (proxyError) throw proxyError;
-
-    if (!proxyConf && STRICT_PROXY_ISOLATION) {
-      throw new AppError(
-        'No proxy available for new session (STRICT_PROXY_ISOLATION=true). ' +
-          'Add a working proxy in the Proxies page first.',
-        503,
-        'NO_PROXY_AVAILABLE'
+    } else {
+      logger.info(
+        `Session creation start: tempId=${tempId} phone=${normalizedPhone} ` +
+          `useProxy=false → connecting direct (no proxy reserved).`
       );
     }
 
@@ -292,6 +304,7 @@ class SessionCreationService {
         identity,
         proxyConf,
         reservedProxyId,
+        useProxy: wantsProxy,
       });
 
       logger.info(`Session creation start: tempId=${tempId} phone=${normalizedPhone} platform=${identity.platform}`);
@@ -481,7 +494,8 @@ class SessionCreationService {
   // ---------------------------------------------------------------------------
   async _persistAndFinish(userId, tempId, hadTwoFA) {
     const entry = this._mustGet(userId, tempId);
-    const { client, phone, apiId, apiHash, credentialId, identity, reservedProxyId, proxyConf } = entry;
+    const { client, phone, apiId, apiHash, credentialId, identity, reservedProxyId, proxyConf, useProxy } = entry;
+    const wantsProxy = useProxy === false ? false : true;
 
     // Pull user info + session string before we hand the client off.
     let me = null;
@@ -575,10 +589,18 @@ class SessionCreationService {
     // Bind the proxy slot to the new session ID so future reconnects
     // resolve through the same pool. If the start() flow already
     // reserved one we just transfer that reservation; otherwise we let
-    // proxyService pick.
+    // proxyService pick — except when the operator explicitly opted
+    // out of proxies on this create flow, in which case we leave
+    // bound_proxy_id NULL and never call assignProxyForSession (which
+    // would otherwise try to reserve from the pool, defeating the
+    // opt-out).
     try {
       const proxyService = require('./proxyService');
-      if (reservedProxyId) {
+      if (!wantsProxy) {
+        logger.info(
+          `Session ${sessionId} created with useProxy=false; skipping proxy bind.`
+        );
+      } else if (reservedProxyId) {
         await proxyService.transferAdHocToSession(`creation:${tempId}`, sessionId);
       } else {
         await proxyService.assignProxyForSession(sessionId);
