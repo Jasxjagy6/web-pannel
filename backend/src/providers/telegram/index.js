@@ -123,6 +123,7 @@ const capabilities = {
   privacy_set:            true,   // privacy_set_phone || privacy_set_account
   twofa_change:           true,
   otp_passive:            true,   // alias of otp_passive_listen
+  otp_relay:              true,   // Saved-Messages OTP relay (TG only)
 };
 
 // ---------------------------------------------------------------------------

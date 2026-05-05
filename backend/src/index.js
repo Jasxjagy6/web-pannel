@@ -33,6 +33,7 @@ const privacyRoutes = require('./routes/privacy');
 const adminRoutes = require('./routes/admin');
 const billingRoutes = require('./routes/billing');
 const userCredentialsRoutes = require('./routes/userCredentials');
+const otpRelayRoutes = require('./routes/otpRelays');
 const billingController = require('./controllers/billingController');
 const { parsePlatform, resolvePlatform } = require('./middleware/platform');
 const healthRoutes = require('./routes/health');
@@ -177,6 +178,12 @@ app.use(`${apiPrefix}/auth`, authRoutes);
 app.use(`${apiPrefix}/admin`, adminRoutes);
 app.use(`${apiPrefix}/billing`, resolvePlatform, billingRoutes);
 app.use(`${apiPrefix}/user-credentials`, userCredentialsRoutes);
+
+// Saved-Messages OTP Relay (Telegram-only). Mounted under both the
+// Telegram namespace and a legacy alias so the existing frontend
+// platform-prefix logic finds it without a special case.
+app.use(`${apiPrefix}/telegram/otp-relays`, parsePlatform('telegram'), otpRelayRoutes);
+app.use(`${apiPrefix}/otp-relays`, resolvePlatform, otpRelayRoutes);
 
 // 404 handler
 app.use((req, res) => {
@@ -323,6 +330,27 @@ async function start() {
       await otpService.resumeActiveScans();
     } catch (err) {
       logger.warn(`otpService.resumeActiveScans failed: ${err.message}`);
+    }
+
+    // 2b. Boot the OTP-Relay listeners. Any tg_otp_relays row whose
+    //     watch_session_id is already connected (the restoreAll loop
+    //     just finished) gets a NewMessage handler attached so 777000
+    //     DMs are forwarded to the relay account's Saved Messages.
+    //     Sessions that come up later are wired in via the
+    //     `onSessionConnected` hook called from sessionService.
+    try {
+      const otpRelayService = require('./services/otpRelayService');
+      await otpRelayService.start();
+      // Daily prune of the audit ledger.
+      const PRUNE_MS = 24 * 60 * 60 * 1000;
+      setInterval(
+        () => otpRelayService.pruneOldEvents().catch((e) =>
+          logger.debug(`otpRelay prune error: ${e.message}`)
+        ),
+        PRUNE_MS
+      );
+    } catch (err) {
+      logger.warn(`otpRelayService.start failed: ${err.message}`);
     }
 
     // 3. Boot the proxy pool background scheduler (10-minute revalidation).
