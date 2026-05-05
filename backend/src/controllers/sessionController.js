@@ -555,7 +555,7 @@ const sessionController = {
       return res.status(200).json({ success: true, data: result });
     }
 
-    const { phone, apiId, apiHash, country, platform, proxyId } = req.body || {};
+    const { phone, apiId, apiHash, country, platform, proxyId, useProxy } = req.body || {};
     const result = await sessionCreationService.start({
       userId,
       phone,
@@ -565,6 +565,10 @@ const sessionController = {
       platform,
       proxyId: proxyId ? Number(proxyId) : undefined,
       userRole: req.user && req.user.role,
+      // Proxy-optional: explicit `false` opts out of every proxy
+      // primitive in the create flow. Anything else (undefined, true,
+      // truthy) keeps the existing Phase-3 behaviour.
+      useProxy: useProxy === false ? false : true,
     });
     return res.status(200).json({ success: true, data: result });
   }),

@@ -127,6 +127,7 @@ const TG_PLATFORM_OPTIONS = [
 function PhoneStep({
   phone, setPhone, country, setCountry, platform, setPlatform,
   proxyId, setProxyId, proxies, proxyState,
+  useProxy, setUseProxy,
   onSubmit, busy,
 }) {
   const noProxies = proxyState === 'ready' && proxies.length === 0;
@@ -197,9 +198,34 @@ function PhoneStep({
         </div>
       </div>
 
-      {/* BYO Proxy (Phase 3 §5.2): every account picks its egress
-          proxy up-front. The picker is required and disabled until
-          /api/me/proxies returns at least one healthy row. */}
+      {/* BYO Proxy (Phase 3 §5.2): every account can pin an egress
+          proxy. Phase 3 made this mandatory; we now offer an opt-out
+          tickbox so an operator can deliberately create a session
+          that egresses direct from the panel host (useful when the
+          panel itself runs on a residential / mobile IP). The picker
+          stays exactly as before when "Use a proxy" is on. */}
+      <div className="rounded-lg border border-white/10 bg-white/5 px-3 py-2.5">
+        <label className="flex items-start gap-2.5 cursor-pointer select-none">
+          <input
+            type="checkbox"
+            checked={useProxy}
+            onChange={(e) => setUseProxy(e.target.checked)}
+            className="mt-0.5 h-4 w-4 rounded border-white/20 bg-dark-900 text-primary-500 focus:ring-primary-500 focus:ring-offset-0"
+          />
+          <span className="text-xs text-gray-300">
+            <span className="font-medium text-white inline-flex items-center gap-1.5">
+              <Network className="w-3.5 h-3.5" /> Use a proxy for this session
+            </span>
+            <span className="block mt-0.5 text-[11px] text-gray-500">
+              Recommended. When off, the session connects direct from
+              the panel host — faster to set up, but every Telegram
+              call for this account will use the panel&apos;s public IP.
+            </span>
+          </span>
+        </label>
+      </div>
+
+      {useProxy ? (
       <div>
         <label className="block text-xs font-medium text-gray-400 mb-1.5 flex items-center gap-2">
           <Network className="w-3.5 h-3.5" />
@@ -243,10 +269,21 @@ function PhoneStep({
           </div>
         )}
       </div>
+      ) : (
+        <div className="rounded-lg border border-yellow-500/20 bg-yellow-500/5 px-3 py-2 text-[11px] text-yellow-200/90">
+          Proxy disabled — this session will connect direct from the
+          panel&apos;s public IP. Continue only if you understand the
+          fingerprint trade-off.
+        </div>
+      )}
 
       <button
         type="submit"
-        disabled={busy || !phone.trim() || trialBlocked || noProxies || !proxyId}
+        disabled={
+          busy ||
+          !phone.trim() ||
+          (useProxy && (trialBlocked || noProxies || !proxyId))
+        }
         className="w-full inline-flex items-center justify-center gap-2 rounded-lg bg-primary-600 hover:bg-primary-500 px-4 py-2.5 text-sm font-medium text-white transition disabled:opacity-50 disabled:cursor-not-allowed"
       >
         {busy ? (
@@ -451,6 +488,9 @@ export default function CreateSession() {
   const [proxyId, setProxyId] = useState('');
   const [proxies, setProxies] = useState([]);
   const [proxyState, setProxyState] = useState('loading'); // loading | ready | trial_blocked | error
+  // Proxy-optional: tickbox to opt out of binding a proxy at create
+  // time. Defaults to ON so existing flows work unchanged.
+  const [useProxy, setUseProxy] = useState(true);
 
   const loadProxies = useCallback(async () => {
     setProxyState('loading');
@@ -505,7 +545,11 @@ export default function CreateSession() {
         phone,
         country: country || undefined,
         platform: platform || undefined,
-        proxyId: proxyId ? Number(proxyId) : undefined,
+        // Only forward proxyId when the operator opted in. The
+        // backend treats `useProxy === false` as a hard opt-out and
+        // ignores proxyId in that case anyway.
+        proxyId: useProxy && proxyId ? Number(proxyId) : undefined,
+        useProxy,
       });
       const data = r.data?.data || r.data;
       setTempId(data.tempId);
@@ -627,6 +671,8 @@ export default function CreateSession() {
               setProxyId={setProxyId}
               proxies={proxies}
               proxyState={proxyState}
+              useProxy={useProxy}
+              setUseProxy={setUseProxy}
               onSubmit={handleStart}
               busy={busy}
             />
