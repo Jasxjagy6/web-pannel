@@ -134,6 +134,10 @@ const sessions = {
   get:           (...a) => sessionService.getSession(...a),
   login:         (...a) => sessionService.loginSession(...a),
   logout:        (...a) => sessionService.logoutSession(...a),
+  // Anti-revoke Phase 4 — bring a 'revoked' row back to life if the
+  // on-disk encrypted session string (or its newest backup) is still
+  // accepted by Telegram. Telegram-only.
+  recover:       (...a) => sessionService.recoverSession(...a),
   status:        (...a) => sessionService.checkSessionStatus(...a),
   download:      (...a) => sessionService.downloadSession(...a),
   delete:        (...a) => sessionService.deleteSession(...a),

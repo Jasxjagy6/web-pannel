@@ -31,6 +31,8 @@ const ANTI_REVOKE_PHASE_2_ENABLED =
   String(process.env.ANTI_REVOKE_PHASE_2_ENABLED ?? 'true').toLowerCase() === 'true';
 const ANTI_REVOKE_PHASE_3_ENABLED =
   String(process.env.ANTI_REVOKE_PHASE_3_ENABLED ?? 'true').toLowerCase() === 'true';
+const ANTI_REVOKE_PHASE_4_ENABLED =
+  String(process.env.ANTI_REVOKE_PHASE_4_ENABLED ?? 'true').toLowerCase() === 'true';
 
 const telegramConfig = {
   apiId: parseInt(process.env.TELEGRAM_API_ID || '0'),
@@ -54,6 +56,7 @@ const telegramConfig = {
   ANTI_REVOKE_PHASE_1_ENABLED,
   ANTI_REVOKE_PHASE_2_ENABLED,
   ANTI_REVOKE_PHASE_3_ENABLED,
+  ANTI_REVOKE_PHASE_4_ENABLED,
 
   // Phase 1 — restore-on-boot jitter window. Default 5 min so 50 sessions
   // reconnect over 5 min instead of all at once → no "data-centre sweep"
@@ -79,6 +82,59 @@ const telegramConfig = {
 
   // Phase 3 — risk gate threshold for heavy operations.
   RISK_GATE_THRESHOLD: parseFloat(process.env.TG_RISK_GATE_THRESHOLD || '0.65'),
+
+  // Phase 4 — bulletproof panel sessions.
+  //
+  // Number of consecutive permanent-auth errors required before the
+  // heartbeat marks a session status='revoked'. Default 2 so single
+  // false-positives (transient proxy / DC migrate / GramJS internals)
+  // don't kill an otherwise healthy session.
+  ANTI_REVOKE_PHASE_4_CONSECUTIVE_REVOKE_THRESHOLD: parseInt(
+    process.env.ANTI_REVOKE_PHASE_4_CONSECUTIVE_REVOKE_THRESHOLD || '2', 10
+  ),
+  // Minimum elapsed time between the first strike and the threshold-
+  // crossing strike. Default 30 minutes — gives Telegram's own DC
+  // migration storms time to subside before we conclude the auth_key
+  // is really dead.
+  ANTI_REVOKE_PHASE_4_REVOKE_CONFIRM_WINDOW_MS: parseInt(
+    process.env.ANTI_REVOKE_PHASE_4_REVOKE_CONFIRM_WINDOW_MS || `${30 * 60 * 1000}`, 10
+  ),
+  // Number of consecutive "session disappeared from
+  // account.GetAuthorizations" probes required before we mark the row
+  // revoked-externally. Same rationale as the heartbeat counter.
+  ANTI_REVOKE_PHASE_4_CONSECUTIVE_EXTERNAL_REVOKE_THRESHOLD: parseInt(
+    process.env.ANTI_REVOKE_PHASE_4_CONSECUTIVE_EXTERNAL_REVOKE_THRESHOLD || '2', 10
+  ),
+  // Re-call account.ChangeAuthorizationSettings(confirmed=true) every
+  // N hours so we keep the panel session in the "trusted" bucket even
+  // if Telegram ever rotates the flag silently. Default 7 days.
+  ANTI_REVOKE_PHASE_4_RECONFIRM_INTERVAL_MS: parseInt(
+    process.env.ANTI_REVOKE_PHASE_4_RECONFIRM_INTERVAL_MS || `${7 * 24 * 60 * 60 * 1000}`, 10
+  ),
+  // Re-call account.SetAccountTTL on the same cadence so an idle
+  // account never auto-expires. Default 30 days (effectively the same
+  // 730-day TTL stays at 730 days forever).
+  ANTI_REVOKE_PHASE_4_RESET_ACCOUNT_TTL_INTERVAL_MS: parseInt(
+    process.env.ANTI_REVOKE_PHASE_4_RESET_ACCOUNT_TTL_INTERVAL_MS || `${30 * 24 * 60 * 60 * 1000}`, 10
+  ),
+  // Account-TTL we ask Telegram to enforce. Max accepted by the
+  // protocol is 730 days; we use the max so an idle account is never
+  // pruned. Operators can lower this for compliance reasons.
+  ANTI_REVOKE_PHASE_4_ACCOUNT_TTL_DAYS: parseInt(
+    process.env.ANTI_REVOKE_PHASE_4_ACCOUNT_TTL_DAYS || '730', 10
+  ),
+  // How long encrypted off-DB session backups are retained before the
+  // pruner deletes them. 90 days is the working compromise between
+  // "long enough to recover from operator error" and disk usage.
+  ANTI_REVOKE_PHASE_4_BACKUP_RETENTION_DAYS: parseInt(
+    process.env.ANTI_REVOKE_PHASE_4_BACKUP_RETENTION_DAYS || '90', 10
+  ),
+  // Minimum interval between two outbound bot alerts for the same
+  // session — prevents the user from getting hammered when the
+  // heartbeat sees the same problem on every tick.
+  ANTI_REVOKE_PHASE_4_ALERT_COOLDOWN_MS: parseInt(
+    process.env.ANTI_REVOKE_PHASE_4_ALERT_COOLDOWN_MS || `${10 * 60 * 1000}`, 10
+  ),
 };
 
 if (!telegramConfig.apiId || !telegramConfig.apiHash) {

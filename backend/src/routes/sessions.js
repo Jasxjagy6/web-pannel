@@ -42,6 +42,12 @@ router.post('/:id/login', sessionController.loginSession);
 // POST /api/sessions/:id/logout - Logout session
 router.post('/:id/logout', sessionController.logoutSession);
 
+// POST /api/sessions/:id/recover - Anti-revoke Phase 4: re-import a
+// session that was marked status='revoked' (re-loads the encrypted
+// session file or its newest backup, runs getMe, flips the row back
+// to active if the auth key is still good).
+router.post('/:id/recover', sessionController.recoverSession);
+
 // GET /api/sessions/:id/status - Check status
 router.get('/:id/status', sessionController.checkSessionStatus);
 

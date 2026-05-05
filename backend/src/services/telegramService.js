@@ -3112,6 +3112,212 @@ class TelegramService {
       return { checked: false };
     }
   }
+
+  // ====================================================================
+  //  Anti-revoke Phase 4 — confirmed-authorization + accountTTL helpers
+  // ====================================================================
+
+  /**
+   * Mark the current authorization as "confirmed" so it survives the
+   * 24h unconfirmed-session window. Real Telegram clients implicitly do
+   * this via the official "Yes, this is me" UI; userbots and string
+   * sessions never get the prompt and stay in the unconfirmed bucket
+   * forever — which is what makes them vulnerable to "Terminate other
+   * sessions" wipes from the user's phone.
+   *
+   * `account.ChangeAuthorizationSettings({ hash: 0, confirmed: true })`
+   * has been a no-op-on-already-confirmed since MTProto layer 162. Safe
+   * to call repeatedly. Telegram returns BoolTrue / BoolFalse — we
+   * treat anything non-throwing as success.
+   *
+   * @param {string|number} sessionId
+   * @returns {Promise<{confirmed:boolean, error?:string}>}
+   */
+  async confirmCurrentAuthorization(sessionId) {
+    const sid = String(sessionId);
+    const entry = this.clients.get(sid);
+    if (!entry || !entry.client) {
+      return { confirmed: false, error: 'no client' };
+    }
+    if (!Api || !Api.account || !Api.account.ChangeAuthorizationSettings) {
+      // Older GramJS: skip silently. The whole feature is best-effort
+      // anti-revoke insurance, not load-bearing.
+      return { confirmed: false, error: 'method missing' };
+    }
+    try {
+      // hash=0 selects the current authorization (the one we're calling
+      // through). encryptedRequestsDisabled=true also blocks
+      // PEER-to-PEER call invitations from random users (a known nuisance
+      // vector for userbot accounts). callRequestsDisabled=true blocks
+      // VOIP call requests for the same reason — neither flag affects
+      // outbound RPCs we initiate ourselves.
+      await entry.client.invoke(
+        new Api.account.ChangeAuthorizationSettings({
+          hash: 0n,
+          confirmed: true,
+          encryptedRequestsDisabled: true,
+          callRequestsDisabled: true,
+        })
+      );
+      try {
+        const { pool } = require('../config/database');
+        await pool.query(
+          `INSERT INTO tg_session_health (session_id, confirmed_at, updated_at)
+           VALUES ($1, NOW(), NOW())
+           ON CONFLICT (session_id) DO UPDATE SET
+             confirmed_at = NOW(),
+             updated_at = NOW()`,
+          [sid]
+        ).catch(() => {});
+      } catch { /* tg_session_health may be missing in dev */ }
+      return { confirmed: true };
+    } catch (err) {
+      if (this.isPermanentAuthError(err)) throw err;
+      logger.debug(`confirmCurrentAuthorization failed for ${sid}: ${err.message}`);
+      return { confirmed: false, error: err.message };
+    }
+  }
+
+  /**
+   * Idempotently push the account's auto-delete TTL out to its maximum
+   * (730 days). Without this, a Telegram account that goes idle for the
+   * default 6 months gets nuked along with all its sessions — including
+   * the panel's. Real clients call this via the Privacy & Security UI.
+   *
+   * Uses tg_session_health.account_ttl_set_at to skip the call if it's
+   * already been made within ANTI_REVOKE_PHASE_4_RESET_ACCOUNT_TTL_INTERVAL_MS.
+   *
+   * @param {string|number} sessionId
+   * @param {object}        [opts]
+   * @param {boolean}       [opts.force=false] - bypass the cadence check
+   * @returns {Promise<{set:boolean, days:number, error?:string}>}
+   */
+  async maximizeAccountTTL(sessionId, opts = {}) {
+    const sid = String(sessionId);
+    const cfg = require('../config/telegram');
+    const days = Math.max(30, Math.min(730, cfg.ANTI_REVOKE_PHASE_4_ACCOUNT_TTL_DAYS || 730));
+    const entry = this.clients.get(sid);
+    if (!entry || !entry.client) {
+      return { set: false, days, error: 'no client' };
+    }
+    if (!Api || !Api.account || !Api.account.SetAccountTTL || !Api.AccountDaysTTL) {
+      return { set: false, days, error: 'method missing' };
+    }
+    if (!opts.force) {
+      try {
+        const { pool } = require('../config/database');
+        const r = await pool.query(
+          `SELECT account_ttl_set_at FROM tg_session_health WHERE session_id = $1`,
+          [sid]
+        );
+        const last = r.rows[0] && r.rows[0].account_ttl_set_at;
+        const cadence = cfg.ANTI_REVOKE_PHASE_4_RESET_ACCOUNT_TTL_INTERVAL_MS;
+        if (last && Date.now() - new Date(last).getTime() < cadence) {
+          return { set: false, days, error: 'not due' };
+        }
+      } catch { /* tg_session_health may be missing in dev */ }
+    }
+    try {
+      await entry.client.invoke(
+        new Api.account.SetAccountTTL({
+          ttl: new Api.AccountDaysTTL({ days }),
+        })
+      );
+      try {
+        const { pool } = require('../config/database');
+        await pool.query(
+          `INSERT INTO tg_session_health (session_id, account_ttl_set_at, updated_at)
+           VALUES ($1, NOW(), NOW())
+           ON CONFLICT (session_id) DO UPDATE SET
+             account_ttl_set_at = NOW(),
+             updated_at = NOW()`,
+          [sid]
+        ).catch(() => {});
+      } catch { /* tg_session_health may be missing in dev */ }
+      return { set: true, days };
+    } catch (err) {
+      if (this.isPermanentAuthError(err)) throw err;
+      logger.debug(`maximizeAccountTTL failed for ${sid}: ${err.message}`);
+      return { set: false, days, error: err.message };
+    }
+  }
+
+  /**
+   * Drive both Phase-4 hardenings on a freshly-connected client so
+   * loginSession / verify / password don't have to know the protocol
+   * details. Best-effort: any failure is logged but never thrown to the
+   * caller — we don't want a single Telegram-side flake to block a
+   * successful login from being persisted.
+   *
+   * @param {string|number} sessionId
+   * @returns {Promise<{confirmed:boolean, ttlDays:number}>}
+   */
+  async hardenSessionAgainstRevocation(sessionId) {
+    const sid = String(sessionId);
+    const cfg = require('../config/telegram');
+    if (!cfg.ANTI_REVOKE_PHASE_4_ENABLED) {
+      return { confirmed: false, ttlDays: 0 };
+    }
+    let confirmed = false;
+    let ttlDays = 0;
+    try {
+      const r = await this.confirmCurrentAuthorization(sid);
+      confirmed = !!r.confirmed;
+    } catch (err) {
+      if (this.isPermanentAuthError(err)) throw err;
+      logger.debug(`hardenSessionAgainstRevocation: confirm failed for ${sid}: ${err.message}`);
+    }
+    try {
+      const r = await this.maximizeAccountTTL(sid, { force: true });
+      if (r.set) ttlDays = r.days;
+    } catch (err) {
+      if (this.isPermanentAuthError(err)) throw err;
+      logger.debug(`hardenSessionAgainstRevocation: ttl failed for ${sid}: ${err.message}`);
+    }
+    return { confirmed, ttlDays };
+  }
+
+  /**
+   * Heartbeat-side variant of hardenSessionAgainstRevocation: only
+   * issues the protocol calls when their tg_session_health bookkeeping
+   * timestamps have aged past the configured intervals. Cheap, safe to
+   * call on every heartbeat tick.
+   *
+   * @param {string|number} sessionId
+   */
+  async reaffirmHardeningIfDue(sessionId) {
+    const sid = String(sessionId);
+    const cfg = require('../config/telegram');
+    if (!cfg.ANTI_REVOKE_PHASE_4_ENABLED) return { reaffirmed: false };
+    let reaffirmed = false;
+    try {
+      const { pool } = require('../config/database');
+      const r = await pool.query(
+        `SELECT confirmed_at, account_ttl_set_at FROM tg_session_health WHERE session_id = $1`,
+        [sid]
+      );
+      const row = r.rows[0] || {};
+      const now = Date.now();
+      const confirmAge = row.confirmed_at
+        ? now - new Date(row.confirmed_at).getTime()
+        : Number.POSITIVE_INFINITY;
+      if (confirmAge >= cfg.ANTI_REVOKE_PHASE_4_RECONFIRM_INTERVAL_MS) {
+        const c = await this.confirmCurrentAuthorization(sid).catch(() => ({ confirmed: false }));
+        if (c.confirmed) reaffirmed = true;
+      }
+      const ttlAge = row.account_ttl_set_at
+        ? now - new Date(row.account_ttl_set_at).getTime()
+        : Number.POSITIVE_INFINITY;
+      if (ttlAge >= cfg.ANTI_REVOKE_PHASE_4_RESET_ACCOUNT_TTL_INTERVAL_MS) {
+        const t = await this.maximizeAccountTTL(sid, { force: true }).catch(() => ({ set: false }));
+        if (t.set) reaffirmed = true;
+      }
+    } catch (err) {
+      if (this.isPermanentAuthError(err)) throw err;
+      logger.debug(`reaffirmHardeningIfDue failed for ${sid}: ${err.message}`);
+    }
+    return { reaffirmed };
+  }
 }
 
 /**

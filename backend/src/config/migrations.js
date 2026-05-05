@@ -51,6 +51,7 @@ const MIGRATION_ORDER = [
   'migration_v14_user_proxies.sql',
   'migration_v15_deployments.sql',
   'migration_v16_session_fk_cascade.sql',
+  'migration_v17_tg_anti_revoke_phase4.sql',
 ];
 
 function listMigrationFiles() {
