@@ -170,13 +170,27 @@ export function createTgClientStore() {
       if (!pending) return;
       const next = new Map(get().pendingOutgoing);
       next.delete(clientMsgId);
-      // Append the finalised message; the optimistic version will be
-      // filtered out by id-equality on the next selector run.
       const k = peerKey(pending.peerType, pending.peerId);
       const nextMessages = new Map(get().messagesByPeer);
       const existing = nextMessages.get(k) || [];
-      const filtered = existing.filter((m) => m.clientMsgId !== clientMsgId);
-      nextMessages.set(k, [...filtered, finalMessage]);
+
+      // Drop the optimistic row by clientMsgId.
+      let filtered = existing.filter((m) => m.clientMsgId !== clientMsgId);
+
+      // The Socket.IO broadcast (`tg-client:newMessage`) and the HTTP
+      // response race each other — both originate from the same backend
+      // sendMessage call. If the socket event won the race the final
+      // row is already in the store, keyed by `message.id`. In that
+      // case we MUST NOT append again or the chat pane shows the same
+      // bubble twice.
+      const alreadyHasFinal =
+        finalMessage &&
+        finalMessage.id != null &&
+        filtered.some((m) => m.id === finalMessage.id);
+      if (!alreadyHasFinal) {
+        filtered = [...filtered, finalMessage];
+      }
+      nextMessages.set(k, filtered);
 
       // Bump this dialog's preview locally so the left-rail row updates
       // before the round-tripped Socket.IO `tg-client:dialogUpdate`
