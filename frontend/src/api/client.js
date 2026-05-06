@@ -101,13 +101,26 @@ function isPanelAuthFailure(error) {
 // (raised by the per-user Telegram credentials gate) and dispatch a
 // global event so any mounted MissingApiCredsModal can pop up,
 // regardless of which page made the request.
+// Pages that are reachable without a valid panel JWT. The auth-failure
+// branch below leaves visitors here alone — otherwise a stale token in
+// localStorage would force a full-page redirect to /login the moment
+// AuthContext fires its boot-time getProfile() call, kicking the user
+// off the public landing / register pages.
+const PUBLIC_PATHS = new Set(['/', '/landing', '/login', '/register']);
+
 api.interceptors.response.use(
   (response) => response,
   (error) => {
-    if (isPanelAuthFailure(error) && window.location.pathname !== '/login') {
+    if (isPanelAuthFailure(error) && !PUBLIC_PATHS.has(window.location.pathname)) {
       localStorage.removeItem('token');
       localStorage.removeItem('user');
       window.location.href = '/login';
+    } else if (isPanelAuthFailure(error) && PUBLIC_PATHS.has(window.location.pathname)) {
+      // Still clear the now-known-bad credentials so the user appears
+      // unauthenticated to React Router (which is what the public
+      // pages assume), but don't navigate away from the public page.
+      localStorage.removeItem('token');
+      localStorage.removeItem('user');
     }
     if (error?.response?.status === 412) {
       const code = error.response?.data?.error?.code || error.response?.data?.code;
