@@ -106,4 +106,12 @@ router.post(
 );
 router.delete('/sessions/:id/profile/me/photo', controller.deleteSelfPhoto);
 
+// --- Peer profile (D6) ---------------------------------------------------
+// 'me' is matched above, so :peerType won't capture it as long as we
+// keep the more-specific routes first.
+router.get('/sessions/:id/profile/:peerType/:peerId', controller.getPeerProfile);
+router.patch('/sessions/:id/profile/:peerType/:peerId/block', controller.setPeerBlocked);
+router.patch('/sessions/:id/profile/:peerType/:peerId/mute', controller.setPeerMuted);
+router.get('/sessions/:id/profile/user/:peerId/common-chats', controller.getCommonChats);
+
 module.exports = router;

@@ -16,6 +16,7 @@ import {
   forwardClientMessages,
 } from '../../api/telegramClient';
 import ForwardDialog from './ForwardDialog';
+import PeerProfileDrawer from './PeerProfileDrawer';
 
 function _shouldShowSenderHeader(prev, current) {
   if (!current || current.out) return false;
@@ -73,6 +74,7 @@ export default function ChatPane({ sessionId, store, onTitleChange }) {
 
   const [forwardingMessage, setForwardingMessage] = React.useState(null);
   const [actionError, setActionError] = React.useState(null);
+  const [peerProfileOpen, setPeerProfileOpen] = React.useState(false);
 
   const scrollerRef = useRef(null);
   const lastLoadedKey = useRef(null);
@@ -398,7 +400,12 @@ export default function ChatPane({ sessionId, store, onTitleChange }) {
 
   return (
     <div className="flex h-full flex-1 flex-col bg-dark-950">
-      <div className="flex items-center gap-3 border-b border-white/5 bg-dark-900 px-4 py-3">
+      <button
+        type="button"
+        onClick={() => setPeerProfileOpen(true)}
+        className="flex w-full items-center gap-3 border-b border-white/5 bg-dark-900 px-4 py-3 text-left hover:bg-white/5"
+        title="View profile"
+      >
         <Avatar
           sessionId={sessionId}
           peerType={dialog.peerType}
@@ -420,7 +427,7 @@ export default function ChatPane({ sessionId, store, onTitleChange }) {
                 : 'Group')}
           </div>
         </div>
-      </div>
+      </button>
 
       <div ref={scrollerRef} className="flex-1 overflow-y-auto px-3 py-3">
         {loadingMessages && messages.length === 0 ? (
@@ -509,6 +516,14 @@ export default function ChatPane({ sessionId, store, onTitleChange }) {
           onSelect={performForward}
         />
       )}
+
+      <PeerProfileDrawer
+        sessionId={sessionId}
+        peerType={dialog.peerType}
+        peerId={dialog.peerId}
+        isOpen={peerProfileOpen}
+        onClose={() => setPeerProfileOpen(false)}
+      />
     </div>
   );
 }

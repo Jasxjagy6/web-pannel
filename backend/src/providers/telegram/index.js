@@ -146,6 +146,8 @@ const capabilities = {
   tgc_message_actions:    true,
   // D5 — self profile (view + edit name / bio / username / photo).
   tgc_self_profile:       true,
+  // D6 — peer profile (other user / chat / channel) + mute / block.
+  tgc_peer_profile:       true,
 };
 
 // ---------------------------------------------------------------------------

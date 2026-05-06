@@ -260,3 +260,22 @@ export const updateSelfPhoto = (sessionId, file) => {
 
 export const deleteSelfPhoto = (sessionId) =>
   api.delete(`${BASE}/sessions/${sessionId}/profile/me/photo`);
+
+// --- D6 — peer profile ----------------------------------------------------
+
+export const getPeerProfile = (sessionId, peerType, peerId) =>
+  api.get(`${BASE}/sessions/${sessionId}/profile/${peerType}/${peerId}`);
+
+export const setPeerBlocked = (sessionId, peerType, peerId, blocked) =>
+  api.patch(`${BASE}/sessions/${sessionId}/profile/${peerType}/${peerId}/block`, { blocked });
+
+export const setPeerMuted = (sessionId, peerType, peerId, muted, muteUntilSec) =>
+  api.patch(`${BASE}/sessions/${sessionId}/profile/${peerType}/${peerId}/mute`, {
+    muted,
+    muteUntilSec,
+  });
+
+export const getCommonChats = (sessionId, peerId, opts = {}) =>
+  api.get(`${BASE}/sessions/${sessionId}/profile/user/${peerId}/common-chats`, {
+    params: { limit: opts.limit ?? 100 },
+  });

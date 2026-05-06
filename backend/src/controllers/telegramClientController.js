@@ -528,6 +528,65 @@ const telegramClientController = {
       .catch(() => {});
     res.json({ success: true, data });
   }),
+
+  // ---------------------------------------------------------------------
+  // D6 — Peer profile (other user / chat / channel)
+  // ---------------------------------------------------------------------
+
+  /**
+   * GET /sessions/:id/profile/:peerType/:peerId
+   */
+  getPeerProfile: asyncHandler(async (req, res) => {
+    const { peerType, peerId } = req.params;
+    const data = await tcService.getPeerProfile(req.params.id, req.user.id, peerType, peerId);
+    res.json({ success: true, data });
+  }),
+
+  /**
+   * PATCH /sessions/:id/profile/:peerType/:peerId/block
+   * Body: { blocked: boolean }
+   */
+  setPeerBlocked: asyncHandler(async (req, res) => {
+    const { peerType, peerId } = req.params;
+    const blocked = req.body?.blocked === true;
+    const data = await tcService.setPeerBlocked(req.params.id, req.user.id, peerType, peerId, blocked);
+    await reportService
+      .logActivity(req.user.id, blocked ? 'tg_client_block_peer' : 'tg_client_unblock_peer', 'session', req.params.id, {
+        platform: 'telegram', peerType, peerId,
+      })
+      .catch(() => {});
+    res.json({ success: true, data });
+  }),
+
+  /**
+   * PATCH /sessions/:id/profile/:peerType/:peerId/mute
+   * Body: { muted: boolean, muteUntilSec?: number }
+   */
+  setPeerMuted: asyncHandler(async (req, res) => {
+    const { peerType, peerId } = req.params;
+    const muted = req.body?.muted === true;
+    const muteUntilSec = req.body?.muteUntilSec;
+    const data = await tcService.setPeerMuted(req.params.id, req.user.id, peerType, peerId, muted, muteUntilSec);
+    await reportService
+      .logActivity(req.user.id, muted ? 'tg_client_mute_peer' : 'tg_client_unmute_peer', 'session', req.params.id, {
+        platform: 'telegram', peerType, peerId,
+      })
+      .catch(() => {});
+    res.json({ success: true, data });
+  }),
+
+  /**
+   * GET /sessions/:id/profile/user/:peerId/common-chats?limit=100
+   */
+  getCommonChats: asyncHandler(async (req, res) => {
+    const data = await tcService.getCommonChats(
+      req.params.id,
+      req.user.id,
+      req.params.peerId,
+      { limit: parseInt(req.query?.limit, 10) || 100 },
+    );
+    res.json({ success: true, data });
+  }),
 };
 
 module.exports = telegramClientController;

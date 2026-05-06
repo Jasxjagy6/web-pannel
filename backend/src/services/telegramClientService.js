@@ -1609,6 +1609,288 @@ class TelegramClientService {
     _broadcastProfileChanged(userId, sessionId, profile);
     return profile;
   }
+
+  /**
+   * D6 — Profile of another user / chat / channel.
+   *
+   * Returns a normalized object covering the three peer kinds, so the
+   * UI can render one drawer regardless of what the user clicked on.
+   * Includes notification + block status (account.getNotifySettings,
+   * contacts.getBlocked) when the underlying call is supported, since
+   * the D6 spec requires "is muted / is blocked" pills next to the bio.
+   */
+  async getPeerProfile(sessionId, userId, peerType, peerId) {
+    if (!['user', 'chat', 'channel'].includes(peerType)) {
+      throw new AppError('Invalid peer type', 400, 'INVALID_PEER_TYPE');
+    }
+    await _loadAndAuthSession(sessionId, userId);
+    await tgService._ensureConnected(sessionId);
+    const entry = tgService.clients.get(String(sessionId));
+    if (!entry) throw new AppError('Session client not loaded', 500, 'CLIENT_NOT_LOADED');
+
+    const peerIdNum = _toIdNum(peerId);
+    if (peerIdNum == null) {
+      throw new AppError('Invalid peer id', 400, 'INVALID_PEER_ID');
+    }
+
+    let entity;
+    try {
+      entity = await entry.client.getEntity(_buildPeerInput(peerType, peerIdNum));
+    } catch (err) {
+      throw new AppError(`getEntity failed: ${err.message}`, 502, 'GETENTITY_FAILED');
+    }
+    if (!entity) throw new AppError('Peer not found', 404, 'PEER_NOT_FOUND');
+
+    const out = {
+      peerType,
+      id: peerIdNum,
+      title: '',
+      firstName: '',
+      lastName: '',
+      username: null,
+      usernames: [],
+      phone: null,
+      bio: '',
+      photoId: null,
+      hasPhoto: false,
+      participantsCount: null,
+      isContact: false,
+      isMutualContact: false,
+      isBlocked: false,
+      isMuted: false,
+      isVerified: false,
+      isScam: false,
+      isFake: false,
+      isPremium: false,
+      isBot: false,
+      isBroadcast: false,
+      isMegagroup: false,
+      isGigagroup: false,
+      isCreator: false,
+      isAdmin: false,
+      isLeft: false,
+      isJoinToSend: false,
+      isPublic: false,
+      isVerifiedBot: false,
+      botInfo: null,
+      commonChatsCount: 0,
+      langCode: null,
+    };
+
+    if (peerType === 'user') {
+      out.firstName = entity.firstName || '';
+      out.lastName = entity.lastName || '';
+      out.title = [entity.firstName, entity.lastName].filter(Boolean).join(' ').trim();
+      out.username = entity.username || null;
+      out.usernames = Array.isArray(entity.usernames) ? entity.usernames.map((u) => ({
+        username: u.username, active: !!u.active, editable: !!u.editable,
+      })) : [];
+      out.phone = entity.phone || null;
+      out.isBot = !!entity.bot;
+      out.isVerified = !!entity.verified;
+      out.isScam = !!entity.scam;
+      out.isFake = !!entity.fake;
+      out.isPremium = !!entity.premium;
+      out.isContact = !!entity.contact;
+      out.isMutualContact = !!entity.mutualContact;
+      out.langCode = entity.langCode || null;
+      out.hasPhoto = !!(entity.photo && (entity.photo.photoId || entity.photo.photoSmall));
+      out.photoId = entity.photo?.photoId ? String(entity.photo.photoId) : null;
+
+      try {
+        const full = await entry.client.invoke(new Api.users.GetFullUser({ id: _buildPeerInput('user', peerIdNum) }));
+        const fu = full?.fullUser;
+        if (fu) {
+          out.bio = fu.about || '';
+          out.commonChatsCount = fu.commonChatsCount || 0;
+          out.isBlocked = !!fu.blocked;
+          if (fu.notifySettings && fu.notifySettings.muteUntil) {
+            out.isMuted = Number(fu.notifySettings.muteUntil) * 1000 > Date.now();
+          }
+          if (fu.botInfo) {
+            out.botInfo = {
+              description: fu.botInfo.description || '',
+              commands: Array.isArray(fu.botInfo.commands)
+                ? fu.botInfo.commands.map((c) => ({
+                    command: c.command,
+                    description: c.description,
+                  }))
+                : [],
+            };
+          }
+        }
+      } catch (err) {
+        logger.debug(`tg-client GetFullUser failed for ${peerIdNum}: ${err.message}`);
+      }
+    } else if (peerType === 'chat') {
+      out.title = entity.title || '';
+      out.participantsCount = entity.participantsCount || 0;
+      out.isCreator = !!entity.creator;
+      out.isLeft = !!entity.left;
+      out.hasPhoto = !!(entity.photo && (entity.photo.photoId || entity.photo.photoSmall));
+      out.photoId = entity.photo?.photoId ? String(entity.photo.photoId) : null;
+      try {
+        const full = await entry.client.invoke(new Api.messages.GetFullChat({ chatId: peerIdNum }));
+        const fc = full?.fullChat;
+        if (fc) {
+          out.bio = fc.about || '';
+          out.participantsCount = (fc.participants?.participants?.length) || out.participantsCount;
+          if (fc.notifySettings && fc.notifySettings.muteUntil) {
+            out.isMuted = Number(fc.notifySettings.muteUntil) * 1000 > Date.now();
+          }
+        }
+      } catch (err) {
+        logger.debug(`tg-client GetFullChat failed for ${peerIdNum}: ${err.message}`);
+      }
+    } else if (peerType === 'channel') {
+      out.title = entity.title || '';
+      out.username = entity.username || null;
+      out.usernames = Array.isArray(entity.usernames) ? entity.usernames.map((u) => ({
+        username: u.username, active: !!u.active, editable: !!u.editable,
+      })) : [];
+      out.isBroadcast = !!entity.broadcast;
+      out.isMegagroup = !!entity.megagroup;
+      out.isGigagroup = !!entity.gigagroup;
+      out.isCreator = !!entity.creator;
+      out.isVerified = !!entity.verified;
+      out.isScam = !!entity.scam;
+      out.isFake = !!entity.fake;
+      out.isLeft = !!entity.left;
+      out.isJoinToSend = !!entity.joinToSend;
+      out.isPublic = !!entity.username || (Array.isArray(entity.usernames) && entity.usernames.some((u) => u.active));
+      out.participantsCount = entity.participantsCount || 0;
+      out.hasPhoto = !!(entity.photo && (entity.photo.photoId || entity.photo.photoSmall));
+      out.photoId = entity.photo?.photoId ? String(entity.photo.photoId) : null;
+      try {
+        const full = await entry.client.invoke(new Api.channels.GetFullChannel({ channel: _buildPeerInput('channel', peerIdNum) }));
+        const fc = full?.fullChat;
+        if (fc) {
+          out.bio = fc.about || '';
+          out.participantsCount = fc.participantsCount || out.participantsCount;
+          out.linkedChatId = fc.linkedChatId ? _toIdNum(fc.linkedChatId) : null;
+          out.canViewParticipants = !!fc.canViewParticipants;
+          out.canSetUsername = !!fc.canSetUsername;
+          out.canSetStickers = !!fc.canSetStickers;
+          out.slowmodeSeconds = fc.slowmodeSeconds || 0;
+          if (fc.notifySettings && fc.notifySettings.muteUntil) {
+            out.isMuted = Number(fc.notifySettings.muteUntil) * 1000 > Date.now();
+          }
+        }
+      } catch (err) {
+        logger.debug(`tg-client GetFullChannel failed for ${peerIdNum}: ${err.message}`);
+      }
+    }
+
+    return out;
+  }
+
+  /**
+   * D6 — Block / unblock a user. The Telegram block list is a flat
+   * scalar, so we expose a single setter that takes a boolean.
+   */
+  async setPeerBlocked(sessionId, userId, peerType, peerId, blocked) {
+    if (peerType !== 'user') {
+      throw new AppError('Only users can be blocked', 400, 'INVALID_PEER_TYPE');
+    }
+    await _loadAndAuthSession(sessionId, userId);
+    await tgService._ensureConnected(sessionId);
+    const entry = tgService.clients.get(String(sessionId));
+    if (!entry) throw new AppError('Session client not loaded', 500, 'CLIENT_NOT_LOADED');
+
+    const peerIdNum = _toIdNum(peerId);
+    const id = _buildPeerInput('user', peerIdNum);
+    try {
+      if (blocked) {
+        await entry.client.invoke(new Api.contacts.Block({ id }));
+      } else {
+        await entry.client.invoke(new Api.contacts.Unblock({ id }));
+      }
+    } catch (err) {
+      throw new AppError(`block/unblock failed: ${err.message}`, 502, 'BLOCK_FAILED');
+    }
+    const profile = await this.getPeerProfile(sessionId, userId, peerType, peerIdNum);
+    _broadcastPeerProfileChanged(userId, sessionId, peerType, peerIdNum, profile);
+    return profile;
+  }
+
+  /**
+   * D6 — Mute / unmute a peer (account.updateNotifySettings).
+   * `muteUntil` is in seconds; 0 = unmute, 0x7fffffff = mute forever.
+   */
+  async setPeerMuted(sessionId, userId, peerType, peerId, muted, muteUntilSec) {
+    await _loadAndAuthSession(sessionId, userId);
+    await tgService._ensureConnected(sessionId);
+    const entry = tgService.clients.get(String(sessionId));
+    if (!entry) throw new AppError('Session client not loaded', 500, 'CLIENT_NOT_LOADED');
+
+    const peerIdNum = _toIdNum(peerId);
+    const peerInput = _buildPeerInput(peerType, peerIdNum);
+    let muteUntil = 0;
+    if (muted) {
+      muteUntil = Number.isFinite(Number(muteUntilSec)) && Number(muteUntilSec) > 0
+        ? Math.floor(Number(muteUntilSec))
+        : 0x7fffffff;
+    }
+    try {
+      await entry.client.invoke(new Api.account.UpdateNotifySettings({
+        peer: new Api.InputNotifyPeer({ peer: peerInput }),
+        settings: new Api.InputPeerNotifySettings({
+          muteUntil,
+        }),
+      }));
+    } catch (err) {
+      throw new AppError(`updateNotifySettings failed: ${err.message}`, 502, 'MUTE_FAILED');
+    }
+    const profile = await this.getPeerProfile(sessionId, userId, peerType, peerIdNum);
+    _broadcastPeerProfileChanged(userId, sessionId, peerType, peerIdNum, profile);
+    return profile;
+  }
+
+  /**
+   * D6 — Common chats with this user (getCommonChats). Returns up to
+   * 100 entries (Telegram's hard cap is 100 per page).
+   */
+  async getCommonChats(sessionId, userId, peerId, { limit = 100 } = {}) {
+    await _loadAndAuthSession(sessionId, userId);
+    await tgService._ensureConnected(sessionId);
+    const entry = tgService.clients.get(String(sessionId));
+    if (!entry) throw new AppError('Session client not loaded', 500, 'CLIENT_NOT_LOADED');
+
+    const peerIdNum = _toIdNum(peerId);
+    let res;
+    try {
+      res = await entry.client.invoke(new Api.messages.GetCommonChats({
+        userId: _buildPeerInput('user', peerIdNum),
+        maxId: 0,
+        limit: Math.max(1, Math.min(Number(limit) || 100, 100)),
+      }));
+    } catch (err) {
+      throw new AppError(`getCommonChats failed: ${err.message}`, 502, 'COMMON_CHATS_FAILED');
+    }
+    const ownId = _toIdNum((await entry.client.getMe().catch(() => null))?.id);
+    const chats = Array.isArray(res?.chats) ? res.chats.map((c) => _normalizeEntity(c, ownId)).filter(Boolean) : [];
+    return { chats };
+  }
+}
+
+/**
+ * Broadcast a peer profile mutation (block / mute) so other windows
+ * sharing this session refresh their open drawer.
+ */
+function _broadcastPeerProfileChanged(userId, sessionId, peerType, peerId, profile) {
+  try {
+    const io = global.io;
+    if (!io) return;
+    io.to(`tg-client:u${userId}:s${sessionId}`).emit('tg-client:profileChanged', {
+      sessionId: String(sessionId),
+      kind: 'peer',
+      peerType,
+      peerId,
+      profile: { ...profile, peerType },
+    });
+  } catch (err) {
+    logger.debug(`tg-client peer profile broadcast failed: ${err.message}`);
+  }
 }
 
 /**
