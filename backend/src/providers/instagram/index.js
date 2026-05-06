@@ -104,6 +104,7 @@ const capabilities = {
 
   // Phase 2 in-panel Telegram client features — all Telegram-only.
   tgc_send_media:         false,
+  tgc_view_media:         false,
 };
 
 // Lazy module loaders — keeps the IG runtime out of the cold-start path.

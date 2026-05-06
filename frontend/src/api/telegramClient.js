@@ -65,18 +65,48 @@ export const fetchProfilePhotoBlob = async (sessionId, peerType, peerId, opts = 
   return data;
 };
 
-export const fetchMessageMediaBlob = async (sessionId, peerType, peerId, messageId) => {
-  const { data, status } = await api.get(
+export const fetchMessageMediaBlob = async (sessionId, peerType, peerId, messageId, opts = {}) => {
+  const { data, status, headers } = await api.get(
     `${BASE}/sessions/${sessionId}/dialogs/${peerType}/${peerId}/messages/${messageId}/media`,
     {
       responseType: 'blob',
+      params: {
+        ...(opts.thumb ? { thumb: 1 } : {}),
+        ...(opts.download ? { download: 1 } : {}),
+      },
       validateStatus: (s) => (s >= 200 && s < 300) || s === 204,
     }
   );
   if (status === 204 || !data || (data.size != null && data.size === 0)) {
     return null;
   }
-  return data;
+  return {
+    blob: data,
+    kind: headers?.['x-tg-media-kind'] || null,
+    width: headers?.['x-tg-media-width'] ? Number(headers['x-tg-media-width']) : null,
+    height: headers?.['x-tg-media-height'] ? Number(headers['x-tg-media-height']) : null,
+    duration: headers?.['x-tg-media-duration'] ? Number(headers['x-tg-media-duration']) : null,
+    isThumb: headers?.['x-tg-media-is-thumb'] === '1',
+    mimeType: data.type || 'application/octet-stream',
+  };
+};
+
+/**
+ * Direct URL for use as `<video src=...>`, `<audio src=...>`, or as
+ * a file download link. Uses the configured API_BASE_URL so it works
+ * when the panel is mounted on a non-root path. The browser will
+ * carry the panel JWT via the existing axios interceptor when used
+ * as part of a fetch — but `<video>` tags don't honor cookies the
+ * same way; for those, prefer building a blob URL via fetchMessageMediaBlob
+ * and assigning the resulting object URL.
+ */
+export const buildMessageMediaUrl = (sessionId, peerType, peerId, messageId, opts = {}) => {
+  const base = (import.meta.env.VITE_API_URL || '/api').replace(/\/$/, '');
+  const params = new URLSearchParams();
+  if (opts.thumb) params.set('thumb', '1');
+  if (opts.download) params.set('download', '1');
+  const qs = params.toString();
+  return `${base}${BASE}/sessions/${sessionId}/dialogs/${peerType}/${peerId}/messages/${messageId}/media${qs ? `?${qs}` : ''}`;
 };
 
 /**

@@ -281,8 +281,15 @@ const telegramClientController = {
   /**
    * GET /sessions/:id/dialogs/:peerType/:peerId/messages/:messageId/media
    *
-   * Streams photo/document attached to the message. 204 when there's no
-   * media or it couldn't be downloaded.
+   * Query params:
+   *   thumb=1     fetch the thumbnail-sized preview only (jpeg)
+   *   download=1  send Content-Disposition: attachment for "Save as"
+   *
+   * Honors HTTP Range so HTML5 <video>/<audio> can stream out of the
+   * cached buffer. 204 when there's no media or it couldn't be downloaded.
+   *
+   * Caches the buffer in the service-layer LRU so repeat Range hits and
+   * a "thumb then full" sequence don't re-download from Telegram.
    */
   getMessageMedia: asyncHandler(async (req, res) => {
     const { peerType, peerId } = _parsePeer(req);
@@ -290,22 +297,65 @@ const telegramClientController = {
     if (!Number.isFinite(messageId)) {
       throw new AppError('messageId must be an integer', 400, 'BAD_MESSAGE_ID');
     }
+    const wantThumb = req.query.thumb === '1' || req.query.thumb === 'true';
+    const wantDownload = req.query.download === '1' || req.query.download === 'true';
+
     const result = await tcService.downloadMessageMedia(
       req.params.id,
       req.user.id,
       peerType,
       peerId,
-      messageId
+      messageId,
+      { thumb: wantThumb }
     );
     if (!result) return res.status(204).end();
+
+    const buf = result.buffer;
+    const total = buf.length;
+    const etag = `W/"tgmedia-${result.docId || messageId}-${wantThumb ? 't' : 'f'}-${total}"`;
+    const ifNoneMatch = req.headers['if-none-match'];
+    if (ifNoneMatch && ifNoneMatch === etag) {
+      res.status(304).end();
+      return;
+    }
+
+    const filename = (result.fileName || 'media').replace(/"/g, '_');
+    const dispoType = wantDownload ? 'attachment' : 'inline';
+
+    // Telegram-side metadata for the player.
+    if (result.kind) res.setHeader('X-Tg-Media-Kind', result.kind);
+    if (result.width) res.setHeader('X-Tg-Media-Width', String(result.width));
+    if (result.height) res.setHeader('X-Tg-Media-Height', String(result.height));
+    if (result.duration) res.setHeader('X-Tg-Media-Duration', String(result.duration));
+    if (result.isThumb) res.setHeader('X-Tg-Media-Is-Thumb', '1');
+
     res.setHeader('Content-Type', result.mimeType || 'application/octet-stream');
-    res.setHeader(
-      'Content-Disposition',
-      `inline; filename="${(result.fileName || 'media').replace(/"/g, '_')}"`
-    );
+    res.setHeader('Content-Disposition', `${dispoType}; filename="${filename}"`);
     res.setHeader('Cache-Control', 'private, max-age=300');
+    res.setHeader('Accept-Ranges', 'bytes');
+    res.setHeader('ETag', etag);
     res.setHeader('X-No-Compression', '1');
-    return res.end(result.buffer);
+
+    const range = req.headers.range;
+    if (range && /^bytes=/.test(range)) {
+      const m = /bytes=(\d*)-(\d*)/.exec(range);
+      const start = m && m[1] ? parseInt(m[1], 10) : 0;
+      const end = m && m[2] ? parseInt(m[2], 10) : total - 1;
+      if (Number.isFinite(start) && Number.isFinite(end) && start >= 0 && end >= start && start < total) {
+        const clampedEnd = Math.min(end, total - 1);
+        res.status(206);
+        res.setHeader('Content-Range', `bytes ${start}-${clampedEnd}/${total}`);
+        res.setHeader('Content-Length', String(clampedEnd - start + 1));
+        return res.end(buf.slice(start, clampedEnd + 1));
+      }
+      // Out of range
+      res.status(416);
+      res.setHeader('Content-Range', `bytes */${total}`);
+      return res.end();
+    }
+
+    res.setHeader('Content-Length', String(total));
+    return res.end(buf);
   }),
 };
 

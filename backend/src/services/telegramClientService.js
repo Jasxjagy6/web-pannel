@@ -1009,14 +1009,30 @@ class TelegramClientService {
   }
 
   /**
-   * Download the media attached to a single message (best-effort —
-   * photos and small documents only). Returns `{ buffer, mimeType, fileName }`
-   * or null on miss.
+   * Download the media attached to a single message. Supports both the
+   * full-resolution download and a thumbnail preview so the UI can lazy
+   * load thumbs on scroll without paying for full-resolution fetches.
+   *
+   * Result is cached in-memory per (sessionId, peerType, peerId,
+   * messageId, thumb) for `MEDIA_CACHE_TTL_MS` so the controller can
+   * answer Range requests without re-downloading.
+   *
+   * @param {object} opts
+   * @param {boolean} [opts.thumb=false] - when true, only fetch the
+   *   smallest available thumbnail (PhotoStrippedSize / video preview).
+   * @returns {Promise<null|{buffer, mimeType, fileName, kind, width, height, duration, isThumb}>}
    */
-  async downloadMessageMedia(sessionId, userId, peerType, peerId, messageId) {
+  async downloadMessageMedia(sessionId, userId, peerType, peerId, messageId, opts = {}) {
     if (!PEER_TYPES.has(peerType)) {
       throw new AppError('Invalid peer type', 400, 'INVALID_PEER_TYPE');
     }
+    const thumb = opts.thumb === true;
+    const cacheKey = `${sessionId}:${peerType}:${peerId}:${messageId}:${thumb ? 1 : 0}`;
+    const cached = _MEDIA_CACHE.get(cacheKey);
+    if (cached && Date.now() - cached.t < MEDIA_CACHE_TTL_MS) {
+      return cached.v;
+    }
+
     await _loadAndAuthSession(sessionId, userId);
     await tgService._ensureConnected(sessionId);
     const entry = tgService.clients.get(String(sessionId));
@@ -1040,34 +1056,118 @@ class TelegramClientService {
     const msg = messages && messages[0];
     if (!msg || !msg.media) return null;
 
+    const meta = _extractMediaMeta(msg);
     let buf;
     try {
-      buf = await entry.client.downloadMedia(msg, {});
+      if (thumb) {
+        buf = await entry.client.downloadMedia(msg, { thumb: 0 });
+      } else {
+        buf = await entry.client.downloadMedia(msg, {});
+      }
     } catch (err) {
-      logger.warn(`downloadMedia failed for msg ${messageId}: ${err.message}`);
-      return null;
+      logger.warn(`downloadMedia failed for msg ${messageId} (thumb=${thumb}): ${err.message}`);
+      // Fallback: when full download fails for documents, try the thumb
+      // anyway so the UI still gets *something*.
+      if (!thumb) {
+        try { buf = await entry.client.downloadMedia(msg, { thumb: 0 }); } catch (_) { buf = null; }
+        if (buf) {
+          meta.isThumb = true;
+        } else {
+          return null;
+        }
+      } else {
+        return null;
+      }
     }
     if (!buf) return null;
 
-    let mimeType = 'application/octet-stream';
-    let fileName = `media-${messageId}`;
-    if (msg.media.className?.includes('Photo')) {
-      mimeType = 'image/jpeg';
-      fileName = `photo-${messageId}.jpg`;
-    } else if (msg.media.document) {
-      mimeType = msg.media.document.mimeType || mimeType;
-      const fnAttr = (msg.media.document.attributes || []).find(
-        (a) => a.className === 'DocumentAttributeFilename'
-      );
-      if (fnAttr && fnAttr.fileName) fileName = fnAttr.fileName;
-    }
-
-    return {
+    const value = {
       buffer: Buffer.isBuffer(buf) ? buf : Buffer.from(buf),
-      mimeType,
-      fileName,
+      mimeType: thumb ? 'image/jpeg' : meta.mimeType,
+      fileName: meta.fileName,
+      kind: meta.kind,
+      width: meta.width,
+      height: meta.height,
+      duration: meta.duration,
+      isThumb: thumb || meta.isThumb || false,
+      // Used by ETag generation in the controller.
+      docId: meta.docId,
     };
+    _MEDIA_CACHE.set(cacheKey, { t: Date.now(), v: value });
+    if (_MEDIA_CACHE.size > MEDIA_CACHE_MAX_ENTRIES) {
+      // Drop the oldest 25% of entries (insertion order = age in v8 maps).
+      const drop = Math.floor(MEDIA_CACHE_MAX_ENTRIES / 4);
+      let n = 0;
+      for (const k of _MEDIA_CACHE.keys()) {
+        _MEDIA_CACHE.delete(k);
+        n += 1;
+        if (n >= drop) break;
+      }
+    }
+    return value;
   }
+}
+
+const _MEDIA_CACHE = new Map();
+const MEDIA_CACHE_TTL_MS = 5 * 60 * 1000;
+const MEDIA_CACHE_MAX_ENTRIES = 256;
+
+function _extractMediaMeta(msg) {
+  const out = {
+    kind: 'document',
+    mimeType: 'application/octet-stream',
+    fileName: `media-${msg.id || 'msg'}`,
+    width: null,
+    height: null,
+    duration: null,
+    isThumb: false,
+    docId: null,
+  };
+  const m = msg.media;
+  if (!m) return out;
+  if (m.className?.includes('Photo') || (m.photo && !m.document)) {
+    out.kind = 'photo';
+    out.mimeType = 'image/jpeg';
+    out.fileName = `photo-${msg.id}.jpg`;
+    if (m.photo) {
+      out.docId = m.photo.id ? String(m.photo.id) : null;
+      const sizes = (m.photo.sizes || []).filter((s) => s.w && s.h);
+      const largest = sizes.sort((a, b) => (b.w * b.h) - (a.w * a.h))[0];
+      if (largest) {
+        out.width = largest.w;
+        out.height = largest.h;
+      }
+    }
+    return out;
+  }
+  if (m.document) {
+    const doc = m.document;
+    out.docId = doc.id ? String(doc.id) : null;
+    out.mimeType = doc.mimeType || out.mimeType;
+    const attrs = doc.attributes || [];
+    const fnAttr = attrs.find((a) => a.className === 'DocumentAttributeFilename');
+    if (fnAttr?.fileName) out.fileName = fnAttr.fileName;
+    const videoAttr = attrs.find((a) => a.className === 'DocumentAttributeVideo');
+    const audioAttr = attrs.find((a) => a.className === 'DocumentAttributeAudio');
+    const stickerAttr = attrs.find((a) => a.className === 'DocumentAttributeSticker');
+    if (stickerAttr) {
+      out.kind = 'sticker';
+    } else if (audioAttr) {
+      out.kind = audioAttr.voice ? 'voice' : 'audio';
+      out.duration = audioAttr.duration || null;
+    } else if (videoAttr) {
+      out.kind = videoAttr.roundMessage ? 'videoNote' : 'video';
+      out.width = videoAttr.w || null;
+      out.height = videoAttr.h || null;
+      out.duration = videoAttr.duration || null;
+    } else if ((doc.mimeType || '').startsWith('image/')) {
+      out.kind = 'photo';
+    } else {
+      out.kind = 'document';
+    }
+    return out;
+  }
+  return out;
 }
 
 /**

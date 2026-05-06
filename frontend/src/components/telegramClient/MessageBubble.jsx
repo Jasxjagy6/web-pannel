@@ -1,6 +1,7 @@
 import React from 'react';
 import { Check, CheckCheck, AlertCircle } from 'lucide-react';
 import Avatar from './Avatar';
+import MediaInline from './MediaInline';
 
 function _time(iso) {
   if (!iso) return '';
@@ -8,6 +9,10 @@ function _time(iso) {
   if (Number.isNaN(d.getTime())) return '';
   return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
 }
+
+const RENDERABLE_INLINE_KINDS = new Set([
+  'photo', 'video', 'sticker', 'voice', 'audio', 'document',
+]);
 
 function _mediaLabel(kind) {
   if (!kind) return null;
@@ -90,13 +95,17 @@ export default function MessageBubble({
           } ${message.pending ? 'opacity-80' : ''}`}
         >
           {message.mediaKind && (
+            <MediaInline
+              sessionId={sessionId}
+              peerType={peerType}
+              peerId={peerId}
+              message={message}
+              out={out}
+            />
+          )}
+          {message.mediaKind && !RENDERABLE_INLINE_KINDS.has(message.mediaKind) && (
             <div className={`mb-1 text-xs ${out ? 'text-blue-100/80' : 'text-gray-400'}`}>
-              {message.mediaPreview?.label || _mediaLabel(message.mediaKind)}
-              {message.mediaPreview?.fileName && (
-                <span className={`ml-1 ${out ? 'text-blue-100/60' : 'text-gray-500'}`}>
-                  · {message.mediaPreview.fileName}
-                </span>
-              )}
+              {_mediaLabel(message.mediaKind)}
             </div>
           )}
           {typeof uploadProgress === 'number' && uploadProgress < 1 && (

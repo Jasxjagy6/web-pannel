@@ -140,6 +140,8 @@ const capabilities = {
   // ---------------------------------------------------------------------
   // D1 — send media (photo/video/file/voice/sticker).
   tgc_send_media:         true,
+  // D2 — view media inline (image/video/audio rendering + Range streaming).
+  tgc_view_media:         true,
 };
 
 // ---------------------------------------------------------------------------
