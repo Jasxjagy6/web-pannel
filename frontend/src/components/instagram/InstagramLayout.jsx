@@ -60,28 +60,23 @@ import { usePlatform, useCapabilities } from '../../context/PlatformContext';
 // `capability` (or the entry is platform-agnostic, capability=null).
 // `dock` flags the entries surfaced in the mobile bottom dock.
 //
-// `wip:true` items are kept in the sidebar so the layout matches the
-// Telegram panel, but the IG provider is not yet hardened for them.
-// Clicking such an item routes to /instagram/<path>, which the App.jsx
-// router redirects to the IG-themed WorkInProgress page.
-//
-// Currently working IG features: dashboard, sessions, create-session,
-// upload-session, scrape, admin (admin is rendered separately above).
+// All IG-side sidebar entries are now backed by IG-native pages
+// (PR #42 + the router wire-up in this PR). `wip` flags removed.
 const IG_NAV = [
   { path: 'dashboard',         label: 'Dashboard',     icon: LayoutDashboard, capability: null,                section: 'main',   dock: true,  wip: false },
   { path: 'sessions',          label: 'Accounts',      icon: Users,           capability: 'sessions_list',     section: 'main',   dock: true,  wip: false },
   { path: 'create-session',    label: 'Add account',   icon: UserPlus,        capability: 'sessions_create',   section: 'main',   dock: true,  wip: false },
   { path: 'upload-session',    label: 'Upload session',icon: Upload,          capability: 'sessions_create',   section: 'main',                 wip: false },
   { path: 'scrape',            label: 'Scraping',      icon: Search,          capability: 'scrape_any',        section: 'main',   dock: true,  wip: false },
-  { path: 'lists',             label: 'Saved lists',   icon: ListIcon,        capability: 'lists',             section: 'engage',               wip: true  },
-  { path: 'reports',           label: 'Reports',       icon: BarChart3,       capability: 'reports',           section: 'engage',               wip: true  },
-  { path: 'proxies',           label: 'Proxies',       icon: Network,         capability: 'proxies',           section: 'safety',               wip: true  },
-  { path: 'anti-detect',       label: 'Identity',      icon: Fingerprint,     capability: 'identity_device',   section: 'safety',               wip: true  },
-  { path: 'privacy',           label: 'Privacy',       icon: Shield,          capability: 'privacy_set',       section: 'safety',               wip: true  },
-  { path: 'change-2fa',        label: '2FA',           icon: ShieldCheck,     capability: 'twofa_change',      section: 'safety',               wip: true  },
-  { path: 'account-settings',  label: 'Account',       icon: UserCog,         capability: 'account_settings',  section: 'system',               wip: true  },
-  { path: 'billing',           label: 'Billing',       icon: CreditCard,      capability: null,                section: 'system',               wip: true  },
-  { path: 'settings',          label: 'Settings',      icon: SettingsIcon,    capability: null,                section: 'system',               wip: true  },
+  { path: 'lists',             label: 'Saved lists',   icon: ListIcon,        capability: 'lists',             section: 'engage',               wip: false },
+  { path: 'reports',           label: 'Reports',       icon: BarChart3,       capability: 'reports',           section: 'engage',               wip: false },
+  { path: 'proxies',           label: 'Proxies',       icon: Network,         capability: 'proxies',           section: 'safety',               wip: false },
+  { path: 'anti-detect',       label: 'Identity',      icon: Fingerprint,     capability: 'identity_device',   section: 'safety',               wip: false },
+  { path: 'privacy',           label: 'Privacy',       icon: Shield,          capability: 'privacy_set',       section: 'safety',               wip: false },
+  { path: 'change-2fa',        label: '2FA',           icon: ShieldCheck,     capability: 'twofa_change',      section: 'safety',               wip: false },
+  { path: 'account-settings',  label: 'Account',       icon: UserCog,         capability: 'account_settings',  section: 'system',               wip: false },
+  { path: 'billing',           label: 'Billing',       icon: CreditCard,      capability: null,                section: 'system',               wip: false },
+  { path: 'settings',          label: 'Settings',      icon: SettingsIcon,    capability: null,                section: 'system',               wip: false },
 ];
 
 const SECTION_LABELS = {

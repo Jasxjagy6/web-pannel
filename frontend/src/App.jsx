@@ -47,11 +47,21 @@ const InstagramSessions        = lazy(() => import('./pages/instagram/Sessions')
 const InstagramCreateSession   = lazy(() => import('./pages/instagram/CreateSession'));
 const InstagramUploadSession   = lazy(() => import('./pages/instagram/UploadSession'));
 const InstagramScrape          = lazy(() => import('./pages/instagram/Scrape'));
-// IG sections that aren't yet hardened all render the same
-// InstagramWorkInProgress page below — we keep their lazy imports
-// out of the bundle to avoid loading code that the IG sidebar can
-// no longer reach. The TG counterparts still ship in full.
+// IG-native pages shipped in PR #42. Each is a first-class implementation
+// (not a wrapper around the Telegram page) backed by IG-only API routes.
+const InstagramLists           = lazy(() => import('./pages/instagram/Lists'));
+const InstagramReports         = lazy(() => import('./pages/instagram/Reports'));
+const InstagramProxies         = lazy(() => import('./pages/instagram/Proxies'));
+const InstagramAntiDetect      = lazy(() => import('./pages/instagram/AntiDetect'));
+const InstagramPrivacy         = lazy(() => import('./pages/instagram/Privacy'));
+const InstagramChange2FA       = lazy(() => import('./pages/instagram/Change2FA'));
+const InstagramAccountSettings = lazy(() => import('./pages/instagram/AccountSettings'));
+const InstagramBilling         = lazy(() => import('./pages/instagram/Billing'));
+const InstagramSettings        = lazy(() => import('./pages/instagram/Settings'));
 const InstagramAdmin           = lazy(() => import('./pages/instagram/Admin'));
+// Kept around for the Telegram-only routes that aren't reachable from
+// the IG sidebar (messaging, otp-relay) so visiting them via the URL
+// bar still renders something IG-themed instead of crashing.
 const InstagramWorkInProgress  = lazy(() => import('./pages/instagram/WorkInProgress'));
 
 /**
@@ -235,7 +245,7 @@ function LegacyRedirect({ to }) {
 function PlatformRoutes() {
   return (
     <Routes>
-      <Route path="billing" element={<ProtectedRoute title="Billing" allowWithoutSubscription><PlatformPage tg={Billing} ig={InstagramWorkInProgress} /></ProtectedRoute>} />
+      <Route path="billing" element={<ProtectedRoute title="Billing" allowWithoutSubscription><PlatformPage tg={Billing} ig={InstagramBilling} /></ProtectedRoute>} />
       <Route path="dashboard" element={<ProtectedRoute title="Dashboard"><PlatformPage tg={Dashboard} ig={InstagramDashboard} /></ProtectedRoute>} />
       <Route path="sessions" element={<ProtectedRoute title="Sessions"><PlatformPage tg={Sessions} ig={InstagramSessions} /></ProtectedRoute>} />
       <Route path="create-session" element={<ProtectedRoute title="Create Session"><PlatformPage tg={CreateSession} ig={InstagramCreateSession} /></ProtectedRoute>} />
@@ -257,16 +267,16 @@ function PlatformRoutes() {
       {/* Instagram-side: any sidebar option that isn't yet hardened
           renders the IG WorkInProgress page. Telegram still gets its
           fully-functional implementation under /telegram/<path>. */}
-      <Route path="lists" element={<ProtectedRoute title="Saved lists"><PlatformPage tg={Lists} ig={InstagramWorkInProgress} /></ProtectedRoute>} />
-      <Route path="reports" element={<ProtectedRoute title="Reports"><PlatformPage tg={Reports} ig={InstagramWorkInProgress} /></ProtectedRoute>} />
-      <Route path="account-settings" element={<ProtectedRoute title="Account Settings"><PlatformPage tg={AccountSettings} ig={InstagramWorkInProgress} /></ProtectedRoute>} />
-      <Route path="change-2fa" element={<ProtectedRoute title="Change 2FA"><PlatformPage tg={Change2FA} ig={InstagramWorkInProgress} /></ProtectedRoute>} />
+      <Route path="lists" element={<ProtectedRoute title="Saved lists"><PlatformPage tg={Lists} ig={InstagramLists} /></ProtectedRoute>} />
+      <Route path="reports" element={<ProtectedRoute title="Reports"><PlatformPage tg={Reports} ig={InstagramReports} /></ProtectedRoute>} />
+      <Route path="account-settings" element={<ProtectedRoute title="Account Settings"><PlatformPage tg={AccountSettings} ig={InstagramAccountSettings} /></ProtectedRoute>} />
+      <Route path="change-2fa" element={<ProtectedRoute title="Change 2FA"><PlatformPage tg={Change2FA} ig={InstagramChange2FA} /></ProtectedRoute>} />
       <Route path="get-otp" element={<ProtectedRoute title="Get OTP"><GetOTP /></ProtectedRoute>} />
       <Route path="otp-relay" element={<ProtectedRoute title="OTP Relay"><PlatformPage tg={OtpRelay} ig={InstagramWorkInProgress} /></ProtectedRoute>} />
-      <Route path="proxies" element={<ProtectedRoute title="Proxies"><PlatformPage tg={Proxies} ig={InstagramWorkInProgress} /></ProtectedRoute>} />
-      <Route path="anti-detect" element={<ProtectedRoute title="Anti-Detect"><PlatformPage tg={AntiDetect} ig={InstagramWorkInProgress} /></ProtectedRoute>} />
-      <Route path="privacy" element={<ProtectedRoute title="Privacy"><PlatformPage tg={Privacy} ig={InstagramWorkInProgress} /></ProtectedRoute>} />
-      <Route path="settings" element={<ProtectedRoute title="Settings" allowWithoutSubscription><PlatformPage tg={Settings} ig={InstagramWorkInProgress} /></ProtectedRoute>} />
+      <Route path="proxies" element={<ProtectedRoute title="Proxies"><PlatformPage tg={Proxies} ig={InstagramProxies} /></ProtectedRoute>} />
+      <Route path="anti-detect" element={<ProtectedRoute title="Anti-Detect"><PlatformPage tg={AntiDetect} ig={InstagramAntiDetect} /></ProtectedRoute>} />
+      <Route path="privacy" element={<ProtectedRoute title="Privacy"><PlatformPage tg={Privacy} ig={InstagramPrivacy} /></ProtectedRoute>} />
+      <Route path="settings" element={<ProtectedRoute title="Settings" allowWithoutSubscription><PlatformPage tg={Settings} ig={InstagramSettings} /></ProtectedRoute>} />
       <Route path="*" element={<Navigate to="dashboard" replace />} />
     </Routes>
   );
