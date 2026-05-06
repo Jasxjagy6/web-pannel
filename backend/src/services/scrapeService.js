@@ -723,35 +723,59 @@ class ScrapeService {
     let inserted = 0;
     let duplicates = 0;
 
+    // v19: widened the row from 12 columns to 24 so scrape exports get
+    // every User flag we can read off the GramJS object — see
+    // normalizeParticipant() in telegramService.js for the full list.
+    const COLS_PER_ROW = 24;
+
     for (let i = 0; i < users.length; i += DB_BATCH_SIZE) {
       const batch = users.slice(i, i + DB_BATCH_SIZE);
-      
+
       const values = [];
       const placeholders = [];
-      
+
       batch.forEach((user, idx) => {
-        const base = idx * 12;
-        placeholders.push(`($${base + 1}, $${base + 2}, $${base + 3}, $${base + 4}, $${base + 5}, $${base + 6}, $${base + 7}, $${base + 8}, $${base + 9}, $${base + 10}, $${base + 11}, $${base + 12})`);
+        const base = idx * COLS_PER_ROW;
+        const pks = [];
+        for (let k = 1; k <= COLS_PER_ROW; k += 1) pks.push(`$${base + k}`);
+        placeholders.push(`(${pks.join(', ')})`);
+
+        const lastSeen = user.lastSeenAt ? new Date(user.lastSeenAt) : null;
         values.push(
-          jobIdInt,
-          user.telegramId || user.id,
-          user.username || null,
-          user.firstName || null,
-          user.lastName || null,
-          user.phone || null,
-          user.isBot || false,
-          user.isPremium || false,
-          user.accessHash || null,
-          user.botScore || 0,
-          user.botFlags ? JSON.stringify(user.botFlags) : null,
-          new Date()
+          jobIdInt,                                                 // job_id
+          user.telegramId || user.id,                               // telegram_id
+          user.username || null,                                    // username
+          user.firstName || null,                                   // first_name
+          user.lastName || null,                                    // last_name
+          user.phone || null,                                       // phone
+          user.isBot || false,                                      // is_bot
+          user.isPremium || false,                                  // is_premium
+          user.accessHash || null,                                  // access_hash
+          user.botScore || 0,                                       // bot_score
+          user.botFlags ? JSON.stringify(user.botFlags) : null,     // bot_flags
+          new Date(),                                               // scraped_at
+          user.isVerified || false,                                 // is_verified
+          user.isScam || false,                                     // is_scam
+          user.isFake || false,                                     // is_fake
+          user.isRestricted || false,                               // is_restricted
+          user.isDeleted || false,                                  // is_deleted
+          user.isSupport || false,                                  // is_support
+          user.isContact || false,                                  // is_contact
+          user.isMutualContact || false,                            // is_mutual_contact
+          user.isCloseFriend || false,                              // is_close_friend
+          user.langCode || null,                                    // lang_code
+          user.status || null,                                      // status
+          lastSeen,                                                 // last_seen
         );
       });
 
       const query = `
         INSERT INTO scraped_users (
           job_id, telegram_id, username, first_name, last_name, phone,
-          is_bot, is_premium, access_hash, bot_score, bot_flags, scraped_at
+          is_bot, is_premium, access_hash, bot_score, bot_flags, scraped_at,
+          is_verified, is_scam, is_fake, is_restricted, is_deleted,
+          is_support, is_contact, is_mutual_contact, is_close_friend,
+          lang_code, status, last_seen
         ) VALUES ${placeholders.join(', ')}
         ON CONFLICT (job_id, telegram_id) DO NOTHING
       `;
@@ -759,6 +783,33 @@ class ScrapeService {
       const result = await pool.query(query, values);
       inserted += batch.length - parseInt(result.rowCount || 0);
       duplicates += parseInt(result.rowCount || 0);
+    }
+
+    // Best-effort: also persist the has_profile_photo / restriction_reason
+    // / dc_id columns in a single follow-up UPDATE so the INSERT stays
+    // narrow and ON CONFLICT cheap. Each scraped user already has a
+    // unique (job_id, telegram_id) row at this point.
+    const enriched = users.filter((u) => (u.telegramId || u.id) && (u.hasProfilePhoto || u.restrictionReason || u.dcId));
+    for (const u of enriched) {
+      try {
+        await pool.query(
+          `UPDATE scraped_users
+              SET has_profile_photo = COALESCE($3, has_profile_photo),
+                  restriction_reason = COALESCE($4, restriction_reason),
+                  dc_id              = COALESCE($5, dc_id)
+            WHERE job_id = $1 AND telegram_id = $2`,
+          [
+            jobIdInt,
+            u.telegramId || u.id,
+            u.hasProfilePhoto || null,
+            u.restrictionReason || null,
+            u.dcId || null,
+          ]
+        );
+      } catch (err) {
+        // Non-fatal — the row is still useful even without these.
+        logger.debug(`scraped_users enrich update failed: ${err.message}`);
+      }
     }
 
     return { inserted, duplicates };

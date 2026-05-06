@@ -131,11 +131,30 @@ function normalizeParticipant(participant) {
   // GramJS may return either:
   // 1. A ChannelParticipant object with participant.user
   // 2. A User object directly (what we're seeing now)
-  
+
   const user = participant.user || participant;
-  
+
   // Check if it looks like a valid user (must have id)
   if (!user.id) return null;
+
+  // Telegram's User object exposes a lot more than the bare id+name.
+  // We surface every flag / scalar that is generally useful for
+  // exports without any extra round-trips. Boolean flags that come
+  // through as undefined are coerced to false so CSV exports don't
+  // get half-empty cells for accounts that simply don't have the
+  // flag set.
+  const status = user.status ? user.status.className || null : null;
+  let lastSeen = null;
+  if (user.status) {
+    if (user.status.wasOnline) {
+      lastSeen = new Date(user.status.wasOnline * 1000).toISOString();
+    } else if (user.status.expires) {
+      lastSeen = new Date(user.status.expires * 1000).toISOString();
+    }
+  }
+  const photoId = user.photo && user.photo.photoId
+    ? String(user.photo.photoId.value !== undefined ? user.photo.photoId : user.photo.photoId)
+    : null;
 
   return {
     id: user.id ? Number(user.id) : null,
@@ -143,10 +162,28 @@ function normalizeParticipant(participant) {
     firstName: user.firstName || null,
     lastName: user.lastName || null,
     phone: user.phone || null,
-    isBot: user.bot || false,
-    isPremium: user.premium || false,
-    isVerified: user.verified || false,
+    isBot: !!user.bot,
+    isPremium: !!user.premium,
+    isVerified: !!user.verified,
+    isScam: !!user.scam,
+    isFake: !!user.fake,
+    isRestricted: !!user.restricted,
+    isDeleted: !!user.deleted,
+    isSupport: !!user.support,
+    isContact: !!user.contact,
+    isMutualContact: !!user.mutualContact,
+    isCloseFriend: !!user.closeFriend,
     accessHash: user.accessHash ? Number(user.accessHash) : null,
+    langCode: user.langCode || null,
+    status,
+    lastSeenAt: lastSeen,
+    hasProfilePhoto: !!(user.photo && (user.photo.photoId || user.photo.photoSmall)),
+    photoId,
+    restrictionReason: Array.isArray(user.restrictionReason) && user.restrictionReason.length
+      ? user.restrictionReason.map((r) => `${r.platform || 'all'}:${r.reason}:${r.text || ''}`).join('; ')
+      : null,
+    dcId: user.photo && typeof user.photo.dcId === 'number' ? user.photo.dcId : null,
+    botInlinePlaceholder: user.botInlinePlaceholder || null,
     date: participant.date ? new Date(participant.date * 1000).toISOString() : null,
     inviterId: participant.inviterId ? Number(participant.inviterId) : null,
   };

@@ -119,31 +119,44 @@ async function _setStatus(jobId, status, extras = {}) {
 
 async function _insertUsersBatch(jobId, rows) {
   if (!rows || rows.length === 0) return 0;
+  // Per-row column count must match the column list in the INSERT and
+  // the value-pushes inside the loop. v19 widened the row from 7 IG
+  // payload fields to 16 so we capture as much as IG's friend-list
+  // and likers responses give us without extra HTTP round-trips.
+  const COLS_PER_ROW = 17;
   const placeholders = [];
   const values = [];
   let p = 1;
   for (const r of rows) {
-    // scraped_users (post-v9) columns we use:
-    //   job_id, telegram_id (NULL for IG), username, first_name, last_name,
-    //   platform, instagram_pk, full_name, is_private, is_verified,
-    //   thumbnail_url, scraped_at
-    placeholders.push(
-      `($${p++}, NULL, $${p++}, NULL, NULL, 'instagram', $${p++}, $${p++}, $${p++}, $${p++}, $${p++}, NOW())`
-    );
+    const pks = [];
+    for (let i = 0; i < COLS_PER_ROW; i += 1) pks.push(`$${p++}`);
+    placeholders.push(`(${pks.join(', ')}, NOW())`);
     values.push(
-      jobId,
-      r.username || null,
-      r.pk ? Number(r.pk) : null,
-      r.full_name || null,
-      r.is_private == null ? null : !!r.is_private,
-      r.is_verified == null ? null : !!r.is_verified,
-      r.profile_pic_url || null
+      jobId,                                                                 // job_id
+      r.username || null,                                                    // username
+      r.pk ? Number(r.pk) : null,                                            // instagram_pk
+      r.full_name || null,                                                   // full_name
+      r.is_private == null ? null : !!r.is_private,                          // is_private
+      r.is_verified == null ? null : !!r.is_verified,                        // is_verified
+      r.profile_pic_url || null,                                             // thumbnail_url
+      r.profile_pic_id ? String(r.profile_pic_id) : null,                    // profile_pic_id
+      r.has_anonymous_profile_picture == null ? null : !!r.has_anonymous_profile_picture, // has_anonymous_profile_picture
+      r.is_business == null ? null : !!r.is_business,                        // is_business
+      r.account_type == null ? null : Number(r.account_type),                // account_type
+      r.latest_reel_media == null ? null : Number(r.latest_reel_media),      // latest_reel_media
+      r.has_chaining == null ? null : !!r.has_chaining,                      // has_chaining
+      r.social_context || null,                                              // social_context
+      r.biography || r.bio || null,                                          // bio (rare on list endpoints, but free if present)
+      r.profile_pic_url ? true : (r.has_anonymous_profile_picture === false), // has_profile_photo
+      'instagram',                                                           // platform
     );
   }
   await pool.query(
     `INSERT INTO scraped_users
-       (job_id, telegram_id, username, first_name, last_name, platform,
-        instagram_pk, full_name, is_private, is_verified, thumbnail_url, scraped_at)
+       (job_id, username, instagram_pk, full_name, is_private, is_verified,
+        thumbnail_url, profile_pic_id, has_anonymous_profile_picture,
+        is_business, account_type, latest_reel_media, has_chaining,
+        social_context, bio, has_profile_photo, platform, scraped_at)
      VALUES ${placeholders.join(', ')}
      ON CONFLICT DO NOTHING`,
     values
@@ -313,22 +326,21 @@ async function _executeScrapeJob(jobId) {
     return;
   }
 
-  // Active-hours gate: at least one session must be inside its
-  // active-hours window. We don't gate per-session here because
-  // multi-session jobs can pivot to a different session; the
-  // per-session pivot loop checks again.
-  const someAllowed = sessRows.rows.some((s) => activeHours.gate(s).allowed);
-  if (!someAllowed) {
-    const first = sessRows.rows[0];
-    const ahGate = activeHours.gate(first);
+  // Active-hours window. Scrape jobs are operator-initiated (the
+  // human clicked "Run scrape") so we DO NOT silently postpone the
+  // job back to `pending` when the configured wake window has not
+  // started yet — there's no scheduler to resume it later, so the job
+  // would just hang forever which is exactly the "stuck on pending"
+  // bug operators were reporting. We still log when the request
+  // arrives outside-of-window so the active-hours info is visible in
+  // ops logs, and the warm-up scheduler keeps honouring the window
+  // for its own (autonomous) traffic.
+  const allOutOfWindow = sessRows.rows.every((s) => !activeHours.gate(s).allowed);
+  if (allOutOfWindow) {
     logger.info(
-      `IG.scrape job ${jobId}: every session outside active-hours; ` +
-      `postponing until ${ahGate.nextOpenAt.toISOString()}`
+      `IG.scrape job ${jobId}: all sessions outside their active-hours window; ` +
+      `executing anyway because the scrape was operator-initiated.`
     );
-    await _setStatus(jobId, 'pending', {
-      error: `Postponed: all sessions outside active-hours window. Will resume at ${ahGate.nextOpenAt.toISOString()}.`,
-    });
-    return;
   }
 
   let totalScraped = 0;
@@ -470,13 +482,12 @@ async function _runScrape({ jobId, job, sessions, targets, limit, onSessionPick 
       const session = sessionPool[cursor % sessionPool.length];
       if (typeof onSessionPick === 'function') onSessionPick(session);
 
-      // Skip sessions that are out-of-window or capped.
-      const ah = activeHours.gate(session);
-      if (!ah.allowed) {
-        parkedReasons.push(`session ${session.id}: outside active-hours`);
-        sessionPool.splice(cursor % sessionPool.length, 1);
-        continue;
-      }
+      // Skip sessions that are capped. We deliberately DO NOT park
+      // sessions for active-hours here either — the outer
+      // _executeScrapeJob bypass already let the operator-initiated
+      // job through, so per-session gating would re-introduce the
+      // same "stuck pending" bug for jobs whose only session is
+      // outside its window.
       try {
         await scrapeQuota.assertWithinCap(session.id, 1);
       } catch (quotaErr) {
