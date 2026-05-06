@@ -53,6 +53,7 @@ const MIGRATION_ORDER = [
   'migration_v16_session_fk_cascade.sql',
   'migration_v17_tg_anti_revoke_phase4.sql',
   'migration_v18_tg_otp_relay.sql',
+  'migration_v19_rich_scrape_fields.sql',
 ];
 
 function listMigrationFiles() {

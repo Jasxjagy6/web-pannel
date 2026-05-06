@@ -313,12 +313,22 @@ const scrapeController = {
     const format = req.body.format || req.query.format || 'csv';
     const ig = _isInstagram(req);
 
-    // Get filters
+    // Get filters. v19: default excludeBots to FALSE so the export
+    // reflects exactly what the scrape captured — operators were
+    // running scrapes with bot-filtering off and then getting CSVs
+    // that silently stripped every bot row anyway because the export
+    // endpoint was opt-out instead of opt-in. Callers that want a
+    // bots-removed CSV can still pass `excludeBots: true` explicitly.
+    const _bool = (v, fallback) => {
+      if (v === undefined || v === null) return fallback;
+      if (typeof v === 'boolean') return v;
+      return String(v).toLowerCase() === 'true';
+    };
     const filters = {
-      excludeBots: req.body.excludeBots !== undefined ? req.body.excludeBots === 'true' : true,
-      requireUsername: req.body.requireUsername === 'true',
-      requirePhone: req.body.requirePhone === 'true',
-      requirePhoto: req.body.requirePhoto === 'true',
+      excludeBots: _bool(req.body.excludeBots, false),
+      requireUsername: _bool(req.body.requireUsername, false),
+      requirePhone: _bool(req.body.requirePhone, false),
+      requirePhoto: _bool(req.body.requirePhoto, false),
       minBotScore: 0,
       maxBotScore: parseFloat(req.body.maxBotScore) || 1.0,
       columns: req.body.columns || null, // null = all columns
@@ -359,15 +369,24 @@ const scrapeController = {
 
     const whereClause = conditions.join(' AND ');
 
-    // Get columns
+    // Get columns. v19: surface every enriched field we capture so
+    // CSV/JSON exports aren't artificially narrow. Operators can still
+    // override via `body.columns`.
     const tgColumns = [
       'telegram_id', 'username', 'first_name', 'last_name', 'phone',
-      'is_bot', 'is_premium', 'access_hash', 'bot_score', 'bot_flags',
-      'account_created_at', 'has_profile_photo', 'bio', 'scraped_at'
+      'is_bot', 'is_premium', 'is_verified', 'is_scam', 'is_fake',
+      'is_restricted', 'is_deleted', 'is_support', 'is_contact',
+      'is_mutual_contact', 'is_close_friend', 'lang_code', 'status',
+      'last_seen', 'access_hash', 'dc_id', 'has_profile_photo', 'bio',
+      'restriction_reason', 'bot_score', 'bot_flags',
+      'account_created_at', 'scraped_at',
     ];
     const igColumns = [
       'instagram_pk', 'username', 'full_name', 'is_private', 'is_verified',
-      'thumbnail_url', 'scraped_at'
+      'is_business', 'account_type', 'has_profile_photo',
+      'has_anonymous_profile_picture', 'thumbnail_url', 'profile_pic_id',
+      'latest_reel_media', 'has_chaining', 'social_context', 'bio',
+      'scraped_at',
     ];
     const allColumns = ig ? igColumns : tgColumns;
     const columns = filters.columns || allColumns;
@@ -638,7 +657,11 @@ const scrapeController = {
     } else {
       const cols = [
         'telegram_id', 'username', 'first_name', 'last_name', 'phone',
-        'is_bot', 'is_premium', 'message_count', 'first_seen_at', 'last_seen_at',
+        'is_bot', 'is_premium', 'is_verified', 'is_scam', 'is_fake',
+        'is_restricted', 'is_deleted', 'is_support', 'is_contact',
+        'is_mutual_contact', 'is_close_friend', 'lang_code', 'status',
+        'access_hash', 'dc_id', 'has_profile_photo', 'bio',
+        'restriction_reason', 'message_count', 'first_seen_at', 'last_seen_at',
       ];
       const escape = (val) => {
         if (val === null || val === undefined) return '';

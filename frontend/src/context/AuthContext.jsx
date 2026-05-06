@@ -88,7 +88,18 @@ export function AuthProvider({ children }) {
               setUser(r.data.user);
             }
           })
-          .catch(() => { /* interceptor handles invalid token */ })
+          .catch((err) => {
+            // Stale token: the api client interceptor has already cleared
+            // localStorage for us (and either redirected to /login when
+            // we were on a private page, or left us on /landing/etc.).
+            // Mirror that by clearing the in-memory state so React Router
+            // sees the user as unauthenticated and renders the public
+            // route accordingly.
+            if (err?.response?.status === 401) {
+              setUser(null);
+              setToken(null);
+            }
+          })
           .finally(() => setLoading(false));
         return;
       } catch (e) {

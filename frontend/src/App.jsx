@@ -17,6 +17,7 @@ import PanelSwitchOverlay from './components/common/PanelSwitchOverlay';
 import Login from './pages/Login';
 import Register from './pages/Register';
 import Pending from './pages/Pending';
+import Landing from './pages/Landing';
 
 const Admin = lazy(() => import('./pages/Admin'));
 const AdminProxies = lazy(() => import('./pages/admin/AdminProxies'));
@@ -204,7 +205,10 @@ function PendingGate() {
  */
 function HomeRedirect() {
   const { isAuthenticated, isAdmin, user } = useAuth();
-  if (!isAuthenticated) return <Navigate to="/login" replace />;
+  // Unauthenticated visitors land on the public marketing page rather
+  // than the login form. The landing page itself has Sign-in / Get
+  // Started CTAs that route on to /login and /register.
+  if (!isAuthenticated) return <Landing />;
   let platform = DEFAULT_PLATFORM;
   try {
     const stored = localStorage.getItem('panel_platform');
@@ -325,6 +329,11 @@ export default function App() {
               <Route path="/privacy"           element={<LegacyRedirect to="/privacy" />} />
               <Route path="/settings"          element={<LegacyRedirect to="/settings" />} />
 
+              {/* Public marketing landing page. Reachable directly via
+                  /landing, and also rendered by HomeRedirect at "/" for
+                  unauthenticated visitors. Authenticated users hitting
+                  "/" still get bounced to their dashboard. */}
+              <Route path="/landing" element={<Landing />} />
               <Route path="/" element={<HomeRedirect />} />
               <Route path="*" element={<HomeRedirect />} />
             </Routes>

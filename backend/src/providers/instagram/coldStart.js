@@ -75,11 +75,20 @@ async function _runSequence(session) {
     ((session.platform_state && session.platform_state.source === 'browser_cookies')
       ? 'web' : 'mobile');
 
+  // Browser-cookie sessions arrive already-warm: the cookies were
+  // exported from a real, recently-active browser session, so the
+  // user has already "opened the app" themselves before we started
+  // hitting IG. Re-running the timeline/inbox/news triplet from the
+  // panel host (often a data-centre IP) just adds three extra
+  // requests that IG can rate-limit BEFORE we even get to the real
+  // scrape call. Keeping cold-start mobile-only meaningfully cuts
+  // the "first request returns 429" failure mode operators were
+  // seeing on web/cookie sessions.
   if (apiMode === 'web') {
-    await _warmupWeb(session);
-  } else {
-    await _warmupMobile(session);
+    logger.debug(`IG.coldStart: session=${session.id} skipping web warmup (cookies are already-warm)`);
+    return;
   }
+  await _warmupMobile(session);
 }
 
 async function _warmupMobile(session) {

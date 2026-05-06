@@ -63,9 +63,37 @@ const DEFAULT_SEC_CH_UA =
 // ---------------------------------------------------------------------
 
 const _dispatcherCache = new Map(); // proxyUrl -> ProxyAgent
+let _directH2Agent = null;
+
+/**
+ * The direct (no proxy) dispatcher for IG web requests. We intentionally
+ * enable HTTP/2 here — Instagram returns a body-less HTTP/1.1 429 to
+ * non-browser clients on `www.instagram.com/api/v1/...`, even with a
+ * perfectly valid sessionid + browser-grade headers, because no real
+ * Chrome/Firefox client has spoken HTTP/1.1 to instagram.com in years.
+ * Browsers ALWAYS negotiate H2 via ALPN, so the panel was the obvious
+ * outlier.
+ *
+ * Switching to undici's H2-capable Agent for the direct path makes the
+ * request shape match Chrome on the wire and the rate-limit signal
+ * disappears. When the operator has assigned a per-session proxy we
+ * still use ProxyAgent (which negotiates H2 via the proxy when the
+ * upstream supports it).
+ */
+function _getDirectH2Agent() {
+  if (_directH2Agent) return _directH2Agent;
+  const { Agent } = _loadUndici();
+  _directH2Agent = new Agent({
+    allowH2: true,
+    connectTimeout: 10_000,
+    bodyTimeout: 30_000,
+    headersTimeout: 15_000,
+  });
+  return _directH2Agent;
+}
 
 function _getDispatcher(proxyUrl) {
-  if (!proxyUrl) return undefined;
+  if (!proxyUrl) return _getDirectH2Agent();
   let agent = _dispatcherCache.get(proxyUrl);
   if (agent) return agent;
   const { ProxyAgent } = _loadUndici();
@@ -75,6 +103,10 @@ function _getDispatcher(proxyUrl) {
     connectTimeout: 10_000,
     bodyTimeout: 30_000,
     headersTimeout: 15_000,
+    // Tell undici to attempt ALPN H2 with the upstream when the proxy
+    // supports CONNECT — critical for matching real-browser request
+    // shape on instagram.com.
+    allowH2: true,
   });
   _dispatcherCache.set(proxyUrl, agent);
   return agent;
@@ -378,7 +410,10 @@ async function igFetch(ctx, url, opts = {}) {
     throw e;
   }
 
-  const dispatcher = ctx.bypassProxy ? undefined : _getDispatcher(ctx.proxyUrl);
+  // Always run through an undici dispatcher so HTTP/2 is negotiated;
+  // bypassProxy just skips the ProxyAgent path and uses the H2-capable
+  // direct agent.
+  const dispatcher = ctx.bypassProxy ? _getDirectH2Agent() : _getDispatcher(ctx.proxyUrl);
   const headers = browserHeaders(ctx, opts);
   const init = {
     method: opts.method || 'GET',

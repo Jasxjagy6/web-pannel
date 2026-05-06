@@ -118,6 +118,31 @@ function applySenderEntity(profile, entity) {
   profile.phone = entity.phone || profile.phone || null;
   profile.isBot = !!(entity.bot || profile.isBot);
   profile.isPremium = !!(entity.premium || profile.isPremium);
+  // v19: capture the rest of the User flags / scalars so monitor
+  // exports can include verified/scam/lang/etc. Only overwrite fields
+  // that are still unset on the profile so a more authoritative
+  // enrichment doesn't get clobbered by a later piggy-backed event.
+  profile.isVerified = !!(entity.verified || profile.isVerified);
+  profile.isScam = !!(entity.scam || profile.isScam);
+  profile.isFake = !!(entity.fake || profile.isFake);
+  profile.isRestricted = !!(entity.restricted || profile.isRestricted);
+  profile.isDeleted = !!(entity.deleted || profile.isDeleted);
+  profile.isSupport = !!(entity.support || profile.isSupport);
+  profile.isContact = !!(entity.contact || profile.isContact);
+  profile.isMutualContact = !!(entity.mutualContact || profile.isMutualContact);
+  profile.isCloseFriend = !!(entity.closeFriend || profile.isCloseFriend);
+  profile.langCode = entity.langCode || profile.langCode || null;
+  profile.accessHash = profile.accessHash
+    || (entity.accessHash != null ? bigToString(entity.accessHash) : null);
+  profile.status = (entity.status && entity.status.className) || profile.status || null;
+  profile.hasProfilePhoto = profile.hasProfilePhoto
+    || !!(entity.photo && (entity.photo.photoId || entity.photo.photoSmall));
+  profile.dcId = profile.dcId
+    || (entity.photo && typeof entity.photo.dcId === 'number' ? entity.photo.dcId : null);
+  profile.restrictionReason = profile.restrictionReason
+    || (Array.isArray(entity.restrictionReason) && entity.restrictionReason.length
+      ? entity.restrictionReason.map((r) => `${r.platform || 'all'}:${r.reason}:${r.text || ''}`).join('; ')
+      : null);
 }
 
 function blankProfile(telegramId) {
@@ -129,6 +154,21 @@ function blankProfile(telegramId) {
     phone: null,
     isBot: false,
     isPremium: false,
+    isVerified: false,
+    isScam: false,
+    isFake: false,
+    isRestricted: false,
+    isDeleted: false,
+    isSupport: false,
+    isContact: false,
+    isMutualContact: false,
+    isCloseFriend: false,
+    langCode: null,
+    accessHash: null,
+    status: null,
+    hasProfilePhoto: false,
+    dcId: null,
+    restrictionReason: null,
   };
 }
 
@@ -1013,15 +1053,32 @@ class ScrapeMonitorService {
 
         // Back-fill EVERY scrape_monitor_users row for this job
         // that matches this telegram_id and is missing fields.
-        // COALESCE preserves any value already in the row.
+        // COALESCE preserves any value already in the row, but the
+        // boolean flag-or'ing latches a flag once any source has
+        // observed it as true.
         await pool.query(
           `UPDATE scrape_monitor_users
-              SET username   = COALESCE(username,   $3),
-                  first_name = COALESCE(first_name, $4),
-                  last_name  = COALESCE(last_name,  $5),
-                  phone      = COALESCE(phone,      $6),
-                  is_bot     = is_bot OR $7,
-                  is_premium = is_premium OR $8
+              SET username           = COALESCE(username,           $3),
+                  first_name         = COALESCE(first_name,         $4),
+                  last_name          = COALESCE(last_name,          $5),
+                  phone              = COALESCE(phone,              $6),
+                  is_bot             = is_bot OR $7,
+                  is_premium         = is_premium OR $8,
+                  is_verified        = is_verified OR $9,
+                  is_scam            = is_scam OR $10,
+                  is_fake            = is_fake OR $11,
+                  is_restricted      = is_restricted OR $12,
+                  is_deleted         = is_deleted OR $13,
+                  is_support         = is_support OR $14,
+                  is_contact         = is_contact OR $15,
+                  is_mutual_contact  = is_mutual_contact OR $16,
+                  is_close_friend    = is_close_friend OR $17,
+                  lang_code          = COALESCE(lang_code,          $18),
+                  status             = COALESCE(status,             $19),
+                  access_hash        = COALESCE(access_hash,        $20),
+                  has_profile_photo  = has_profile_photo OR $21,
+                  dc_id              = COALESCE(dc_id,              $22),
+                  restriction_reason = COALESCE(restriction_reason, $23)
             WHERE monitor_job_id = $1
               AND telegram_id = $2`,
           [
@@ -1029,6 +1086,14 @@ class ScrapeMonitorService {
             enriched.username, enriched.firstName,
             enriched.lastName, enriched.phone,
             !!enriched.isBot, !!enriched.isPremium,
+            !!enriched.isVerified, !!enriched.isScam, !!enriched.isFake,
+            !!enriched.isRestricted, !!enriched.isDeleted, !!enriched.isSupport,
+            !!enriched.isContact, !!enriched.isMutualContact, !!enriched.isCloseFriend,
+            enriched.langCode, enriched.status,
+            enriched.accessHash != null ? String(enriched.accessHash) : null,
+            !!enriched.hasProfilePhoto,
+            enriched.dcId != null ? Number(enriched.dcId) : null,
+            enriched.restrictionReason || null,
           ]
         );
         // Tell the UI a known user got fleshed out — useful for the
@@ -1195,19 +1260,42 @@ class ScrapeMonitorService {
       if (existing.rows[0]) {
         await pool.query(
           `UPDATE scrape_monitor_users
-              SET message_count = message_count + 1,
-                  last_seen_at  = NOW(),
-                  username      = COALESCE($3, username),
-                  first_name    = COALESCE($4, first_name),
-                  last_name     = COALESCE($5, last_name),
-                  phone         = COALESCE($6, phone),
-                  is_premium    = is_premium OR $7,
-                  is_bot        = is_bot OR $8
+              SET message_count    = message_count + 1,
+                  last_seen_at     = NOW(),
+                  username         = COALESCE($3, username),
+                  first_name       = COALESCE($4, first_name),
+                  last_name        = COALESCE($5, last_name),
+                  phone            = COALESCE($6, phone),
+                  is_premium       = is_premium OR $7,
+                  is_bot           = is_bot OR $8,
+                  is_verified      = is_verified OR $9,
+                  is_scam          = is_scam OR $10,
+                  is_fake          = is_fake OR $11,
+                  is_restricted    = is_restricted OR $12,
+                  is_deleted       = is_deleted OR $13,
+                  is_support       = is_support OR $14,
+                  is_contact       = is_contact OR $15,
+                  is_mutual_contact = is_mutual_contact OR $16,
+                  is_close_friend  = is_close_friend OR $17,
+                  lang_code        = COALESCE($18, lang_code),
+                  status           = COALESCE($19, status),
+                  access_hash      = COALESCE($20, access_hash),
+                  has_profile_photo = has_profile_photo OR $21,
+                  dc_id            = COALESCE($22, dc_id),
+                  restriction_reason = COALESCE($23, restriction_reason)
             WHERE id = $1 AND monitor_job_id = $2`,
           [
             existing.rows[0].id, jobId, profile.username,
             profile.firstName, profile.lastName, profile.phone,
             !!profile.isPremium, !!profile.isBot,
+            !!profile.isVerified, !!profile.isScam, !!profile.isFake,
+            !!profile.isRestricted, !!profile.isDeleted, !!profile.isSupport,
+            !!profile.isContact, !!profile.isMutualContact, !!profile.isCloseFriend,
+            profile.langCode, profile.status,
+            profile.accessHash != null ? String(profile.accessHash) : null,
+            !!profile.hasProfilePhoto,
+            profile.dcId != null ? Number(profile.dcId) : null,
+            profile.restrictionReason || null,
           ]
         );
         inserted = false;
@@ -1216,12 +1304,26 @@ class ScrapeMonitorService {
           `INSERT INTO scrape_monitor_users
              (monitor_job_id, telegram_id, username, first_name, last_name,
               phone, is_bot, is_premium, message_count,
-              first_seen_at, last_seen_at, via_session_id)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 1, NOW(), NOW(), $9)`,
+              first_seen_at, last_seen_at, via_session_id,
+              is_verified, is_scam, is_fake, is_restricted, is_deleted,
+              is_support, is_contact, is_mutual_contact, is_close_friend,
+              lang_code, status, access_hash, has_profile_photo, dc_id,
+              restriction_reason)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 1, NOW(), NOW(), $9,
+                   $10, $11, $12, $13, $14, $15, $16, $17, $18,
+                   $19, $20, $21, $22, $23, $24)`,
           [
             jobId, profile.telegramId, profile.username,
             profile.firstName, profile.lastName, profile.phone,
             !!profile.isBot, !!profile.isPremium, sessionId,
+            !!profile.isVerified, !!profile.isScam, !!profile.isFake,
+            !!profile.isRestricted, !!profile.isDeleted, !!profile.isSupport,
+            !!profile.isContact, !!profile.isMutualContact, !!profile.isCloseFriend,
+            profile.langCode, profile.status,
+            profile.accessHash != null ? String(profile.accessHash) : null,
+            !!profile.hasProfilePhoto,
+            profile.dcId != null ? Number(profile.dcId) : null,
+            profile.restrictionReason || null,
           ]
         );
         inserted = true;
@@ -1234,12 +1336,26 @@ class ScrapeMonitorService {
         `INSERT INTO scrape_monitor_users
            (monitor_job_id, telegram_id, username, first_name, last_name,
             phone, is_bot, is_premium, message_count,
-            first_seen_at, last_seen_at, via_session_id)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 1, NOW(), NOW(), $9)`,
+            first_seen_at, last_seen_at, via_session_id,
+            is_verified, is_scam, is_fake, is_restricted, is_deleted,
+            is_support, is_contact, is_mutual_contact, is_close_friend,
+            lang_code, status, access_hash, has_profile_photo, dc_id,
+            restriction_reason)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 1, NOW(), NOW(), $9,
+                 $10, $11, $12, $13, $14, $15, $16, $17, $18,
+                 $19, $20, $21, $22, $23, $24)`,
         [
           jobId, profile.telegramId, profile.username,
           profile.firstName, profile.lastName, profile.phone,
           !!profile.isBot, !!profile.isPremium, sessionId,
+          !!profile.isVerified, !!profile.isScam, !!profile.isFake,
+          !!profile.isRestricted, !!profile.isDeleted, !!profile.isSupport,
+          !!profile.isContact, !!profile.isMutualContact, !!profile.isCloseFriend,
+          profile.langCode, profile.status,
+          profile.accessHash != null ? String(profile.accessHash) : null,
+          !!profile.hasProfilePhoto,
+          profile.dcId != null ? Number(profile.dcId) : null,
+          profile.restrictionReason || null,
         ]
       );
       inserted = true;

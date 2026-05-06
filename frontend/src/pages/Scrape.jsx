@@ -1272,7 +1272,14 @@ export default function Scrape() {
                 <button
                   key={format}
                   onClick={() => {
-                    handleExport(exportModal.id, format, { excludeBots: true });
+                    // Export reflects what the scrape captured. The
+                    // bot-filter choice belongs to the scrape itself,
+                    // not the export — hard-coding excludeBots:true
+                    // here was silently dropping every bot row even
+                    // when the user ran the scrape with bot filtering
+                    // disabled. Operators that want a humans-only CSV
+                    // should run the scrape with Bot Filtering ON.
+                    handleExport(exportModal.id, format, {});
                     setExportModal(null);
                   }}
                   className={btnPrimary}
