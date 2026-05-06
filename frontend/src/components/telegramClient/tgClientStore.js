@@ -53,6 +53,9 @@ const DIALOG_INITIAL = () => ({
 
   // Optimistic outgoing messages keyed by clientMsgId (uuid). Cleared on ack.
   pendingOutgoing: new Map(),
+
+  // Live media-upload progress per pending clientMsgId, in [0,1].
+  uploadProgressByClientId: new Map(),
 });
 
 function _sortDialogOrder(dialogs) {
@@ -207,11 +210,14 @@ export function createTgClientStore() {
         nextOrder = _sortDialogOrder(nextDialogs);
       }
 
+      const nextUpload = new Map(get().uploadProgressByClientId);
+      nextUpload.delete(clientMsgId);
       set({
         pendingOutgoing: next,
         messagesByPeer: nextMessages,
         dialogs: nextDialogs,
         dialogOrder: nextOrder,
+        uploadProgressByClientId: nextUpload,
       });
     },
 
@@ -229,7 +235,13 @@ export function createTgClientStore() {
         copy[idx] = { ...existing[idx], failed: true, error: errorMessage };
         nextMessages.set(k, copy);
       }
-      set({ pendingOutgoing: next, messagesByPeer: nextMessages });
+      const nextUpload = new Map(get().uploadProgressByClientId);
+      nextUpload.delete(clientMsgId);
+      set({
+        pendingOutgoing: next,
+        messagesByPeer: nextMessages,
+        uploadProgressByClientId: nextUpload,
+      });
     },
 
     bumpDialogPreview: (peerType, peerId, lastMessage, unreadDelta = 0) => {
@@ -256,6 +268,26 @@ export function createTgClientStore() {
       if (!prev) return;
       next.set(k, { ...prev, unreadCount: 0, unreadMentionsCount: 0 });
       set({ dialogs: next });
+    },
+
+    setUploadProgress: (clientMsgId, progress) => {
+      if (!clientMsgId) return;
+      const next = new Map(get().uploadProgressByClientId);
+      const clamped = Math.max(0, Math.min(1, Number(progress) || 0));
+      if (clamped >= 1) {
+        next.delete(clientMsgId);
+      } else {
+        next.set(clientMsgId, clamped);
+      }
+      set({ uploadProgressByClientId: next });
+    },
+
+    clearUploadProgress: (clientMsgId) => {
+      if (!clientMsgId) return;
+      const next = new Map(get().uploadProgressByClientId);
+      if (!next.has(clientMsgId)) return;
+      next.delete(clientMsgId);
+      set({ uploadProgressByClientId: next });
     },
   }));
 }

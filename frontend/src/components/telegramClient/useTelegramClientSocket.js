@@ -113,6 +113,13 @@ export function useTelegramClientSocket(sessionId, store) {
       }
     });
 
+    socket.on('tg-client:uploadProgress', (data) => {
+      if (!data || String(data.sessionId) !== String(sessionId)) return;
+      const { clientMsgId, progress } = data;
+      if (!clientMsgId) return;
+      store.getState().setUploadProgress(clientMsgId, progress);
+    });
+
     socket.on('tg-client:typing', (data) => {
       if (!data || String(data.sessionId) !== String(sessionId)) return;
       // Typing indicators are best-effort; we just record them with a

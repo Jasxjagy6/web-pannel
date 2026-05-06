@@ -163,6 +163,122 @@ const telegramClientController = {
   }),
 
   /**
+   * POST /sessions/:id/dialogs/:peerType/:peerId/send-media
+   *
+   * multipart/form-data — file under field `file`, plus `kind`,
+   * `caption`, `replyToMsgId`, `silent`, `clientMsgId`,
+   * `duration`, `width`, `height`. Server emits per-upload
+   * progress on `tg-client:uploadProgress` while GramJS streams
+   * the upload to Telegram.
+   */
+  sendMedia: asyncHandler(async (req, res) => {
+    const { peerType, peerId } = _parsePeer(req);
+    const file = req.file;
+    if (!file) {
+      throw new AppError('file is required', 400, 'FILE_REQUIRED');
+    }
+    const data = await tcService.sendMedia(
+      req.params.id,
+      req.user.id,
+      peerType,
+      peerId,
+      {
+        kind: req.body?.kind || 'auto',
+        filePath: file.path,
+        fileName: file.originalname || undefined,
+        mimeType: file.mimetype || undefined,
+        caption: req.body?.caption,
+        replyToMsgId: req.body?.replyToMsgId,
+        silent: req.body?.silent === 'true' || req.body?.silent === true,
+        clientMsgId: req.body?.clientMsgId,
+        duration: req.body?.duration,
+        width: req.body?.width,
+        height: req.body?.height,
+        waveform: req.body?.waveform,
+      }
+    );
+    await reportService
+      .logActivity(req.user.id, 'tg_client_send_media', 'session', req.params.id, {
+        platform: 'telegram',
+        peerType,
+        peerId: String(peerId),
+        kind: data.kind,
+        size: file.size,
+      })
+      .catch(() => {});
+    res.json({ success: true, data });
+  }),
+
+  /**
+   * POST /sessions/:id/dialogs/:peerType/:peerId/send-voice
+   *
+   * Same multipart shape as send-media but the file lives under
+   * `voice` and is force-rendered as a voice note.
+   */
+  sendVoice: asyncHandler(async (req, res) => {
+    const { peerType, peerId } = _parsePeer(req);
+    const file = req.file;
+    if (!file) {
+      throw new AppError('voice is required', 400, 'VOICE_REQUIRED');
+    }
+    const data = await tcService.sendVoice(
+      req.params.id,
+      req.user.id,
+      peerType,
+      peerId,
+      {
+        filePath: file.path,
+        fileName: file.originalname || 'voice.ogg',
+        mimeType: file.mimetype || 'audio/ogg',
+        replyToMsgId: req.body?.replyToMsgId,
+        silent: req.body?.silent === 'true' || req.body?.silent === true,
+        clientMsgId: req.body?.clientMsgId,
+        duration: req.body?.duration,
+        waveform: req.body?.waveform,
+      }
+    );
+    res.json({ success: true, data });
+  }),
+
+  /**
+   * POST /sessions/:id/dialogs/:peerType/:peerId/send-sticker
+   *
+   * Two modes:
+   *   - JSON body { documentId, accessHash, fileReference } to re-send
+   *     a sticker the user already has in their stickerset cache.
+   *   - multipart with `file` to upload a one-off sticker (rare; used
+   *     for custom stickers).
+   */
+  sendSticker: asyncHandler(async (req, res) => {
+    const { peerType, peerId } = _parsePeer(req);
+    const file = req.file;
+    const data = await tcService.sendSticker(
+      req.params.id,
+      req.user.id,
+      peerType,
+      peerId,
+      file
+        ? {
+            filePath: file.path,
+            fileName: file.originalname || 'sticker.webp',
+            mimeType: file.mimetype || 'image/webp',
+            replyToMsgId: req.body?.replyToMsgId,
+            silent: req.body?.silent === 'true' || req.body?.silent === true,
+            clientMsgId: req.body?.clientMsgId,
+          }
+        : {
+            documentId: req.body?.documentId,
+            accessHash: req.body?.accessHash,
+            fileReference: req.body?.fileReference,
+            replyToMsgId: req.body?.replyToMsgId,
+            silent: !!req.body?.silent,
+            clientMsgId: req.body?.clientMsgId,
+          }
+    );
+    res.json({ success: true, data });
+  }),
+
+  /**
    * GET /sessions/:id/dialogs/:peerType/:peerId/messages/:messageId/media
    *
    * Streams photo/document attached to the message. 204 when there's no

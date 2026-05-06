@@ -629,6 +629,320 @@ class TelegramClientService {
   }
 
   /**
+   * Send media (photo, video, file, voice, sticker) on behalf of `sessionId`.
+   *
+   * `payload.filePath` is a path on the panel disk written by the multer
+   * middleware. `kind` selects the GramJS attribute set so the receiver
+   * sees the file as a "Photo", "Video", "Voice message", "Sticker" or
+   * generic document. `progressCallback` is a per-upload reporter that
+   * emits `tg-client:uploadProgress` over Socket.IO.
+   *
+   * @param {string|number} sessionId
+   * @param {string|number} userId
+   * @param {string} peerType
+   * @param {string|number} peerId
+   * @param {object} payload
+   * @param {'photo'|'video'|'audio'|'voice'|'sticker'|'document'|'auto'} payload.kind
+   * @param {string} payload.filePath  absolute path on disk
+   * @param {string} [payload.fileName]
+   * @param {string} [payload.mimeType]
+   * @param {string} [payload.caption]
+   * @param {number} [payload.replyToMsgId]
+   * @param {boolean} [payload.silent]
+   * @param {string} [payload.clientMsgId] caller-supplied id for progress eventing
+   * @param {number} [payload.duration] seconds (voice/audio/video)
+   * @param {number} [payload.width] pixels (photo/video)
+   * @param {number} [payload.height] pixels (photo/video)
+   * @param {string} [payload.waveform] base64 voice waveform
+   */
+  async sendMedia(sessionId, userId, peerType, peerId, payload = {}) {
+    if (!PEER_TYPES.has(peerType)) {
+      throw new AppError('Invalid peer type', 400, 'INVALID_PEER_TYPE');
+    }
+    const filePath = String(payload.filePath || '');
+    if (!filePath) {
+      throw new AppError('filePath is required', 400, 'FILE_REQUIRED');
+    }
+    const fs = require('fs');
+    if (!fs.existsSync(filePath)) {
+      throw new AppError('Uploaded file is missing on disk', 500, 'FILE_NOT_ON_DISK');
+    }
+
+    await _loadAndAuthSession(sessionId, userId);
+    await tgService._ensureConnected(sessionId);
+    const entry = tgService.clients.get(String(sessionId));
+    if (!entry) throw new AppError('Session client not loaded', 500, 'CLIENT_NOT_LOADED');
+
+    const peerIdNum = _toIdNum(peerId);
+    const kind = String(payload.kind || 'auto').toLowerCase();
+    const caption = payload.caption ? String(payload.caption).slice(0, 1024) : '';
+    const fileName = payload.fileName || _basename(filePath);
+    const mimeType = payload.mimeType || _guessMime(fileName, kind);
+    const clientMsgId = payload.clientMsgId || null;
+    const replyToMsgId = payload.replyToMsgId
+      ? parseInt(payload.replyToMsgId, 10) || undefined
+      : undefined;
+    const silent = payload.silent === true;
+
+    const sendOpts = {
+      file: filePath,
+      caption,
+      replyTo: replyToMsgId,
+      silent,
+      forceDocument: kind === 'document',
+      voiceNote: kind === 'voice',
+      videoNote: kind === 'videonote',
+    };
+
+    // Build attribute hints for video/audio/voice/sticker so Telegram
+    // renders the message as the correct kind.
+    const attributes = _buildAttributes(kind, payload, fileName, mimeType);
+    if (attributes.length > 0) sendOpts.attributes = attributes;
+
+    if (kind !== 'photo') {
+      sendOpts.fileName = fileName;
+    }
+
+    const io = global.io;
+    const room = `tg-client:u${userId}:s${sessionId}`;
+    const progressEmit = (progress) => {
+      if (!io || !clientMsgId) return;
+      try {
+        io.to(room).emit('tg-client:uploadProgress', {
+          sessionId: String(sessionId),
+          clientMsgId,
+          progress: Math.max(0, Math.min(1, progress || 0)),
+          peerType,
+          peerId: peerIdNum,
+        });
+      } catch (err) {
+        logger.debug(`tg-client uploadProgress emit failed: ${err.message}`);
+      }
+    };
+
+    sendOpts.progressCallback = (progress) => {
+      // GramJS reports progress as a number in [0,1]. Throttle in caller.
+      progressEmit(typeof progress === 'number' ? progress : 0);
+    };
+
+    let entity;
+    try {
+      entity = await entry.client.getEntity(_buildPeerInput(peerType, peerIdNum));
+    } catch (err) {
+      throw new AppError(`Could not resolve peer: ${err.message}`, 404, 'PEER_NOT_FOUND');
+    }
+
+    let sent;
+    try {
+      progressEmit(0);
+      sent = await entry.client.sendFile(entity, sendOpts);
+      progressEmit(1);
+    } catch (err) {
+      logger.warn(`sendFile failed for session ${sessionId}: ${err.message}`);
+      throw new AppError(`Failed to send media: ${err.message}`, 502, 'SEND_MEDIA_FAILED');
+    } finally {
+      // Best-effort cleanup; don't crash the request on permission errors.
+      try { fs.unlinkSync(filePath); } catch (_) { /* ignore */ }
+    }
+
+    const messageId = _toIdNum(sent?.id ?? null);
+    const date = sent?.date ? _toIsoDate(sent.date) : new Date().toISOString();
+
+    const ownId = (await tgService.getMe(sessionId).catch(() => null))?.id;
+    const dialogPeer = entity.id != null ? { [`${peerType}Id`]: entity.id } : null;
+    const normalized =
+      _normalizeMessage(sent, ownId != null ? Number(ownId) : null, dialogPeer) || {
+        id: messageId,
+        text: caption,
+        out: true,
+        fromId: ownId != null ? Number(ownId) : null,
+        date,
+        hasMedia: true,
+        mediaKind: kind === 'voice' ? 'voice' : (kind === 'sticker' ? 'sticker' : kind),
+      };
+
+    let chatSummary = {
+      peerType: _peerTypeOf(entity) || peerType,
+      peerId: _toIdNum(entity.id) ?? peerIdNum,
+      title: _entityTitle(entity),
+      username: entity.username || null,
+      photoId: entity.photo?.photoId ? String(entity.photo.photoId) : null,
+      hasPhoto: !!(entity.photo && (entity.photo.photoId || entity.photo.photoSmall)),
+    };
+    let senderSummary = null;
+    try {
+      const me = await entry.client.getMe();
+      if (me) {
+        senderSummary = {
+          peerType: 'user',
+          peerId: _toIdNum(me.id),
+          title: _entityTitle(me),
+          username: me.username || null,
+          photoId: me.photo?.photoId ? String(me.photo.photoId) : null,
+          hasPhoto: !!(me.photo && (me.photo.photoId || me.photo.photoSmall)),
+        };
+      }
+    } catch (_) { /* best-effort */ }
+
+    if (io) {
+      try {
+        io.to(room).emit('tg-client:newMessage', {
+          sessionId: String(sessionId),
+          chat: chatSummary,
+          sender: senderSummary,
+          message: normalized,
+          clientMsgId,
+        });
+        io.to(room).emit('tg-client:dialogUpdate', {
+          sessionId: String(sessionId),
+          chat: chatSummary,
+          lastMessage: normalized,
+          unreadDelta: 0,
+        });
+      } catch (err) {
+        logger.debug(`tg-client sendMedia broadcast failed: ${err.message}`);
+      }
+    }
+
+    return {
+      messageId,
+      date,
+      peerType,
+      peerId: peerIdNum,
+      kind,
+      fileName,
+      mimeType,
+      caption,
+      chat: chatSummary,
+      sender: senderSummary,
+      message: normalized,
+      clientMsgId,
+    };
+  }
+
+  /**
+   * Send a voice message. Convenience wrapper around `sendMedia` that
+   * pins kind=voice and sets the duration / waveform attributes
+   * Telegram clients use to render the voice bubble.
+   */
+  async sendVoice(sessionId, userId, peerType, peerId, payload = {}) {
+    return this.sendMedia(sessionId, userId, peerType, peerId, {
+      ...payload,
+      kind: 'voice',
+      mimeType: payload.mimeType || 'audio/ogg',
+    });
+  }
+
+  /**
+   * Send an existing sticker (sticker set + document id) without
+   * re-uploading. Two payload modes:
+   *   - re-send a known InputDocument: payload.documentId + accessHash + fileReference
+   *   - upload a fresh sticker file from disk: payload.filePath + kind
+   */
+  async sendSticker(sessionId, userId, peerType, peerId, payload = {}) {
+    if (!PEER_TYPES.has(peerType)) {
+      throw new AppError('Invalid peer type', 400, 'INVALID_PEER_TYPE');
+    }
+    await _loadAndAuthSession(sessionId, userId);
+    await tgService._ensureConnected(sessionId);
+    const entry = tgService.clients.get(String(sessionId));
+    if (!entry) throw new AppError('Session client not loaded', 500, 'CLIENT_NOT_LOADED');
+
+    if (payload.filePath) {
+      return this.sendMedia(sessionId, userId, peerType, peerId, {
+        ...payload,
+        kind: 'sticker',
+      });
+    }
+
+    const docId = payload.documentId;
+    const accessHash = payload.accessHash;
+    const fileReference = payload.fileReference;
+    if (docId == null || accessHash == null || !fileReference) {
+      throw new AppError(
+        'documentId, accessHash and fileReference are required to re-send a sticker',
+        400,
+        'STICKER_REF_REQUIRED'
+      );
+    }
+
+    const peerIdNum = _toIdNum(peerId);
+    let entity;
+    try {
+      entity = await entry.client.getEntity(_buildPeerInput(peerType, peerIdNum));
+    } catch (err) {
+      throw new AppError(`Could not resolve peer: ${err.message}`, 404, 'PEER_NOT_FOUND');
+    }
+
+    let inputDoc;
+    try {
+      inputDoc = new Api.InputDocument({
+        id: _toBigInt(docId),
+        accessHash: _toBigInt(accessHash),
+        fileReference: _decodeFileRef(fileReference),
+      });
+    } catch (err) {
+      throw new AppError(`Invalid sticker reference: ${err.message}`, 400, 'STICKER_REF_INVALID');
+    }
+
+    let sent;
+    try {
+      sent = await entry.client.invoke(
+        new Api.messages.SendMedia({
+          peer: entity,
+          media: new Api.InputMediaDocument({ id: inputDoc }),
+          message: '',
+          replyToMsgId: payload.replyToMsgId
+            ? parseInt(payload.replyToMsgId, 10) || undefined
+            : undefined,
+          silent: payload.silent === true,
+          randomId: _randomBigInt(),
+        })
+      );
+    } catch (err) {
+      logger.warn(`sendSticker invoke failed for session ${sessionId}: ${err.message}`);
+      throw new AppError(`Failed to send sticker: ${err.message}`, 502, 'SEND_STICKER_FAILED');
+    }
+
+    const message = _extractFirstMessageFromUpdates(sent);
+    const ownId = (await tgService.getMe(sessionId).catch(() => null))?.id;
+    const dialogPeer = entity.id != null ? { [`${peerType}Id`]: entity.id } : null;
+    const normalized = message
+      ? _normalizeMessage(message, ownId != null ? Number(ownId) : null, dialogPeer)
+      : null;
+
+    const io = global.io;
+    if (io && normalized) {
+      const room = `tg-client:u${userId}:s${sessionId}`;
+      try {
+        io.to(room).emit('tg-client:newMessage', {
+          sessionId: String(sessionId),
+          chat: {
+            peerType: _peerTypeOf(entity) || peerType,
+            peerId: _toIdNum(entity.id) ?? peerIdNum,
+            title: _entityTitle(entity),
+            username: entity.username || null,
+          },
+          sender: null,
+          message: normalized,
+          clientMsgId: payload.clientMsgId || null,
+        });
+      } catch (err) {
+        logger.debug(`tg-client sendSticker broadcast failed: ${err.message}`);
+      }
+    }
+
+    return {
+      messageId: normalized?.id ?? null,
+      date: normalized?.date ?? new Date().toISOString(),
+      peerType,
+      peerId: peerIdNum,
+      message: normalized,
+      clientMsgId: payload.clientMsgId || null,
+    };
+  }
+
+  /**
    * Mark messages up to `maxId` as read for the given peer.
    */
   async markRead(sessionId, userId, peerType, peerId, maxId) {
@@ -779,6 +1093,137 @@ function safeParseJson(s) {
   } catch {
     return null;
   }
+}
+
+function _basename(p) {
+  if (!p) return 'file';
+  const i1 = p.lastIndexOf('/');
+  const i2 = p.lastIndexOf('\\');
+  const i = Math.max(i1, i2);
+  return i === -1 ? p : p.slice(i + 1);
+}
+
+const MIME_BY_EXT = {
+  '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.png': 'image/png',
+  '.gif': 'image/gif', '.webp': 'image/webp', '.heic': 'image/heic',
+  '.mp4': 'video/mp4', '.mov': 'video/quicktime', '.webm': 'video/webm',
+  '.m4v': 'video/mp4', '.mkv': 'video/x-matroska',
+  '.mp3': 'audio/mpeg', '.m4a': 'audio/mp4', '.aac': 'audio/aac',
+  '.wav': 'audio/wav', '.ogg': 'audio/ogg', '.opus': 'audio/ogg',
+  '.flac': 'audio/flac',
+  '.pdf': 'application/pdf', '.zip': 'application/zip',
+  '.txt': 'text/plain', '.csv': 'text/csv',
+  '.tgs': 'application/x-tgsticker', '.webm-stick': 'video/webm',
+};
+
+function _guessMime(fileName, kind) {
+  const lower = String(fileName || '').toLowerCase();
+  const dot = lower.lastIndexOf('.');
+  if (dot !== -1) {
+    const ext = lower.slice(dot);
+    if (MIME_BY_EXT[ext]) return MIME_BY_EXT[ext];
+  }
+  switch (kind) {
+    case 'photo':   return 'image/jpeg';
+    case 'video':   return 'video/mp4';
+    case 'audio':   return 'audio/mpeg';
+    case 'voice':   return 'audio/ogg';
+    case 'sticker': return 'image/webp';
+    default:        return 'application/octet-stream';
+  }
+}
+
+function _buildAttributes(kind, payload, fileName, mimeType) {
+  const attrs = [];
+  const dur = parseInt(payload.duration, 10);
+  const w = parseInt(payload.width, 10);
+  const h = parseInt(payload.height, 10);
+  if (kind === 'voice') {
+    let waveform;
+    if (payload.waveform) {
+      try { waveform = Buffer.from(String(payload.waveform), 'base64'); } catch (_) { /* ignore */ }
+    }
+    attrs.push(new Api.DocumentAttributeAudio({
+      duration: Number.isFinite(dur) ? dur : 0,
+      voice: true,
+      waveform,
+    }));
+    attrs.push(new Api.DocumentAttributeFilename({ fileName: fileName || 'voice.ogg' }));
+  } else if (kind === 'audio') {
+    attrs.push(new Api.DocumentAttributeAudio({
+      duration: Number.isFinite(dur) ? dur : 0,
+      voice: false,
+      title: payload.title || undefined,
+      performer: payload.performer || undefined,
+    }));
+    attrs.push(new Api.DocumentAttributeFilename({ fileName }));
+  } else if (kind === 'video') {
+    attrs.push(new Api.DocumentAttributeVideo({
+      duration: Number.isFinite(dur) ? dur : 0,
+      w: Number.isFinite(w) ? w : 0,
+      h: Number.isFinite(h) ? h : 0,
+      supportsStreaming: true,
+    }));
+    attrs.push(new Api.DocumentAttributeFilename({ fileName }));
+  } else if (kind === 'sticker') {
+    if (mimeType === 'application/x-tgsticker') {
+      attrs.push(new Api.DocumentAttributeSticker({
+        alt: payload.alt || '',
+        stickerset: new Api.InputStickerSetEmpty(),
+      }));
+    }
+    attrs.push(new Api.DocumentAttributeFilename({ fileName }));
+  } else if (kind === 'document') {
+    attrs.push(new Api.DocumentAttributeFilename({ fileName }));
+  }
+  return attrs;
+}
+
+function _toBigInt(v) {
+  if (v == null) return BigInt(0);
+  try {
+    if (typeof v === 'bigint') return v;
+    if (typeof v === 'number') return BigInt(Math.trunc(v));
+    return BigInt(String(v));
+  } catch {
+    return BigInt(0);
+  }
+}
+
+function _decodeFileRef(ref) {
+  if (!ref) return Buffer.alloc(0);
+  if (Buffer.isBuffer(ref)) return ref;
+  if (typeof ref === 'string') {
+    // Accept hex or base64.
+    if (/^[0-9a-fA-F]+$/.test(ref) && ref.length % 2 === 0) {
+      return Buffer.from(ref, 'hex');
+    }
+    return Buffer.from(ref, 'base64');
+  }
+  if (Array.isArray(ref)) return Buffer.from(ref);
+  return Buffer.alloc(0);
+}
+
+function _randomBigInt() {
+  // GramJS expects a 64-bit signed random id for SendMedia/SendMessage.
+  const buf = require('crypto').randomBytes(8);
+  return BigInt.asIntN(64, BigInt(`0x${buf.toString('hex')}`));
+}
+
+/**
+ * GramJS messages.SendMedia returns an Updates container. The new
+ * message lives inside `updates[].message` for `UpdateNewMessage`,
+ * `UpdateNewChannelMessage`, or top-level `update.message`. Pull the
+ * first one we find.
+ */
+function _extractFirstMessageFromUpdates(result) {
+  if (!result) return null;
+  if (result.message && typeof result.message === 'object') return result.message;
+  const list = result.updates || [];
+  for (const u of list) {
+    if (u && u.message) return u.message;
+  }
+  return null;
 }
 
 module.exports = new TelegramClientService();

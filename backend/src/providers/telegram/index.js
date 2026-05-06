@@ -132,6 +132,14 @@ const capabilities = {
   // chat surface that opens in its own window per session.
   // ---------------------------------------------------------------------
   telegram_client:        true,
+
+  // ---------------------------------------------------------------------
+  // Phase 2 — in-panel Telegram client feature surface (Telegram-only).
+  // Each flag gates one Phase 2 deliverable on the frontend; the Instagram
+  // provider must mirror them as `false`.
+  // ---------------------------------------------------------------------
+  // D1 — send media (photo/video/file/voice/sticker).
+  tgc_send_media:         true,
 };
 
 // ---------------------------------------------------------------------------

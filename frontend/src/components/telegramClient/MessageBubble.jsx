@@ -44,6 +44,7 @@ export default function MessageBubble({
   showAvatar,
   peerType,
   peerId,
+  uploadProgress,
 }) {
   const out = !!message.out;
   const isService = !!message.isService;
@@ -90,7 +91,20 @@ export default function MessageBubble({
         >
           {message.mediaKind && (
             <div className={`mb-1 text-xs ${out ? 'text-blue-100/80' : 'text-gray-400'}`}>
-              {_mediaLabel(message.mediaKind)}
+              {message.mediaPreview?.label || _mediaLabel(message.mediaKind)}
+              {message.mediaPreview?.fileName && (
+                <span className={`ml-1 ${out ? 'text-blue-100/60' : 'text-gray-500'}`}>
+                  · {message.mediaPreview.fileName}
+                </span>
+              )}
+            </div>
+          )}
+          {typeof uploadProgress === 'number' && uploadProgress < 1 && (
+            <div className="mb-1 h-1 w-full overflow-hidden rounded-full bg-black/20">
+              <div
+                className="h-full bg-white/80 transition-[width] duration-150"
+                style={{ width: `${Math.round(uploadProgress * 100)}%` }}
+              />
             </div>
           )}
           {message.text && (

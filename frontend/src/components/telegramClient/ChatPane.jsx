@@ -4,10 +4,13 @@ import Avatar from './Avatar';
 import MessageBubble from './MessageBubble';
 import Composer from './Composer';
 import { peerKey } from './tgClientStore';
+import { useCapabilities } from '../../context/PlatformContext';
 import {
   getClientMessages,
   sendClientMessage,
   markClientRead,
+  sendClientMedia,
+  sendClientVoice,
 } from '../../api/telegramClient';
 
 function _shouldShowSenderHeader(prev, current) {
@@ -38,6 +41,11 @@ export default function ChatPane({ sessionId, store, onTitleChange }) {
   const failPendingOutgoing = store((s) => s.failPendingOutgoing);
   const clearUnread = store((s) => s.clearUnread);
   const me = store((s) => s.me);
+
+  const uploadProgressByClientId = store((s) => s.uploadProgressByClientId);
+
+  const capabilities = useCapabilities();
+  const canSendMedia = !!capabilities?.tgc_send_media;
 
   const dialog = selectedPeerKey ? dialogs.get(selectedPeerKey) : null;
   const messages = selectedPeerKey ? messagesByPeer.get(selectedPeerKey) || [] : [];
@@ -151,6 +159,106 @@ export default function ChatPane({ sessionId, store, onTitleChange }) {
     }
   };
 
+  const _mediaKindLabel = (k) => {
+    if (k === 'photo') return 'Photo';
+    if (k === 'video') return 'Video';
+    if (k === 'audio') return 'Audio';
+    if (k === 'voice') return 'Voice message';
+    if (k === 'sticker') return 'Sticker';
+    return 'File';
+  };
+
+  const handleSendMedia = async ({ file, kind, caption, clientMsgId }) => {
+    if (!dialog || !file) return false;
+    const optimistic = {
+      id: -Date.now(),
+      clientMsgId,
+      text: caption || '',
+      out: true,
+      fromId: me?.id ? Number(me.id) : null,
+      isSelf: true,
+      date: new Date().toISOString(),
+      pending: true,
+      mediaKind: kind === 'voice' ? 'voice' : kind,
+      hasMedia: true,
+      mediaPreview: { fileName: file.name, size: file.size, kind, label: _mediaKindLabel(kind) },
+    };
+    appendMessage(dialog.peerType, dialog.peerId, optimistic);
+    addPendingOutgoing(dialog.peerType, dialog.peerId, clientMsgId, optimistic);
+
+    try {
+      const { data } = await sendClientMedia(sessionId, dialog.peerType, dialog.peerId, {
+        file,
+        kind,
+        caption,
+        clientMsgId,
+      });
+      const result = data?.data || {};
+      const finalMessage = result.message || {
+        id: result.messageId,
+        text: caption || '',
+        out: true,
+        fromId: me?.id ? Number(me.id) : null,
+        isSelf: true,
+        date: result.date || new Date().toISOString(),
+        pending: false,
+        hasMedia: true,
+        mediaKind: kind,
+      };
+      resolvePendingOutgoing(clientMsgId, finalMessage);
+      return true;
+    } catch (err) {
+      const msg = err?.response?.data?.error?.message || err?.response?.data?.error || err?.message || 'Failed to send media';
+      failPendingOutgoing(clientMsgId, msg);
+      return false;
+    }
+  };
+
+  const handleSendVoice = async ({ file, duration, clientMsgId }) => {
+    if (!dialog || !file) return false;
+    const optimistic = {
+      id: -Date.now(),
+      clientMsgId,
+      text: '',
+      out: true,
+      fromId: me?.id ? Number(me.id) : null,
+      isSelf: true,
+      date: new Date().toISOString(),
+      pending: true,
+      mediaKind: 'voice',
+      hasMedia: true,
+      mediaPreview: { fileName: file.name, size: file.size, kind: 'voice', label: 'Voice message', duration },
+    };
+    appendMessage(dialog.peerType, dialog.peerId, optimistic);
+    addPendingOutgoing(dialog.peerType, dialog.peerId, clientMsgId, optimistic);
+
+    try {
+      const { data } = await sendClientVoice(sessionId, dialog.peerType, dialog.peerId, {
+        file,
+        duration,
+        clientMsgId,
+      });
+      const result = data?.data || {};
+      const finalMessage = result.message || {
+        id: result.messageId,
+        text: '',
+        out: true,
+        fromId: me?.id ? Number(me.id) : null,
+        isSelf: true,
+        date: result.date || new Date().toISOString(),
+        pending: false,
+        hasMedia: true,
+        mediaKind: 'voice',
+      };
+      resolvePendingOutgoing(clientMsgId, finalMessage);
+      return true;
+    } catch (err) {
+      const msg = err?.response?.data?.error?.message || err?.response?.data?.error || err?.message || 'Failed to send voice';
+      failPendingOutgoing(clientMsgId, msg);
+      return false;
+    }
+  };
+
   if (!dialog) {
     return (
       <div className="flex h-full flex-1 flex-col items-center justify-center gap-3 bg-dark-950 text-gray-500">
@@ -230,6 +338,9 @@ export default function ChatPane({ sessionId, store, onTitleChange }) {
                   showAvatar={dialog.peerType !== 'user' && _shouldShowAvatar(next, m)}
                   peerType={dialog.peerType}
                   peerId={dialog.peerId}
+                  uploadProgress={
+                    m.clientMsgId ? uploadProgressByClientId.get(m.clientMsgId) : undefined
+                  }
                 />
               );
             })}
@@ -237,7 +348,13 @@ export default function ChatPane({ sessionId, store, onTitleChange }) {
         )}
       </div>
 
-      <Composer disabled={loadingMessages && messages.length === 0} onSend={handleSend} />
+      <Composer
+        disabled={loadingMessages && messages.length === 0}
+        onSend={handleSend}
+        onSendMedia={canSendMedia ? handleSendMedia : undefined}
+        onSendVoice={canSendMedia ? handleSendVoice : undefined}
+        uploadProgressByClientId={uploadProgressByClientId}
+      />
     </div>
   );
 }

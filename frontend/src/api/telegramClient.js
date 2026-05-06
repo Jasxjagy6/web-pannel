@@ -78,3 +78,102 @@ export const fetchMessageMediaBlob = async (sessionId, peerType, peerId, message
   }
   return data;
 };
+
+/**
+ * Send a media (photo/video/audio/document) message. `kind` selects the
+ * Telegram document attribute set used by the receiver for rendering.
+ *
+ * `extras.onUploadProgress` receives raw axios progress events for the
+ * outgoing HTTP body; the *actual* Telegram-side upload progress
+ * arrives via Socket.IO `tg-client:uploadProgress`.
+ */
+export const sendClientMedia = (
+  sessionId,
+  peerType,
+  peerId,
+  { file, kind, caption, replyToMsgId, silent, clientMsgId, duration, width, height, waveform } = {},
+  extras = {}
+) => {
+  const fd = new FormData();
+  fd.append('file', file);
+  if (kind) fd.append('kind', kind);
+  if (caption) fd.append('caption', caption);
+  if (replyToMsgId != null) fd.append('replyToMsgId', String(replyToMsgId));
+  if (silent) fd.append('silent', 'true');
+  if (clientMsgId) fd.append('clientMsgId', clientMsgId);
+  if (duration != null) fd.append('duration', String(duration));
+  if (width != null) fd.append('width', String(width));
+  if (height != null) fd.append('height', String(height));
+  if (waveform) fd.append('waveform', waveform);
+  return api.post(
+    `${BASE}/sessions/${sessionId}/dialogs/${peerType}/${peerId}/send-media`,
+    fd,
+    {
+      headers: { 'Content-Type': 'multipart/form-data' },
+      onUploadProgress: extras.onUploadProgress,
+      // media uploads are slow — bump axios timeout
+      timeout: 0,
+    }
+  );
+};
+
+export const sendClientVoice = (
+  sessionId,
+  peerType,
+  peerId,
+  { file, replyToMsgId, silent, clientMsgId, duration, waveform } = {},
+  extras = {}
+) => {
+  const fd = new FormData();
+  fd.append('voice', file);
+  if (replyToMsgId != null) fd.append('replyToMsgId', String(replyToMsgId));
+  if (silent) fd.append('silent', 'true');
+  if (clientMsgId) fd.append('clientMsgId', clientMsgId);
+  if (duration != null) fd.append('duration', String(duration));
+  if (waveform) fd.append('waveform', waveform);
+  return api.post(
+    `${BASE}/sessions/${sessionId}/dialogs/${peerType}/${peerId}/send-voice`,
+    fd,
+    {
+      headers: { 'Content-Type': 'multipart/form-data' },
+      onUploadProgress: extras.onUploadProgress,
+      timeout: 0,
+    }
+  );
+};
+
+/**
+ * Send a sticker. Either provide `{ documentId, accessHash, fileReference }`
+ * to re-send a known sticker, or `{ file }` to upload a one-off
+ * sticker file.
+ */
+export const sendClientSticker = (
+  sessionId,
+  peerType,
+  peerId,
+  payload = {}
+) => {
+  if (payload.file) {
+    const fd = new FormData();
+    fd.append('file', payload.file);
+    if (payload.replyToMsgId != null) fd.append('replyToMsgId', String(payload.replyToMsgId));
+    if (payload.silent) fd.append('silent', 'true');
+    if (payload.clientMsgId) fd.append('clientMsgId', payload.clientMsgId);
+    return api.post(
+      `${BASE}/sessions/${sessionId}/dialogs/${peerType}/${peerId}/send-sticker`,
+      fd,
+      { headers: { 'Content-Type': 'multipart/form-data' }, timeout: 0 }
+    );
+  }
+  return api.post(
+    `${BASE}/sessions/${sessionId}/dialogs/${peerType}/${peerId}/send-sticker`,
+    {
+      documentId: payload.documentId,
+      accessHash: payload.accessHash,
+      fileReference: payload.fileReference,
+      replyToMsgId: payload.replyToMsgId,
+      silent: !!payload.silent,
+      clientMsgId: payload.clientMsgId,
+    }
+  );
+};

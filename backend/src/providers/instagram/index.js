@@ -101,6 +101,9 @@ const capabilities = {
   // In-panel Telegram client — Telegram-only capability. Always false
   // here so the IG sidebar never renders the "Login" entry.
   telegram_client:        false,
+
+  // Phase 2 in-panel Telegram client features — all Telegram-only.
+  tgc_send_media:         false,
 };
 
 // Lazy module loaders — keeps the IG runtime out of the cold-start path.
