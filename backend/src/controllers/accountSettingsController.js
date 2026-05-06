@@ -1,5 +1,6 @@
 const accountSettingsService = require('../services/accountSettingsService');
 const { asyncHandler } = require('../utils/errorHandler');
+const { resolveSessionIdsFromRequest } = require('../utils/resolveSessions');
 const logger = require('../utils/logger');
 
 module.exports = {
@@ -9,7 +10,7 @@ module.exports = {
    */
   updateMultipleSessions: asyncHandler(async (req, res) => {
     const {
-      sessionIds,
+      sessionIds: rawSessionIds,
       firstName,
       lastName,
       username,
@@ -18,6 +19,7 @@ module.exports = {
     } = req.body;
 
     const userId = req.user?.id;
+    const sessionIds = await resolveSessionIdsFromRequest(req, rawSessionIds || []);
 
     logger.info(`Account settings update request from user ${userId}`, {
       sessionCount: sessionIds?.length || 0,

@@ -15,6 +15,7 @@ const { pool } = require('../config/database');
 const { AppError, asyncHandler } = require('../utils/errorHandler');
 const privacyService = require('../services/privacyService');
 const reportService = require('../services/reportService');
+const { resolveSessionIdsFromRequest } = require('../utils/resolveSessions');
 const logger = require('../utils/logger');
 
 // Map every panel key to the rule set the UI is allowed to submit. The
@@ -72,15 +73,20 @@ const privacyController = {
     const body = req.body || {};
     const settings = _validateSettings(body.settings);
     const rawIds = Array.isArray(body.sessionIds) ? body.sessionIds : [];
+    const expanded = await resolveSessionIdsFromRequest(req, rawIds);
     const sessionIds = Array.from(
       new Set(
-        rawIds
+        expanded
           .map((x) => Number(x))
           .filter((x) => Number.isInteger(x) && x > 0)
       )
     );
     if (sessionIds.length === 0) {
-      throw new AppError('Pick at least one session', 400, 'NO_SESSIONS');
+      throw new AppError(
+        'Pick at least one session (or a non-empty session list)',
+        400,
+        'NO_SESSIONS'
+      );
     }
 
     // Restrict to sessions the caller actually owns and that are usable.

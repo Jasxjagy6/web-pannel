@@ -1,17 +1,19 @@
 const twoFAJobService = require('../services/twoFAJobService');
 const reportService = require('../services/reportService');
 const { AppError, asyncHandler } = require('../utils/errorHandler');
+const { resolveSessionIdsFromRequest } = require('../utils/resolveSessions');
 const logger = require('../utils/logger');
 
 const twoFAJobController = {
   /** POST /api/2fa-jobs/bulk */
   createBulkJob: asyncHandler(async (req, res) => {
     const userId = req.user.id;
-    const { sessionIds, oldPassword, newPassword } = req.body || {};
+    const { sessionIds: rawSessionIds, oldPassword, newPassword } = req.body || {};
+    const expanded = await resolveSessionIdsFromRequest(req, rawSessionIds || []);
 
     const result = await twoFAJobService.createBulkJob({
       userId,
-      sessionIds: Array.isArray(sessionIds) ? sessionIds.map(Number) : [],
+      sessionIds: Array.isArray(expanded) ? expanded.map(Number) : [],
       oldPassword,
       newPassword,
     });

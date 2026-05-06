@@ -2,11 +2,33 @@ const scrapeService = require('../services/scrapeService');
 const reportService = require('../services/reportService');
 const monitorService = require('../services/scrapeMonitorService');
 const telegramService = require('../services/telegramService');
+const sessionListService = require('../services/sessionListService');
 const { pool } = require('../config/database');
 const { AppError, asyncHandler } = require('../utils/errorHandler');
 const logger = require('../utils/logger');
 
 function _isInstagram(req) { return req && req.platform === 'instagram'; }
+
+/**
+ * Expand `req.body.sessionListId` to its member session IDs when set,
+ * otherwise return the explicit `sessionIds` array unchanged. Keeps
+ * each controller handler from having to know about the session-lists
+ * feature directly.
+ */
+async function _resolveSessions(req, fallbackSessionIds = []) {
+  const body = req.body || {};
+  const listId = body.sessionListId ?? body.session_list_id;
+  if (listId != null && listId !== '') {
+    const ids = await sessionListService.resolveSessionIds({
+      userId: req.user.id,
+      platform: req.platform,
+      sessionIds: [],
+      sessionListId: listId,
+    });
+    return ids;
+  }
+  return fallbackSessionIds;
+}
 
 const scrapeController = {
   /**
@@ -43,14 +65,17 @@ const scrapeController = {
       targetType: bodyTargetType,
     } = req.body;
 
-    // Build session IDs array
-    const sessions = sessionIds || (sessionId ? [parseInt(sessionId)] : []);
-    
+    // Build session IDs array. If the caller passed `sessionListId`,
+    // expand it to that list's active members; otherwise honour the
+    // explicit `sessionIds` / `sessionId` as before.
+    const explicitSessions = sessionIds || (sessionId ? [parseInt(sessionId)] : []);
+    const sessions = await _resolveSessions(req, explicitSessions);
+
     // Build target IDs array
     const targets = targetIds || (groupId ? [groupId] : (targetId ? [targetId] : []));
 
     if (!sessions.length) {
-      throw new AppError('sessionIds or sessionId is required', 400, 'MISSING_SESSIONS');
+      throw new AppError('sessionIds, sessionId, or a non-empty sessionListId is required', 400, 'MISSING_SESSIONS');
     }
     if (!targets.length) {
       throw new AppError('targetIds, groupId, or targetId is required', 400, 'MISSING_TARGETS');
@@ -166,11 +191,12 @@ const scrapeController = {
       async = true,
     } = req.body;
 
-    const sessions = sessionIds || (sessionId ? [parseInt(sessionId)] : []);
+    const explicitSessions = sessionIds || (sessionId ? [parseInt(sessionId)] : []);
+    const sessions = await _resolveSessions(req, explicitSessions);
     const targets = targetIds || (channelId ? [channelId] : (targetId ? [targetId] : []));
 
     if (!sessions.length) {
-      throw new AppError('sessionIds or sessionId is required', 400, 'MISSING_SESSIONS');
+      throw new AppError('sessionIds, sessionId, or a non-empty sessionListId is required', 400, 'MISSING_SESSIONS');
     }
     if (!targets.length) {
       throw new AppError('targetIds, channelId, or targetId is required', 400, 'MISSING_TARGETS');
@@ -540,9 +566,10 @@ const scrapeController = {
       dedupEnabled, allowDuplicates,
     } = req.body || {};
 
-    const sessions = Array.isArray(sessionIds) && sessionIds.length
+    const explicitSessions = Array.isArray(sessionIds) && sessionIds.length
       ? sessionIds
       : (sessionId ? [parseInt(sessionId, 10)] : []);
+    const sessions = await _resolveSessions(req, explicitSessions);
 
     let duration = parseInt(durationSeconds, 10);
     if (!Number.isFinite(duration) || duration <= 0) {

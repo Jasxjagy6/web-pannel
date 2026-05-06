@@ -7,6 +7,7 @@ import { parseApiError, formatNumber, formatRelativeTime, formatDateTime } from 
 import { useToast } from '../components/common/Toast';
 import { Modal } from '../components/common/Modal';
 import StatusBadge from '../components/common/StatusBadge';
+import SessionListSwitcher from '../components/common/SessionListSwitcher';
 import {
   Loader2,
   X,
@@ -46,13 +47,19 @@ function JoinLeaveForm({ sessions, onSubmit, submitting }) {
   const [mode, setMode] = useState('join'); // 'join' or 'leave'
   const [targetIds, setTargetIds] = useState('');
   const [selectedSessionIds, setSelectedSessionIds] = useState([]);
+  const [sessionPickMode, setSessionPickMode] = useState('sessions');
+  const [selectedSessionListId, setSelectedSessionListId] = useState('');
   const [errors, setErrors] = useState({});
   const [showAllSessions, setShowAllSessions] = useState(false);
 
   const validate = () => {
     const newErrors = {};
     if (!targetIds.trim()) newErrors.targetIds = 'Please enter at least one group/channel.';
-    if (selectedSessionIds.length === 0) newErrors.session = 'Please select at least one session.';
+    if (sessionPickMode === 'list') {
+      if (!selectedSessionListId) newErrors.session = 'Please pick a session list.';
+    } else if (selectedSessionIds.length === 0) {
+      newErrors.session = 'Please select at least one session (or pick a session list).';
+    }
     setErrors(newErrors);
     return Object.keys(newErrors).length === 0;
   };
@@ -66,15 +73,18 @@ function JoinLeaveForm({ sessions, onSubmit, submitting }) {
       .map(t => t.trim())
       .filter(t => t.length > 0);
 
-    onSubmit({
-      mode,
-      targetIds: targets,
-      sessionIds: selectedSessionIds,
-    });
+    const payload = { mode, targetIds: targets };
+    if (sessionPickMode === 'list' && selectedSessionListId) {
+      payload.sessionListId = Number(selectedSessionListId);
+    } else {
+      payload.sessionIds = selectedSessionIds;
+    }
+    onSubmit(payload);
 
     // Reset
     setTargetIds('');
     setSelectedSessionIds([]);
+    setSelectedSessionListId('');
     setErrors({});
   };
 
@@ -165,8 +175,16 @@ or -1001234567890
         </p>
       </div>
 
-      {/* Session Selection (Multi-Select) */}
-      <div>
+      {/* Session source: pick sessions OR pick a saved session list */}
+      <SessionListSwitcher
+        mode={sessionPickMode}
+        onModeChange={setSessionPickMode}
+        selectedSessionListId={selectedSessionListId}
+        onSelectedSessionListIdChange={setSelectedSessionListId}
+      />
+
+      {/* Session Selection (Multi-Select), hidden in list mode */}
+      <div className={sessionPickMode === 'list' ? 'hidden' : ''}>
         <label className={labelClass}>
           <span className="flex items-center gap-1.5">
             <Users className="w-3.5 h-3.5 text-gray-500" />
@@ -216,6 +234,9 @@ or -1001234567890
           <p className="mt-1 text-xs text-amber-400">No active sessions. Please login first.</p>
         )}
       </div>
+      {errors.session && sessionPickMode === 'list' && (
+        <p className="mt-1 text-xs text-red-400">{errors.session}</p>
+      )}
 
       {/* Submit Button */}
       <button
@@ -252,6 +273,8 @@ function AddMembersForm({ sessions, targetLists, onSubmit, submitting }) {
   const [targetType, setTargetType] = useState('group'); // 'group' or 'channel'
   const [targetIds, setTargetIds] = useState('');
   const [selectedSessionIds, setSelectedSessionIds] = useState([]);
+  const [sessionPickMode, setSessionPickMode] = useState('sessions');
+  const [selectedSessionListId, setSelectedSessionListId] = useState('');
   const [delayMin, setDelayMin] = useState(30);
   const [delayMax, setDelayMax] = useState(60);
   const [batchSize, setBatchSize] = useState(5);
@@ -262,7 +285,11 @@ function AddMembersForm({ sessions, targetLists, onSubmit, submitting }) {
     const newErrors = {};
     if (!sourceList) newErrors.sourceList = 'Please select a source list.';
     if (!targetIds.trim()) newErrors.targetIds = 'Please enter at least one target.';
-    if (selectedSessionIds.length === 0) newErrors.session = 'Please select at least one session.';
+    if (sessionPickMode === 'list') {
+      if (!selectedSessionListId) newErrors.session = 'Please pick a session list.';
+    } else if (selectedSessionIds.length === 0) {
+      newErrors.session = 'Please select at least one session (or pick a session list).';
+    }
     if (delayMin < 1 || delayMin > 600) newErrors.delayMin = 'Min delay must be between 1 and 600.';
     if (delayMax < 1 || delayMax > 600) newErrors.delayMax = 'Max delay must be between 1 and 600.';
     if (delayMin > delayMax) newErrors.delayMin = 'Min delay cannot exceed max delay.';
@@ -280,20 +307,26 @@ function AddMembersForm({ sessions, targetLists, onSubmit, submitting }) {
       .map(t => t.trim())
       .filter(t => t.length > 0);
 
-    onSubmit({
+    const submitPayload = {
       sourceList,
       targetIds: targets,
       targetType,
-      sessionIds: selectedSessionIds,
       delayMin: Number(delayMin),
       delayMax: Number(delayMax),
       batchSize: Number(batchSize),
-    });
+    };
+    if (sessionPickMode === 'list' && selectedSessionListId) {
+      submitPayload.sessionListId = Number(selectedSessionListId);
+    } else {
+      submitPayload.sessionIds = selectedSessionIds;
+    }
+    onSubmit(submitPayload);
 
     // Reset
     setSourceList('');
     setTargetIds('');
     setSelectedSessionIds([]);
+    setSelectedSessionListId('');
     setDelayMin(30);
     setDelayMax(60);
     setBatchSize(5);
@@ -410,8 +443,16 @@ function AddMembersForm({ sessions, targetLists, onSubmit, submitting }) {
         </p>
       </div>
 
-      {/* Session Selection (Multi-Select) */}
-      <div>
+      {/* Session source: pick sessions OR pick a saved session list */}
+      <SessionListSwitcher
+        mode={sessionPickMode}
+        onModeChange={setSessionPickMode}
+        selectedSessionListId={selectedSessionListId}
+        onSelectedSessionListIdChange={setSelectedSessionListId}
+      />
+
+      {/* Session Selection (Multi-Select), hidden in list mode */}
+      <div className={sessionPickMode === 'list' ? 'hidden' : ''}>
         <label className={labelClass}>
           <span className="flex items-center gap-1.5">
             <Users className="w-3.5 h-3.5 text-gray-500" />
@@ -461,6 +502,9 @@ function AddMembersForm({ sessions, targetLists, onSubmit, submitting }) {
           <p className="mt-1 text-xs text-amber-400">No active sessions. Please login first.</p>
         )}
       </div>
+      {errors.session && sessionPickMode === 'list' && (
+        <p className="mt-1 text-xs text-red-400">{errors.session}</p>
+      )}
 
       {/* Options */}
       <div>
@@ -750,8 +794,7 @@ export default function Groups() {
         return;
       }
 
-      const response = await groupsAPI.addMembers({
-        sessionIds: data.sessionIds.map(id => parseInt(id)),
+      const addMembersPayload = {
         targetIds: data.targetIds,
         targetType: data.targetType,
         userList: users,
@@ -759,7 +802,13 @@ export default function Groups() {
         delayMax: data.delayMax,
         batchSize: data.batchSize,
         async: false,
-      });
+      };
+      if (data.sessionListId) {
+        addMembersPayload.sessionListId = Number(data.sessionListId);
+      } else {
+        addMembersPayload.sessionIds = (data.sessionIds || []).map(id => parseInt(id));
+      }
+      const response = await groupsAPI.addMembers(addMembersPayload);
 
       const elapsed = Date.now() - startTime;
       const remaining = Math.max(0, minLoadingTime - elapsed);
@@ -798,10 +847,13 @@ export default function Groups() {
     try {
       const apiCall = data.mode === 'join' ? groupsAPI.joinChannels : groupsAPI.leaveChannels;
 
-      const response = await apiCall({
-        sessionIds: data.sessionIds.map(id => parseInt(id)),
-        targetIds: data.targetIds,
-      });
+      const joinPayload = { targetIds: data.targetIds };
+      if (data.sessionListId) {
+        joinPayload.sessionListId = Number(data.sessionListId);
+      } else {
+        joinPayload.sessionIds = (data.sessionIds || []).map(id => parseInt(id));
+      }
+      const response = await apiCall(joinPayload);
 
       const elapsed = Date.now() - startTime;
       const remaining = Math.max(0, minLoadingTime - elapsed);
