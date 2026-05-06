@@ -10,6 +10,7 @@
 
 import { useEffect, useRef } from 'react';
 import { io } from 'socket.io-client';
+import { invalidateProfilePhoto } from './useProfilePhoto';
 
 const SOCKET_URL =
   import.meta.env.VITE_SOCKET_URL ||
@@ -140,6 +141,23 @@ export function useTelegramClientSocket(sessionId, store) {
       const { clientMsgId, progress } = data;
       if (!clientMsgId) return;
       store.getState().setUploadProgress(clientMsgId, progress);
+    });
+
+    socket.on('tg-client:profileChanged', (data) => {
+      if (!data || String(data.sessionId) !== String(sessionId)) return;
+      const profile = data.profile;
+      if (!profile) return;
+      // Self update — refresh the cached `me` so headers / footers
+      // reflect the new name+username, and invalidate the avatar cache
+      // so a new photo loads instantly.
+      if (data.kind === 'self') {
+        store.getState().setMe(profile);
+        if (profile.id != null) invalidateProfilePhoto(sessionId, 'user', Number(profile.id));
+      } else if (data.kind === 'peer' && profile.id != null) {
+        // D6 peer profile updates also flow through this event.
+        const peerType = profile.peerType || 'user';
+        invalidateProfilePhoto(sessionId, peerType, Number(profile.id));
+      }
     });
 
     socket.on('tg-client:typing', (data) => {

@@ -1392,6 +1392,242 @@ class TelegramClientService {
       messages: normalized,
     };
   }
+
+  /**
+   * D5 — Get the current account's full profile (firstName, lastName,
+   * username, phone, bio/about, photoId, premium flag).
+   *
+   * The minimal `getMe` already exposes the cheap fields; we additionally
+   * call users.getFullUser so we can return the bio + common chats count.
+   */
+  async getSelfProfile(sessionId, userId) {
+    await _loadAndAuthSession(sessionId, userId);
+    await tgService._ensureConnected(sessionId);
+    const entry = tgService.clients.get(String(sessionId));
+    if (!entry) throw new AppError('Session client not loaded', 500, 'CLIENT_NOT_LOADED');
+
+    let me;
+    try {
+      me = await entry.client.getMe();
+    } catch (err) {
+      throw new AppError(`getMe failed: ${err.message}`, 502, 'GETME_FAILED');
+    }
+    if (!me) throw new AppError('Self entity not available', 500, 'NO_SELF');
+
+    let full;
+    try {
+      full = await entry.client.invoke(new Api.users.GetFullUser({ id: 'me' }));
+    } catch (err) {
+      logger.debug(`tg-client getFullUser failed: ${err.message}`);
+    }
+
+    const fullUser = full?.fullUser || null;
+    return {
+      id: _toIdNum(me.id),
+      firstName: me.firstName || '',
+      lastName: me.lastName || '',
+      username: me.username || null,
+      usernames: Array.isArray(me.usernames) ? me.usernames.map((u) => ({
+        username: u.username,
+        active: !!u.active,
+        editable: !!u.editable,
+      })) : [],
+      phone: me.phone || null,
+      bio: fullUser?.about || '',
+      isPremium: !!me.premium,
+      isVerified: !!me.verified,
+      isScam: !!me.scam,
+      isFake: !!me.fake,
+      photoId: me.photo?.photoId ? String(me.photo.photoId) : null,
+      hasPhoto: !!(me.photo && (me.photo.photoId || me.photo.photoSmall)),
+      commonChatsCount: fullUser?.commonChatsCount || 0,
+      langCode: me.langCode || null,
+    };
+  }
+
+  /**
+   * D5 — Update the current account's name and/or bio (account.updateProfile).
+   * All fields are optional; passing undefined keeps the current value.
+   */
+  async updateSelfProfile(sessionId, userId, { firstName, lastName, bio } = {}) {
+    await _loadAndAuthSession(sessionId, userId);
+    await tgService._ensureConnected(sessionId);
+    const entry = tgService.clients.get(String(sessionId));
+    if (!entry) throw new AppError('Session client not loaded', 500, 'CLIENT_NOT_LOADED');
+
+    const params = {};
+    if (typeof firstName === 'string') params.firstName = firstName.slice(0, 64);
+    if (typeof lastName === 'string') params.lastName = lastName.slice(0, 64);
+    if (typeof bio === 'string') params.about = bio.slice(0, 70);
+
+    if (Object.keys(params).length === 0) {
+      throw new AppError('At least one of firstName / lastName / bio is required', 400, 'NO_FIELDS');
+    }
+
+    try {
+      await entry.client.invoke(new Api.account.UpdateProfile(params));
+    } catch (err) {
+      throw new AppError(`updateProfile failed: ${err.message}`, 502, 'UPDATE_PROFILE_FAILED');
+    }
+
+    const profile = await this.getSelfProfile(sessionId, userId);
+    _broadcastProfileChanged(userId, sessionId, profile);
+    return profile;
+  }
+
+  /**
+   * D5 — Update the public username (account.updateUsername).
+   * Pass an empty string to clear it.
+   */
+  async updateSelfUsername(sessionId, userId, username) {
+    await _loadAndAuthSession(sessionId, userId);
+    await tgService._ensureConnected(sessionId);
+    const entry = tgService.clients.get(String(sessionId));
+    if (!entry) throw new AppError('Session client not loaded', 500, 'CLIENT_NOT_LOADED');
+
+    const value = typeof username === 'string' ? username.trim() : '';
+    if (value && !/^[A-Za-z][A-Za-z0-9_]{4,31}$/.test(value)) {
+      throw new AppError(
+        'Username must be 5-32 chars: a-z, 0-9, _ and start with a letter',
+        400,
+        'BAD_USERNAME',
+      );
+    }
+    try {
+      await entry.client.invoke(new Api.account.UpdateUsername({ username: value }));
+    } catch (err) {
+      throw new AppError(`updateUsername failed: ${err.message}`, 502, 'UPDATE_USERNAME_FAILED');
+    }
+    const profile = await this.getSelfProfile(sessionId, userId);
+    _broadcastProfileChanged(userId, sessionId, profile);
+    return profile;
+  }
+
+  /**
+   * D5 — Check whether a candidate username is free.
+   * Returns { available: boolean }.
+   */
+  async checkSelfUsername(sessionId, userId, username) {
+    await _loadAndAuthSession(sessionId, userId);
+    await tgService._ensureConnected(sessionId);
+    const entry = tgService.clients.get(String(sessionId));
+    if (!entry) throw new AppError('Session client not loaded', 500, 'CLIENT_NOT_LOADED');
+
+    const value = typeof username === 'string' ? username.trim() : '';
+    if (!value) return { available: false, reason: 'EMPTY' };
+    if (!/^[A-Za-z][A-Za-z0-9_]{4,31}$/.test(value)) {
+      return { available: false, reason: 'BAD_FORMAT' };
+    }
+    try {
+      const ok = await entry.client.invoke(new Api.account.CheckUsername({ username: value }));
+      return { available: !!ok };
+    } catch (err) {
+      const msg = (err && err.message) || '';
+      if (/USERNAME_INVALID/i.test(msg)) return { available: false, reason: 'INVALID' };
+      if (/USERNAME_OCCUPIED/i.test(msg)) return { available: false, reason: 'OCCUPIED' };
+      if (/USERNAME_PURCHASE_AVAILABLE/i.test(msg)) return { available: false, reason: 'PURCHASE_ONLY' };
+      throw new AppError(`checkUsername failed: ${msg}`, 502, 'CHECK_USERNAME_FAILED');
+    }
+  }
+
+  /**
+   * D5 — Upload a new profile photo (photos.uploadProfilePhoto).
+   *
+   * `filePath` is a path on the panel disk (multer middleware).
+   * Returns the new self profile so the UI can refresh in one round-trip.
+   */
+  async updateSelfPhoto(sessionId, userId, { filePath, fileName } = {}) {
+    if (!filePath) throw new AppError('file is required', 400, 'NO_FILE');
+    const fs = require('fs');
+    if (!fs.existsSync(filePath)) {
+      throw new AppError('Uploaded file is missing on disk', 500, 'FILE_NOT_ON_DISK');
+    }
+    const { CustomFile } = require('telegram/client/uploads');
+
+    await _loadAndAuthSession(sessionId, userId);
+    await tgService._ensureConnected(sessionId);
+    const entry = tgService.clients.get(String(sessionId));
+    if (!entry) throw new AppError('Session client not loaded', 500, 'CLIENT_NOT_LOADED');
+
+    let inputFile;
+    try {
+      const stat = fs.statSync(filePath);
+      inputFile = await entry.client.uploadFile({
+        file: new CustomFile(
+          fileName || _basename(filePath) || `photo-${Date.now()}.jpg`,
+          stat.size,
+          filePath,
+        ),
+        workers: 4,
+      });
+    } catch (err) {
+      try { fs.unlinkSync(filePath); } catch (_) { /* ignore */ }
+      throw new AppError(`Photo upload failed: ${err.message}`, 502, 'PHOTO_UPLOAD_FAILED');
+    }
+
+    try {
+      await entry.client.invoke(new Api.photos.UploadProfilePhoto({ file: inputFile }));
+    } catch (err) {
+      try { fs.unlinkSync(filePath); } catch (_) { /* ignore */ }
+      throw new AppError(`UploadProfilePhoto failed: ${err.message}`, 502, 'UPDATE_PHOTO_FAILED');
+    }
+    try { fs.unlinkSync(filePath); } catch (_) { /* ignore */ }
+
+    const profile = await this.getSelfProfile(sessionId, userId);
+    _broadcastProfileChanged(userId, sessionId, profile);
+    return profile;
+  }
+
+  /**
+   * D5 — Remove the current profile photo. Falls back to no-op if the
+   * account has no photo set.
+   */
+  async deleteSelfPhoto(sessionId, userId) {
+    await _loadAndAuthSession(sessionId, userId);
+    await tgService._ensureConnected(sessionId);
+    const entry = tgService.clients.get(String(sessionId));
+    if (!entry) throw new AppError('Session client not loaded', 500, 'CLIENT_NOT_LOADED');
+
+    let me;
+    try { me = await entry.client.getMe(); } catch (_) { me = null; }
+    if (!me?.photo?.photoId) {
+      // Nothing to delete — return current profile.
+      return this.getSelfProfile(sessionId, userId);
+    }
+    try {
+      await entry.client.invoke(new Api.photos.DeletePhotos({
+        id: [new Api.InputPhoto({
+          id: me.photo.photoId,
+          accessHash: me.photo.photoAccessHash || me.photo.dcId,
+          fileReference: me.photo.fileReference || Buffer.alloc(0),
+        })],
+      }));
+    } catch (err) {
+      throw new AppError(`DeletePhotos failed: ${err.message}`, 502, 'DELETE_PHOTO_FAILED');
+    }
+    const profile = await this.getSelfProfile(sessionId, userId);
+    _broadcastProfileChanged(userId, sessionId, profile);
+    return profile;
+  }
+}
+
+/**
+ * Broadcast a profile mutation back to every window tracking this
+ * session. Other places (D6 / D10) reuse the same event so peer-side
+ * caches can refresh without a full re-poll.
+ */
+function _broadcastProfileChanged(userId, sessionId, profile) {
+  try {
+    const io = global.io;
+    if (!io) return;
+    io.to(`tg-client:u${userId}:s${sessionId}`).emit('tg-client:profileChanged', {
+      sessionId: String(sessionId),
+      kind: 'self',
+      profile,
+    });
+  } catch (err) {
+    logger.debug(`tg-client profile broadcast failed: ${err.message}`);
+  }
 }
 
 const _MEDIA_CACHE = new Map();

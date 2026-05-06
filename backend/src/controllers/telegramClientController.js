@@ -440,6 +440,94 @@ const telegramClientController = {
     res.setHeader('Content-Length', String(total));
     return res.end(buf);
   }),
+
+  /**
+   * GET /sessions/:id/profile/me
+   */
+  getSelfProfile: asyncHandler(async (req, res) => {
+    const data = await tcService.getSelfProfile(req.params.id, req.user.id);
+    res.json({ success: true, data });
+  }),
+
+  /**
+   * PATCH /sessions/:id/profile/me
+   * Body: { firstName?, lastName?, bio? }
+   */
+  updateSelfProfile: asyncHandler(async (req, res) => {
+    const data = await tcService.updateSelfProfile(req.params.id, req.user.id, {
+      firstName: req.body?.firstName,
+      lastName: req.body?.lastName,
+      bio: req.body?.bio,
+    });
+    await reportService
+      .logActivity(req.user.id, 'tg_client_update_self_profile', 'session', req.params.id, {
+        platform: 'telegram',
+        fields: Object.keys(req.body || {}),
+      })
+      .catch(() => {});
+    res.json({ success: true, data });
+  }),
+
+  /**
+   * PATCH /sessions/:id/profile/me/username
+   * Body: { username }
+   */
+  updateSelfUsername: asyncHandler(async (req, res) => {
+    const data = await tcService.updateSelfUsername(
+      req.params.id,
+      req.user.id,
+      req.body?.username,
+    );
+    await reportService
+      .logActivity(req.user.id, 'tg_client_update_username', 'session', req.params.id, {
+        platform: 'telegram',
+      })
+      .catch(() => {});
+    res.json({ success: true, data });
+  }),
+
+  /**
+   * GET /sessions/:id/profile/me/check-username?username=...
+   */
+  checkSelfUsername: asyncHandler(async (req, res) => {
+    const data = await tcService.checkSelfUsername(
+      req.params.id,
+      req.user.id,
+      String(req.query?.username || ''),
+    );
+    res.json({ success: true, data });
+  }),
+
+  /**
+   * POST /sessions/:id/profile/me/photo  (multipart "photo")
+   */
+  updateSelfPhoto: asyncHandler(async (req, res) => {
+    const file = req.file;
+    if (!file) throw new AppError('photo file is required', 400, 'NO_FILE');
+    const data = await tcService.updateSelfPhoto(req.params.id, req.user.id, {
+      filePath: file.path,
+      fileName: file.originalname,
+    });
+    await reportService
+      .logActivity(req.user.id, 'tg_client_update_photo', 'session', req.params.id, {
+        platform: 'telegram',
+      })
+      .catch(() => {});
+    res.json({ success: true, data });
+  }),
+
+  /**
+   * DELETE /sessions/:id/profile/me/photo
+   */
+  deleteSelfPhoto: asyncHandler(async (req, res) => {
+    const data = await tcService.deleteSelfPhoto(req.params.id, req.user.id);
+    await reportService
+      .logActivity(req.user.id, 'tg_client_delete_photo', 'session', req.params.id, {
+        platform: 'telegram',
+      })
+      .catch(() => {});
+    res.json({ success: true, data });
+  }),
 };
 
 module.exports = telegramClientController;

@@ -46,6 +46,8 @@ export default function Avatar({
   const sizeClass =
     size === 'sm' ? 'h-8 w-8 text-xs' :
     size === 'lg' ? 'h-12 w-12 text-base' :
+    size === 'xl' ? 'h-16 w-16 text-lg' :
+    size === '2xl' ? 'h-24 w-24 text-2xl' :
     'h-10 w-10 text-sm';
   const colorClass = _color(`${peerType}:${peerId}:${label || ''}`);
 

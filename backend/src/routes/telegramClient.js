@@ -11,7 +11,7 @@ const router = express.Router();
 const controller = require('../controllers/telegramClientController');
 const { authenticate, requireApproved } = require('../middleware/auth');
 const { generalLimiter } = require('../middleware/rateLimiter');
-const { uploadFile, uploadVoice } = require('../middleware/tgClientUpload');
+const { uploadFile, uploadVoice, uploadPhoto } = require('../middleware/tgClientUpload');
 
 router.use(authenticate);
 router.use(requireApproved);
@@ -93,5 +93,17 @@ router.get(
   '/sessions/:id/photo/:peerType/:peerId',
   controller.getProfilePhoto
 );
+
+// --- Self profile (D5) ---------------------------------------------------
+router.get('/sessions/:id/profile/me', controller.getSelfProfile);
+router.patch('/sessions/:id/profile/me', controller.updateSelfProfile);
+router.patch('/sessions/:id/profile/me/username', controller.updateSelfUsername);
+router.get('/sessions/:id/profile/me/check-username', controller.checkSelfUsername);
+router.post(
+  '/sessions/:id/profile/me/photo',
+  uploadPhoto,
+  controller.updateSelfPhoto
+);
+router.delete('/sessions/:id/profile/me/photo', controller.deleteSelfPhoto);
 
 module.exports = router;

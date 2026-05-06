@@ -22,6 +22,7 @@ import { useTelegramClientSocket } from '../components/telegramClient/useTelegra
 import DialogList from '../components/telegramClient/DialogList';
 import ChatPane from '../components/telegramClient/ChatPane';
 import Avatar from '../components/telegramClient/Avatar';
+import SelfProfileDrawer from '../components/telegramClient/SelfProfileDrawer';
 
 export default function TelegramClient() {
   const { sessionId } = useParams();
@@ -96,6 +97,7 @@ export default function TelegramClient() {
   }, [me, sessionId]);
 
   const [activeDialogTitle, setActiveDialogTitle] = useState(null);
+  const [profileOpen, setProfileOpen] = useState(false);
   useEffect(() => {
     const parts = [activeDialogTitle, accountLabel].filter(Boolean);
     document.title =
@@ -112,7 +114,12 @@ export default function TelegramClient() {
       <div className="flex w-full flex-col">
         <header className="flex shrink-0 items-center gap-3 border-b border-white/5 bg-dark-900 px-4 py-2">
           {me ? (
-            <>
+            <button
+              type="button"
+              onClick={() => setProfileOpen(true)}
+              className="-mx-1 flex min-w-0 items-center gap-3 rounded-md px-1 py-0.5 text-left hover:bg-white/5"
+              title="View my profile"
+            >
               <Avatar
                 sessionId={sessionId}
                 peerType="user"
@@ -130,7 +137,7 @@ export default function TelegramClient() {
                   {me.phone ? ` · ${me.phone}` : ''}
                 </div>
               </div>
-            </>
+            </button>
           ) : (
             <div className="text-sm text-gray-400">Connecting…</div>
           )}
@@ -173,6 +180,13 @@ export default function TelegramClient() {
           )}
         </div>
       </div>
+
+      <SelfProfileDrawer
+        sessionId={sessionId}
+        isOpen={profileOpen}
+        onClose={() => setProfileOpen(false)}
+        onProfileLoaded={(p) => p && useStore.getState().setMe({ ...useStore.getState().me, ...p })}
+      />
     </div>
   );
 }

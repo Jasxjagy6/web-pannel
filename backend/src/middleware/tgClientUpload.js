@@ -47,5 +47,6 @@ const upload = multer({
 module.exports = {
   uploadFile: upload.single('file'),
   uploadVoice: upload.single('voice'),
+  uploadPhoto: upload.single('photo'),
   rootDir: ROOT,
 };

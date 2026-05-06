@@ -232,3 +232,31 @@ export const deleteClientMessages = (sessionId, peerType, peerId, messageIds, re
  */
 export const forwardClientMessages = (sessionId, payload) =>
   api.post(`${BASE}/sessions/${sessionId}/forward`, payload);
+
+// --- D5 — self profile ----------------------------------------------------
+
+export const getSelfProfile = (sessionId) =>
+  api.get(`${BASE}/sessions/${sessionId}/profile/me`);
+
+export const updateSelfProfile = (sessionId, payload) =>
+  api.patch(`${BASE}/sessions/${sessionId}/profile/me`, payload);
+
+export const updateSelfUsername = (sessionId, username) =>
+  api.patch(`${BASE}/sessions/${sessionId}/profile/me/username`, { username });
+
+export const checkSelfUsername = (sessionId, username) =>
+  api.get(`${BASE}/sessions/${sessionId}/profile/me/check-username`, {
+    params: { username },
+  });
+
+export const updateSelfPhoto = (sessionId, file) => {
+  const fd = new FormData();
+  fd.append('photo', file);
+  return api.post(`${BASE}/sessions/${sessionId}/profile/me/photo`, fd, {
+    headers: { 'Content-Type': 'multipart/form-data' },
+    timeout: 0,
+  });
+};
+
+export const deleteSelfPhoto = (sessionId) =>
+  api.delete(`${BASE}/sessions/${sessionId}/profile/me/photo`);

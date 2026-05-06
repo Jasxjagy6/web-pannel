@@ -106,6 +106,7 @@ const capabilities = {
   tgc_send_media:         false,
   tgc_view_media:         false,
   tgc_message_actions:    false,
+  tgc_self_profile:       false,
 };
 
 // Lazy module loaders — keeps the IG runtime out of the cold-start path.

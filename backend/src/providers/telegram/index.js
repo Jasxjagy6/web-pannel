@@ -144,6 +144,8 @@ const capabilities = {
   tgc_view_media:         true,
   // D3 — message actions: reply / forward / edit / delete.
   tgc_message_actions:    true,
+  // D5 — self profile (view + edit name / bio / username / photo).
+  tgc_self_profile:       true,
 };
 
 // ---------------------------------------------------------------------------
