@@ -13,4 +13,11 @@ router.get('/jobs/:id', ctrl.getJob);
 router.get('/jobs/:id/items', ctrl.getJobItems);
 router.post('/jobs/:id/cancel', ctrl.cancelJob);
 
+// Instagram-specific per-account privacy. The handlers themselves
+// reject non-IG platforms with 400 WRONG_PLATFORM, so it's safe to
+// mount them on the shared router (the legacy /api/privacy alias
+// stays Telegram-only because req.platform defaults to 'telegram').
+router.get('/account/:sessionId', ctrl.getInstagramPrivacy);
+router.patch('/account/:sessionId', ctrl.setInstagramPrivacy);
+
 module.exports = router;

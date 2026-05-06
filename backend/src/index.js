@@ -185,6 +185,33 @@ app.use(`${apiPrefix}/user-credentials`, userCredentialsRoutes);
 app.use(`${apiPrefix}/telegram/otp-relays`, parsePlatform('telegram'), otpRelayRoutes);
 app.use(`${apiPrefix}/otp-relays`, resolvePlatform, otpRelayRoutes);
 
+// Instagram-only per-account 2FA (TOTP enable/disable/status). Telegram
+// has its own bulk-job model under /2fa-jobs which doesn't apply here.
+const instagramTwoFactorRoutes = require('./routes/instagramTwoFactor');
+app.use(
+  `${apiPrefix}/instagram/two-factor`,
+  parsePlatform('instagram'),
+  instagramTwoFactorRoutes
+);
+
+// Instagram-only per-account settings (username, full_name, bio, pfp).
+// Mounted independently of /account-settings so the IG payload shape
+// doesn't have to fit the TG bulk-update model.
+const instagramAccountRoutes = require('./routes/instagramAccount');
+app.use(
+  `${apiPrefix}/instagram/account`,
+  parsePlatform('instagram'),
+  instagramAccountRoutes
+);
+
+// Instagram-only per-account identity / device fingerprint surface.
+const instagramIdentityRoutes = require('./routes/instagramIdentity');
+app.use(
+  `${apiPrefix}/instagram/identity`,
+  parsePlatform('instagram'),
+  instagramIdentityRoutes
+);
+
 // 404 handler
 app.use((req, res) => {
   res.status(404).json({ success: false, error: { message: 'Route not found', code: 'NOT_FOUND' } });

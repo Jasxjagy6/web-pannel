@@ -238,6 +238,67 @@ const privacyController = {
       .catch(() => {});
     return res.json({ success: true });
   }),
+
+  // -------------------------------------------------------------------
+  // Instagram-specific privacy surface (per-account, single session).
+  //
+  // Telegram exposes 11 named privacy keys (phone_number, last_seen, ...)
+  // each settable to everybody/contacts/nobody. Instagram does NOT —
+  // the closest mobile-API surface is `setAccountPrivate / setAccountPublic`
+  // plus a handful of comment / message-receipt flags. Modelling this
+  // as TG-style keys/jobs would be misleading, so the IG panel hits a
+  // dedicated single-session GET/PATCH at /api/instagram/privacy/account/:id.
+  // -------------------------------------------------------------------
+
+  /** GET /api/instagram/privacy/account/:sessionId */
+  getInstagramPrivacy: asyncHandler(async (req, res) => {
+    if (req.platform !== 'instagram') {
+      throw new AppError(
+        'This endpoint is Instagram-only.',
+        400,
+        'WRONG_PLATFORM'
+      );
+    }
+    const userId = req.user.id;
+    const sessionId = Number(req.params.sessionId);
+    if (!sessionId) throw new AppError('Invalid session id', 400, 'BAD_ID');
+    const out = await req.provider.privacy.get({ userId, sessionId });
+    return res.json({ success: true, data: out });
+  }),
+
+  /** PATCH /api/instagram/privacy/account/:sessionId */
+  setInstagramPrivacy: asyncHandler(async (req, res) => {
+    if (req.platform !== 'instagram') {
+      throw new AppError(
+        'This endpoint is Instagram-only.',
+        400,
+        'WRONG_PLATFORM'
+      );
+    }
+    const userId = req.user.id;
+    const sessionId = Number(req.params.sessionId);
+    if (!sessionId) throw new AppError('Invalid session id', 400, 'BAD_ID');
+    const settings = req.body || {};
+    if (typeof settings.is_private !== 'boolean'
+        && typeof settings.has_anonymous_profile_picture !== 'boolean') {
+      throw new AppError(
+        'Provide at least one boolean key: is_private, has_anonymous_profile_picture',
+        400,
+        'EMPTY_SETTINGS'
+      );
+    }
+    const out = await req.provider.privacy.set({ userId, sessionId, settings });
+    reportService
+      .logActivity(req.user.id, 'instagram_privacy_set', 'session', sessionId, {
+        settings,
+      })
+      .catch(() => {});
+    logger.info(
+      `IG privacy set user=${req.user.id} session=${sessionId} ` +
+      `settings=${JSON.stringify(settings)}`
+    );
+    return res.json({ success: true, data: out });
+  }),
 };
 
 module.exports = privacyController;
