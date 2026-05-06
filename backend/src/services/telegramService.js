@@ -1102,17 +1102,21 @@ class TelegramService {
 
       // Telegram's InviteToChannel does not throw when a user can't be
       // added because of privacy settings — it returns the user inside
-      // `missing_invitees` / `missingInvitees` and the call "succeeds".
-      // Surface that as a real error so callers can mark it skipped.
+      // `missingInvitees` (Layer 198: messages.InvitedUsers wrapper)
+      // and the call "succeeds". Since we only invite one user per
+      // call, any non-empty missingInvitees means our user was the
+      // dropped one. Surface that as USER_PRIVACY_RESTRICT so the
+      // controller marks it skipped instead of falsely added.
       const missing = (inviteResult && (inviteResult.missingInvitees || inviteResult.missing_invitees)) || [];
       if (Array.isArray(missing) && missing.length > 0) {
-        const missedId = missing[0] && (missing[0].userId || missing[0].user_id);
-        const missedStr = missedId ? String(missedId) : String(userEntity.id);
-        const expectedStr = String(userEntity.id);
-        if (missedStr === expectedStr) {
-          logger.warn(`Telegram dropped invite (privacy/restricted) for ${userId}`, { sessionId, groupId });
-          throw new Error('USER_PRIVACY_RESTRICT');
-        }
+        const detail = missing[0] || {};
+        const wouldAllow = detail.premiumWouldAllowInvite || detail.premium_would_allow_invite;
+        logger.warn(
+          `Telegram dropped invite (privacy/restricted) for ${userId}` +
+            (wouldAllow ? ' [premiumWouldAllowInvite=true]' : ''),
+          { sessionId, groupId }
+        );
+        throw new Error('USER_PRIVACY_RESTRICT');
       }
 
       logger.info(`Added user ${userId} to group ${groupId}`, { sessionId });
@@ -2530,13 +2534,15 @@ class TelegramService {
           continue;
         }
 
-        // Check for PEER_FLOOD
-        if (errorMessage.includes('PEER_FLOOD') && retries < maxRetries) {
-          retries++;
-          const waitTime = DEFAULT_FLOOD_BACKOFF;
-
+        // PEER_FLOOD is account-level: Telegram has flagged this
+        // session as spam, and the cooldown is hours / days — not 30s.
+        // Retrying every 30s for 5 attempts just burns 2.5 minutes per
+        // call (and per call site there can be hundreds), without any
+        // chance of recovery in that window. Fail fast so callers can
+        // abort the whole batch and surface a real error to the UI.
+        if (errorMessage.includes('PEER_FLOOD')) {
           logger.warn(
-            `Peer flood detected for session ${sessionId}: waiting ${waitTime}s (retry ${retries}/${maxRetries})`
+            `Peer flood detected for session ${sessionId}: not retrying (account-level cooldown is hours, not seconds)`
           );
           try {
             const cfg = require('../config/telegram');
@@ -2548,9 +2554,7 @@ class TelegramService {
               });
             }
           } catch { /* best-effort */ }
-
-          await sleep(waitTime * 1000);
-          continue;
+          throw this._handleTelegramError(error);
         }
 
         // Check for SLOWMODE_WAIT
