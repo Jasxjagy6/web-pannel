@@ -18,7 +18,7 @@ const listController = {
       throw new AppError('File is required for import', 400, 'MISSING_FILE');
     }
 
-    const listName = req.body.name;
+    const listName = req.body.name || req.body.listName;
     const type = req.body.type || 'users';
 
     if (!listName || listName.trim().length === 0) {

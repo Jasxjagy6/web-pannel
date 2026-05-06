@@ -100,19 +100,67 @@ function parseJson(value) {
 }
 
 /**
- * Extract a user_id from a target object that may be a plain value or
- * an object with various id field names.
+ * UUID-style placeholder used by the scraper for hidden / unresolved
+ * users. These are never valid Telegram identifiers and must not be
+ * forwarded to the MTProto layer.
+ * @private
+ */
+const _UUID_LIKE_TARGET_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/**
+ * Extract an addressable identifier from a target object that may be a
+ * plain value or an object with various id / handle field names.
+ *
+ * Numeric ids win, but we fall back to `@username` / phone so list
+ * entries that only have a handle (e.g. hidden-user rows from scrape
+ * exports) still reach `_resolveEntity` instead of being silently
+ * dropped. UUID placeholders are explicitly skipped — the underlying
+ * Telegram client treats `2617dd5b-...` as garbage and the row would
+ * just fail later anyway.
+ *
  * @param {string|number|object} target - The target identifier
- * @returns {string|null} Normalized target ID string
+ * @returns {string|null} Normalized target identifier or null
  */
 function normalizeTargetId(target) {
   if (target === null || target === undefined) return null;
+
   if (typeof target === 'object') {
-    return String(
-      target.telegram_id || target.id || target.userId || target.target_id || ''
-    );
+    const rawId =
+      target.telegram_id ??
+      target.telegramId ??
+      target.id ??
+      target.userId ??
+      target.user_id ??
+      target.target_id ??
+      null;
+    const idStr = rawId === null || rawId === undefined ? '' : String(rawId).trim();
+    if (idStr && /^-?\d+$/.test(idStr)) {
+      return idStr;
+    }
+
+    const rawUsername = target.username ?? target.user_name ?? target.handle ?? null;
+    if (rawUsername) {
+      const u = String(rawUsername).replace(/^@+/, '').trim();
+      if (u && !_UUID_LIKE_TARGET_RE.test(u) && !/^\d+$/.test(u)) {
+        return `@${u}`;
+      }
+    }
+
+    const rawPhone = target.phone ?? target.phone_number ?? null;
+    if (rawPhone) {
+      const p = String(rawPhone).trim();
+      if (/^\+?\d{5,15}$/.test(p)) {
+        return p.startsWith('+') ? p : `+${p}`;
+      }
+    }
+
+    return null;
   }
-  return String(target);
+
+  const str = String(target).trim();
+  if (!str) return null;
+  if (_UUID_LIKE_TARGET_RE.test(str)) return null;
+  return str;
 }
 
 /**
@@ -2339,3 +2387,10 @@ class MessageService {
 // =========================================================================
 
 module.exports = new MessageService();
+
+// Internal helpers exposed for unit/smoke tests. Not part of the public
+// service API — prefer the singleton above.
+module.exports.__internal = {
+  normalizeTargetId,
+  isRetryableError,
+};

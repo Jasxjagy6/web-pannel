@@ -57,19 +57,24 @@ const schemas = {
   }),
 
   bulkMessage: Joi.object({
-    sessionIds: Joi.array().items(Joi.number().integer().positive()).min(1).required(),
+    // sessionIds is required *unless* the caller resolves sessions via a
+    // sessionListId (handled in the controller). We still accept the
+    // legacy required-array contract.
+    sessionIds: Joi.array().items(Joi.number().integer().positive()).min(1).optional(),
+    sessionListId: Joi.alternatives().try(Joi.number().integer().positive(), Joi.string()).optional(),
     targetList: Joi.array().items(
       Joi.alternatives().try(
         Joi.string(),
         Joi.number(),
         Joi.object({
-          telegram_id: Joi.alternatives().try(Joi.string(), Joi.number()),
-          id: Joi.alternatives().try(Joi.string(), Joi.number()),
-          username: Joi.string().allow(null),
-          first_name: Joi.string().allow(null),
-          last_name: Joi.string().allow(null),
-          phone: Joi.string().allow(null),
-        })
+          telegram_id: Joi.alternatives().try(Joi.string(), Joi.number()).allow(null, ''),
+          telegramId: Joi.alternatives().try(Joi.string(), Joi.number()).allow(null, ''),
+          id: Joi.alternatives().try(Joi.string(), Joi.number()).allow(null, ''),
+          username: Joi.string().allow(null, ''),
+          first_name: Joi.string().allow(null, ''),
+          last_name: Joi.string().allow(null, ''),
+          phone: Joi.string().allow(null, ''),
+        }).unknown(true)
       )
     ).min(1).required(),
     message: Joi.string().max(4096).required(),
@@ -78,9 +83,11 @@ const schemas = {
     delayMin: Joi.number().min(1).max(10).default(1),
     delayMax: Joi.number().min(1).max(10).default(3),
     messagesPerSession: Joi.number().integer().min(1).default(50),
+    messageOptions: Joi.alternatives().try(Joi.object().unknown(true), Joi.string()).optional(),
+    async: Joi.alternatives().try(Joi.boolean(), Joi.string()).optional(),
     sourceType: Joi.string().valid('manual', 'list').default('manual'),
     sourceId: Joi.number().integer().positive().optional(),
-  }),
+  }).or('sessionIds', 'sessionListId'),
 
   addMembersToGroup: Joi.object({
     // New multi-session mode
@@ -135,9 +142,15 @@ const schemas = {
   }),
 
   listImport: Joi.object({
-    listName: Joi.string().max(255).required(),
-    type: Joi.string().valid('users', 'groups', 'channels').required(),
-  }),
+    // The frontend posts the list name as `name` and the controller reads
+    // `req.body.name`. Accept both `name` and `listName` so older clients
+    // (and the merge/from-scrape flows) keep working.
+    name: Joi.string().max(255),
+    listName: Joi.string().max(255),
+    type: Joi.string().valid('users', 'groups', 'channels').default('users'),
+  })
+    .or('name', 'listName')
+    .unknown(true),
 
   reportGenerate: Joi.object({
     reportType: Joi.string().valid('channel', 'group', 'user', 'session').required(),
