@@ -519,6 +519,24 @@ async function _runScrape({ jobId, job, sessions, targets, limit, onSessionPick 
       } catch (err) {
         const mapped = _mapIgError(err);
         lastError = mapped;
+
+        // Partial-success signal raised by paginateFriendList after
+        // exhausting its retries mid-pagination. The rows we already
+        // streamed are committed via onProgress(); finish this target
+        // cleanly with a warning instead of failing the job.
+        if (err && err.partial && producedThisTarget > 0) {
+          logger.warn(
+            `IG.scrape job ${jobId}: session ${session.id} returned partial result ` +
+            `for target=${targetRaw} (${producedThisTarget} rows) — accepting and moving on.`
+          );
+          await _setStatus(jobId, 'running', {
+            total_found: totalScraped,
+            error: `Partial: target=${targetRaw} stopped after ${producedThisTarget} rows (${err.kind || 'rate_limited'}).`,
+          });
+          cursor = (cursor + 1) % Math.max(1, sessionPool.length);
+          break;
+        }
+
         const isPivotable =
           mapped.kind === 'rate_limited' ||
           mapped.kind === 'action_blocked' ||
@@ -532,6 +550,23 @@ async function _runScrape({ jobId, job, sessions, targets, limit, onSessionPick 
           sessionPool.splice(cursor % sessionPool.length, 1);
           continue;
         }
+
+        // Single-session pool that ran out of retries on a transient
+        // throttle: keep whatever we already produced (partial success)
+        // rather than failing the whole job and discarding 36 rows.
+        if (isPivotable && producedThisTarget > 0) {
+          logger.warn(
+            `IG.scrape job ${jobId}: session ${session.id} hit ${mapped.kind} on target=${targetRaw} ` +
+            `with no other sessions to pivot to (already scraped ${producedThisTarget}). Accepting partial.`
+          );
+          await _setStatus(jobId, 'running', {
+            total_found: totalScraped,
+            error: `Partial: target=${targetRaw} stopped after ${producedThisTarget} rows (${mapped.kind}).`,
+          });
+          cursor = (cursor + 1) % Math.max(1, sessionPool.length);
+          break;
+        }
+
         // Non-pivotable error (login_required / checkpoint / 404 /
         // network) — propagate so the outer handler records it and
         // flips the session state if appropriate.
@@ -633,7 +668,13 @@ async function _runWebScrapeTarget({ jobId, job, session, targetRaw, targetType,
   throw e;
 }
 
-async function _streamUsers(generator, { jobId, session, limit, onProgress, batchSize = 25 }) {
+async function _streamUsers(generator, { jobId, session, limit, onProgress, batchSize = 10 }) {
+  // batchSize=10 (was 25): commit partial pages to scraped_users every
+  // 10 yields rather than every 25. With IG's web friend-list endpoint
+  // returning ~25 users/page, this guarantees the rows from page 1
+  // are durably committed before page 2 has a chance to throttle.
+  // The previous 25 default meant a mid-page throttle at user 36
+  // could discard rows 26-36 on rollback.
   let inserted = 0;
   const buffer = [];
   for await (const u of generator) {
