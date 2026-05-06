@@ -1977,9 +1977,15 @@ class SessionService {
         `UPDATE sessions SET
           is_logged_in = true,
           status = 'active',
+          -- Promote parked rows (keep_alive=FALSE because the user
+          -- ticked off "Keep this session logged in on the panel" at
+          -- create time) into the heartbeat / restore loops so the
+          -- session survives backend restarts and the next ZDU flip.
+          keep_alive = TRUE,
           phone = $1,
           account_info = $2,
-          last_active = NOW()
+          last_active = NOW(),
+          last_heartbeat = NOW()
          WHERE id = $3`,
         [
           me.phone,

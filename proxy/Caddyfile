@@ -74,9 +74,22 @@
 		}
 	}
 
-	# Everything else → static SPA from the frontend container.
+	# Everything else → static SPA from the active frontend color. The
+	# orchestrator rewrites this on every deploy via the admin API the
+	# same way it does for /api/*. Default seed is frontend-blue.
 	handle {
-		reverse_proxy frontend:83
+		reverse_proxy {$ACTIVE_FRONTEND:frontend-blue:83} {
+			# Active health check: nginx serves "/" with a 200 once the
+			# SPA bundle is mounted. Caddy will mark the upstream down
+			# if "/" stops returning 200, which is enough to fall back
+			# to a 502 instead of a hung request while the new color
+			# is starting up. The orchestrator uses the docker
+			# healthcheck (not this) for cutover gating.
+			health_uri /
+			health_interval 10s
+			health_timeout 2s
+			health_status 200
+		}
 	}
 
 	encode gzip zstd

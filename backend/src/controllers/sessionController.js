@@ -11,6 +11,15 @@ const logger = require('../utils/logger');
 
 const ENCRYPTED_SESSION_RE = /^[0-9a-f]+:[0-9a-f]+:[0-9a-f]+$/i;
 
+// Allowed values for the `format` query param on GET /sessions/:id/download.
+//   "json"   — legacy default; encrypted GramJS string wrapped in a small
+//              JSON envelope (Telethon-friendly via the existing
+//              convert_telethon_to_gramjs.py script).
+//   "session"— Telethon-native binary `.session` SQLite file. Built
+//              on-the-fly from the GramJS auth_key + dc/server_address/
+//              port. Compatible with Telethon >= 1.32.
+const TG_DOWNLOAD_FORMATS = new Set(['json', 'session']);
+
 // ---------------------------------------------------------------------------
 // Multi-platform dispatch helpers.
 //
@@ -555,7 +564,7 @@ const sessionController = {
       return res.status(200).json({ success: true, data: result });
     }
 
-    const { phone, apiId, apiHash, country, platform, proxyId, useProxy } = req.body || {};
+    const { phone, apiId, apiHash, country, platform, proxyId, useProxy, loginOnPanel } = req.body || {};
     const result = await sessionCreationService.start({
       userId,
       phone,
@@ -569,6 +578,11 @@ const sessionController = {
       // primitive in the create flow. Anything else (undefined, true,
       // truthy) keeps the existing Phase-3 behaviour.
       useProxy: useProxy === false ? false : true,
+      // Login-on-panel toggle: explicit `false` parks the session
+      // (downloads only, never adopted into telegramService). Default
+      // remains true so legacy callers that don't send the field
+      // continue to auto-login the new session.
+      loginOnPanel: loginOnPanel === false ? false : true,
     });
     return res.status(200).json({ success: true, data: result });
   }),
@@ -669,6 +683,20 @@ const sessionController = {
       }, null, 2));
     }
 
+    // `?format=json|session`. Default keeps the legacy JSON envelope so
+    // existing scripts that hit /download with no format keep working.
+    const requestedFormat = String(
+      req.query.format || req.query.fmt || 'json'
+    ).toLowerCase();
+    if (!TG_DOWNLOAD_FORMATS.has(requestedFormat)) {
+      throw new AppError(
+        `Unsupported download format "${requestedFormat}". ` +
+        `Allowed: ${[...TG_DOWNLOAD_FORMATS].join(', ')}`,
+        400,
+        'BAD_DOWNLOAD_FORMAT'
+      );
+    }
+
     const r = await pool.query(
       `SELECT id, phone, session_file_path, account_info
          FROM sessions
@@ -689,23 +717,80 @@ const sessionController = {
 
     const ext = path.extname(row.session_file_path) || '.json';
     const safePhone = (row.phone || `session-${row.id}`).replace(/[^A-Za-z0-9+_-]/g, '');
-    const downloadName = `${safePhone}${ext}`;
 
+    // Helper: get a decrypted GramJS session string from the on-disk
+    // JSON envelope. Returns null if the source file is in the legacy
+    // Telethon binary format (we don't support converting that here —
+    // the caller falls back to the existing JSON path).
+    const readPlainSessionString = async () => {
+      if (ext.toLowerCase() !== '.json') return null;
+      const raw = await fs.readFile(fullPath, 'utf8');
+      const parsed = JSON.parse(raw);
+      if (!parsed || typeof parsed.session !== 'string') return null;
+      let plain = parsed.session;
+      if (ENCRYPTED_SESSION_RE.test(plain)) {
+        try { plain = decrypt(plain); }
+        catch (err) {
+          logger.warn(
+            `downloadSession: decrypt failed for session ${row.id}: ${err.message}`
+          );
+          return null;
+        }
+      }
+      return { plain, parsed };
+    };
+
+    // ---- Telethon binary `.session` (SQLite) ----
+    if (requestedFormat === 'session') {
+      const decoded = await readPlainSessionString();
+      if (!decoded || !decoded.plain) {
+        throw new AppError(
+          'This session has no recoverable GramJS string on disk; ' +
+          '.session export is unavailable. Try the JSON format instead.',
+          409,
+          'SESSION_NOT_CONVERTIBLE'
+        );
+      }
+      const { writeTelethonSessionFile } = require('../utils/gramjsToTelethon');
+      const tmpDir = path.join(uploadDir, '_tmp');
+      await fs.ensureDir(tmpDir);
+      const tmpPath = path.join(
+        tmpDir,
+        `tg-${row.id}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.session`
+      );
+      try {
+        writeTelethonSessionFile(decoded.plain, tmpPath);
+      } catch (err) {
+        logger.warn(
+          `downloadSession: Telethon export failed for session ${row.id}: ${err.message}`
+        );
+        throw new AppError(
+          `Failed to build .session file: ${err.message}`,
+          500,
+          'SESSION_EXPORT_FAILED'
+        );
+      }
+      const downloadName = `${safePhone}.session`;
+      res.setHeader('Content-Type', 'application/x-sqlite3');
+      res.setHeader(
+        'Content-Disposition',
+        `attachment; filename="${downloadName}"`
+      );
+      return res.sendFile(tmpPath, (err) => {
+        // Clean up the on-disk temp regardless of success/failure so
+        // the uploads volume doesn't accumulate one-off SQLite files.
+        fs.remove(tmpPath).catch(() => {});
+        if (err) logger.debug(`sendFile error for ${tmpPath}: ${err.message}`);
+      });
+    }
+
+    // ---- JSON envelope (legacy default) ----
+    const downloadName = `${safePhone}.json`;
     if (ext.toLowerCase() === '.json') {
       try {
-        const raw = await fs.readFile(fullPath, 'utf8');
-        const parsed = JSON.parse(raw);
-        if (parsed && typeof parsed.session === 'string') {
-          let plain = parsed.session;
-          if (ENCRYPTED_SESSION_RE.test(plain)) {
-            try {
-              plain = decrypt(plain);
-            } catch (err) {
-              logger.warn(
-                `downloadSession: decrypt failed for session ${row.id}: ${err.message}`
-              );
-            }
-          }
+        const decoded = await readPlainSessionString();
+        if (decoded && decoded.parsed) {
+          const { plain, parsed } = decoded;
           const body = {
             session: plain,
             createdAt:
@@ -729,10 +814,12 @@ const sessionController = {
       }
     }
 
+    // Fall-through: ship the raw on-disk file (covers legacy
+    // telethon_binary uploads and any unexpected on-disk shapes).
     res.setHeader('Content-Type', 'application/octet-stream');
     res.setHeader(
       'Content-Disposition',
-      `attachment; filename="${downloadName}"`
+      `attachment; filename="${safePhone}${ext}"`
     );
     return res.sendFile(fullPath);
   }),

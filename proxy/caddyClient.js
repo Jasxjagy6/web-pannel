@@ -102,6 +102,21 @@ function buildConfig({ backendUpstream, frontendUpstream, publicDomain, acmeEmai
       {
         handler: 'reverse_proxy',
         upstreams: [{ dial: frontendUpstream }],
+        // Active health check on the SPA shell. The frontend nginx
+        // returns 200 at "/" once it is mounted, so this is enough to
+        // gate Caddy off a half-started upstream during a deploy. The
+        // orchestrator never relies on this for cutover (it uses the
+        // docker healthcheck and a direct HTTP probe), but it does
+        // mean a brief frontend restart degrades to a 502 instead of
+        // a hung request.
+        health_checks: {
+          active: {
+            uri: '/',
+            interval: '10s',
+            timeout: '2s',
+            expect_status: 200,
+          },
+        },
       },
     ],
   };

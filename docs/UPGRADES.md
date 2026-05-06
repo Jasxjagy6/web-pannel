@@ -39,9 +39,9 @@ internet
     ▼
  Caddy            public-facing reverse proxy + admin API on :2019
    │   │
-   │   └── /            → frontend:83  (static SPA)
+   │   └── /            → frontend-blue OR frontend-green  (static SPA)
    │
-   └────── /api/*       → backend-blue OR backend-green
+   └────── /api/*       → backend-blue  OR backend-green
            /socket.io/*
 
  postgres :5435   named volume postgres_data
@@ -52,13 +52,18 @@ internet
  state            named volume state_data
 ```
 
-Two backend containers exist, but only one (`blue` or `green`) is
-serving traffic at any moment. The orchestrator starts the inactive
-color with the new image, waits for `/health/ready`, atomically tells
-Caddy to switch upstreams, drains the old color, and stops it.
+Two backend containers AND two frontend containers exist, but only one
+of each (`blue` or `green`) serves traffic at any moment. The
+orchestrator starts the inactive color with the new image (backend
+first, then frontend), waits for `/health/ready` on the backend and a
+"/" 200 on the frontend, atomically tells Caddy to switch BOTH
+upstreams in a single admin POST, drains the old colors, and stops
+them.
 
-Postgres, Redis, the frontend container, and the persistent volumes are
-**never** restarted during a normal deploy.
+Postgres, Redis, and the persistent volumes are **never** restarted
+during a normal deploy. Backend AND frontend always flip in lockstep
+(same color) so there is never a code-skew between SPA bundle and API
+shape.
 
 ---
 
@@ -91,8 +96,17 @@ Edit `.env`:
 docker compose --profile blue --profile bot up -d
 ```
 
-This starts: postgres, redis, frontend, caddy, backend-blue, admin-bot
-(only if the bot env vars are set).
+This starts: postgres, redis, caddy, backend-blue, frontend-blue,
+admin-bot (only if the bot env vars are set). The `blue` profile
+brings up BOTH the backend and the frontend in the blue color. The
+orchestrator handles the green side on subsequent deploys.
+
+> **Migrating from the pre-blue/green frontend topology.** Older
+> compose files spawned a single `frontend` service. The first
+> `bin/upgrade deploy` after pulling this revision will detect that
+> legacy container, force-remove it, then bring up `frontend-blue` /
+> `frontend-green` in lockstep with the backend. No manual cleanup is
+> required.
 
 Verify:
 
@@ -126,18 +140,25 @@ What it does:
 4. `docker compose build` → tagged `web-pannel-backend:<short-sha>`.
 5. Runs `node bin/migrate.js --apply` inside a one-shot container of the
    new image. Each migration runs in its own transaction.
-6. Starts the inactive color (`backend-green` if blue is active).
-7. Polls `/health/ready` on the new color (DB+Redis pingable, queues
-   initialized, sessions restore loop done) up to
+6. Starts the inactive backend color (`backend-green` if blue is active).
+7. Polls `/health/ready` on the new backend color (DB+Redis pingable,
+   queues initialized, sessions restore loop done) up to
    `ROLLOUT_HEALTH_TIMEOUT_MS` (default 120s).
-8. POSTs a fresh Caddy config to `127.0.0.1:2019/load`. Cutover happens
-   atomically — new requests go to the new color; in-flight requests
-   finish on the old upstream.
-9. Sleeps `DRAIN_GRACE_MS` (default 25s) so live Socket.IO clients
-   reconnect to the new color.
-10. Stops the old backend container.
-11. Updates `state/active-color.json` and inserts a row in the
-    `deployments` table.
+8. Removes the legacy single-`frontend` container if one exists (one-time
+   migration), then `docker compose build frontend-blue` to produce a
+   fresh `web-pannel-frontend:<short-sha>` image.
+9. Starts the inactive frontend color (`frontend-green` if blue is
+   active) and polls "/" until nginx returns 200, up to
+   `FRONTEND_HEALTH_TIMEOUT_MS` (default 60s).
+10. POSTs a fresh Caddy config to `127.0.0.1:2019/load`. Cutover happens
+    atomically — new requests go to BOTH the new backend and new
+    frontend colors; in-flight requests finish on the old upstreams.
+11. Sleeps `DRAIN_GRACE_MS` (default 25s) so live Socket.IO clients
+    reconnect to the new backend color and the previous SPA tab finishes
+    any pending fetch().
+12. Stops the old backend AND old frontend containers.
+13. Updates `state/active-color.json` (with both colors) and inserts a
+    row in the `deployments` table.
 
 ### 3.2 Registry mode (CI-built images)
 
@@ -296,16 +317,37 @@ Redis will replay AOF on startup.
 
 ### 7.5 Frontend updates
 
-The frontend nginx is a single stateless container. To deploy a new
-frontend image:
+The frontend is now part of the same blue/green flow as the backend.
+A normal `./bin/upgrade deploy --ref <ref>` builds a fresh
+`web-pannel-frontend:<short-sha>` image, brings up the inactive
+`frontend-<color>` container, waits for nginx to serve "/" with a 200,
+then flips Caddy's `handle { ... }` upstream to the new color in the
+SAME admin POST that flipped the backend. The old `frontend-<color>`
+container is stopped after the drain interval.
+
+If you want to ship ONLY a backend hotfix without rebuilding the SPA
+bundle (rare — saves 30-90 seconds on the deploy), set
+`UPGRADE_SKIP_FRONTEND=true` for that one deploy:
 
 ```bash
-docker compose build frontend && docker compose up -d frontend
+UPGRADE_SKIP_FRONTEND=true ./bin/upgrade deploy --ref hotfix-branch
 ```
 
-Caddy will route to the new frontend on its next health check (10s).
-There is no blue/green here because the frontend has no in-memory
-state.
+The orchestrator will leave the frontend on whatever color was active
+before. Use sparingly — if the SPA expects an API shape that only the
+new backend serves, you'll get runtime errors in the browser.
+
+#### Why the operator's "I deployed but I don't see changes" was real
+
+The pre-blue/green topology had a single `frontend` service that the
+orchestrator never touched. Running `./bin/upgrade deploy` rebuilt and
+swapped the backend image, but the SPA bundle baked into the
+`frontend` container kept serving the OLD JavaScript until the
+operator manually ran `docker compose build frontend && docker
+compose up -d frontend`. The new lockstep flow makes that step
+unnecessary AND atomic — the SPA and the API switch in the same
+admin POST so end users never see the old bundle making calls
+against new API shapes.
 
 ---
 
@@ -334,6 +376,29 @@ They stay connected to the old color until either (a) the user closes
 the tab, or (b) the old color is stopped after `DRAIN_GRACE_MS`. When
 disconnect happens, the browser auto-reconnects via Socket.IO and lands
 on the new color.
+
+**Q: Do live MTProto sessions stay logged in across an upgrade?**
+Yes. Every session row with `is_logged_in=TRUE` and `keep_alive=TRUE`
+is restored from disk on the new backend color's boot via
+`restoreAllLoggedInSessions()` — the GramJS string session is
+re-decrypted, a fresh TelegramClient is built with the same auth_key,
+proxy, and persisted device identity, and reconnected to the same DC.
+The old color keeps its in-memory clients running for `DRAIN_GRACE_MS`
+(default 25s) so live actions in flight on the previous color
+complete cleanly. Auth keys are NOT regenerated, so Telegram does not
+see the upgrade as a logout/login event. Sessions created with
+`loginOnPanel=false` (parked, `keep_alive=FALSE`) are intentionally
+NOT restored — the user opted them out of the panel's heartbeat — and
+must be promoted with `POST /sessions/:id/login` first.
+
+**Q: My deploy says "OK" but the browser still shows the old SPA.**
+That's the bug the frontend blue/green flow was added to fix. Make
+sure your stack has been brought up at least once with the new
+docker-compose.yml (which adds `frontend-blue` / `frontend-green`),
+then run `./bin/upgrade deploy --ref main`. The first deploy after
+upgrading will detect and remove the legacy `frontend` container.
+You can confirm the active SPA color with `./bin/upgrade status` —
+the line `Active frontend color:` flips on every successful deploy.
 
 **Q: Is there a global maintenance mode?**
 No, and that's intentional — the whole point is no downtime. If you

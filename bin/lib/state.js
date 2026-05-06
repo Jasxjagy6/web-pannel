@@ -8,13 +8,19 @@
  *
  * Layout:
  * {
- *   "color":         "blue" | "green",
- *   "image":         "web-pannel-backend:abcdef0",
- *   "git_sha":       "abcdef0123...",
- *   "git_ref":       "main",
- *   "deployed_at":   "2026-05-04T03:18:00Z",
+ *   "color":           "blue" | "green",     // legacy alias for backend color
+ *   "backend_color":   "blue" | "green",
+ *   "frontend_color":  "blue" | "green",
+ *   "image":           "web-pannel-backend:abcdef0",
+ *   "frontend_image":  "web-pannel-frontend:abcdef0",
+ *   "git_sha":         "abcdef0123...",
+ *   "git_ref":         "main",
+ *   "deployed_at":     "2026-05-04T03:18:00Z",
  *   "previous": { ...same shape, the snapshot replaced on this deploy }
  * }
+ *
+ * `color` is kept as an alias for `backend_color` for backwards compat with
+ * older state files written before the frontend was put behind blue/green.
  */
 
 const fs = require('fs');
@@ -36,7 +42,10 @@ function readState() {
   if (!fs.existsSync(STATE_FILE)) {
     return {
       color: 'blue',
+      backend_color: 'blue',
+      frontend_color: 'blue',
       image: null,
+      frontend_image: null,
       git_sha: null,
       git_ref: null,
       deployed_at: null,
@@ -44,7 +53,14 @@ function readState() {
     };
   }
   try {
-    return JSON.parse(fs.readFileSync(STATE_FILE, 'utf8'));
+    const raw = JSON.parse(fs.readFileSync(STATE_FILE, 'utf8'));
+    // Backwards-compat: pre-frontend-blue/green files only had `color`.
+    // Default `frontend_color` to whatever backend was on so the next
+    // deploy still flips both in lockstep.
+    if (!raw.backend_color) raw.backend_color = raw.color || 'blue';
+    if (!raw.frontend_color) raw.frontend_color = raw.backend_color;
+    if (!raw.color) raw.color = raw.backend_color;
+    return raw;
   } catch (err) {
     throw new Error(`active-color.json is corrupt (${err.message}); inspect ${STATE_FILE}`);
   }
