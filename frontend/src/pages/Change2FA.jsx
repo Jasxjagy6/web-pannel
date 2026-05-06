@@ -25,6 +25,7 @@ import {
   getJob,
 } from '../api/twoFAJobs';
 import { parseApiError, formatRelativeTime } from '../utils/formatters';
+import SessionListSwitcher from '../components/common/SessionListSwitcher';
 
 const TABS = [
   { id: 'bulk', label: 'Bulk change', desc: 'Same old/new password for many sessions', icon: Users },
@@ -149,6 +150,8 @@ export default function Change2FA() {
 
   // Bulk state
   const [selectedIds, setSelectedIds] = useState([]);
+  const [sessionPickMode, setSessionPickMode] = useState('sessions');
+  const [selectedSessionListId, setSelectedSessionListId] = useState('');
   const [bulkOld, setBulkOld] = useState('');
   const [bulkNew, setBulkNew] = useState('');
 
@@ -224,19 +227,27 @@ export default function Change2FA() {
 
   const submitBulk = async () => {
     if (!bulkOld || !bulkNew) return showError('Enter old & new passwords', 'Missing fields');
-    if (selectedIds.length === 0) return showError('Pick at least one session', 'No selection');
+    const usingList = sessionPickMode === 'list' && selectedSessionListId;
+    if (!usingList && selectedIds.length === 0) return showError('Pick at least one session (or pick a session list)', 'No selection');
+    if (sessionPickMode === 'list' && !selectedSessionListId) return showError('Pick a session list', 'No selection');
     setSubmitting(true);
     try {
-      const res = await createBulkJob({
-        sessionIds: selectedIds,
+      const bulkPayload = {
         oldPassword: bulkOld,
         newPassword: bulkNew,
-      });
+      };
+      if (usingList) {
+        bulkPayload.sessionListId = Number(selectedSessionListId);
+      } else {
+        bulkPayload.sessionIds = selectedIds;
+      }
+      const res = await createBulkJob(bulkPayload);
       showSuccess(`Bulk job #${res.data.data.jobId} queued for ${res.data.data.total} sessions`, 'Job created');
       setActiveJob({ id: res.data.data.jobId });
       setBulkOld('');
       setBulkNew('');
       setSelectedIds([]);
+      setSelectedSessionListId('');
       await loadJobs();
       await refreshActive(res.data.data.jobId);
     } catch (err) {
@@ -331,17 +342,31 @@ export default function Change2FA() {
       {tab === 'bulk' && (
         <div className="grid grid-cols-1 xl:grid-cols-2 gap-6">
           <div className="space-y-4">
-            <SessionPicker
-              sessions={activeSessions}
-              selected={selectedIds}
-              onToggle={toggleBulk}
-              onSelectAll={() => setSelectedIds(activeSessions.map((s) => s.id))}
-              onClear={() => setSelectedIds([])}
-              search={search}
-              onSearch={setSearch}
+            <SessionListSwitcher
+              mode={sessionPickMode}
+              onModeChange={setSessionPickMode}
+              selectedSessionListId={selectedSessionListId}
+              onSelectedSessionListIdChange={setSelectedSessionListId}
             />
+            {sessionPickMode === 'sessions' && (
+              <SessionPicker
+                sessions={activeSessions}
+                selected={selectedIds}
+                onToggle={toggleBulk}
+                onSelectAll={() => setSelectedIds(activeSessions.map((s) => s.id))}
+                onClear={() => setSelectedIds([])}
+                search={search}
+                onSearch={setSearch}
+              />
+            )}
             <div className="text-xs text-gray-400">
-              <span className="text-primary-400 font-semibold">{selectedIds.length}</span> of {activeSessions.length} sessions selected.
+              {sessionPickMode === 'list' ? (
+                <span className="text-primary-400 font-semibold">Session list mode</span>
+              ) : (
+                <>
+                  <span className="text-primary-400 font-semibold">{selectedIds.length}</span> of {activeSessions.length} sessions selected.
+                </>
+              )}
             </div>
           </div>
 
@@ -358,7 +383,7 @@ export default function Change2FA() {
               className="w-full inline-flex items-center justify-center gap-2 rounded-lg bg-primary-600 px-4 py-2.5 text-sm font-semibold text-white shadow-lg shadow-primary-600/20 hover:bg-primary-700 transition-colors disabled:opacity-50"
             >
               {submitting ? <Loader2 className="w-4 h-4 animate-spin" /> : <PlayCircle className="w-4 h-4" />}
-              Confirm bulk change for {selectedIds.length} session(s)
+              Confirm bulk change for {sessionPickMode === 'list' ? 'session list' : `${selectedIds.length} session(s)`}
             </button>
             <div className="text-[11px] text-gray-500 flex items-start gap-1.5">
               <AlertTriangle className="w-3.5 h-3.5 mt-0.5 text-yellow-400" />

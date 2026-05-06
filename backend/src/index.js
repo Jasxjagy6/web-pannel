@@ -35,6 +35,7 @@ const billingRoutes = require('./routes/billing');
 const userCredentialsRoutes = require('./routes/userCredentials');
 const otpRelayRoutes = require('./routes/otpRelays');
 const telegramClientRoutes = require('./routes/telegramClient');
+const sessionListRoutes = require('./routes/sessionLists');
 const billingController = require('./controllers/billingController');
 const { parsePlatform, resolvePlatform } = require('./middleware/platform');
 const healthRoutes = require('./routes/health');
@@ -163,6 +164,7 @@ const PLATFORM_ROUTERS = [
   ['/me/proxies',       userProxyRoutes],
   ['/anti-detect',      antiDetectRoutes],
   ['/privacy',          privacyRoutes],
+  ['/session-lists',    sessionListRoutes],
 ];
 
 for (const [mountPath, router] of PLATFORM_ROUTERS) {

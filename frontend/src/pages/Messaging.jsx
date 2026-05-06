@@ -9,6 +9,7 @@ import {
   getMessageHistory,
 } from '../api/messages';
 import { listsAPI } from '../api/lists';
+import SessionListSwitcher from '../components/common/SessionListSwitcher';
 import { parseApiError, formatNumber, formatRelativeTime, formatDateTime } from '../utils/formatters';
 import { useToast } from '../components/common/Toast';
 import { Modal } from '../components/common/Modal';
@@ -217,6 +218,10 @@ function DistributionSettings({
   setMsgsPerSession,
   targetMode,
   setTargetMode,
+  sessionPickMode = 'sessions',
+  setSessionPickMode,
+  selectedSessionListId = '',
+  setSelectedSessionListId,
 }) {
   const [showSessionDropdown, setShowSessionDropdown] = useState(false);
   const dropdownRef = useRef(null);
@@ -340,8 +345,18 @@ function DistributionSettings({
           </div>
         )}
 
-        {/* Session Multi-Select */}
-        <div>
+        {/* Session Source: pick sessions OR pick a saved session list */}
+        {setSessionPickMode && (
+          <SessionListSwitcher
+            mode={sessionPickMode}
+            onModeChange={setSessionPickMode}
+            selectedSessionListId={selectedSessionListId}
+            onSelectedSessionListIdChange={setSelectedSessionListId}
+          />
+        )}
+
+        {/* Session Multi-Select (hidden when "Use session list" mode is active) */}
+        <div className={sessionPickMode === 'list' ? 'hidden' : ''}>
           <label className="mb-1.5 block text-sm font-medium text-gray-300 flex items-center gap-1.5">
             <PaperClipIcon className="w-3.5 h-3.5 text-gray-500" />
             Sessions ({selectedSessionIds.size} selected)
@@ -800,6 +815,12 @@ export default function Messaging() {
   const [selectedList, setSelectedList] = useState('');
   const [targetIds, setTargetIds] = useState('');
   const [selectedSessionIds, setSelectedSessionIds] = useState(new Set());
+  // "Use session list" mode lets the operator pick a pre-saved
+  // session list (Lists -> Session Lists tab) instead of ticking
+  // individual sessions. The backend resolves the listId to the
+  // active members of that list at request time.
+  const [sessionPickMode, setSessionPickMode] = useState('sessions');
+  const [selectedSessionListId, setSelectedSessionListId] = useState('');
   const [delayMin, setDelayMin] = useState(2);
   const [delayMax, setDelayMax] = useState(5);
   const [msgsPerSession, setMsgsPerSession] = useState('');
@@ -965,8 +986,13 @@ export default function Messaging() {
       showError('Message exceeds maximum length.', 'Validation Error');
       return;
     }
-    if (selectedSessionIds.size === 0) {
-      showError('Please select at least one session.', 'Validation Error');
+    const usingSessionList = sessionPickMode === 'list' && selectedSessionListId;
+    if (!usingSessionList && selectedSessionIds.size === 0) {
+      showError('Please select at least one session (or pick a session list).', 'Validation Error');
+      return;
+    }
+    if (sessionPickMode === 'list' && !selectedSessionListId) {
+      showError('Please pick a session list.', 'Validation Error');
       return;
     }
     if (targetMode === 'list' && !selectedList) {
@@ -986,11 +1012,15 @@ export default function Messaging() {
       const payload = {
         message,
         messageType: format,
-        sessionIds: Array.from(selectedSessionIds),
         delayMin,
         delayMax,
         async: false,
       };
+      if (sessionPickMode === 'list' && selectedSessionListId) {
+        payload.sessionListId = Number(selectedSessionListId);
+      } else {
+        payload.sessionIds = Array.from(selectedSessionIds);
+      }
 
       if (targetMode === 'list') {
         // Fetch the actual user list items to send as targetList
@@ -1231,6 +1261,10 @@ export default function Messaging() {
           setMsgsPerSession={setMsgsPerSession}
           targetMode={targetMode}
           setTargetMode={setTargetMode}
+          sessionPickMode={sessionPickMode}
+          setSessionPickMode={setSessionPickMode}
+          selectedSessionListId={selectedSessionListId}
+          setSelectedSessionListId={setSelectedSessionListId}
         />
       </div>
 

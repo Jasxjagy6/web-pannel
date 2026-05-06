@@ -2,8 +2,16 @@ import api from './client';
 
 export const getPrivacyKeys = () => api.get('/privacy/keys');
 
-export const createPrivacyJob = (settings, sessionIds) =>
-  api.post('/privacy/jobs', { settings, sessionIds });
+// Accepts EITHER an array of explicit session IDs (legacy call shape) or
+// an object body { sessionIds, sessionListId }. The backend resolves
+// sessionListId to its active member session IDs at request time.
+export const createPrivacyJob = (settings, sessionIdsOrBody) => {
+  const body =
+    Array.isArray(sessionIdsOrBody) || sessionIdsOrBody == null
+      ? { settings, sessionIds: sessionIdsOrBody || [] }
+      : { settings, ...sessionIdsOrBody };
+  return api.post('/privacy/jobs', body);
+};
 
 export const listPrivacyJobs = (params) =>
   api.get('/privacy/jobs', { params });

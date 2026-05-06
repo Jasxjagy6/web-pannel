@@ -3,6 +3,7 @@ const behaviorService = require('../services/behaviorService');
 const fingerprint = require('../utils/deviceFingerprint');
 const reportService = require('../services/reportService');
 const { AppError, asyncHandler } = require('../utils/errorHandler');
+const { resolveSessionIdsFromRequest } = require('../utils/resolveSessions');
 
 const antiDetectController = {
   /** GET /api/anti-detect/status */
@@ -74,9 +75,14 @@ const antiDetectController = {
   /** POST /api/anti-detect/warmup/run */
   runTick: asyncHandler(async (req, res) => {
     const userId = req.user.id;
-    const sessionIds = Array.isArray(req.body && req.body.sessionIds)
+    const rawIds = Array.isArray(req.body && req.body.sessionIds)
       ? req.body.sessionIds
       : undefined;
+    // If a sessionListId was supplied, expand it; else fall back to raw.
+    let sessionIds = rawIds;
+    if (req.body && (req.body.sessionListId || req.body.session_list_id)) {
+      sessionIds = await resolveSessionIdsFromRequest(req, rawIds || []);
+    }
     const result = await behaviorService.tickOnce({
       batchSize: Number(req.body && req.body.batchSize) || undefined,
       sessionIds,

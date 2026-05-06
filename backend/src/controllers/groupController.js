@@ -3,6 +3,7 @@ const telegramService = require('../services/telegramService');
 const reportService = require('../services/reportService');
 const groupQueue = require('../queues/groupQueue');
 const { AppError, asyncHandler } = require('../utils/errorHandler');
+const { resolveSessionIdsFromRequest } = require('../utils/resolveSessions');
 const logger = require('../utils/logger');
 
 const groupController = {
@@ -38,12 +39,18 @@ const groupController = {
       async,
     } = req.body;
 
-    // Support both old and new API
-    const finalSessionIds = sessionIds || (sessionId ? [sessionId] : []);
+    // Support both old and new API. If the caller passed `sessionListId`,
+    // expand it; else honour the explicit IDs.
+    const explicitSessionIds = sessionIds || (sessionId ? [sessionId] : []);
+    const finalSessionIds = await resolveSessionIdsFromRequest(req, explicitSessionIds);
     const finalTargetIds = targetIds || (targetGroupId ? [targetGroupId] : []);
 
     if (!finalSessionIds || finalSessionIds.length === 0) {
-      throw new AppError('sessionIds array or sessionId is required', 400, 'MISSING_SESSION_ID');
+      throw new AppError(
+        'sessionIds array, sessionId, or a non-empty sessionListId is required',
+        400,
+        'MISSING_SESSION_ID'
+      );
     }
 
     if (!finalTargetIds || finalTargetIds.length === 0) {
@@ -421,10 +428,15 @@ const groupController = {
    */
   joinChannels: asyncHandler(async (req, res) => {
     const userId = req.user.id;
-    const { sessionIds, targetIds, targetType = 'group' } = req.body;
+    const { sessionIds: rawSessionIds, targetIds, targetType = 'group' } = req.body;
 
-    if (!sessionIds || !Array.isArray(sessionIds) || sessionIds.length === 0) {
-      throw new AppError('sessionIds array is required', 400, 'MISSING_SESSIONS');
+    const sessionIds = await resolveSessionIdsFromRequest(req, rawSessionIds || []);
+    if (!Array.isArray(sessionIds) || sessionIds.length === 0) {
+      throw new AppError(
+        'sessionIds array (or a non-empty sessionListId) is required',
+        400,
+        'MISSING_SESSIONS'
+      );
     }
 
     if (!targetIds || !Array.isArray(targetIds) || targetIds.length === 0) {
@@ -522,10 +534,15 @@ const groupController = {
    */
   leaveChannels: asyncHandler(async (req, res) => {
     const userId = req.user.id;
-    const { sessionIds, targetIds, targetType = 'group' } = req.body;
+    const { sessionIds: rawSessionIds, targetIds, targetType = 'group' } = req.body;
 
-    if (!sessionIds || !Array.isArray(sessionIds) || sessionIds.length === 0) {
-      throw new AppError('sessionIds array is required', 400, 'MISSING_SESSIONS');
+    const sessionIds = await resolveSessionIdsFromRequest(req, rawSessionIds || []);
+    if (!Array.isArray(sessionIds) || sessionIds.length === 0) {
+      throw new AppError(
+        'sessionIds array (or a non-empty sessionListId) is required',
+        400,
+        'MISSING_SESSIONS'
+      );
     }
 
     if (!targetIds || !Array.isArray(targetIds) || targetIds.length === 0) {

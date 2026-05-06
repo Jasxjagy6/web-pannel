@@ -18,6 +18,7 @@ import { useWebSocket } from '../hooks/useWebSocket';
 import { listSessions } from '../api/sessions';
 import { startScan, listJobs, getJob } from '../api/otp';
 import { parseApiError, formatRelativeTime } from '../utils/formatters';
+import SessionListSwitcher from '../components/common/SessionListSwitcher';
 
 const DURATION_OPTIONS = [
   { value: 60, label: '1 minute' },
@@ -96,6 +97,8 @@ export default function GetOTP() {
   const [sessions, setSessions] = useState([]);
   const [search, setSearch] = useState('');
   const [selectedIds, setSelectedIds] = useState([]);
+  const [sessionPickMode, setSessionPickMode] = useState('sessions');
+  const [selectedSessionListId, setSelectedSessionListId] = useState('');
   const [duration, setDuration] = useState(300);
   const [submitting, setSubmitting] = useState(false);
 
@@ -179,13 +182,22 @@ export default function GetOTP() {
     setSelectedIds((p) => (p.includes(id) ? p.filter((x) => x !== id) : [...p, id]));
 
   const startJob = async () => {
-    if (selectedIds.length === 0) return showError('Select at least one session', 'No selection');
+    const usingList = sessionPickMode === 'list' && selectedSessionListId;
+    if (!usingList && selectedIds.length === 0) return showError('Select at least one session (or pick a session list)', 'No selection');
+    if (sessionPickMode === 'list' && !selectedSessionListId) return showError('Pick a session list', 'No selection');
     setSubmitting(true);
     try {
-      const res = await startScan({ sessionIds: selectedIds, durationSeconds: duration });
+      const scanPayload = { durationSeconds: duration };
+      if (usingList) {
+        scanPayload.sessionListId = Number(selectedSessionListId);
+      } else {
+        scanPayload.sessionIds = selectedIds;
+      }
+      const res = await startScan(scanPayload);
       const jobId = res.data?.data?.jobId;
       showSuccess(`Scan #${jobId} started for ${res.data.data.total} session(s)`, 'Scanning');
       setSelectedIds([]);
+      setSelectedSessionListId('');
       await loadJobs();
       await refreshActive(jobId);
     } catch (err) {
@@ -223,7 +235,13 @@ export default function GetOTP() {
 
       <div className="grid grid-cols-1 xl:grid-cols-2 gap-6">
         <div className="space-y-4">
-          <div className="rounded-xl border border-white/5 bg-dark-800">
+          <SessionListSwitcher
+            mode={sessionPickMode}
+            onModeChange={setSessionPickMode}
+            selectedSessionListId={selectedSessionListId}
+            onSelectedSessionListIdChange={setSelectedSessionListId}
+          />
+          <div className={`rounded-xl border border-white/5 bg-dark-800 ${sessionPickMode === 'list' ? 'hidden' : ''}`}>
             <div className="p-4 border-b border-white/5 flex items-center gap-3">
               <div className="relative flex-1">
                 <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-gray-500" />
@@ -269,7 +287,13 @@ export default function GetOTP() {
             </div>
           </div>
           <div className="text-xs text-gray-400">
-            <span className="text-primary-400 font-semibold">{selectedIds.length}</span> session(s) selected.
+            {sessionPickMode === 'list' ? (
+              <span className="text-primary-400 font-semibold">Session list mode</span>
+            ) : (
+              <>
+                <span className="text-primary-400 font-semibold">{selectedIds.length}</span> session(s) selected.
+              </>
+            )}
           </div>
         </div>
 
@@ -295,11 +319,14 @@ export default function GetOTP() {
           </div>
           <button
             onClick={startJob}
-            disabled={submitting || selectedIds.length === 0}
+            disabled={
+              submitting ||
+              (sessionPickMode === 'list' ? !selectedSessionListId : selectedIds.length === 0)
+            }
             className="w-full inline-flex items-center justify-center gap-2 rounded-lg bg-primary-600 px-4 py-2.5 text-sm font-semibold text-white shadow-lg shadow-primary-600/20 hover:bg-primary-700 transition-colors disabled:opacity-50"
           >
             {submitting ? <Loader2 className="w-4 h-4 animate-spin" /> : <PlayCircle className="w-4 h-4" />}
-            Start scan ({selectedIds.length})
+            Start scan ({sessionPickMode === 'list' ? 'session list' : selectedIds.length})
           </button>
           <div className="text-[11px] text-gray-500 flex items-start gap-1.5">
             <AlertTriangle className="w-3.5 h-3.5 mt-0.5 text-yellow-400" />

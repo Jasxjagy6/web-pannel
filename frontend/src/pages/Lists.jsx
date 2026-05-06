@@ -24,6 +24,7 @@ import { Modal } from '../components/common/Modal';
 import { useToast } from '../components/common/Toast';
 import { listsAPI } from '@/api';
 import { parseApiError, formatNumber, formatDate, formatRelativeTime, exportToFile } from '@/utils/formatters';
+import SessionListsTab from '../components/common/SessionListsTab';
 
 function TypeBadge({ type }) {
   const config = {
@@ -291,6 +292,36 @@ export default function Lists() {
     );
   };
 
+  const [tab, setTab] = useState('user'); // 'user' or 'session'
+
+  if (tab === 'session') {
+    return (
+      <div className="space-y-6">
+        <div>
+          <h1 className="text-2xl font-bold tracking-tight text-white">Lists</h1>
+          <p className="mt-1 text-sm text-gray-400">
+            Switch between your contact lists (imported users / groups / channels) and session lists (named groupings of your Telegram sessions).
+          </p>
+        </div>
+        <div className="border-b border-white/10 flex gap-1">
+          <button
+            onClick={() => setTab('user')}
+            className="px-4 py-2 text-sm font-medium text-gray-400 hover:text-white border-b-2 border-transparent"
+          >
+            User lists
+          </button>
+          <button
+            onClick={() => setTab('session')}
+            className="px-4 py-2 text-sm font-medium text-white border-b-2 border-primary-500"
+          >
+            Session lists
+          </button>
+        </div>
+        <SessionListsTab />
+      </div>
+    );
+  }
+
   return (
     <div className="space-y-6">
       {/* Page Header */}
@@ -301,7 +332,7 @@ export default function Lists() {
             Manage your contact lists — import, merge, export, and inspect items.
           </p>
         </div>
-        <div className="flex items-center gap-3">
+        <div className="flex items-center gap-3 flex-wrap">
           {selectedLists.length > 0 && (
             <button
               onClick={() => {
@@ -322,6 +353,22 @@ export default function Lists() {
             New List
           </button>
         </div>
+      </div>
+
+      {/* Tabs: User Lists vs Session Lists */}
+      <div className="border-b border-white/10 flex gap-1">
+        <button
+          onClick={() => setTab('user')}
+          className="px-4 py-2 text-sm font-medium text-white border-b-2 border-primary-500"
+        >
+          User lists
+        </button>
+        <button
+          onClick={() => setTab('session')}
+          className="px-4 py-2 text-sm font-medium text-gray-400 hover:text-white border-b-2 border-transparent"
+        >
+          Session lists
+        </button>
       </div>
 
       {/* Lists Table */}

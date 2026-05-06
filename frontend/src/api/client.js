@@ -24,7 +24,7 @@ const PLATFORM_AGNOSTIC_NOUNS = new Set([
   'sessions', 'scrape', 'messages', 'messaging', 'groups', 'threads',
   'lists', 'reports', 'proxies', 'twoFAJobs', 'two-fa-jobs',
   'antiDetect', 'anti-detect', 'privacy', 'accountSettings',
-  'account-settings', 'otp', 'meta',
+  'account-settings', 'otp', 'meta', 'session-lists', 'sessionLists',
 ]);
 function _prefixPlatform(url) {
   if (!url || typeof url !== 'string') return url;

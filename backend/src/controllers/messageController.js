@@ -2,6 +2,7 @@ const messageService = require('../services/messageService');
 const reportService = require('../services/reportService');
 const messageQueue = require('../queues/messageQueue');
 const { AppError, asyncHandler } = require('../utils/errorHandler');
+const { resolveSessionIdsFromRequest } = require('../utils/resolveSessions');
 const logger = require('../utils/logger');
 
 const messageController = {
@@ -79,7 +80,7 @@ const messageController = {
   sendBulk: asyncHandler(async (req, res) => {
     const userId = req.user.id;
     const {
-      sessionIds,
+      sessionIds: rawSessionIds,
       targetList,
       message,
       messageType,
@@ -92,8 +93,13 @@ const messageController = {
       sourceId,
     } = req.body;
 
-    if (!sessionIds || !Array.isArray(sessionIds) || sessionIds.length === 0) {
-      throw new AppError('sessionIds array is required and must not be empty', 400, 'NO_SESSIONS');
+    const sessionIds = await resolveSessionIdsFromRequest(req, rawSessionIds || []);
+    if (!Array.isArray(sessionIds) || sessionIds.length === 0) {
+      throw new AppError(
+        'sessionIds array (or a non-empty sessionListId) is required',
+        400,
+        'NO_SESSIONS'
+      );
     }
 
     if (!targetList || !Array.isArray(targetList) || targetList.length === 0) {
@@ -522,15 +528,20 @@ const messageController = {
   sendBulkToGroups: asyncHandler(async (req, res) => {
     const userId = req.user.id;
     const {
-      sessionIds,
+      sessionIds: rawSessionIds,
       groupIds,
       message,
       messageType = 'text',
       delayBetweenRounds = 20,
     } = req.body;
 
-    if (!sessionIds || !Array.isArray(sessionIds) || sessionIds.length === 0) {
-      throw new AppError('sessionIds array is required', 400, 'NO_SESSIONS');
+    const sessionIds = await resolveSessionIdsFromRequest(req, rawSessionIds || []);
+    if (!Array.isArray(sessionIds) || sessionIds.length === 0) {
+      throw new AppError(
+        'sessionIds array (or a non-empty sessionListId) is required',
+        400,
+        'NO_SESSIONS'
+      );
     }
 
     if (!groupIds || !Array.isArray(groupIds) || groupIds.length === 0) {
@@ -581,7 +592,7 @@ const messageController = {
   sendBulkToUsers: asyncHandler(async (req, res) => {
     const userId = req.user.id;
     const {
-      sessionIds,
+      sessionIds: rawSessionIds,
       users,
       message,
       messageType = 'text',
@@ -589,8 +600,13 @@ const messageController = {
       delayBetweenRounds = 60,
     } = req.body;
 
-    if (!sessionIds || !Array.isArray(sessionIds) || sessionIds.length === 0) {
-      throw new AppError('sessionIds array is required', 400, 'NO_SESSIONS');
+    const sessionIds = await resolveSessionIdsFromRequest(req, rawSessionIds || []);
+    if (!Array.isArray(sessionIds) || sessionIds.length === 0) {
+      throw new AppError(
+        'sessionIds array (or a non-empty sessionListId) is required',
+        400,
+        'NO_SESSIONS'
+      );
     }
 
     if (!users || !Array.isArray(users) || users.length === 0) {

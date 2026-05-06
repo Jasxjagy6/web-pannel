@@ -20,6 +20,7 @@ import {
   exportMonitorJob,
 } from '../api/scrape';
 import { listsAPI } from '../api/lists';
+import SessionListSwitcher from '../components/common/SessionListSwitcher';
 import { parseApiError, formatNumber } from '../utils/formatters';
 import { useToast } from '../components/common/Toast';
 import { Modal } from '../components/common/Modal';
@@ -77,6 +78,11 @@ export default function Scrape() {
   
   // Scrape form state
   const [selectedSessions, setSelectedSessions] = useState([]);
+  // Pick-by-list mode: routes the request through a saved session list
+  // instead of an explicit sessionIds array. When mode='list' and an id
+  // is selected, we send sessionListId; the backend expands it.
+  const [sessionPickMode, setSessionPickMode] = useState('sessions');
+  const [selectedSessionListId, setSelectedSessionListId] = useState('');
   const [targets, setTargets] = useState('');
   const [scrapeType, setScrapeType] = useState('group');
   const [limit, setLimit] = useState(1000);
@@ -279,8 +285,13 @@ export default function Scrape() {
   const handleScrape = async (e) => {
     e.preventDefault();
 
-    if (selectedSessions.length === 0) {
-      showError('Please select at least one session', 'Validation Error');
+    const usingList = sessionPickMode === 'list' && selectedSessionListId;
+    if (!usingList && selectedSessions.length === 0) {
+      showError('Please select at least one session (or pick a session list)', 'Validation Error');
+      return;
+    }
+    if (sessionPickMode === 'list' && !selectedSessionListId) {
+      showError('Please pick a session list', 'Validation Error');
       return;
     }
 
@@ -317,17 +328,20 @@ export default function Scrape() {
 
       // Preview every target with the first selected session so we can
       // detect admin-only chats up front and offer the period-monitor
-      // path instead of failing the scrape.
+      // path instead of failing the scrape. Skipped in "use session list"
+      // mode since the picker hasn't materialised individual ids.
       let preview = null;
-      try {
-        const previewRes = await previewScrapeTargets({
-          sessionId: selectedSessions[0],
-          targetType: scrapeType,
-          targets: targetList,
-        });
-        preview = previewRes.data?.data?.results || [];
-      } catch (err) {
-        console.warn('preview failed, falling back to direct scrape', err);
+      if (sessionPickMode !== 'list' && selectedSessions[0]) {
+        try {
+          const previewRes = await previewScrapeTargets({
+            sessionId: selectedSessions[0],
+            targetType: scrapeType,
+            targets: targetList,
+          });
+          preview = previewRes.data?.data?.results || [];
+        } catch (err) {
+          console.warn('preview failed, falling back to direct scrape', err);
+        }
       }
 
       const adminTargets = preview ? preview.filter((r) => r.isAdminOnly) : [];
@@ -343,8 +357,7 @@ export default function Scrape() {
 
       // Otherwise launch the regular scrape on whatever IS scrapable.
       const apiCall = scrapeType === 'group' ? scrapeGroup : scrapeChannel;
-      const response = await apiCall({
-        sessionIds: selectedSessions,
+      const apiPayload = {
         targetIds: scrapableTargets,
         limit,
         filterBots: botFilterOptions.enabled,
@@ -352,15 +365,25 @@ export default function Scrape() {
         saveToList,
         listName: saveToList ? listName.trim() : undefined,
         async: true,
-      });
+      };
+      if (sessionPickMode === 'list' && selectedSessionListId) {
+        apiPayload.sessionListId = Number(selectedSessionListId);
+      } else {
+        apiPayload.sessionIds = selectedSessions;
+      }
+      const response = await apiCall(apiPayload);
 
       const jobId = response.data.data?.jobId;
       const elapsed = Date.now() - startTime;
       const remaining = Math.max(0, minLoadingTime - elapsed);
       await new Promise(resolve => setTimeout(resolve, remaining));
 
+      const sessionsCountLabel =
+        sessionPickMode === 'list' && selectedSessionListId
+          ? 'session list'
+          : `${selectedSessions.length} session(s)`;
       showSuccess(
-        `Scrape job started: ${scrapableTargets.length} target(s), ${selectedSessions.length} session(s). Job #${jobId}`,
+        `Scrape job started: ${scrapableTargets.length} target(s), ${sessionsCountLabel}. Job #${jobId}`,
         'Scrape Started'
       );
 
@@ -388,7 +411,8 @@ export default function Scrape() {
   // Launch period-bounded monitor jobs for the prompted admin-only targets.
   const handleStartMonitors = async () => {
     if (!periodPrompt || !periodPrompt.adminTargets?.length) return;
-    if (!selectedSessions.length) {
+    const usingList = sessionPickMode === 'list' && selectedSessionListId;
+    if (!usingList && !selectedSessions.length) {
       showError('Sessions selection is empty', 'Validation Error');
       return;
     }
@@ -397,8 +421,7 @@ export default function Scrape() {
     let failed = 0;
     for (const t of periodPrompt.adminTargets) {
       try {
-        await createMonitorJob({
-          sessionIds: selectedSessions,
+        const monitorPayload = {
           targetId: t.target,
           targetType: t.targetType || scrapeType,
           targetTitle: t.info?.title || null,
@@ -406,7 +429,13 @@ export default function Scrape() {
           reason: t.reason || 'admin_only',
           autoStart: true,
           dedupEnabled: monitorDedupEnabled,
-        });
+        };
+        if (usingList) {
+          monitorPayload.sessionListId = Number(selectedSessionListId);
+        } else {
+          monitorPayload.sessionIds = selectedSessions;
+        }
+        await createMonitorJob(monitorPayload);
         started++;
       } catch (err) {
         console.error('failed to create monitor', err);
@@ -630,7 +659,14 @@ export default function Scrape() {
         <form onSubmit={handleScrape} className="space-y-6">
           {/* Session Selection */}
           <div className={cardClass}>
-            <div className="flex justify-between items-center mb-3">
+            <SessionListSwitcher
+              mode={sessionPickMode}
+              onModeChange={setSessionPickMode}
+              selectedSessionListId={selectedSessionListId}
+              onSelectedSessionListIdChange={setSelectedSessionListId}
+              className="mb-4"
+            />
+            <div className={`flex justify-between items-center mb-3 ${sessionPickMode === 'list' ? 'hidden' : ''}`}>
               <label className={labelClass}>
                 <Users className="w-4 h-4 inline mr-2" />
                 Sessions ({selectedSessions.length} selected)
@@ -643,8 +679,8 @@ export default function Scrape() {
                 Select All Active
               </button>
             </div>
-            
-            {activeSessions.length === 0 ? (
+
+            {sessionPickMode === 'list' ? null : activeSessions.length === 0 ? (
               <div className="p-8 text-center text-gray-500 border border-dashed border-white/10 rounded-lg">
                 <Users className="w-12 h-12 mx-auto mb-3 opacity-50" />
                 <p className="text-sm">No active sessions available</p>
@@ -903,7 +939,11 @@ export default function Scrape() {
           {/* Submit Button */}
           <button
             type="submit"
-            disabled={submitting || selectedSessions.length === 0 || !targets.trim()}
+            disabled={
+              submitting ||
+              !targets.trim() ||
+              (sessionPickMode === 'list' ? !selectedSessionListId : selectedSessions.length === 0)
+            }
             className={`${btnPrimary} w-full py-3 text-base`}
           >
             {submitting ? (
@@ -914,7 +954,11 @@ export default function Scrape() {
             ) : (
               <>
                 <Play className="w-4 h-4" />
-                Start Scraping ({selectedSessions.length} sessions, {targets.split('\n').filter(t => t.trim()).length} targets)
+                Start Scraping (
+                {sessionPickMode === 'list'
+                  ? 'session list'
+                  : `${selectedSessions.length} sessions`}
+                , {targets.split('\n').filter(t => t.trim()).length} targets)
               </>
             )}
           </button>

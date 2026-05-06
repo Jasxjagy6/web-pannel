@@ -18,6 +18,7 @@ import { useToast } from '../components/common/Toast';
 import { listSessions } from '../api/sessions';
 import { updateAccountSettings, uploadProfilePhoto } from '../api/accountSettings';
 import { parseApiError } from '../utils/formatters';
+import SessionListSwitcher from '../components/common/SessionListSwitcher';
 
 export default function AccountSettings() {
   const { showSuccess, showError } = useToast();
@@ -25,6 +26,8 @@ export default function AccountSettings() {
   // Sessions
   const [sessions, setSessions] = useState([]);
   const [selectedSessionIds, setSelectedSessionIds] = useState([]);
+  const [sessionPickMode, setSessionPickMode] = useState('sessions');
+  const [selectedSessionListId, setSelectedSessionListId] = useState('');
   const [showAllSessions, setShowAllSessions] = useState(false);
 
   // Form fields
@@ -120,8 +123,13 @@ export default function AccountSettings() {
     e.preventDefault();
 
     // Validation
-    if (selectedSessionIds.length === 0) {
-      showError('Please select at least one session', 'Validation Error');
+    const usingList = sessionPickMode === 'list' && selectedSessionListId;
+    if (!usingList && selectedSessionIds.length === 0) {
+      showError('Please select at least one session (or pick a session list)', 'Validation Error');
+      return;
+    }
+    if (sessionPickMode === 'list' && !selectedSessionListId) {
+      showError('Please pick a session list', 'Validation Error');
       return;
     }
 
@@ -133,15 +141,20 @@ export default function AccountSettings() {
 
     setSubmitting(true);
     try {
-      const result = await updateAccountSettings({
-        sessionIds: selectedSessionIds,
+      const updatePayload = {
         firstName: updateFlags.firstName ? firstName : undefined,
         lastName: updateFlags.lastName ? lastName : undefined,
         username: updateFlags.username ? username : undefined,
         bio: updateFlags.bio ? bio : undefined,
         profilePhotoPath: updateFlags.profilePhoto && profilePhoto ? profilePhoto.path : undefined,
         updateFlags,
-      });
+      };
+      if (usingList) {
+        updatePayload.sessionListId = Number(selectedSessionListId);
+      } else {
+        updatePayload.sessionIds = selectedSessionIds;
+      }
+      const result = await updateAccountSettings(updatePayload);
 
       const { success, failed } = result.data.data;
       
@@ -398,6 +411,15 @@ export default function AccountSettings() {
           <div className="space-y-6">
             {/* Session Selection */}
             <div className="rounded-xl border border-white/5 bg-dark-800 p-5">
+              <SessionListSwitcher
+                mode={sessionPickMode}
+                onModeChange={setSessionPickMode}
+                selectedSessionListId={selectedSessionListId}
+                onSelectedSessionListIdChange={setSelectedSessionListId}
+                className="mb-4"
+              />
+              {sessionPickMode === 'list' ? null : (
+              <>
               <div className="flex items-center justify-between mb-3">
                 <h3 className="text-sm font-semibold text-white flex items-center gap-2">
                   <Users className="w-4 h-4 text-primary-500" />
@@ -463,6 +485,8 @@ export default function AccountSettings() {
               {activeSessions.length === 0 && (
                 <p className="mt-2 text-xs text-amber-400">No active sessions. Please login first.</p>
               )}
+              </>
+              )}
             </div>
 
             {/* Summary */}
@@ -475,7 +499,9 @@ export default function AccountSettings() {
               <div className="space-y-2 text-sm">
                 <div className="flex justify-between">
                   <span className="text-gray-400">Sessions:</span>
-                  <span className="text-white">{selectedSessionIds.length}</span>
+                  <span className="text-white">
+                    {sessionPickMode === 'list' ? 'session list' : selectedSessionIds.length}
+                  </span>
                 </div>
                 <div className="flex justify-between">
                   <span className="text-gray-400">Fields to update:</span>

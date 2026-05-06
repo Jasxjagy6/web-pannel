@@ -54,6 +54,7 @@ const MIGRATION_ORDER = [
   'migration_v17_tg_anti_revoke_phase4.sql',
   'migration_v18_tg_otp_relay.sql',
   'migration_v19_rich_scrape_fields.sql',
+  'migration_v20_session_lists.sql',
 ];
 
 function listMigrationFiles() {

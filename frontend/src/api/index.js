@@ -4,6 +4,7 @@ export * from './scrape';
 export * from './messages';
 export * from './groups';
 export * from './lists';
+export * from './sessionLists';
 export * from './reports';
 export * from './dashboard';
 export * from './accountSettings';

@@ -37,6 +37,7 @@ import {
   cancelPrivacyJob,
 } from '../api/privacy';
 import { parseApiError, formatRelativeTime } from '../utils/formatters';
+import SessionListSwitcher from '../components/common/SessionListSwitcher';
 
 // ---------------------------------------------------------------------
 // Static metadata for the 11 privacy keys exposed by the panel
@@ -451,6 +452,8 @@ export default function Privacy() {
   const { showSuccess, showError, showInfo } = useToast();
   const [sessions, setSessions] = useState([]);
   const [selectedSessionIds, setSelectedSessionIds] = useState([]);
+  const [sessionPickMode, setSessionPickMode] = useState('sessions');
+  const [selectedSessionListId, setSelectedSessionListId] = useState('');
   const [settings, setSettings] = useState({});
   const [submitting, setSubmitting] = useState(false);
 
@@ -519,13 +522,20 @@ export default function Privacy() {
       showError('Pick at least one privacy option', 'Nothing to apply');
       return;
     }
-    if (selectedSessionIds.length === 0) {
-      showError('Pick at least one session', 'No targets');
+    const usingList = sessionPickMode === 'list' && selectedSessionListId;
+    if (!usingList && selectedSessionIds.length === 0) {
+      showError('Pick at least one session (or pick a session list)', 'No targets');
+      return;
+    }
+    if (sessionPickMode === 'list' && !selectedSessionListId) {
+      showError('Pick a session list', 'No targets');
       return;
     }
     setSubmitting(true);
     try {
-      const r = await createPrivacyJob(settings, selectedSessionIds);
+      const r = usingList
+        ? await createPrivacyJob(settings, { sessionListId: Number(selectedSessionListId) })
+        : await createPrivacyJob(settings, selectedSessionIds);
       const data = r.data?.data || {};
       showSuccess(
         `Job #${data.jobId} queued for ${data.sessionCount} session(s)` +
@@ -534,6 +544,7 @@ export default function Privacy() {
       );
       setSettings({});
       setSelectedSessionIds([]);
+      setSelectedSessionListId('');
       setOpenSettings(false);
       fetchJobs();
     } catch (err) {
@@ -617,17 +628,29 @@ export default function Privacy() {
 
         {/* Sessions + submit */}
         <div className="space-y-4">
-          <SessionPicker
-            sessions={sessions}
-            selected={selectedSessionIds}
-            onToggle={toggleSession}
-            onSelectAll={setSelectedSessionIds}
-            onClear={() => setSelectedSessionIds([])}
+          <SessionListSwitcher
+            mode={sessionPickMode}
+            onModeChange={setSessionPickMode}
+            selectedSessionListId={selectedSessionListId}
+            onSelectedSessionListIdChange={setSelectedSessionListId}
           />
+          {sessionPickMode === 'sessions' && (
+            <SessionPicker
+              sessions={sessions}
+              selected={selectedSessionIds}
+              onToggle={toggleSession}
+              onSelectAll={setSelectedSessionIds}
+              onClear={() => setSelectedSessionIds([])}
+            />
+          )}
           <button
             onClick={submit}
             disabled={
-              submitting || selectedKeyCount === 0 || selectedSessionIds.length === 0
+              submitting ||
+              selectedKeyCount === 0 ||
+              (sessionPickMode === 'list'
+                ? !selectedSessionListId
+                : selectedSessionIds.length === 0)
             }
             className="w-full flex items-center justify-center gap-2 rounded-xl bg-gradient-to-r from-primary-600 to-primary-500 py-3 text-sm font-semibold text-white shadow-lg shadow-primary-500/20 hover:shadow-primary-500/40 disabled:opacity-40 disabled:cursor-not-allowed transition"
           >
@@ -636,8 +659,9 @@ export default function Privacy() {
             ) : (
               <Play className="w-4 h-4" />
             )}
-            Apply to {selectedSessionIds.length} session
-            {selectedSessionIds.length === 1 ? '' : 's'}
+            {sessionPickMode === 'list'
+              ? 'Apply to session list'
+              : `Apply to ${selectedSessionIds.length} session${selectedSessionIds.length === 1 ? '' : 's'}`}
           </button>
         </div>
       </div>

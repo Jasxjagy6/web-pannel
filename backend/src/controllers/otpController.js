@@ -1,15 +1,17 @@
 const otpService = require('../services/otpService');
 const reportService = require('../services/reportService');
 const { AppError, asyncHandler } = require('../utils/errorHandler');
+const { resolveSessionIdsFromRequest } = require('../utils/resolveSessions');
 
 const otpController = {
   /** POST /api/otp/jobs */
   createJob: asyncHandler(async (req, res) => {
     const userId = req.user.id;
-    const { sessionIds, durationSeconds } = req.body || {};
+    const { sessionIds: rawSessionIds, durationSeconds } = req.body || {};
+    const expanded = await resolveSessionIdsFromRequest(req, rawSessionIds || []);
     const result = await otpService.createJob({
       userId,
-      sessionIds: Array.isArray(sessionIds) ? sessionIds.map(Number) : [],
+      sessionIds: Array.isArray(expanded) ? expanded.map(Number) : [],
       durationSeconds: durationSeconds ? Number(durationSeconds) : undefined,
     });
     await reportService.logActivity(userId, 'otp_job', 'otp_job', result.jobId, {
