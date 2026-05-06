@@ -518,12 +518,113 @@ class TelegramClientService {
       silent: payload.silent === true,
     });
 
-    return {
-      messageId: _toIdNum(result.messageId ?? result.id ?? null),
-      date: result.date || new Date().toISOString(),
-      peerType,
-      peerId: _toIdNum(peerId),
+    const messageId = _toIdNum(result.messageId ?? result.id ?? null);
+    const date = result.date || new Date().toISOString();
+    const peerIdNum = _toIdNum(peerId);
+
+    // Build the same UI-shaped message + chat summary the live-event
+    // bridge would produce, then emit `tg-client:dialogUpdate` /
+    // `tg-client:newMessage` directly. This matters in two ways:
+    //   1. Other windows watching the same session immediately see
+    //      the new outgoing message in their dialog list / chat pane
+    //      (instead of only the sending window seeing the optimistic
+    //      insert).
+    //   2. We don't have to rely on GramJS's NewMessage event firing
+    //      for the round-tripped outgoing — empirically that handler
+    //      can race / drop on flaky proxies and the dialog preview
+    //      would be stuck on the previous incoming message.
+    const normalizedMessage = {
+      id: messageId,
       text,
+      out: true,
+      fromId: null,
+      senderPeerType: null,
+      senderPeerId: null,
+      date,
+      replyToMsgId: payload.replyToMsgId || null,
+      hasMedia: false,
+      mediaKind: null,
+      photoId: null,
+      mediaThumb: null,
+      mediaFileName: null,
+      mediaSizeBytes: null,
+      editDate: null,
+      pinned: false,
+      mentioned: false,
+      silent: !!payload.silent,
+      action: null,
+      actionType: null,
+      forwardFrom: null,
+    };
+    let chatSummary = null;
+    let senderSummary = null;
+    try {
+      const meId = (await this.getMe(sessionId, userId).catch(() => null))?.id;
+      if (meId != null) {
+        normalizedMessage.fromId = Number(meId);
+      }
+    } catch (_) { /* ignore */ }
+    try {
+      const entry = tgService.clients.get(String(sessionId));
+      if (entry) {
+        const entity = await entry.client.getEntity(_buildPeerInput(peerType, peerIdNum));
+        if (entity) {
+          chatSummary = {
+            peerType: _peerTypeOf(entity) || peerType,
+            peerId: _toIdNum(entity.id) ?? peerIdNum,
+            title: _entityTitle(entity),
+            username: entity.username || null,
+            photoId: entity.photo?.photoId ? String(entity.photo.photoId) : null,
+            hasPhoto: !!(entity.photo && (entity.photo.photoId || entity.photo.photoSmall)),
+          };
+        }
+        const me = await entry.client.getMe().catch(() => null);
+        if (me) {
+          senderSummary = {
+            peerType: 'user',
+            peerId: _toIdNum(me.id),
+            title: _entityTitle(me),
+            username: me.username || null,
+            photoId: me.photo?.photoId ? String(me.photo.photoId) : null,
+            hasPhoto: !!(me.photo && (me.photo.photoId || me.photo.photoSmall)),
+          };
+        }
+      }
+    } catch (_) { /* best-effort enrichment */ }
+    if (!chatSummary) {
+      chatSummary = { peerType, peerId: peerIdNum, title: null, username: null, photoId: null, hasPhoto: false };
+    }
+
+    const io = global.io;
+    if (io) {
+      const room = `tg-client:u${userId}:s${sessionId}`;
+      try {
+        io.to(room).emit('tg-client:newMessage', {
+          sessionId: String(sessionId),
+          chat: chatSummary,
+          sender: senderSummary,
+          message: normalizedMessage,
+        });
+        io.to(room).emit('tg-client:dialogUpdate', {
+          sessionId: String(sessionId),
+          chat: chatSummary,
+          lastMessage: normalizedMessage,
+          unreadDelta: 0,
+        });
+      } catch (err) {
+        logger.debug(`tg-client send broadcast failed: ${err.message}`);
+      }
+    }
+
+    return {
+      messageId,
+      date,
+      peerType,
+      peerId: peerIdNum,
+      text,
+      chat: chatSummary,
+      sender: senderSummary,
+      message: normalizedMessage,
     };
   }
 

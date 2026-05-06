@@ -177,7 +177,28 @@ export function createTgClientStore() {
       const existing = nextMessages.get(k) || [];
       const filtered = existing.filter((m) => m.clientMsgId !== clientMsgId);
       nextMessages.set(k, [...filtered, finalMessage]);
-      set({ pendingOutgoing: next, messagesByPeer: nextMessages });
+
+      // Bump this dialog's preview locally so the left-rail row updates
+      // before the round-tripped Socket.IO `tg-client:dialogUpdate`
+      // arrives (and even when GramJS's own NewMessage event fails to
+      // fire for the outgoing — e.g. on flaky media-DC proxies).
+      const nextDialogs = new Map(get().dialogs);
+      const prevDialog = nextDialogs.get(k);
+      let nextOrder = get().dialogOrder;
+      if (prevDialog) {
+        nextDialogs.set(k, {
+          ...prevDialog,
+          lastMessage: finalMessage,
+        });
+        nextOrder = _sortDialogOrder(nextDialogs);
+      }
+
+      set({
+        pendingOutgoing: next,
+        messagesByPeer: nextMessages,
+        dialogs: nextDialogs,
+        dialogOrder: nextOrder,
+      });
     },
 
     failPendingOutgoing: (clientMsgId, errorMessage) => {
