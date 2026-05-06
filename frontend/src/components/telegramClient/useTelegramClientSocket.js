@@ -160,6 +160,16 @@ export function useTelegramClientSocket(sessionId, store) {
       }
     });
 
+    socket.on('tg-client:participantUpdate', (data) => {
+      if (!data || String(data.sessionId) !== String(sessionId)) return;
+      // The admin panel listens on the window to refresh its members
+      // list. Using a CustomEvent keeps this decoupled from the Zustand
+      // store (members are panel-local, not store-global).
+      try {
+        window.dispatchEvent(new CustomEvent('tg-client:participantUpdate', { detail: data }));
+      } catch (_) { /* ignore */ }
+    });
+
     socket.on('tg-client:typing', (data) => {
       if (!data || String(data.sessionId) !== String(sessionId)) return;
       // Typing indicators are best-effort; we just record them with a

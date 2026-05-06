@@ -1867,9 +1867,536 @@ class TelegramClientService {
     } catch (err) {
       throw new AppError(`getCommonChats failed: ${err.message}`, 502, 'COMMON_CHATS_FAILED');
     }
-    const ownId = _toIdNum((await entry.client.getMe().catch(() => null))?.id);
-    const chats = Array.isArray(res?.chats) ? res.chats.map((c) => _normalizeEntity(c, ownId)).filter(Boolean) : [];
+    const chats = Array.isArray(res?.chats) ? res.chats.map((c) => {
+      if (!c) return null;
+      const peerType = c.className === 'Channel' || c.className === 'ChannelForbidden' ? 'channel' : 'chat';
+      return {
+        peerType,
+        peerId: _toIdNum(c.id),
+        title: c.title || '',
+        username: c.username || null,
+        participantsCount: c.participantsCount || 0,
+        isBroadcast: !!c.broadcast,
+        isMegagroup: !!c.megagroup,
+        hasPhoto: !!(c.photo && (c.photo.photoId || c.photo.photoSmall)),
+      };
+    }).filter(Boolean) : [];
     return { chats };
+  }
+
+  // -----------------------------------------------------------------------
+  // D10 — Group / channel info + admin
+  // -----------------------------------------------------------------------
+
+  /**
+   * D10 — List participants of a group / channel.
+   *
+   * Supports filters (`all`, `admins`, `kicked`, `banned`, `bots`,
+   * `recent`, `search`) and offset / limit for pagination.
+   * Telegram caps `limit` at 200 in a single call.
+   */
+  async getChatMembers(sessionId, userId, peerType, peerId, opts = {}) {
+    if (!['chat', 'channel'].includes(peerType)) {
+      throw new AppError('Members are only available for chat / channel', 400, 'INVALID_PEER_TYPE');
+    }
+    await _loadAndAuthSession(sessionId, userId);
+    await tgService._ensureConnected(sessionId);
+    const entry = tgService.clients.get(String(sessionId));
+    if (!entry) throw new AppError('Session client not loaded', 500, 'CLIENT_NOT_LOADED');
+
+    const peerIdNum = _toIdNum(peerId);
+    const limit = Math.max(1, Math.min(Number(opts.limit) || 200, 200));
+    const offset = Math.max(0, Number(opts.offset) || 0);
+    const search = typeof opts.search === 'string' ? opts.search : '';
+    const filterRaw = String(opts.filter || 'recent').toLowerCase();
+
+    let members = [];
+    let total = 0;
+
+    if (peerType === 'chat') {
+      // Basic groups don't have channels.GetParticipants — pull the
+      // full chat and synthesize a participant list.
+      try {
+        const full = await entry.client.invoke(new Api.messages.GetFullChat({ chatId: peerIdNum }));
+        const list = full?.fullChat?.participants?.participants || [];
+        const users = full?.users || [];
+        const userById = new Map(users.map((u) => [String(_toIdNum(u.id)), u]));
+        const ownId = _toIdNum((await entry.client.getMe().catch(() => null))?.id);
+        members = list.map((p) => _normalizeParticipantBasic(p, userById, ownId)).filter(Boolean);
+        total = members.length;
+        if (search) {
+          const q = search.toLowerCase();
+          members = members.filter((m) => {
+            const t = `${m.firstName} ${m.lastName} ${m.username || ''}`.toLowerCase();
+            return t.includes(q);
+          });
+        }
+        if (filterRaw === 'admins') members = members.filter((m) => m.isAdmin || m.isCreator);
+        if (filterRaw === 'bots') members = members.filter((m) => m.isBot);
+        members = members.slice(offset, offset + limit);
+      } catch (err) {
+        throw new AppError(`GetFullChat failed: ${err.message}`, 502, 'GET_MEMBERS_FAILED');
+      }
+    } else {
+      // Channel / supergroup.
+      let filter;
+      if (search) {
+        filter = new Api.ChannelParticipantsSearch({ q: search });
+      } else if (filterRaw === 'admins') {
+        filter = new Api.ChannelParticipantsAdmins();
+      } else if (filterRaw === 'kicked') {
+        filter = new Api.ChannelParticipantsKicked({ q: '' });
+      } else if (filterRaw === 'banned') {
+        filter = new Api.ChannelParticipantsBanned({ q: '' });
+      } else if (filterRaw === 'bots') {
+        filter = new Api.ChannelParticipantsBots();
+      } else {
+        filter = new Api.ChannelParticipantsRecent();
+      }
+
+      let res;
+      try {
+        res = await entry.client.invoke(new Api.channels.GetParticipants({
+          channel: _buildPeerInput('channel', peerIdNum),
+          filter,
+          offset,
+          limit,
+          hash: 0,
+        }));
+      } catch (err) {
+        throw new AppError(`GetParticipants failed: ${err.message}`, 502, 'GET_MEMBERS_FAILED');
+      }
+      total = res?.count || 0;
+      const users = res?.users || [];
+      const userById = new Map(users.map((u) => [String(_toIdNum(u.id)), u]));
+      const ownId = _toIdNum((await entry.client.getMe().catch(() => null))?.id);
+      members = (res?.participants || []).map((p) => _normalizeChannelParticipant(p, userById, ownId)).filter(Boolean);
+    }
+
+    return { peerType, peerId: peerIdNum, total, offset, limit, members };
+  }
+
+  /**
+   * D10 — Add a user to a chat / channel (messages.AddChatUser / channels.InviteToChannel).
+   * `userId` is the Telegram user-id to add.
+   */
+  async addChatMember(sessionId, userId, peerType, peerId, targetUserId, { fwdLimit = 100 } = {}) {
+    if (!['chat', 'channel'].includes(peerType)) {
+      throw new AppError('Add member only valid for chat / channel', 400, 'INVALID_PEER_TYPE');
+    }
+    await _loadAndAuthSession(sessionId, userId);
+    await tgService._ensureConnected(sessionId);
+    const entry = tgService.clients.get(String(sessionId));
+    if (!entry) throw new AppError('Session client not loaded', 500, 'CLIENT_NOT_LOADED');
+
+    const peerIdNum = _toIdNum(peerId);
+    const targetIdNum = _toIdNum(targetUserId);
+    const userInput = _buildPeerInput('user', targetIdNum);
+    try {
+      if (peerType === 'chat') {
+        await entry.client.invoke(new Api.messages.AddChatUser({
+          chatId: peerIdNum,
+          userId: userInput,
+          fwdLimit: Math.max(0, Math.min(Number(fwdLimit) || 100, 100)),
+        }));
+      } else {
+        await entry.client.invoke(new Api.channels.InviteToChannel({
+          channel: _buildPeerInput('channel', peerIdNum),
+          users: [userInput],
+        }));
+      }
+    } catch (err) {
+      throw new AppError(`Add member failed: ${err.message}`, 502, 'ADD_MEMBER_FAILED');
+    }
+    _broadcastParticipantUpdate(userId, sessionId, peerType, peerIdNum, {
+      action: 'add', userId: targetIdNum,
+    });
+    return { ok: true };
+  }
+
+  /**
+   * D10 — Kick or ban a user. For basic chats we use messages.DeleteChatUser;
+   * for channels we set ChatBannedRights with viewMessages=true (= banned)
+   * or rights={} (= kicked / soft remove).
+   */
+  async kickChatMember(sessionId, userId, peerType, peerId, targetUserId, { ban = false, untilDate = 0 } = {}) {
+    if (!['chat', 'channel'].includes(peerType)) {
+      throw new AppError('Kick only valid for chat / channel', 400, 'INVALID_PEER_TYPE');
+    }
+    await _loadAndAuthSession(sessionId, userId);
+    await tgService._ensureConnected(sessionId);
+    const entry = tgService.clients.get(String(sessionId));
+    if (!entry) throw new AppError('Session client not loaded', 500, 'CLIENT_NOT_LOADED');
+
+    const peerIdNum = _toIdNum(peerId);
+    const targetIdNum = _toIdNum(targetUserId);
+    const userInput = _buildPeerInput('user', targetIdNum);
+    try {
+      if (peerType === 'chat') {
+        await entry.client.invoke(new Api.messages.DeleteChatUser({
+          chatId: peerIdNum,
+          userId: userInput,
+          revokeHistory: !!ban,
+        }));
+      } else {
+        const rights = new Api.ChatBannedRights({
+          untilDate: Number(untilDate) || 0,
+          viewMessages: !!ban,
+          sendMessages: !!ban,
+          sendMedia: !!ban,
+          sendStickers: !!ban,
+          sendGifs: !!ban,
+          sendGames: !!ban,
+          sendInline: !!ban,
+          embedLinks: !!ban,
+        });
+        await entry.client.invoke(new Api.channels.EditBanned({
+          channel: _buildPeerInput('channel', peerIdNum),
+          participant: userInput,
+          bannedRights: rights,
+        }));
+      }
+    } catch (err) {
+      throw new AppError(`Kick / ban failed: ${err.message}`, 502, 'KICK_FAILED');
+    }
+    _broadcastParticipantUpdate(userId, sessionId, peerType, peerIdNum, {
+      action: ban ? 'ban' : 'kick', userId: targetIdNum,
+    });
+    return { ok: true };
+  }
+
+  /**
+   * D10 — Promote / demote a user as admin in a channel / supergroup.
+   * `rights` is an object of admin-right flags; pass an empty object to
+   * demote. For basic chats we use messages.EditChatAdmin which is a
+   * single-bit toggle.
+   */
+  async setChatAdmin(sessionId, userId, peerType, peerId, targetUserId, { isAdmin, rights, rank = '' } = {}) {
+    if (!['chat', 'channel'].includes(peerType)) {
+      throw new AppError('Admin set only valid for chat / channel', 400, 'INVALID_PEER_TYPE');
+    }
+    await _loadAndAuthSession(sessionId, userId);
+    await tgService._ensureConnected(sessionId);
+    const entry = tgService.clients.get(String(sessionId));
+    if (!entry) throw new AppError('Session client not loaded', 500, 'CLIENT_NOT_LOADED');
+
+    const peerIdNum = _toIdNum(peerId);
+    const targetIdNum = _toIdNum(targetUserId);
+    const userInput = _buildPeerInput('user', targetIdNum);
+    try {
+      if (peerType === 'chat') {
+        await entry.client.invoke(new Api.messages.EditChatAdmin({
+          chatId: peerIdNum,
+          userId: userInput,
+          isAdmin: !!isAdmin,
+        }));
+      } else {
+        const r = rights || {};
+        const adminRights = new Api.ChatAdminRights({
+          changeInfo:    !!r.changeInfo,
+          postMessages:  !!r.postMessages,
+          editMessages:  !!r.editMessages,
+          deleteMessages:!!r.deleteMessages,
+          banUsers:      !!r.banUsers,
+          inviteUsers:   !!r.inviteUsers,
+          pinMessages:   !!r.pinMessages,
+          addAdmins:     !!r.addAdmins,
+          anonymous:     !!r.anonymous,
+          manageCall:    !!r.manageCall,
+          other:         !!r.other,
+          manageTopics:  !!r.manageTopics,
+        });
+        await entry.client.invoke(new Api.channels.EditAdmin({
+          channel: _buildPeerInput('channel', peerIdNum),
+          userId: userInput,
+          adminRights: isAdmin === false ? new Api.ChatAdminRights({}) : adminRights,
+          rank: String(rank || '').slice(0, 16),
+        }));
+      }
+    } catch (err) {
+      throw new AppError(`Admin update failed: ${err.message}`, 502, 'ADMIN_FAILED');
+    }
+    _broadcastParticipantUpdate(userId, sessionId, peerType, peerIdNum, {
+      action: 'admin', userId: targetIdNum, isAdmin: !!isAdmin,
+    });
+    return { ok: true };
+  }
+
+  /**
+   * D10 — Edit chat title.
+   */
+  async editChatTitle(sessionId, userId, peerType, peerId, title) {
+    if (!['chat', 'channel'].includes(peerType)) {
+      throw new AppError('Edit only valid for chat / channel', 400, 'INVALID_PEER_TYPE');
+    }
+    const t = String(title || '').trim();
+    if (!t) throw new AppError('title is required', 400, 'NO_TITLE');
+
+    await _loadAndAuthSession(sessionId, userId);
+    await tgService._ensureConnected(sessionId);
+    const entry = tgService.clients.get(String(sessionId));
+    if (!entry) throw new AppError('Session client not loaded', 500, 'CLIENT_NOT_LOADED');
+
+    const peerIdNum = _toIdNum(peerId);
+    try {
+      if (peerType === 'chat') {
+        await entry.client.invoke(new Api.messages.EditChatTitle({
+          chatId: peerIdNum,
+          title: t.slice(0, 128),
+        }));
+      } else {
+        await entry.client.invoke(new Api.channels.EditTitle({
+          channel: _buildPeerInput('channel', peerIdNum),
+          title: t.slice(0, 128),
+        }));
+      }
+    } catch (err) {
+      throw new AppError(`Edit title failed: ${err.message}`, 502, 'EDIT_TITLE_FAILED');
+    }
+    const profile = await this.getPeerProfile(sessionId, userId, peerType, peerIdNum);
+    _broadcastPeerProfileChanged(userId, sessionId, peerType, peerIdNum, profile);
+    return profile;
+  }
+
+  /**
+   * D10 — Edit chat description / about.
+   */
+  async editChatAbout(sessionId, userId, peerType, peerId, about) {
+    if (peerType !== 'channel' && peerType !== 'chat') {
+      throw new AppError('Edit only valid for chat / channel', 400, 'INVALID_PEER_TYPE');
+    }
+    await _loadAndAuthSession(sessionId, userId);
+    await tgService._ensureConnected(sessionId);
+    const entry = tgService.clients.get(String(sessionId));
+    if (!entry) throw new AppError('Session client not loaded', 500, 'CLIENT_NOT_LOADED');
+
+    const peerIdNum = _toIdNum(peerId);
+    const peerInput = _buildPeerInput(peerType, peerIdNum);
+    try {
+      await entry.client.invoke(new Api.messages.EditChatAbout({
+        peer: peerInput,
+        about: String(about || '').slice(0, 255),
+      }));
+    } catch (err) {
+      throw new AppError(`Edit about failed: ${err.message}`, 502, 'EDIT_ABOUT_FAILED');
+    }
+    const profile = await this.getPeerProfile(sessionId, userId, peerType, peerIdNum);
+    _broadcastPeerProfileChanged(userId, sessionId, peerType, peerIdNum, profile);
+    return profile;
+  }
+
+  /**
+   * D10 — Edit chat photo (group / channel). `filePath` is the panel
+   * disk path produced by the photo multer middleware.
+   */
+  async editChatPhoto(sessionId, userId, peerType, peerId, { filePath, fileName } = {}) {
+    if (!['chat', 'channel'].includes(peerType)) {
+      throw new AppError('Edit only valid for chat / channel', 400, 'INVALID_PEER_TYPE');
+    }
+    if (!filePath) throw new AppError('file is required', 400, 'NO_FILE');
+    const fs = require('fs');
+    if (!fs.existsSync(filePath)) {
+      throw new AppError('Uploaded file is missing on disk', 500, 'FILE_NOT_ON_DISK');
+    }
+    const { CustomFile } = require('telegram/client/uploads');
+
+    await _loadAndAuthSession(sessionId, userId);
+    await tgService._ensureConnected(sessionId);
+    const entry = tgService.clients.get(String(sessionId));
+    if (!entry) throw new AppError('Session client not loaded', 500, 'CLIENT_NOT_LOADED');
+
+    const peerIdNum = _toIdNum(peerId);
+    let inputFile;
+    try {
+      const stat = fs.statSync(filePath);
+      inputFile = await entry.client.uploadFile({
+        file: new CustomFile(
+          fileName || _basename(filePath) || `photo-${Date.now()}.jpg`,
+          stat.size,
+          filePath,
+        ),
+        workers: 4,
+      });
+    } catch (err) {
+      try { fs.unlinkSync(filePath); } catch (_) { /* ignore */ }
+      throw new AppError(`Photo upload failed: ${err.message}`, 502, 'PHOTO_UPLOAD_FAILED');
+    }
+    try {
+      if (peerType === 'chat') {
+        await entry.client.invoke(new Api.messages.EditChatPhoto({
+          chatId: peerIdNum,
+          photo: new Api.InputChatUploadedPhoto({ file: inputFile }),
+        }));
+      } else {
+        await entry.client.invoke(new Api.channels.EditPhoto({
+          channel: _buildPeerInput('channel', peerIdNum),
+          photo: new Api.InputChatUploadedPhoto({ file: inputFile }),
+        }));
+      }
+    } catch (err) {
+      try { fs.unlinkSync(filePath); } catch (_) { /* ignore */ }
+      throw new AppError(`Edit photo failed: ${err.message}`, 502, 'EDIT_PHOTO_FAILED');
+    }
+    try { fs.unlinkSync(filePath); } catch (_) { /* ignore */ }
+
+    const profile = await this.getPeerProfile(sessionId, userId, peerType, peerIdNum);
+    _broadcastPeerProfileChanged(userId, sessionId, peerType, peerIdNum, profile);
+    return profile;
+  }
+
+  /**
+   * D10 — Leave a chat / channel.
+   */
+  async leaveChat(sessionId, userId, peerType, peerId) {
+    if (!['chat', 'channel'].includes(peerType)) {
+      throw new AppError('Leave only valid for chat / channel', 400, 'INVALID_PEER_TYPE');
+    }
+    await _loadAndAuthSession(sessionId, userId);
+    await tgService._ensureConnected(sessionId);
+    const entry = tgService.clients.get(String(sessionId));
+    if (!entry) throw new AppError('Session client not loaded', 500, 'CLIENT_NOT_LOADED');
+
+    const peerIdNum = _toIdNum(peerId);
+    try {
+      if (peerType === 'chat') {
+        await entry.client.invoke(new Api.messages.DeleteChatUser({
+          chatId: peerIdNum,
+          userId: _buildPeerInput('user', _toIdNum((await entry.client.getMe()).id)),
+          revokeHistory: false,
+        }));
+      } else {
+        await entry.client.invoke(new Api.channels.LeaveChannel({
+          channel: _buildPeerInput('channel', peerIdNum),
+        }));
+      }
+    } catch (err) {
+      throw new AppError(`Leave failed: ${err.message}`, 502, 'LEAVE_FAILED');
+    }
+    return { ok: true };
+  }
+}
+
+/**
+ * Normalize a basic-chat ChatParticipant* type into our wire format.
+ */
+function _normalizeParticipantBasic(p, userById, ownId) {
+  if (!p) return null;
+  const uidNum = _toIdNum(p.userId);
+  const u = userById.get(String(uidNum));
+  const role = p.className === 'ChatParticipantCreator' ? 'creator'
+    : p.className === 'ChatParticipantAdmin' ? 'admin'
+    : 'member';
+  return {
+    userId: uidNum,
+    role,
+    isCreator: role === 'creator',
+    isAdmin: role !== 'member',
+    isSelf: ownId != null && uidNum === ownId,
+    firstName: u?.firstName || '',
+    lastName: u?.lastName || '',
+    username: u?.username || null,
+    isBot: !!u?.bot,
+    isPremium: !!u?.premium,
+    isVerified: !!u?.verified,
+    isDeleted: !!u?.deleted,
+    photoId: u?.photo?.photoId ? String(u.photo.photoId) : null,
+    hasPhoto: !!(u?.photo && (u.photo.photoId || u.photo.photoSmall)),
+    rank: '',
+    inviterId: _toIdNum(p.inviterId),
+    date: p.date || 0,
+    bannedRights: null,
+    adminRights: null,
+  };
+}
+
+/**
+ * Normalize a channel participant variant (creator / admin / member /
+ * banned / left) into the same wire format as basic chat participants.
+ */
+function _normalizeChannelParticipant(p, userById, ownId) {
+  if (!p) return null;
+  const uidNum = _toIdNum(p.userId);
+  const u = userById.get(String(uidNum));
+  let role = 'member';
+  if (p.className === 'ChannelParticipantCreator') role = 'creator';
+  else if (p.className === 'ChannelParticipantAdmin') role = 'admin';
+  else if (p.className === 'ChannelParticipantBanned') role = 'banned';
+  else if (p.className === 'ChannelParticipantLeft') role = 'left';
+  return {
+    userId: uidNum,
+    role,
+    isCreator: role === 'creator',
+    isAdmin: role === 'admin' || role === 'creator',
+    isBanned: role === 'banned',
+    isLeft: role === 'left',
+    isSelf: ownId != null && uidNum === ownId,
+    firstName: u?.firstName || '',
+    lastName: u?.lastName || '',
+    username: u?.username || null,
+    isBot: !!u?.bot,
+    isPremium: !!u?.premium,
+    isVerified: !!u?.verified,
+    isDeleted: !!u?.deleted,
+    photoId: u?.photo?.photoId ? String(u.photo.photoId) : null,
+    hasPhoto: !!(u?.photo && (u.photo.photoId || u.photo.photoSmall)),
+    rank: p.rank || '',
+    inviterId: _toIdNum(p.inviterId),
+    promotedById: _toIdNum(p.promotedBy),
+    kickedById: _toIdNum(p.kickedBy),
+    date: p.date || 0,
+    adminRights: p.adminRights ? _serializeAdminRights(p.adminRights) : null,
+    bannedRights: p.bannedRights ? _serializeBannedRights(p.bannedRights) : null,
+  };
+}
+
+function _serializeAdminRights(r) {
+  if (!r) return null;
+  return {
+    changeInfo: !!r.changeInfo,
+    postMessages: !!r.postMessages,
+    editMessages: !!r.editMessages,
+    deleteMessages: !!r.deleteMessages,
+    banUsers: !!r.banUsers,
+    inviteUsers: !!r.inviteUsers,
+    pinMessages: !!r.pinMessages,
+    addAdmins: !!r.addAdmins,
+    anonymous: !!r.anonymous,
+    manageCall: !!r.manageCall,
+    other: !!r.other,
+    manageTopics: !!r.manageTopics,
+  };
+}
+
+function _serializeBannedRights(r) {
+  if (!r) return null;
+  return {
+    untilDate: r.untilDate || 0,
+    viewMessages: !!r.viewMessages,
+    sendMessages: !!r.sendMessages,
+    sendMedia: !!r.sendMedia,
+    sendStickers: !!r.sendStickers,
+    sendGifs: !!r.sendGifs,
+    sendGames: !!r.sendGames,
+    sendInline: !!r.sendInline,
+    embedLinks: !!r.embedLinks,
+  };
+}
+
+/**
+ * Broadcast a participant change so the open members panel can refresh.
+ */
+function _broadcastParticipantUpdate(userId, sessionId, peerType, peerId, payload) {
+  try {
+    const io = global.io;
+    if (!io) return;
+    io.to(`tg-client:u${userId}:s${sessionId}`).emit('tg-client:participantUpdate', {
+      sessionId: String(sessionId),
+      peerType,
+      peerId,
+      ...payload,
+    });
+  } catch (err) {
+    logger.debug(`tg-client participant broadcast failed: ${err.message}`);
   }
 }
 

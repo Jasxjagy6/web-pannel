@@ -587,6 +587,163 @@ const telegramClientController = {
     );
     res.json({ success: true, data });
   }),
+
+  // ---------------------------------------------------------------------
+  // D10 — Group / channel info + admin
+  // ---------------------------------------------------------------------
+
+  /**
+   * GET /sessions/:id/dialogs/:peerType/:peerId/members?filter=&search=&offset=&limit=
+   */
+  getChatMembers: asyncHandler(async (req, res) => {
+    const { peerType, peerId } = req.params;
+    const data = await tcService.getChatMembers(
+      req.params.id,
+      req.user.id,
+      peerType,
+      peerId,
+      {
+        filter: req.query?.filter,
+        search: req.query?.search,
+        offset: parseInt(req.query?.offset, 10) || 0,
+        limit: parseInt(req.query?.limit, 10) || 200,
+      },
+    );
+    res.json({ success: true, data });
+  }),
+
+  /**
+   * POST /sessions/:id/dialogs/:peerType/:peerId/members
+   * Body: { userId, fwdLimit? }
+   */
+  addChatMember: asyncHandler(async (req, res) => {
+    const { peerType, peerId } = req.params;
+    const data = await tcService.addChatMember(
+      req.params.id,
+      req.user.id,
+      peerType,
+      peerId,
+      req.body?.userId,
+      { fwdLimit: req.body?.fwdLimit },
+    );
+    await reportService
+      .logActivity(req.user.id, 'tg_client_add_member', 'session', req.params.id, {
+        platform: 'telegram', peerType, peerId, targetUserId: req.body?.userId,
+      })
+      .catch(() => {});
+    res.json({ success: true, data });
+  }),
+
+  /**
+   * DELETE /sessions/:id/dialogs/:peerType/:peerId/members/:userId?ban=true&untilDate=...
+   */
+  kickChatMember: asyncHandler(async (req, res) => {
+    const { peerType, peerId, userId: targetUserId } = req.params;
+    const ban = String(req.query?.ban || req.body?.ban || '').toLowerCase() === 'true' || req.body?.ban === true;
+    const untilDate = parseInt(req.query?.untilDate || req.body?.untilDate, 10) || 0;
+    const data = await tcService.kickChatMember(
+      req.params.id,
+      req.user.id,
+      peerType,
+      peerId,
+      targetUserId,
+      { ban, untilDate },
+    );
+    await reportService
+      .logActivity(req.user.id, ban ? 'tg_client_ban_member' : 'tg_client_kick_member', 'session', req.params.id, {
+        platform: 'telegram', peerType, peerId, targetUserId,
+      })
+      .catch(() => {});
+    res.json({ success: true, data });
+  }),
+
+  /**
+   * PATCH /sessions/:id/dialogs/:peerType/:peerId/members/:userId/admin
+   * Body: { isAdmin, rights?, rank? }
+   */
+  setChatAdmin: asyncHandler(async (req, res) => {
+    const { peerType, peerId, userId: targetUserId } = req.params;
+    const data = await tcService.setChatAdmin(
+      req.params.id,
+      req.user.id,
+      peerType,
+      peerId,
+      targetUserId,
+      {
+        isAdmin: req.body?.isAdmin === true,
+        rights: req.body?.rights,
+        rank: req.body?.rank,
+      },
+    );
+    await reportService
+      .logActivity(req.user.id, 'tg_client_set_admin', 'session', req.params.id, {
+        platform: 'telegram', peerType, peerId, targetUserId, isAdmin: req.body?.isAdmin === true,
+      })
+      .catch(() => {});
+    res.json({ success: true, data });
+  }),
+
+  /**
+   * PATCH /sessions/:id/dialogs/:peerType/:peerId/title
+   * Body: { title }
+   */
+  editChatTitle: asyncHandler(async (req, res) => {
+    const { peerType, peerId } = req.params;
+    const data = await tcService.editChatTitle(req.params.id, req.user.id, peerType, peerId, req.body?.title);
+    await reportService
+      .logActivity(req.user.id, 'tg_client_edit_chat_title', 'session', req.params.id, {
+        platform: 'telegram', peerType, peerId,
+      })
+      .catch(() => {});
+    res.json({ success: true, data });
+  }),
+
+  /**
+   * PATCH /sessions/:id/dialogs/:peerType/:peerId/about
+   * Body: { about }
+   */
+  editChatAbout: asyncHandler(async (req, res) => {
+    const { peerType, peerId } = req.params;
+    const data = await tcService.editChatAbout(req.params.id, req.user.id, peerType, peerId, req.body?.about);
+    await reportService
+      .logActivity(req.user.id, 'tg_client_edit_chat_about', 'session', req.params.id, {
+        platform: 'telegram', peerType, peerId,
+      })
+      .catch(() => {});
+    res.json({ success: true, data });
+  }),
+
+  /**
+   * POST /sessions/:id/dialogs/:peerType/:peerId/photo (multipart 'photo')
+   */
+  editChatPhoto: asyncHandler(async (req, res) => {
+    const { peerType, peerId } = req.params;
+    if (!req.file) throw new AppError('photo file is required', 400, 'NO_FILE');
+    const data = await tcService.editChatPhoto(req.params.id, req.user.id, peerType, peerId, {
+      filePath: req.file.path,
+      fileName: req.file.originalname,
+    });
+    await reportService
+      .logActivity(req.user.id, 'tg_client_edit_chat_photo', 'session', req.params.id, {
+        platform: 'telegram', peerType, peerId,
+      })
+      .catch(() => {});
+    res.json({ success: true, data });
+  }),
+
+  /**
+   * POST /sessions/:id/dialogs/:peerType/:peerId/leave
+   */
+  leaveChat: asyncHandler(async (req, res) => {
+    const { peerType, peerId } = req.params;
+    const data = await tcService.leaveChat(req.params.id, req.user.id, peerType, peerId);
+    await reportService
+      .logActivity(req.user.id, 'tg_client_leave_chat', 'session', req.params.id, {
+        platform: 'telegram', peerType, peerId,
+      })
+      .catch(() => {});
+    res.json({ success: true, data });
+  }),
 };
 
 module.exports = telegramClientController;

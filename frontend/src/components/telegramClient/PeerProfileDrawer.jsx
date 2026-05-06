@@ -10,6 +10,7 @@ import {
   getCommonChats,
 } from '../../api/telegramClient';
 import Avatar from './Avatar';
+import ChatAdminPanel from './ChatAdminPanel';
 
 /**
  * PeerProfileDrawer — slide-over for a non-self peer (user / chat / channel).
@@ -227,6 +228,15 @@ export default function PeerProfileDrawer({
                   </InfoRow>
                 )}
               </div>
+
+              {/* Group / channel admin panel (D10) */}
+              {(peerType === 'chat' || peerType === 'channel') && (
+                <ChatAdminPanel
+                  sessionId={sessionId}
+                  profile={profile}
+                  onProfileUpdated={(p) => { setProfile(p); onProfileLoaded?.(p); }}
+                />
+              )}
 
               {/* Common chats */}
               {peerType === 'user' && commonChats.length > 0 && (

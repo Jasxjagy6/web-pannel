@@ -279,3 +279,47 @@ export const getCommonChats = (sessionId, peerId, opts = {}) =>
   api.get(`${BASE}/sessions/${sessionId}/profile/user/${peerId}/common-chats`, {
     params: { limit: opts.limit ?? 100 },
   });
+
+// --- D10 — chat info + admin ---------------------------------------------
+
+export const getChatMembers = (sessionId, peerType, peerId, opts = {}) =>
+  api.get(`${BASE}/sessions/${sessionId}/dialogs/${peerType}/${peerId}/members`, {
+    params: {
+      filter: opts.filter,
+      search: opts.search,
+      offset: opts.offset ?? 0,
+      limit: opts.limit ?? 200,
+    },
+  });
+
+export const addChatMember = (sessionId, peerType, peerId, payload) =>
+  api.post(`${BASE}/sessions/${sessionId}/dialogs/${peerType}/${peerId}/members`, payload);
+
+export const kickChatMember = (sessionId, peerType, peerId, targetUserId, opts = {}) =>
+  api.delete(`${BASE}/sessions/${sessionId}/dialogs/${peerType}/${peerId}/members/${targetUserId}`, {
+    params: { ban: opts.ban ? 'true' : 'false', untilDate: opts.untilDate || 0 },
+  });
+
+export const setChatAdmin = (sessionId, peerType, peerId, targetUserId, payload) =>
+  api.patch(
+    `${BASE}/sessions/${sessionId}/dialogs/${peerType}/${peerId}/members/${targetUserId}/admin`,
+    payload,
+  );
+
+export const editChatTitle = (sessionId, peerType, peerId, title) =>
+  api.patch(`${BASE}/sessions/${sessionId}/dialogs/${peerType}/${peerId}/title`, { title });
+
+export const editChatAbout = (sessionId, peerType, peerId, about) =>
+  api.patch(`${BASE}/sessions/${sessionId}/dialogs/${peerType}/${peerId}/about`, { about });
+
+export const editChatPhoto = (sessionId, peerType, peerId, file) => {
+  const fd = new FormData();
+  fd.append('photo', file);
+  return api.post(`${BASE}/sessions/${sessionId}/dialogs/${peerType}/${peerId}/photo`, fd, {
+    headers: { 'Content-Type': 'multipart/form-data' },
+    timeout: 0,
+  });
+};
+
+export const leaveChat = (sessionId, peerType, peerId) =>
+  api.post(`${BASE}/sessions/${sessionId}/dialogs/${peerType}/${peerId}/leave`);

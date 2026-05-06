@@ -227,6 +227,43 @@ class TelegramClientStream {
             });
             return;
           }
+          if (cn === 'UpdateChatParticipants') {
+            const cp = update.participants;
+            if (!cp) return;
+            emit('tg-client:participantUpdate', {
+              sessionId: sid,
+              peerType: 'chat',
+              peerId: tcService._toIdNum(cp.chatId),
+              action: 'refresh',
+            });
+            return;
+          }
+          if (cn === 'UpdateChannelParticipant') {
+            emit('tg-client:participantUpdate', {
+              sessionId: sid,
+              peerType: 'channel',
+              peerId: tcService._toIdNum(update.channelId),
+              userId: tcService._toIdNum(update.userId),
+              action: update.newParticipant ? 'change' : 'remove',
+              newRights: update.newParticipant?.adminRights ? 'admin'
+                : update.newParticipant?.bannedRights ? 'banned'
+                : update.newParticipant ? 'member'
+                : null,
+            });
+            return;
+          }
+          if (cn === 'UpdateChatParticipantAdd' || cn === 'UpdateChatParticipantDelete' || cn === 'UpdateChatParticipantAdmin') {
+            emit('tg-client:participantUpdate', {
+              sessionId: sid,
+              peerType: 'chat',
+              peerId: tcService._toIdNum(update.chatId),
+              userId: tcService._toIdNum(update.userId),
+              action: cn === 'UpdateChatParticipantAdd' ? 'add'
+                : cn === 'UpdateChatParticipantDelete' ? 'remove'
+                : 'admin',
+            });
+            return;
+          }
           if (cn === 'UpdateReadHistoryInbox' || cn === 'UpdateReadHistoryOutbox') {
             const peer = _peerFromUpdate(update.peer);
             emit('tg-client:readHistory', {

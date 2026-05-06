@@ -148,6 +148,8 @@ const capabilities = {
   tgc_self_profile:       true,
   // D6 — peer profile (other user / chat / channel) + mute / block.
   tgc_peer_profile:       true,
+  // D10 — group / channel info + admin (members, promote/demote/kick/ban).
+  tgc_chat_admin:         true,
 };
 
 // ---------------------------------------------------------------------------

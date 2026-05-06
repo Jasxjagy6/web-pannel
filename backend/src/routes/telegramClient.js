@@ -114,4 +114,14 @@ router.patch('/sessions/:id/profile/:peerType/:peerId/block', controller.setPeer
 router.patch('/sessions/:id/profile/:peerType/:peerId/mute', controller.setPeerMuted);
 router.get('/sessions/:id/profile/user/:peerId/common-chats', controller.getCommonChats);
 
+// --- Members + admin (D10) ----------------------------------------------
+router.get('/sessions/:id/dialogs/:peerType/:peerId/members', controller.getChatMembers);
+router.post('/sessions/:id/dialogs/:peerType/:peerId/members', controller.addChatMember);
+router.delete('/sessions/:id/dialogs/:peerType/:peerId/members/:userId', controller.kickChatMember);
+router.patch('/sessions/:id/dialogs/:peerType/:peerId/members/:userId/admin', controller.setChatAdmin);
+router.patch('/sessions/:id/dialogs/:peerType/:peerId/title', controller.editChatTitle);
+router.patch('/sessions/:id/dialogs/:peerType/:peerId/about', controller.editChatAbout);
+router.post('/sessions/:id/dialogs/:peerType/:peerId/photo', uploadPhoto, controller.editChatPhoto);
+router.post('/sessions/:id/dialogs/:peerType/:peerId/leave', controller.leaveChat);
+
 module.exports = router;
