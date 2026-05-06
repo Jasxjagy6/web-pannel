@@ -22,6 +22,15 @@ const { pool } = require('../../config/database');
 const igClient = require('./client');
 const twoFAJobService = require('../../services/twoFAJobService');
 const logger = require('../../utils/logger');
+const { igFetch, sessionContext } = require('./igFetch');
+
+function _apiMode(session) {
+  return (
+    (session.platform_state && session.platform_state.api_mode) ||
+    ((session.platform_state && session.platform_state.source === 'browser_cookies')
+      ? 'web' : 'mobile')
+  );
+}
 
 async function _session({ userId, sessionId }) {
   const r = await pool.query(
@@ -64,7 +73,6 @@ async function _session({ userId, sessionId }) {
  */
 async function status({ userId, sessionId }) {
   const session = await _session({ userId, sessionId });
-  const client = await igClient.getClient(session);
   const out = {
     is_enabled: false,
     totp_enabled: false,
@@ -75,6 +83,43 @@ async function status({ userId, sessionId }) {
     supported: false,
     raw: null,
   };
+
+  // Cookie / web-API session — read 2FA status from the web settings
+  // endpoint instead of going through the mobile API (which would trip
+  // the device-mismatch checkpoint).
+  if (_apiMode(session) !== 'mobile') {
+    try {
+      const ctx = await sessionContext(session);
+      const r = await igFetch(
+        ctx,
+        'https://www.instagram.com/api/v1/accounts/two_factor_login_method_data/',
+        {
+          method: 'GET',
+          referer: 'https://www.instagram.com/accounts/two_factor_authentication/',
+        }
+      );
+      out.raw = r || {};
+      out.totp_enabled = !!(r && r.is_totp_two_factor_enabled);
+      out.sms_enabled = !!(r && r.is_phone_confirmed && r.is_sms_two_factor_enabled);
+      out.whatsapp_enabled = !!(r && r.is_whatsapp_two_factor_enabled);
+      out.is_enabled = out.totp_enabled || out.sms_enabled || out.whatsapp_enabled;
+      if (out.totp_enabled) out.methods.push('totp');
+      if (out.sms_enabled) out.methods.push('sms');
+      if (out.whatsapp_enabled) out.methods.push('whatsapp');
+      out.trusted_devices = Array.isArray(r && r.trusted_devices)
+        ? r.trusted_devices.length : 0;
+      out.api_mode = 'web';
+      out.supported = true;
+      return out;
+    } catch (err) {
+      logger.warn(`IG.twoFA.status (web) failed: ${err.message}`);
+      out.api_mode = 'web';
+      out.read_error = err.message;
+      return out;
+    }
+  }
+
+  const client = await igClient.getClient(session);
 
   if (typeof client.account.twoFactorAccountSettings === 'function') {
     try {

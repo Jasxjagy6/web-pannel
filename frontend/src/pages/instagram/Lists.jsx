@@ -13,6 +13,7 @@ import {
 import { listsAPI } from '@/api';
 import { useToast } from '../../components/common/Toast';
 import { formatNumber } from '@/utils/formatters';
+import SessionListsTab from '../../components/common/SessionListsTab';
 
 const IG_GRADIENT = 'bg-gradient-to-tr from-[#f09433] via-[#dc2743] to-[#bc1888]';
 
@@ -98,6 +99,41 @@ export default function InstagramLists() {
   const filtered = lists.filter((l) =>
     !search.trim() || (l.name || '').toLowerCase().includes(search.toLowerCase())
   );
+
+  const [tab, setTab] = useState('user');
+
+  if (tab === 'session') {
+    return (
+      <div className="space-y-6">
+        <div className={`rounded-2xl ${IG_GRADIENT} px-6 py-5 text-white shadow-lg`}>
+          <div className="flex items-center gap-3">
+            <ListChecks className="h-7 w-7" />
+            <div>
+              <div className="text-lg font-semibold">Lists</div>
+              <div className="text-sm text-white/85">
+                Switch between contact lists (saved audiences from scrapes) and session lists (named groupings of your Instagram sessions).
+              </div>
+            </div>
+          </div>
+        </div>
+        <div className="border-b border-white/10 flex gap-1">
+          <button
+            onClick={() => setTab('user')}
+            className="px-4 py-2 text-sm font-medium text-gray-400 hover:text-white border-b-2 border-transparent"
+          >
+            User lists
+          </button>
+          <button
+            onClick={() => setTab('session')}
+            className="px-4 py-2 text-sm font-medium text-white border-b-2 border-pink-500"
+          >
+            Session lists
+          </button>
+        </div>
+        <SessionListsTab />
+      </div>
+    );
+  }
 
   return (
     <div className="space-y-6">

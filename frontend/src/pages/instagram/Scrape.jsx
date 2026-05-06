@@ -28,6 +28,7 @@ import { listSessions } from '@/api/sessions';
 import { listsAPI } from '@/api';
 import { useToast } from '../../components/common/Toast';
 import { formatNumber } from '@/utils/formatters';
+import SessionListSwitcher from '../../components/common/SessionListSwitcher';
 
 const IG_GRADIENT = 'bg-gradient-to-tr from-[#f09433] via-[#dc2743] to-[#bc1888]';
 
@@ -60,6 +61,8 @@ export default function InstagramScrape() {
 
   const [sessions, setSessions] = useState([]);
   const [selectedSessions, setSelectedSessions] = useState([]);
+  const [sessionPickMode, setSessionPickMode] = useState('sessions');
+  const [selectedSessionListId, setSelectedSessionListId] = useState('');
   const [targetType, setTargetType] = useState('followers');
   const [targetUsernames, setTargetUsernames] = useState('');
   // Pull defaults from the IG Settings page (localStorage). The
@@ -154,19 +157,29 @@ export default function InstagramScrape() {
       showToast(`Enter at least one ${what}`, 'error');
       return;
     }
-    if (!selectedSessions.length) {
-      showToast('Select at least one logged-in Instagram session', 'error');
+    const usingList = sessionPickMode === 'list' && selectedSessionListId;
+    if (!usingList && !selectedSessions.length) {
+      showToast('Select at least one logged-in Instagram session (or pick a session list)', 'error');
+      return;
+    }
+    if (sessionPickMode === 'list' && !selectedSessionListId) {
+      showToast('Pick a session list', 'error');
       return;
     }
     setSubmitting(true);
     try {
-      await scrapeGroup({
-        sessionIds: selectedSessions,
+      const scrapePayload = {
         targetIds: targets,
         targetType,
         limit: Number(limit) || 1000,
         useProxy,
-      });
+      };
+      if (usingList) {
+        scrapePayload.sessionListId = Number(selectedSessionListId);
+      } else {
+        scrapePayload.sessionIds = selectedSessions;
+      }
+      await scrapeGroup(scrapePayload);
       showToast(
         useProxy
           ? 'Scrape job queued'
@@ -324,24 +337,34 @@ export default function InstagramScrape() {
               </label>
 
               <div className="mt-3">
-                <div className="mb-1 text-sm font-medium text-gray-700 dark:text-gray-200">Sessions to use</div>
-                <div className="max-h-32 overflow-y-auto rounded-lg border border-gray-200 bg-white p-2 dark:border-dark-600 dark:bg-dark-700">
-                  {sessions.length === 0 && (
-                    <div className="px-2 py-3 text-xs text-gray-500 dark:text-gray-400">
-                      No logged-in Instagram sessions. <button type="button" onClick={() => navigate('/instagram/create-session')} className="text-pink-500 underline">Create one</button>.
+                <SessionListSwitcher
+                  mode={sessionPickMode}
+                  onModeChange={setSessionPickMode}
+                  selectedSessionListId={selectedSessionListId}
+                  onSelectedSessionListIdChange={setSelectedSessionListId}
+                />
+                {sessionPickMode === 'sessions' && (
+                  <>
+                    <div className="mb-1 mt-3 text-sm font-medium text-gray-700 dark:text-gray-200">Sessions to use</div>
+                    <div className="max-h-32 overflow-y-auto rounded-lg border border-gray-200 bg-white p-2 dark:border-dark-600 dark:bg-dark-700">
+                      {sessions.length === 0 && (
+                        <div className="px-2 py-3 text-xs text-gray-500 dark:text-gray-400">
+                          No logged-in Instagram sessions. <button type="button" onClick={() => navigate('/instagram/create-session')} className="text-pink-500 underline">Create one</button>.
+                        </div>
+                      )}
+                      {sessions.map((s) => (
+                        <label key={s.id} className="flex items-center gap-2 px-1 py-1 text-sm">
+                          <input
+                            type="checkbox"
+                            checked={selectedSessions.includes(s.id)}
+                            onChange={() => toggleSession(s.id)}
+                          />
+                          <span className="truncate text-gray-700 dark:text-gray-200">@{s.username}</span>
+                        </label>
+                      ))}
                     </div>
-                  )}
-                  {sessions.map((s) => (
-                    <label key={s.id} className="flex items-center gap-2 px-1 py-1 text-sm">
-                      <input
-                        type="checkbox"
-                        checked={selectedSessions.includes(s.id)}
-                        onChange={() => toggleSession(s.id)}
-                      />
-                      <span className="truncate text-gray-700 dark:text-gray-200">@{s.username}</span>
-                    </label>
-                  ))}
-                </div>
+                  </>
+                )}
               </div>
             </div>
           </div>

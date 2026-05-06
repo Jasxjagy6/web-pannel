@@ -17,6 +17,7 @@ const igClient = require('./client');
 const sessionLimiter = require('./sessionLimiter');
 const riskScore = require('./riskScore');
 const logger = require('../../utils/logger');
+const { igFetch, sessionContext } = require('./igFetch');
 
 // Phase 2.B12 — high-risk action gating.
 // Hard limits to keep new / freshly-rotated accounts out of trouble.
@@ -107,24 +108,136 @@ async function _stampCooldown(sessionId, key) {
 }
 
 /**
- * Phase 1.B5 helper — only mobile-API sessions can use the IG private
- * API account.* methods. Cookie-uploaded (api_mode='web') sessions
- * MUST NOT call these endpoints; doing so reliably trips checkpoint.
+ * Phase 1.B5 helper — returns the api_mode of a session ('mobile' or 'web').
+ * Cookie-uploaded sessions are 'web' and use the web-API path
+ * (igFetch against www.instagram.com); interactive-login sessions
+ * are 'mobile' and use the IgApiClient private API.
  */
-function _assertMobileApi(session) {
-  const apiMode =
+function _apiMode(session) {
+  return (
     (session.platform_state && session.platform_state.api_mode) ||
     ((session.platform_state && session.platform_state.source === 'browser_cookies')
-      ? 'web' : 'mobile');
-  if (apiMode !== 'mobile') {
+      ? 'web' : 'mobile')
+  );
+}
+
+function _assertMobileApi(session) {
+  if (_apiMode(session) !== 'mobile') {
     const e = new Error(
-      'Profile editing is not supported for cookie-uploaded (web-API) Instagram sessions. ' +
-      'Use an interactive-login session, or wait for the web settings path to ship.'
+      'This action is only supported on interactive-login (mobile-API) sessions. ' +
+      'Cookie-uploaded sessions must use the web-API path, which is enabled where supported.'
     );
     e.statusCode = 400;
     e.code = 'API_MODE_REFUSED';
     throw e;
   }
+}
+
+/**
+ * Profile edit on a cookie-uploaded (web) session.
+ * Posts the form fields to /api/v1/web/accounts/edit/ — the same
+ * endpoint the IG web client uses behind the Settings page.
+ */
+async function _updateViaWeb({ session, patch, override }) {
+  const ctx = await sessionContext(session);
+  const out = { api_mode: 'web' };
+
+  // The web edit endpoint requires every form field at once; fetch
+  // the current values first and merge the patch in on top.
+  let current = {};
+  try {
+    const r = await igFetch(
+      ctx,
+      'https://www.instagram.com/api/v1/accounts/edit/web_form_data/',
+      { method: 'GET', referer: 'https://www.instagram.com/accounts/edit/' }
+    );
+    current = (r && r.form_data) || {};
+  } catch (err) {
+    out.read_error = err.message;
+  }
+
+  if (patch.username && patch.username !== current.username) {
+    try {
+      await _gateUsernameRename(session, override);
+      await sessionLimiter.acquire(session.id, { class: 'risky' });
+    } catch (err) {
+      out.username_error = err.message;
+      if (err.code) out.username_error_code = err.code;
+    }
+  }
+
+  const willEditText =
+    patch.full_name !== undefined ||
+    patch.biography !== undefined ||
+    patch.phone_number !== undefined ||
+    patch.email !== undefined ||
+    patch.external_url !== undefined ||
+    patch.gender !== undefined ||
+    (patch.username && patch.username !== current.username);
+
+  if (!willEditText) {
+    out.no_op = true;
+    return out;
+  }
+
+  try {
+    if (
+      patch.full_name !== undefined ||
+      patch.biography !== undefined ||
+      patch.phone_number !== undefined ||
+      patch.email !== undefined ||
+      patch.external_url !== undefined ||
+      patch.gender !== undefined
+    ) {
+      await _gateProfileTextEdit(session, override);
+    }
+    await sessionLimiter.acquire(session.id, { class: 'risky' });
+
+    const merged = {
+      first_name:   patch.full_name    !== undefined ? String(patch.full_name)    : (current.first_name   || ''),
+      email:        patch.email        !== undefined ? String(patch.email)        : (current.email        || ''),
+      username:     patch.username     !== undefined ? String(patch.username)     : (current.username     || ''),
+      phone_number: patch.phone_number !== undefined ? String(patch.phone_number) : (current.phone_number || ''),
+      gender:       patch.gender       !== undefined ? String(patch.gender)       : (current.gender       || '1'),
+      biography:    patch.biography    !== undefined ? String(patch.biography)    : (current.biography    || ''),
+      external_url: patch.external_url !== undefined ? String(patch.external_url) : (current.external_url || ''),
+      chaining_enabled: 'on',
+    };
+    const form = new URLSearchParams();
+    for (const [k, v] of Object.entries(merged)) form.append(k, v ?? '');
+
+    const r = await igFetch(
+      ctx,
+      'https://www.instagram.com/api/v1/web/accounts/edit/',
+      {
+        method: 'POST',
+        body: form.toString(),
+        referer: 'https://www.instagram.com/accounts/edit/',
+        limiterClass: 'risky',
+        extraHeaders: {
+          'content-type': 'application/x-www-form-urlencoded',
+          'x-instagram-ajax': '1',
+        },
+      }
+    );
+    out.profile = r || { ok: true };
+    if (patch.username && patch.username !== current.username) {
+      await _stampCooldown(session.id, 'last_username_rename_at');
+    }
+    await _stampCooldown(session.id, 'last_profile_text_edit_at');
+  } catch (err) {
+    out.profile_error = err.message;
+    if (err.code) out.profile_error_code = err.code;
+  }
+
+  if (patch.profile_picture_buffer || patch.profile_picture_path) {
+    out.profile_picture_error =
+      'Profile picture upload via web cookies is not supported. ' +
+      'Use an interactive-login (mobile-API) session for PFP changes.';
+    out.profile_picture_error_code = 'WEB_PFP_UNSUPPORTED';
+  }
+
+  return out;
 }
 
 async function _session({ userId, sessionId }) {
@@ -145,25 +258,81 @@ async function _session({ userId, sessionId }) {
 
 async function get({ userId, sessionId }) {
   const session = await _session({ userId, sessionId });
-  _assertMobileApi(session);
-  // Phase 1.B7 — read-class token for currentUser() probe.
   await sessionLimiter.acquire(session.id, { class: 'read' });
-  const client = await igClient.getClient(session);
-  const me = await client.account.currentUser();
+
+  if (_apiMode(session) === 'mobile') {
+    const client = await igClient.getClient(session);
+    const me = await client.account.currentUser();
+    return {
+      pk: me.pk,
+      username: me.username,
+      full_name: me.full_name,
+      biography: me.biography,
+      profile_pic_url: me.profile_pic_url,
+      is_private: me.is_private,
+      is_verified: me.is_verified,
+      api_mode: 'mobile',
+    };
+  }
+
+  // Cookie / web-API session — use the web settings endpoint.
+  // GET https://www.instagram.com/api/v1/accounts/edit/web_form_data/
+  // returns { form_data: { username, first_name, biography, external_url,
+  // email, phone_number, gender, country_code, profile_pic_url,
+  // is_private }, ... } for the logged-in user.
+  const ctx = await sessionContext(session);
+  let payload;
+  try {
+    payload = await igFetch(
+      ctx,
+      'https://www.instagram.com/api/v1/accounts/edit/web_form_data/',
+      { method: 'GET', referer: 'https://www.instagram.com/accounts/edit/' }
+    );
+  } catch (err) {
+    // Fall back to the public web_profile_info endpoint if the edit
+    // endpoint refuses (some IG cookie sessions are read-only).
+    if (!session.username) throw err;
+    const res = await igFetch(
+      ctx,
+      `https://www.instagram.com/api/v1/users/web_profile_info/?username=${encodeURIComponent(session.username)}`,
+      {
+        method: 'GET',
+        referer: `https://www.instagram.com/${encodeURIComponent(session.username)}/`,
+      }
+    );
+    const u = (res && res.data && res.data.user) || {};
+    return {
+      pk: u.id || null,
+      username: u.username || session.username,
+      full_name: u.full_name || '',
+      biography: u.biography || '',
+      profile_pic_url: u.profile_pic_url_hd || u.profile_pic_url || '',
+      is_private: !!u.is_private,
+      is_verified: !!u.is_verified,
+      external_url: u.external_url || '',
+      api_mode: 'web',
+    };
+  }
+
+  const fd = (payload && payload.form_data) || {};
   return {
-    pk: me.pk,
-    username: me.username,
-    full_name: me.full_name,
-    biography: me.biography,
-    profile_pic_url: me.profile_pic_url,
-    is_private: me.is_private,
-    is_verified: me.is_verified,
+    pk: fd.pk || null,
+    username: fd.username || session.username || '',
+    full_name: fd.first_name || fd.full_name || '',
+    biography: fd.biography || '',
+    profile_pic_url: fd.profile_pic_url || '',
+    is_private: !!fd.is_private,
+    is_verified: false,
+    external_url: fd.external_url || '',
+    email: fd.email || '',
+    phone_number: fd.phone_number || '',
+    gender: fd.gender || '',
+    api_mode: 'web',
   };
 }
 
 async function update({ userId, sessionId, patch = {} }) {
   const session = await _session({ userId, sessionId });
-  _assertMobileApi(session);
 
   // Phase 2.B12 — admin override flag. Operators that explicitly
   // need to bypass the cooldowns can pass `_admin_override:true` in
@@ -177,6 +346,11 @@ async function update({ userId, sessionId, patch = {} }) {
   // to a hard ban.
   if (!override) {
     await riskScore.gateOnRisk({ id: session.id });
+  }
+
+  // Cookie / web-API session — POST /api/v1/web/accounts/edit/
+  if (_apiMode(session) !== 'mobile') {
+    return _updateViaWeb({ session, patch, override });
   }
 
   const client = await igClient.getClient(session);

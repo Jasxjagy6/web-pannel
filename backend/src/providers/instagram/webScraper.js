@@ -276,8 +276,52 @@ async function* paginateFriendList(sessionOrBlob, targetPk, kind, opts = {}) {
     if (nextMaxId) params.set('max_id', nextMaxId);
     const url = `https://www.instagram.com/api/v1/friendships/${encodeURIComponent(targetPk)}/${kind}/?${params}`;
 
-    if (pageNum > 0) await _jitterSleep(1500, 3000); // anti-throttle
-    const json = await igFetch(ctx, url, { referer });
+    if (pageNum > 0) await _jitterSleep(2000, 4500); // anti-throttle
+
+    // Retry-with-backoff on transient throttles. Mid-pagination
+    // `rate_limited` / `forbidden` / `network` errors used to abort
+    // the whole job — and with a single session in the pool, there
+    // was nowhere to fail over to. Retry up to 3 times with
+    // exponential-with-jitter backoff before giving up.
+    let json;
+    let lastErr = null;
+    const RETRYABLE = new Set(['rate_limited', 'forbidden', 'network', 'action_blocked']);
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        json = await igFetch(ctx, url, { referer });
+        lastErr = null;
+        break;
+      } catch (err) {
+        lastErr = err;
+        if (!RETRYABLE.has(err && err.kind)) {
+          throw err;
+        }
+        const base = 30_000 * Math.pow(2, attempt); // 30s → 60s → 120s
+        const jitter = Math.floor(Math.random() * 15_000);
+        const wait = base + jitter;
+        logger.warn(
+          `IG.webScraper.${kind}: page ${pageNum + 1} hit ${err.kind} ` +
+          `(attempt ${attempt + 1}/3). Sleeping ${Math.round(wait / 1000)}s before retry.`
+        );
+        await new Promise((r) => setTimeout(r, wait));
+      }
+    }
+    if (lastErr) {
+      // Surface a clean partial-success signal to the caller so the
+      // job can be marked completed-with-warning instead of failed.
+      if (yielded > 0) {
+        const warn = new Error(
+          `Instagram throttled mid-pagination after ${yielded} ${kind} ` +
+          `(retried ${3} times). Returning partial result.`
+        );
+        warn.kind = lastErr.kind || 'rate_limited';
+        warn.partial = true;
+        warn.yielded = yielded;
+        throw warn;
+      }
+      throw lastErr;
+    }
+
     const users = Array.isArray(json.users) ? json.users : [];
     if (users.length === 0) {
       logger.info(`IG.webScraper.${kind}: no more users (page ${pageNum + 1})`);

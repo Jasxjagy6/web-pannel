@@ -78,10 +78,13 @@ async function _isProxyRequired() {
   const settings = require('../../services/systemSettingsService');
   try {
     const v = await settings.getSetting('security.instagram.require_proxy');
-    if (v === false || v === 'false') return false;
-    return true; // default true — fail closed
+    // Default is now `false` — proxy is OPTIONAL. Operators who need
+    // strict residential-proxy enforcement can set
+    // security.instagram.require_proxy = true in system_settings.
+    if (v === true || v === 'true') return true;
+    return false;
   } catch (_err) {
-    return true;
+    return false;
   }
 }
 
