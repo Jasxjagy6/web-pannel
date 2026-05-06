@@ -1107,13 +1107,43 @@ class TelegramService {
       // call, any non-empty missingInvitees means our user was the
       // dropped one. Surface that as USER_PRIVACY_RESTRICT so the
       // controller marks it skipped instead of falsely added.
-      const missing = (inviteResult && (inviteResult.missingInvitees || inviteResult.missing_invitees)) || [];
-      if (Array.isArray(missing) && missing.length > 0) {
-        const detail = missing[0] || {};
+      // Telegram returns `messages.InvitedUsers` wrapper from Layer
+      // 198 (older replies are bare `Updates`). Privacy-restricted
+      // users are silently demoted into `missingInvitees` on the
+      // wrapper. Older API path will not have this field — that case
+      // is already handled by the empty-updates case below.
+      const missing =
+        (inviteResult && (inviteResult.missingInvitees || inviteResult.missing_invitees)) || [];
+
+      // The successful add produces a non-empty `users` and a
+      // ChatAddUser update inside the wrapper's `updates` field. If
+      // we instead got back an empty users[] AND empty updates[],
+      // treat it as a silent drop. (This catches the case where the
+      // Layer 198 wrapper is missing the missingInvitees array on
+      // older bridges.)
+      const inviteUpdates = (inviteResult && inviteResult.updates) || null;
+      const innerUpdates =
+        inviteUpdates && Array.isArray(inviteUpdates.updates)
+          ? inviteUpdates.updates
+          : Array.isArray(inviteResult && inviteResult.updates)
+            ? inviteResult.updates
+            : [];
+      const innerUsers =
+        (inviteUpdates && Array.isArray(inviteUpdates.users) && inviteUpdates.users) ||
+        (Array.isArray(inviteResult && inviteResult.users) && inviteResult.users) ||
+        [];
+
+      const silentlyDropped =
+        (Array.isArray(missing) && missing.length > 0) ||
+        (innerUpdates.length === 0 && innerUsers.length === 0);
+
+      if (silentlyDropped) {
+        const detail = (Array.isArray(missing) && missing[0]) || {};
         const wouldAllow = detail.premiumWouldAllowInvite || detail.premium_would_allow_invite;
         logger.warn(
           `Telegram dropped invite (privacy/restricted) for ${userId}` +
-            (wouldAllow ? ' [premiumWouldAllowInvite=true]' : ''),
+            (wouldAllow ? ' [premiumWouldAllowInvite=true]' : '') +
+            ` (missing=${Array.isArray(missing) ? missing.length : 0}, updates=${innerUpdates.length}, users=${innerUsers.length})`,
           { sessionId, groupId }
         );
         throw new Error('USER_PRIVACY_RESTRICT');
