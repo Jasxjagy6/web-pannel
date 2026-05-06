@@ -56,6 +56,14 @@ const DIALOG_INITIAL = () => ({
 
   // Live media-upload progress per pending clientMsgId, in [0,1].
   uploadProgressByClientId: new Map(),
+
+  // Currently-quoted message in the composer (D3). Only one slot per
+  // window; null means "no reply staged".
+  replyTarget: null,
+
+  // Currently-edited message id (D3). When set, the composer opens
+  // pre-filled with that message's text and submits as a PATCH.
+  editTarget: null,
 });
 
 function _sortDialogOrder(dialogs) {
@@ -147,6 +155,34 @@ export function createTgClientStore() {
       nextMessages.set(k, [...existing, message]);
       set({ messagesByPeer: nextMessages });
     },
+
+    removeMessages: (peerType, peerId, ids) => {
+      const k = peerKey(peerType, peerId);
+      const nextMessages = new Map(get().messagesByPeer);
+      const existing = nextMessages.get(k);
+      if (!existing) return;
+      const drop = new Set(ids.map((v) => Number(v)).filter(Number.isFinite));
+      if (drop.size === 0) return;
+      const filtered = existing.filter((m) => !drop.has(Number(m.id)));
+      if (filtered.length === existing.length) return;
+      nextMessages.set(k, filtered);
+      // If the dialog's lastMessage was deleted, replace it with the
+      // newest remaining message (or null) so the left-rail preview
+      // doesn't get stuck on a phantom.
+      const nextDialogs = new Map(get().dialogs);
+      const dialog = nextDialogs.get(k);
+      let nextOrder = get().dialogOrder;
+      if (dialog && dialog.lastMessage && drop.has(Number(dialog.lastMessage.id))) {
+        const newLast = filtered.length ? filtered[filtered.length - 1] : null;
+        nextDialogs.set(k, { ...dialog, lastMessage: newLast });
+        nextOrder = _sortDialogOrder(nextDialogs);
+      }
+      set({ messagesByPeer: nextMessages, dialogs: nextDialogs, dialogOrder: nextOrder });
+    },
+
+    setReplyTarget: (target) => set({ replyTarget: target, editTarget: null }),
+    setEditTarget: (target) => set({ editTarget: target, replyTarget: null }),
+    clearComposeTargets: () => set({ replyTarget: null, editTarget: null }),
 
     replaceMessage: (peerType, peerId, edited) => {
       if (!edited || edited.id == null) return;

@@ -279,6 +279,89 @@ const telegramClientController = {
   }),
 
   /**
+   * PATCH /sessions/:id/dialogs/:peerType/:peerId/messages/:messageId
+   * Body: { text }
+   */
+  editMessage: asyncHandler(async (req, res) => {
+    const { peerType, peerId } = _parsePeer(req);
+    const messageId = parseInt(req.params.messageId, 10);
+    if (!Number.isFinite(messageId)) {
+      throw new AppError('messageId must be an integer', 400, 'BAD_MESSAGE_ID');
+    }
+    const data = await tcService.editMessage(req.params.id, req.user.id, peerType, peerId, {
+      messageId,
+      text: req.body?.text,
+    });
+    await reportService
+      .logActivity(req.user.id, 'tg_client_edit_message', 'session', req.params.id, {
+        platform: 'telegram',
+        peerType,
+        peerId: String(peerId),
+        messageId,
+      })
+      .catch(() => {});
+    res.json({ success: true, data });
+  }),
+
+  /**
+   * DELETE /sessions/:id/dialogs/:peerType/:peerId/messages
+   * Body: { messageIds: [..], revoke?: bool }
+   *
+   * Single-id convenience: messageIds can also be passed as a number on
+   * the URL (DELETE /messages/:id) — see the route definition.
+   */
+  deleteMessages: asyncHandler(async (req, res) => {
+    const { peerType, peerId } = _parsePeer(req);
+    let messageIds;
+    if (req.params.messageId) {
+      const single = parseInt(req.params.messageId, 10);
+      messageIds = Number.isFinite(single) ? [single] : [];
+    } else {
+      messageIds = Array.isArray(req.body?.messageIds) ? req.body.messageIds : [];
+    }
+    const revoke = req.body?.revoke !== false && req.query?.revoke !== 'false';
+    const data = await tcService.deleteMessages(req.params.id, req.user.id, peerType, peerId, {
+      messageIds,
+      revoke,
+    });
+    await reportService
+      .logActivity(req.user.id, 'tg_client_delete_messages', 'session', req.params.id, {
+        platform: 'telegram',
+        peerType,
+        peerId: String(peerId),
+        count: messageIds.length,
+        revoke,
+      })
+      .catch(() => {});
+    res.json({ success: true, data });
+  }),
+
+  /**
+   * POST /sessions/:id/forward
+   * Body: { fromPeerType, fromPeerId, toPeerType, toPeerId, messageIds, dropAuthor?, silent? }
+   */
+  forwardMessages: asyncHandler(async (req, res) => {
+    const data = await tcService.forwardMessages(req.params.id, req.user.id, {
+      fromPeerType: req.body?.fromPeerType,
+      fromPeerId: req.body?.fromPeerId,
+      toPeerType: req.body?.toPeerType,
+      toPeerId: req.body?.toPeerId,
+      messageIds: req.body?.messageIds,
+      dropAuthor: !!req.body?.dropAuthor,
+      silent: !!req.body?.silent,
+    });
+    await reportService
+      .logActivity(req.user.id, 'tg_client_forward', 'session', req.params.id, {
+        platform: 'telegram',
+        from: `${req.body?.fromPeerType}:${req.body?.fromPeerId}`,
+        to: `${req.body?.toPeerType}:${req.body?.toPeerId}`,
+        count: Array.isArray(req.body?.messageIds) ? req.body.messageIds.length : 0,
+      })
+      .catch(() => {});
+    res.json({ success: true, data });
+  }),
+
+  /**
    * GET /sessions/:id/dialogs/:peerType/:peerId/messages/:messageId/media
    *
    * Query params:

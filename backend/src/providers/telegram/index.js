@@ -142,6 +142,8 @@ const capabilities = {
   tgc_send_media:         true,
   // D2 — view media inline (image/video/audio rendering + Range streaming).
   tgc_view_media:         true,
+  // D3 — message actions: reply / forward / edit / delete.
+  tgc_message_actions:    true,
 };
 
 // ---------------------------------------------------------------------------

@@ -1,5 +1,5 @@
-import React from 'react';
-import { Check, CheckCheck, AlertCircle } from 'lucide-react';
+import React, { useState, useRef, useEffect } from 'react';
+import { Check, CheckCheck, AlertCircle, Reply, Forward, Pencil, Trash2, Copy, MoreHorizontal } from 'lucide-react';
 import Avatar from './Avatar';
 import MediaInline from './MediaInline';
 
@@ -50,6 +50,13 @@ export default function MessageBubble({
   peerType,
   peerId,
   uploadProgress,
+  messagesById,
+  canMessageActions,
+  onReply,
+  onForward,
+  onEdit,
+  onDelete,
+  onJumpToMessage,
 }) {
   const out = !!message.out;
   const isService = !!message.isService;
@@ -68,6 +75,16 @@ export default function MessageBubble({
     ? 'bg-blue-600/95 text-white'
     : 'bg-dark-700 text-gray-100';
   const align = out ? 'justify-end' : 'justify-start';
+
+  const replyMessage = message.replyToMsgId && messagesById
+    ? messagesById.get(Number(message.replyToMsgId))
+    : null;
+
+  const isLocalPending = !message.id || message.id < 0;
+  const canEdit = !!canMessageActions && out && !isLocalPending && (!message.mediaKind || message.text != null);
+  const canDelete = !!canMessageActions && !isLocalPending;
+  const canReply = !!canMessageActions && !isLocalPending;
+  const canForward = !!canMessageActions && !isLocalPending;
 
   return (
     <div className={`my-0.5 flex w-full items-end gap-2 ${align}`}>
@@ -90,10 +107,33 @@ export default function MessageBubble({
         )}
 
         <div
+          id={`tgmsg-${message.id}`}
           className={`group relative rounded-2xl px-3 py-1.5 shadow-sm ${bubbleColor} ${
             message.failed ? 'opacity-70 ring-1 ring-red-500/60' : ''
           } ${message.pending ? 'opacity-80' : ''}`}
         >
+          {(canReply || canForward || canEdit || canDelete) && (
+            <BubbleMenu
+              out={out}
+              canReply={canReply}
+              canForward={canForward}
+              canEdit={canEdit}
+              canDelete={canDelete}
+              hasText={!!message.text}
+              onReply={() => onReply?.(message)}
+              onForward={() => onForward?.(message)}
+              onEdit={() => onEdit?.(message)}
+              onDelete={() => onDelete?.(message)}
+            />
+          )}
+          {message.replyToMsgId && (
+            <ReplyQuote
+              out={out}
+              replyMessage={replyMessage}
+              replyToMsgId={message.replyToMsgId}
+              onJump={onJumpToMessage}
+            />
+          )}
           {message.mediaKind && (
             <MediaInline
               sessionId={sessionId}
@@ -143,5 +183,106 @@ export default function MessageBubble({
         </div>
       </div>
     </div>
+  );
+}
+
+function BubbleMenu({
+  out, canReply, canForward, canEdit, canDelete, hasText,
+  onReply, onForward, onEdit, onDelete,
+}) {
+  const [open, setOpen] = useState(false);
+  const ref = useRef(null);
+
+  useEffect(() => {
+    if (!open) return undefined;
+    const onDoc = (e) => {
+      if (!ref.current) return;
+      if (!ref.current.contains(e.target)) setOpen(false);
+    };
+    const onKey = (e) => { if (e.key === 'Escape') setOpen(false); };
+    document.addEventListener('mousedown', onDoc);
+    document.addEventListener('keydown', onKey);
+    return () => {
+      document.removeEventListener('mousedown', onDoc);
+      document.removeEventListener('keydown', onKey);
+    };
+  }, [open]);
+
+  const onCopy = async () => {
+    setOpen(false);
+    try {
+      const text = ref.current?.closest('[id^="tgmsg-"]')
+        ?.querySelector('div.whitespace-pre-wrap')?.textContent;
+      if (text && navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(text);
+      }
+    } catch (_) { /* ignore */ }
+  };
+
+  return (
+    <div ref={ref} className="absolute -top-3 right-1 z-10">
+      <button
+        type="button"
+        onClick={(e) => { e.stopPropagation(); setOpen((v) => !v); }}
+        className={`opacity-0 transition-opacity group-hover:opacity-100 rounded-full p-1 ${out ? 'bg-blue-700 text-white hover:bg-blue-800' : 'bg-dark-600 text-gray-200 hover:bg-dark-500'}`}
+        title="Message actions"
+        aria-label="Message actions"
+      >
+        <MoreHorizontal className="h-3 w-3" />
+      </button>
+      {open && (
+        <div
+          className="absolute right-0 top-6 z-20 w-40 rounded-lg border border-white/10 bg-dark-900 py-1 shadow-xl"
+          onClick={(e) => e.stopPropagation()}
+        >
+          {canReply && <MenuRow icon={Reply} label="Reply" onClick={() => { setOpen(false); onReply?.(); }} />}
+          {canForward && <MenuRow icon={Forward} label="Forward" onClick={() => { setOpen(false); onForward?.(); }} />}
+          {canEdit && <MenuRow icon={Pencil} label="Edit" onClick={() => { setOpen(false); onEdit?.(); }} />}
+          {hasText && <MenuRow icon={Copy} label="Copy text" onClick={onCopy} />}
+          {canDelete && (
+            <MenuRow
+              icon={Trash2}
+              label="Delete"
+              variant="danger"
+              onClick={() => { setOpen(false); onDelete?.(); }}
+            />
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function MenuRow({ icon: Icon, label, onClick, variant }) {
+  const cls = variant === 'danger' ? 'text-red-300 hover:bg-red-500/10' : 'text-gray-200 hover:bg-white/5';
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      className={`flex w-full items-center gap-2 px-3 py-1.5 text-left text-sm ${cls}`}
+    >
+      <Icon className="h-4 w-4" />
+      {label}
+    </button>
+  );
+}
+
+function ReplyQuote({ out, replyMessage, replyToMsgId, onJump }) {
+  const text = replyMessage?.text || (replyMessage?.mediaKind ? _mediaLabel(replyMessage.mediaKind) : null);
+  const accent = out ? 'border-blue-200/70 bg-blue-700/40' : 'border-blue-300/70 bg-dark-600/60';
+  return (
+    <button
+      type="button"
+      onClick={() => replyMessage && onJump?.(replyMessage.id)}
+      className={`mb-1 block w-full max-w-full overflow-hidden rounded border-l-2 px-2 py-1 text-left text-[11px] leading-tight ${accent}`}
+      title={replyMessage ? 'Jump to message' : 'Original message not loaded'}
+    >
+      <div className={`truncate ${out ? 'text-blue-50/80' : 'text-blue-200'}`}>
+        {replyMessage?.senderTitle || 'Reply'}
+      </div>
+      <div className={`truncate ${out ? 'text-blue-50' : 'text-gray-200'}`}>
+        {text || `Message #${replyToMsgId}`}
+      </div>
+    </button>
   );
 }

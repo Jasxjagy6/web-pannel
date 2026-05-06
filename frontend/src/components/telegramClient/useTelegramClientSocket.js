@@ -94,6 +94,28 @@ export function useTelegramClientSocket(sessionId, store) {
       }
     });
 
+    socket.on('tg-client:deleteMessages', (data) => {
+      if (!data || String(data.sessionId) !== String(sessionId)) return;
+      const ids = Array.isArray(data.messageIds) ? data.messageIds : [];
+      if (ids.length === 0) return;
+      // If the broadcast carries an explicit peer (service-emitted), we
+      // use it directly. Otherwise (raw-update path), drop matching ids
+      // from every peer this window has loaded — the stream-level
+      // delete event only carries channel ids.
+      if (data.peerType && data.peerId != null) {
+        store.getState().removeMessages(data.peerType, data.peerId, ids);
+        return;
+      }
+      const messagesByPeer = store.getState().messagesByPeer;
+      const idSet = new Set(ids.map(Number));
+      for (const [k, list] of messagesByPeer.entries()) {
+        if (list.some((x) => idSet.has(Number(x.id)))) {
+          const [peerType, peerIdStr] = k.split(':');
+          store.getState().removeMessages(peerType, Number(peerIdStr), ids);
+        }
+      }
+    });
+
     socket.on('tg-client:dialogUpdate', (data) => {
       if (!data || String(data.sessionId) !== String(sessionId)) return;
       const { chat, lastMessage, unreadDelta } = data;

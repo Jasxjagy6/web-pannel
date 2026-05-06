@@ -1106,6 +1106,292 @@ class TelegramClientService {
     }
     return value;
   }
+
+  /**
+   * Edit the text/caption of a message previously sent by `sessionId`.
+   * Telegram only allows the sender to edit their own outgoing messages
+   * within ~48 hours; on failure (FROZEN_USER_ID, MESSAGE_AUTHOR_REQUIRED,
+   * MESSAGE_NOT_MODIFIED, etc.) we surface the GramJS error to the caller.
+   *
+   * Emits `tg-client:editMessage` on success so other windows / tabs
+   * tracking the same session update in place.
+   *
+   * @param {object} payload
+   * @param {number} payload.messageId
+   * @param {string} payload.text  new text/caption (cannot be empty)
+   */
+  async editMessage(sessionId, userId, peerType, peerId, payload = {}) {
+    if (!PEER_TYPES.has(peerType)) {
+      throw new AppError('Invalid peer type', 400, 'INVALID_PEER_TYPE');
+    }
+    const messageId = parseInt(payload.messageId, 10);
+    if (!Number.isFinite(messageId)) {
+      throw new AppError('messageId is required', 400, 'BAD_MESSAGE_ID');
+    }
+    const text = (payload.text == null ? '' : String(payload.text));
+    if (!text.trim() && payload.allowEmpty !== true) {
+      throw new AppError('text cannot be empty', 400, 'EMPTY_TEXT');
+    }
+    const peerIdNum = _toIdNum(peerId);
+    if (peerIdNum == null) {
+      throw new AppError('peerId must be numeric', 400, 'BAD_PEER_ID');
+    }
+
+    await _loadAndAuthSession(sessionId, userId);
+    await tgService._ensureConnected(sessionId);
+    const entry = tgService.clients.get(String(sessionId));
+    if (!entry) throw new AppError('Session client not loaded', 500, 'CLIENT_NOT_LOADED');
+
+    let entity;
+    try {
+      entity = await entry.client.getEntity(_buildPeerInput(peerType, peerIdNum));
+    } catch (err) {
+      throw new AppError(`Could not resolve peer: ${err.message}`, 404, 'PEER_NOT_FOUND');
+    }
+
+    let edited;
+    try {
+      edited = await entry.client.editMessage(entity, {
+        message: messageId,
+        text,
+      });
+    } catch (err) {
+      throw new AppError(`Failed to edit message: ${err.message}`, 502, 'EDIT_FAILED');
+    }
+
+    const editDateRaw = edited?.editDate || edited?.date || Math.floor(Date.now() / 1000);
+    const editDate = typeof editDateRaw === 'number'
+      ? new Date(editDateRaw * 1000).toISOString()
+      : new Date().toISOString();
+
+    const io = global.io;
+    if (io) {
+      const room = `tg-client:u${userId}:s${sessionId}`;
+      try {
+        io.to(room).emit('tg-client:editMessage', {
+          sessionId: String(sessionId),
+          peerType,
+          peerId: peerIdNum,
+          messageId,
+          text,
+          editDate,
+          message: {
+            id: messageId,
+            peerType,
+            peerId: peerIdNum,
+            text,
+            editDate,
+          },
+        });
+      } catch (err) {
+        logger.debug(`tg-client edit broadcast failed: ${err.message}`);
+      }
+    }
+
+    return {
+      messageId,
+      peerType,
+      peerId: peerIdNum,
+      text,
+      editDate,
+    };
+  }
+
+  /**
+   * Delete one or more messages by id. `revoke=true` (default) tells
+   * Telegram to also remove the messages on the recipient side where
+   * possible.
+   *
+   * Emits `tg-client:deleteMessages` so other windows update their
+   * local message list.
+   *
+   * @param {object} payload
+   * @param {number[]} payload.messageIds
+   * @param {boolean} [payload.revoke=true]
+   */
+  async deleteMessages(sessionId, userId, peerType, peerId, payload = {}) {
+    if (!PEER_TYPES.has(peerType)) {
+      throw new AppError('Invalid peer type', 400, 'INVALID_PEER_TYPE');
+    }
+    const ids = Array.isArray(payload.messageIds) ? payload.messageIds : [];
+    const messageIds = ids
+      .map((v) => parseInt(v, 10))
+      .filter((v) => Number.isFinite(v));
+    if (messageIds.length === 0) {
+      throw new AppError('messageIds is required', 400, 'BAD_MESSAGE_IDS');
+    }
+    if (messageIds.length > 100) {
+      throw new AppError('At most 100 messages may be deleted at once', 400, 'TOO_MANY_MESSAGES');
+    }
+    const revoke = payload.revoke !== false;
+    const peerIdNum = _toIdNum(peerId);
+
+    await _loadAndAuthSession(sessionId, userId);
+    await tgService._ensureConnected(sessionId);
+    const entry = tgService.clients.get(String(sessionId));
+    if (!entry) throw new AppError('Session client not loaded', 500, 'CLIENT_NOT_LOADED');
+
+    let entity;
+    try {
+      entity = await entry.client.getEntity(_buildPeerInput(peerType, peerIdNum));
+    } catch (err) {
+      throw new AppError(`Could not resolve peer: ${err.message}`, 404, 'PEER_NOT_FOUND');
+    }
+
+    try {
+      await entry.client.deleteMessages(entity, messageIds, { revoke });
+    } catch (err) {
+      throw new AppError(`Failed to delete messages: ${err.message}`, 502, 'DELETE_FAILED');
+    }
+
+    const io = global.io;
+    if (io) {
+      const room = `tg-client:u${userId}:s${sessionId}`;
+      try {
+        io.to(room).emit('tg-client:deleteMessages', {
+          sessionId: String(sessionId),
+          peerType,
+          peerId: peerIdNum,
+          messageIds,
+          revoke,
+        });
+      } catch (err) {
+        logger.debug(`tg-client delete broadcast failed: ${err.message}`);
+      }
+    }
+
+    return {
+      peerType,
+      peerId: peerIdNum,
+      messageIds,
+      revoke,
+    };
+  }
+
+  /**
+   * Forward a list of message ids from one peer to another.
+   *
+   * Emits `tg-client:newMessage` and `tg-client:dialogUpdate` for the
+   * destination peer so the destination window updates instantly.
+   *
+   * @param {object} payload
+   * @param {string} payload.fromPeerType
+   * @param {number|string} payload.fromPeerId
+   * @param {string} payload.toPeerType
+   * @param {number|string} payload.toPeerId
+   * @param {number[]} payload.messageIds
+   * @param {boolean} [payload.dropAuthor=false] hide the original author header
+   * @param {boolean} [payload.silent=false]
+   */
+  async forwardMessages(sessionId, userId, payload = {}) {
+    const ids = Array.isArray(payload.messageIds) ? payload.messageIds : [];
+    const messageIds = ids
+      .map((v) => parseInt(v, 10))
+      .filter((v) => Number.isFinite(v));
+    if (messageIds.length === 0) {
+      throw new AppError('messageIds is required', 400, 'BAD_MESSAGE_IDS');
+    }
+    if (messageIds.length > 100) {
+      throw new AppError('At most 100 messages may be forwarded at once', 400, 'TOO_MANY_MESSAGES');
+    }
+    const fromType = payload.fromPeerType;
+    const toType = payload.toPeerType;
+    if (!PEER_TYPES.has(fromType) || !PEER_TYPES.has(toType)) {
+      throw new AppError('Invalid peer type', 400, 'INVALID_PEER_TYPE');
+    }
+    const fromIdNum = _toIdNum(payload.fromPeerId);
+    const toIdNum = _toIdNum(payload.toPeerId);
+    if (fromIdNum == null || toIdNum == null) {
+      throw new AppError('Both fromPeerId and toPeerId are required', 400, 'BAD_PEER_ID');
+    }
+
+    await _loadAndAuthSession(sessionId, userId);
+    await tgService._ensureConnected(sessionId);
+    const entry = tgService.clients.get(String(sessionId));
+    if (!entry) throw new AppError('Session client not loaded', 500, 'CLIENT_NOT_LOADED');
+
+    let fromEntity;
+    let toEntity;
+    try {
+      fromEntity = await entry.client.getEntity(_buildPeerInput(fromType, fromIdNum));
+    } catch (err) {
+      throw new AppError(`Could not resolve fromPeer: ${err.message}`, 404, 'PEER_NOT_FOUND');
+    }
+    try {
+      toEntity = await entry.client.getEntity(_buildPeerInput(toType, toIdNum));
+    } catch (err) {
+      throw new AppError(`Could not resolve toPeer: ${err.message}`, 404, 'PEER_NOT_FOUND');
+    }
+
+    let result;
+    try {
+      result = await entry.client.forwardMessages(toEntity, {
+        messages: messageIds,
+        fromPeer: fromEntity,
+        silent: !!payload.silent,
+        dropAuthor: !!payload.dropAuthor,
+      });
+    } catch (err) {
+      throw new AppError(`Failed to forward messages: ${err.message}`, 502, 'FORWARD_FAILED');
+    }
+
+    const ownId = (await this.getMe(sessionId, userId).catch(() => null))?.id;
+    const dialogPeer = { peerType: toType, peerId: toIdNum };
+    const forwarded = Array.isArray(result) ? result : [];
+    const normalized = forwarded
+      .map((m) => _normalizeMessage(m, ownId != null ? Number(ownId) : null, dialogPeer))
+      .filter(Boolean);
+
+    let chatSummary = null;
+    try {
+      if (toEntity) {
+        chatSummary = {
+          peerType: _peerTypeOf(toEntity) || toType,
+          peerId: _toIdNum(toEntity.id) ?? toIdNum,
+          title: _entityTitle(toEntity),
+          username: toEntity.username || null,
+          photoId: toEntity.photo?.photoId ? String(toEntity.photo.photoId) : null,
+          hasPhoto: !!(toEntity.photo && (toEntity.photo.photoId || toEntity.photo.photoSmall)),
+        };
+      }
+    } catch (_) { /* ignore */ }
+    if (!chatSummary) {
+      chatSummary = { peerType: toType, peerId: toIdNum, title: null, username: null, photoId: null, hasPhoto: false };
+    }
+
+    const io = global.io;
+    if (io && normalized.length > 0) {
+      const room = `tg-client:u${userId}:s${sessionId}`;
+      try {
+        const last = normalized[normalized.length - 1];
+        for (const m of normalized) {
+          io.to(room).emit('tg-client:newMessage', {
+            sessionId: String(sessionId),
+            chat: chatSummary,
+            sender: null,
+            message: m,
+          });
+        }
+        io.to(room).emit('tg-client:dialogUpdate', {
+          sessionId: String(sessionId),
+          chat: chatSummary,
+          lastMessage: last,
+          unreadDelta: 0,
+        });
+      } catch (err) {
+        logger.debug(`tg-client forward broadcast failed: ${err.message}`);
+      }
+    }
+
+    return {
+      fromPeerType: fromType,
+      fromPeerId: fromIdNum,
+      toPeerType: toType,
+      toPeerId: toIdNum,
+      messageIds,
+      messages: normalized,
+    };
+  }
 }
 
 const _MEDIA_CACHE = new Map();

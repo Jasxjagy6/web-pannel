@@ -11,7 +11,11 @@ import {
   markClientRead,
   sendClientMedia,
   sendClientVoice,
+  editClientMessage,
+  deleteClientMessages,
+  forwardClientMessages,
 } from '../../api/telegramClient';
+import ForwardDialog from './ForwardDialog';
 
 function _shouldShowSenderHeader(prev, current) {
   if (!current || current.out) return false;
@@ -43,12 +47,32 @@ export default function ChatPane({ sessionId, store, onTitleChange }) {
   const me = store((s) => s.me);
 
   const uploadProgressByClientId = store((s) => s.uploadProgressByClientId);
+  const replyTarget = store((s) => s.replyTarget);
+  const editTarget = store((s) => s.editTarget);
+  const setReplyTarget = store((s) => s.setReplyTarget);
+  const setEditTarget = store((s) => s.setEditTarget);
+  const clearComposeTargets = store((s) => s.clearComposeTargets);
+  const replaceMessage = store((s) => s.replaceMessage);
+  const removeMessages = store((s) => s.removeMessages);
+  const dialogOrder = store((s) => s.dialogOrder);
 
   const capabilities = useCapabilities();
   const canSendMedia = !!capabilities?.tgc_send_media;
+  const canMessageActions = !!capabilities?.tgc_message_actions;
 
   const dialog = selectedPeerKey ? dialogs.get(selectedPeerKey) : null;
   const messages = selectedPeerKey ? messagesByPeer.get(selectedPeerKey) || [] : [];
+
+  const messagesById = useMemo(() => {
+    const map = new Map();
+    for (const m of messages) {
+      if (m && m.id != null) map.set(Number(m.id), m);
+    }
+    return map;
+  }, [messages]);
+
+  const [forwardingMessage, setForwardingMessage] = React.useState(null);
+  const [actionError, setActionError] = React.useState(null);
 
   const scrollerRef = useRef(null);
   const lastLoadedKey = useRef(null);
@@ -120,6 +144,28 @@ export default function ChatPane({ sessionId, store, onTitleChange }) {
 
   const handleSend = async (text) => {
     if (!dialog) return false;
+
+    // Edit mode (D3): the composer is editing an existing message —
+    // submit a PATCH and update the bubble in place.
+    if (editTarget && editTarget.id != null && editTarget.id > 0) {
+      try {
+        await editClientMessage(sessionId, dialog.peerType, dialog.peerId, editTarget.id, text);
+        replaceMessage(dialog.peerType, dialog.peerId, {
+          id: editTarget.id,
+          text,
+          editDate: new Date().toISOString(),
+        });
+        clearComposeTargets();
+        return true;
+      } catch (err) {
+        setActionError(err?.response?.data?.error?.message || err?.message || 'Failed to edit');
+        return false;
+      }
+    }
+
+    const replyToMsgId = replyTarget && replyTarget.id != null && replyTarget.id > 0
+      ? Number(replyTarget.id)
+      : null;
     const clientMsgId = `local-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
     const optimistic = {
       id: -Date.now(), // negative ids never collide with server ids
@@ -132,13 +178,16 @@ export default function ChatPane({ sessionId, store, onTitleChange }) {
       pending: true,
       mediaKind: null,
       hasMedia: false,
+      replyToMsgId,
     };
     appendMessage(dialog.peerType, dialog.peerId, optimistic);
     addPendingOutgoing(dialog.peerType, dialog.peerId, clientMsgId, optimistic);
+    if (replyToMsgId) clearComposeTargets();
 
     try {
       const { data } = await sendClientMessage(sessionId, dialog.peerType, dialog.peerId, {
         text,
+        replyToMsgId,
       });
       const result = data?.data || {};
       const finalMessage = {
@@ -149,6 +198,7 @@ export default function ChatPane({ sessionId, store, onTitleChange }) {
         isSelf: true,
         date: result.date || new Date().toISOString(),
         pending: false,
+        replyToMsgId,
       };
       resolvePendingOutgoing(clientMsgId, finalMessage);
       return true;
@@ -170,6 +220,9 @@ export default function ChatPane({ sessionId, store, onTitleChange }) {
 
   const handleSendMedia = async ({ file, kind, caption, clientMsgId }) => {
     if (!dialog || !file) return false;
+    const replyToMsgId = replyTarget && replyTarget.id != null && replyTarget.id > 0
+      ? Number(replyTarget.id)
+      : null;
     const optimistic = {
       id: -Date.now(),
       clientMsgId,
@@ -182,9 +235,11 @@ export default function ChatPane({ sessionId, store, onTitleChange }) {
       mediaKind: kind === 'voice' ? 'voice' : kind,
       hasMedia: true,
       mediaPreview: { fileName: file.name, size: file.size, kind, label: _mediaKindLabel(kind) },
+      replyToMsgId,
     };
     appendMessage(dialog.peerType, dialog.peerId, optimistic);
     addPendingOutgoing(dialog.peerType, dialog.peerId, clientMsgId, optimistic);
+    if (replyToMsgId) clearComposeTargets();
 
     try {
       const { data } = await sendClientMedia(sessionId, dialog.peerType, dialog.peerId, {
@@ -192,6 +247,7 @@ export default function ChatPane({ sessionId, store, onTitleChange }) {
         kind,
         caption,
         clientMsgId,
+        replyToMsgId,
       });
       const result = data?.data || {};
       const finalMessage = result.message || {
@@ -216,6 +272,9 @@ export default function ChatPane({ sessionId, store, onTitleChange }) {
 
   const handleSendVoice = async ({ file, duration, clientMsgId }) => {
     if (!dialog || !file) return false;
+    const replyToMsgId = replyTarget && replyTarget.id != null && replyTarget.id > 0
+      ? Number(replyTarget.id)
+      : null;
     const optimistic = {
       id: -Date.now(),
       clientMsgId,
@@ -228,15 +287,18 @@ export default function ChatPane({ sessionId, store, onTitleChange }) {
       mediaKind: 'voice',
       hasMedia: true,
       mediaPreview: { fileName: file.name, size: file.size, kind: 'voice', label: 'Voice message', duration },
+      replyToMsgId,
     };
     appendMessage(dialog.peerType, dialog.peerId, optimistic);
     addPendingOutgoing(dialog.peerType, dialog.peerId, clientMsgId, optimistic);
+    if (replyToMsgId) clearComposeTargets();
 
     try {
       const { data } = await sendClientVoice(sessionId, dialog.peerType, dialog.peerId, {
         file,
         duration,
         clientMsgId,
+        replyToMsgId,
       });
       const result = data?.data || {};
       const finalMessage = result.message || {
@@ -259,6 +321,72 @@ export default function ChatPane({ sessionId, store, onTitleChange }) {
     }
   };
 
+  const senderForMessage = (m) => {
+    if (m.out || m.fromId == null) return null;
+    return sendersByKey.get(`user:${m.fromId}`) || null;
+  };
+
+  const handleReply = (msg) => {
+    if (!dialog || !msg || msg.id == null || msg.id < 0) return;
+    setReplyTarget({
+      id: msg.id,
+      text: msg.text || (msg.mediaKind ? `[${msg.mediaKind}]` : ''),
+      senderTitle: senderForMessage(msg)?.title || (msg.out ? 'You' : ''),
+    });
+  };
+
+  const handleEdit = (msg) => {
+    if (!dialog || !msg || !msg.out) return;
+    setEditTarget({ id: msg.id, text: msg.text || '' });
+  };
+
+  const handleDelete = async (msg, revoke = true) => {
+    if (!dialog || !msg || msg.id == null || msg.id < 0) return;
+    if (typeof window !== 'undefined') {
+      const ok = window.confirm(
+        revoke
+          ? 'Delete this message for everyone?'
+          : 'Delete this message just for you?'
+      );
+      if (!ok) return;
+    }
+    try {
+      await deleteClientMessages(sessionId, dialog.peerType, dialog.peerId, [msg.id], revoke);
+      removeMessages(dialog.peerType, dialog.peerId, [msg.id]);
+    } catch (err) {
+      setActionError(err?.response?.data?.error?.message || err?.message || 'Failed to delete');
+    }
+  };
+
+  const handleForward = (msg) => {
+    if (!dialog || !msg || msg.id == null || msg.id < 0) return;
+    setForwardingMessage({ ...msg, fromPeerType: dialog.peerType, fromPeerId: dialog.peerId });
+  };
+
+  const performForward = async ({ toPeerType, toPeerId }) => {
+    if (!forwardingMessage) return;
+    try {
+      await forwardClientMessages(sessionId, {
+        fromPeerType: forwardingMessage.fromPeerType,
+        fromPeerId: forwardingMessage.fromPeerId,
+        toPeerType,
+        toPeerId,
+        messageIds: [forwardingMessage.id],
+      });
+      setForwardingMessage(null);
+    } catch (err) {
+      setActionError(err?.response?.data?.error?.message || err?.message || 'Failed to forward');
+    }
+  };
+
+  const handleJumpToMessage = (msgId) => {
+    const el = scrollerRef.current?.querySelector(`#tgmsg-${msgId}`);
+    if (!el) return;
+    el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    el.classList.add('ring-2', 'ring-blue-300/70');
+    setTimeout(() => el.classList.remove('ring-2', 'ring-blue-300/70'), 1500);
+  };
+
   if (!dialog) {
     return (
       <div className="flex h-full flex-1 flex-col items-center justify-center gap-3 bg-dark-950 text-gray-500">
@@ -267,11 +395,6 @@ export default function ChatPane({ sessionId, store, onTitleChange }) {
       </div>
     );
   }
-
-  const senderForMessage = (m) => {
-    if (m.out || m.fromId == null) return null;
-    return sendersByKey.get(`user:${m.fromId}`) || null;
-  };
 
   return (
     <div className="flex h-full flex-1 flex-col bg-dark-950">
@@ -341,6 +464,13 @@ export default function ChatPane({ sessionId, store, onTitleChange }) {
                   uploadProgress={
                     m.clientMsgId ? uploadProgressByClientId.get(m.clientMsgId) : undefined
                   }
+                  messagesById={messagesById}
+                  canMessageActions={canMessageActions}
+                  onReply={canMessageActions ? handleReply : undefined}
+                  onForward={canMessageActions ? handleForward : undefined}
+                  onEdit={canMessageActions ? handleEdit : undefined}
+                  onDelete={canMessageActions ? handleDelete : undefined}
+                  onJumpToMessage={handleJumpToMessage}
                 />
               );
             })}
@@ -348,13 +478,37 @@ export default function ChatPane({ sessionId, store, onTitleChange }) {
         )}
       </div>
 
+      {actionError && (
+        <div className="mx-3 mb-1 rounded-md bg-red-900/40 px-3 py-1 text-xs text-red-300">
+          {actionError}
+          <button
+            type="button"
+            className="ml-2 text-red-200 underline"
+            onClick={() => setActionError(null)}
+          >dismiss</button>
+        </div>
+      )}
+
       <Composer
         disabled={loadingMessages && messages.length === 0}
         onSend={handleSend}
-        onSendMedia={canSendMedia ? handleSendMedia : undefined}
-        onSendVoice={canSendMedia ? handleSendVoice : undefined}
+        onSendMedia={canSendMedia && !editTarget ? handleSendMedia : undefined}
+        onSendVoice={canSendMedia && !editTarget ? handleSendVoice : undefined}
         uploadProgressByClientId={uploadProgressByClientId}
+        replyTarget={replyTarget}
+        editTarget={editTarget}
+        onClearComposeTarget={clearComposeTargets}
       />
+
+      {forwardingMessage && (
+        <ForwardDialog
+          sessionId={sessionId}
+          dialogs={dialogOrder.map((k) => dialogs.get(k)).filter(Boolean)}
+          message={forwardingMessage}
+          onCancel={() => setForwardingMessage(null)}
+          onSelect={performForward}
+        />
+      )}
     </div>
   );
 }

@@ -1,6 +1,7 @@
 import React, { useEffect, useRef, useState } from 'react';
 import {
   Send, Loader2, Paperclip, Image as ImageIcon, Film, FileText, Mic, Square,
+  X, Reply, Pencil,
 } from 'lucide-react';
 
 const KIND_ICONS = {
@@ -57,6 +58,9 @@ export default function Composer({
   onSendMedia,
   onSendVoice,
   uploadProgressByClientId,
+  replyTarget,
+  editTarget,
+  onClearComposeTarget,
 }) {
   const [text, setText] = useState('');
   const [sending, setSending] = useState(false);
@@ -83,6 +87,28 @@ export default function Composer({
   const progress = activeUploadId
     ? uploadProgressByClientId?.get(activeUploadId) ?? null
     : null;
+
+  // When the parent stages an editTarget, pre-fill the composer with the
+  // existing text. We track the previously seen target id so the user
+  // doesn't have their in-progress draft overwritten on every render.
+  const prevEditIdRef = useRef(null);
+  useEffect(() => {
+    if (editTarget && editTarget.id != null && prevEditIdRef.current !== editTarget.id) {
+      setText(editTarget.text || '');
+      setStaged(null);
+      prevEditIdRef.current = editTarget.id;
+      // Move cursor to end on the next tick.
+      setTimeout(() => {
+        if (ref.current) {
+          ref.current.focus();
+          const len = (editTarget.text || '').length;
+          try { ref.current.setSelectionRange(len, len); } catch (_) { /* ignore */ }
+        }
+      }, 0);
+    } else if (!editTarget) {
+      prevEditIdRef.current = null;
+    }
+  }, [editTarget?.id]);
 
   const canSendText = !sending && !disabled && !recording && !staged && text.trim().length > 0;
   const canSendMedia = !sending && !disabled && !recording && !!staged && !!onSendMedia;
@@ -228,6 +254,31 @@ export default function Composer({
 
   return (
     <div className="border-t border-white/5 bg-dark-900 px-3 py-2">
+      {(replyTarget || editTarget) && (
+        <div className="mb-1 flex items-center gap-2 rounded-md border-l-2 border-blue-400 bg-dark-800 px-3 py-1.5 text-xs">
+          {editTarget ? (
+            <Pencil className="h-4 w-4 text-blue-300" />
+          ) : (
+            <Reply className="h-4 w-4 text-blue-300" />
+          )}
+          <div className="min-w-0 flex-1">
+            <div className="truncate font-semibold text-blue-300">
+              {editTarget ? 'Editing message' : `Replying to ${replyTarget?.senderTitle || ''}`}
+            </div>
+            <div className="truncate text-gray-300">
+              {editTarget?.text || replyTarget?.text || ''}
+            </div>
+          </div>
+          <button
+            type="button"
+            onClick={() => onClearComposeTarget?.()}
+            className="rounded-full p-1 text-gray-400 hover:bg-white/5"
+            aria-label="Cancel"
+          >
+            <X className="h-3.5 w-3.5" />
+          </button>
+        </div>
+      )}
       {recordError && (
         <div className="mb-1 rounded-md bg-red-900/30 px-3 py-1 text-xs text-red-300">
           {recordError}

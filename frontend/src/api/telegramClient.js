@@ -207,3 +207,28 @@ export const sendClientSticker = (
     }
   );
 };
+
+/**
+ * D3 — edit a message (sender's own outgoing only). Empty text rejected.
+ */
+export const editClientMessage = (sessionId, peerType, peerId, messageId, text) =>
+  api.patch(
+    `${BASE}/sessions/${sessionId}/dialogs/${peerType}/${peerId}/messages/${messageId}`,
+    { text }
+  );
+
+/**
+ * D3 — delete one or more messages. `revoke` requests the messages be
+ * removed for the recipient too where Telegram allows it.
+ */
+export const deleteClientMessages = (sessionId, peerType, peerId, messageIds, revoke = true) =>
+  api.delete(
+    `${BASE}/sessions/${sessionId}/dialogs/${peerType}/${peerId}/messages`,
+    { data: { messageIds, revoke } }
+  );
+
+/**
+ * D3 — forward messages from one chat into another.
+ */
+export const forwardClientMessages = (sessionId, payload) =>
+  api.post(`${BASE}/sessions/${sessionId}/forward`, payload);

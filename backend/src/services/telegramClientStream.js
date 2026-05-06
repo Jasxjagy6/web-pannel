@@ -211,6 +211,22 @@ class TelegramClientStream {
             });
             return;
           }
+          if (cn === 'UpdateDeleteMessages' || cn === 'UpdateDeleteChannelMessages') {
+            const ids = Array.isArray(update.messages)
+              ? update.messages.map((v) => tcService._toIdNum(v)).filter((v) => v != null)
+              : [];
+            if (ids.length === 0) return;
+            const peer = cn === 'UpdateDeleteChannelMessages'
+              ? { peerType: 'channel', peerId: tcService._toIdNum(update.channelId) }
+              : null;
+            emit('tg-client:deleteMessages', {
+              sessionId: sid,
+              peerType: peer?.peerType || null,
+              peerId: peer?.peerId || null,
+              messageIds: ids,
+            });
+            return;
+          }
           if (cn === 'UpdateReadHistoryInbox' || cn === 'UpdateReadHistoryOutbox') {
             const peer = _peerFromUpdate(update.peer);
             emit('tg-client:readHistory', {

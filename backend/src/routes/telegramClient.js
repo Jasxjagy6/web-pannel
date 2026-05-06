@@ -70,6 +70,24 @@ router.get(
   controller.getMessageMedia
 );
 
+// --- Edit / delete / forward (D3) ----------------------------------------
+router.patch(
+  '/sessions/:id/dialogs/:peerType/:peerId/messages/:messageId',
+  controller.editMessage
+);
+router.delete(
+  '/sessions/:id/dialogs/:peerType/:peerId/messages/:messageId',
+  controller.deleteMessages
+);
+router.delete(
+  '/sessions/:id/dialogs/:peerType/:peerId/messages',
+  controller.deleteMessages
+);
+router.post(
+  '/sessions/:id/forward',
+  controller.forwardMessages
+);
+
 // --- Profile photo --------------------------------------------------------
 router.get(
   '/sessions/:id/photo/:peerType/:peerId',
