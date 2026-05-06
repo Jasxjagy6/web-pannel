@@ -803,6 +803,75 @@ const telegramClientController = {
     const data = await tcService.listLanguages(req.params.id, req.user.id);
     res.json({ success: true, data });
   }),
+
+  // ---------------------------------------------------------------------
+  // D8 — Security: 2FA + active sessions
+  // ---------------------------------------------------------------------
+
+  get2FAState: asyncHandler(async (req, res) => {
+    const data = await tcService.get2FAState(req.params.id, req.user.id);
+    res.json({ success: true, data });
+  }),
+
+  enable2FA: asyncHandler(async (req, res) => {
+    const data = await tcService.enable2FA(req.params.id, req.user.id, req.body || {});
+    await reportService
+      .logActivity(req.user.id, 'tg_client_enable_2fa', 'session', req.params.id, {
+        platform: 'telegram',
+      })
+      .catch(() => {});
+    res.json({ success: true, data });
+  }),
+
+  disable2FA: asyncHandler(async (req, res) => {
+    const data = await tcService.disable2FA(req.params.id, req.user.id, req.body || {});
+    await reportService
+      .logActivity(req.user.id, 'tg_client_disable_2fa', 'session', req.params.id, {
+        platform: 'telegram',
+      })
+      .catch(() => {});
+    res.json({ success: true, data });
+  }),
+
+  change2FA: asyncHandler(async (req, res) => {
+    const data = await tcService.change2FA(req.params.id, req.user.id, req.body || {});
+    await reportService
+      .logActivity(req.user.id, 'tg_client_change_2fa', 'session', req.params.id, {
+        platform: 'telegram',
+      })
+      .catch(() => {});
+    res.json({ success: true, data });
+  }),
+
+  listAuthorizations: asyncHandler(async (req, res) => {
+    const data = await tcService.listAuthorizations(req.params.id, req.user.id);
+    res.json({ success: true, data });
+  }),
+
+  resetAuthorization: asyncHandler(async (req, res) => {
+    const data = await tcService.resetAuthorization(req.params.id, req.user.id, req.params.hash);
+    await reportService
+      .logActivity(req.user.id, 'tg_client_reset_authorization', 'session', req.params.id, {
+        platform: 'telegram',
+      })
+      .catch(() => {});
+    res.json({ success: true, data });
+  }),
+
+  resetOtherAuthorizations: asyncHandler(async (req, res) => {
+    const data = await tcService.resetOtherAuthorizations(req.params.id, req.user.id);
+    await reportService
+      .logActivity(req.user.id, 'tg_client_reset_other_authorizations', 'session', req.params.id, {
+        platform: 'telegram',
+      })
+      .catch(() => {});
+    res.json({ success: true, data });
+  }),
+
+  setAuthorizationTtl: asyncHandler(async (req, res) => {
+    const data = await tcService.setAuthorizationTtl(req.params.id, req.user.id, req.body?.days);
+    res.json({ success: true, data });
+  }),
 };
 
 module.exports = telegramClientController;

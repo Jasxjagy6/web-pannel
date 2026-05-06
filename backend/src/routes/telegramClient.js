@@ -133,4 +133,14 @@ router.patch('/sessions/:id/settings/privacy/:key', controller.setPrivacy);
 router.get('/sessions/:id/settings/language', controller.getLanguage);
 router.get('/sessions/:id/settings/languages', controller.listLanguages);
 
+// --- Security (D8) -------------------------------------------------------
+router.get('/sessions/:id/security/2fa',          controller.get2FAState);
+router.post('/sessions/:id/security/2fa/enable',  controller.enable2FA);
+router.post('/sessions/:id/security/2fa/disable', controller.disable2FA);
+router.post('/sessions/:id/security/2fa/change',  controller.change2FA);
+router.get('/sessions/:id/security/authorizations',                       controller.listAuthorizations);
+router.delete('/sessions/:id/security/authorizations/:hash',              controller.resetAuthorization);
+router.post('/sessions/:id/security/authorizations/reset-others',         controller.resetOtherAuthorizations);
+router.patch('/sessions/:id/security/authorizations/ttl',                 controller.setAuthorizationTtl);
+
 module.exports = router;

@@ -1,7 +1,7 @@
 import React, { useEffect, useState } from 'react';
 import {
   X, Loader2, AlertCircle, Bell, Shield, Globe, Sun, Moon, Monitor, Volume2,
-  VolumeX, Eye, EyeOff,
+  VolumeX, Eye, EyeOff, Lock, Trash2, LogOut, KeyRound, Smartphone,
 } from 'lucide-react';
 import {
   getDefaultNotifySettings,
@@ -11,6 +11,14 @@ import {
   setPrivacy,
   getLanguage,
   listLanguages,
+  get2FAState,
+  enable2FA,
+  disable2FA,
+  change2FA,
+  listAuthorizations,
+  resetAuthorization,
+  resetOtherAuthorizations,
+  setAuthorizationTtl,
 } from '../../api/telegramClient';
 
 const PRIVACY_KEYS = [
@@ -70,9 +78,10 @@ export default function SettingsDrawer({ sessionId, isOpen, onClose }) {
           </button>
         </div>
 
-        <div className="grid grid-cols-3 gap-1 border-b border-white/5 px-2 py-2 text-[11px]">
+        <div className="grid grid-cols-4 gap-1 border-b border-white/5 px-2 py-2 text-[11px]">
           <TabButton active={tab === 'notifications'} onClick={() => setTab('notifications')} Icon={Bell} label="Notifications" />
           <TabButton active={tab === 'privacy'} onClick={() => setTab('privacy')} Icon={Shield} label="Privacy" />
+          <TabButton active={tab === 'security'} onClick={() => setTab('security')} Icon={Lock} label="Security" />
           <TabButton active={tab === 'appearance'} onClick={() => setTab('appearance')} Icon={Globe} label="Appearance" />
         </div>
 
@@ -86,6 +95,7 @@ export default function SettingsDrawer({ sessionId, isOpen, onClose }) {
         <div className="flex-1 overflow-y-auto p-4">
           {tab === 'notifications' && <NotificationsTab sessionId={sessionId} setError={setError} />}
           {tab === 'privacy' && <PrivacyTab sessionId={sessionId} setError={setError} />}
+          {tab === 'security' && <SecurityTab sessionId={sessionId} setError={setError} />}
           {tab === 'appearance' && <AppearanceTab sessionId={sessionId} setError={setError} />}
         </div>
       </aside>
@@ -266,6 +276,293 @@ function PrivacyTab({ sessionId, setError }) {
           </div>
         </div>
       ))}
+    </div>
+  );
+}
+
+function SecurityTab({ sessionId, setError }) {
+  const [twoFA, setTwoFA] = useState(null);
+  const [auths, setAuths] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [busy, setBusy] = useState(null);
+  const [mode, setMode] = useState(null); // 'enable' | 'change' | 'disable' | null
+  const [form, setForm] = useState({ currentPassword: '', newPassword: '', hint: '', email: '' });
+
+  const refresh = async () => {
+    try {
+      const [s, a] = await Promise.all([
+        get2FAState(sessionId),
+        listAuthorizations(sessionId),
+      ]);
+      setTwoFA(s.data?.data || null);
+      setAuths(a.data?.data || null);
+    } catch (err) {
+      setError(err?.response?.data?.error?.message || err.message);
+    }
+  };
+
+  useEffect(() => {
+    let alive = true;
+    setLoading(true);
+    refresh().finally(() => { if (alive) setLoading(false); });
+    return () => { alive = false; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sessionId]);
+
+  const submit2FA = async () => {
+    setBusy('2fa');
+    try {
+      if (mode === 'enable') {
+        await enable2FA(sessionId, {
+          newPassword: form.newPassword,
+          hint: form.hint,
+          email: form.email,
+        });
+      } else if (mode === 'change') {
+        await change2FA(sessionId, {
+          currentPassword: form.currentPassword,
+          newPassword: form.newPassword,
+          hint: form.hint,
+        });
+      } else if (mode === 'disable') {
+        await disable2FA(sessionId, { currentPassword: form.currentPassword });
+      }
+      setMode(null);
+      setForm({ currentPassword: '', newPassword: '', hint: '', email: '' });
+      await refresh();
+    } catch (err) {
+      setError(err?.response?.data?.error?.message || err.message);
+    } finally { setBusy(null); }
+  };
+
+  const onResetAuth = async (hash) => {
+    if (typeof window !== 'undefined' && !window.confirm('Terminate this session?')) return;
+    setBusy(`auth-${hash}`);
+    try {
+      const { data } = await resetAuthorization(sessionId, hash);
+      setAuths(data?.data || auths);
+    } catch (err) {
+      setError(err?.response?.data?.error?.message || err.message);
+    } finally { setBusy(null); }
+  };
+
+  const onResetOthers = async () => {
+    if (typeof window !== 'undefined' && !window.confirm('Terminate all other sessions?')) return;
+    setBusy('reset-others');
+    try {
+      const { data } = await resetOtherAuthorizations(sessionId);
+      setAuths(data?.data || auths);
+    } catch (err) {
+      setError(err?.response?.data?.error?.message || err.message);
+    } finally { setBusy(null); }
+  };
+
+  const onSetTtl = async (days) => {
+    setBusy('ttl');
+    try {
+      const { data } = await setAuthorizationTtl(sessionId, days);
+      setAuths(data?.data || auths);
+    } catch (err) {
+      setError(err?.response?.data?.error?.message || err.message);
+    } finally { setBusy(null); }
+  };
+
+  if (loading) {
+    return (
+      <div className="flex items-center justify-center py-10 text-gray-400">
+        <Loader2 className="h-5 w-5 animate-spin" />
+      </div>
+    );
+  }
+
+  return (
+    <div className="space-y-4">
+      {/* 2FA */}
+      <div className="rounded-lg border border-white/5 bg-dark-800/40 p-3">
+        <div className="mb-2 flex items-center gap-2 text-sm font-semibold text-gray-100">
+          <KeyRound className="h-4 w-4" /> Two-step verification
+        </div>
+        <div className="mb-2 text-[11px] text-gray-400">
+          {twoFA?.hasPassword
+            ? `Cloud password set${twoFA.hint ? ` (hint: ${twoFA.hint})` : ''}.`
+            : 'Add an extra layer of security to your account.'}
+        </div>
+        {!mode && (
+          <div className="grid grid-cols-2 gap-1 text-xs">
+            {!twoFA?.hasPassword && (
+              <button
+                type="button"
+                onClick={() => setMode('enable')}
+                className="rounded-md bg-blue-600 px-2 py-1.5 text-white hover:bg-blue-500"
+              >
+                Enable
+              </button>
+            )}
+            {twoFA?.hasPassword && (
+              <>
+                <button
+                  type="button"
+                  onClick={() => setMode('change')}
+                  className="rounded-md bg-white/10 px-2 py-1.5 text-gray-100 hover:bg-white/20"
+                >
+                  Change
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setMode('disable')}
+                  className="rounded-md bg-red-600/80 px-2 py-1.5 text-white hover:bg-red-500"
+                >
+                  Disable
+                </button>
+              </>
+            )}
+          </div>
+        )}
+        {mode && (
+          <div className="space-y-2">
+            {(mode === 'change' || mode === 'disable') && (
+              <input
+                type="password"
+                placeholder="Current password"
+                value={form.currentPassword}
+                onChange={(e) => setForm({ ...form, currentPassword: e.target.value })}
+                className="w-full rounded-md border border-white/10 bg-dark-900 px-3 py-1.5 text-xs text-gray-100"
+                autoFocus
+              />
+            )}
+            {mode !== 'disable' && (
+              <input
+                type="password"
+                placeholder="New password"
+                value={form.newPassword}
+                onChange={(e) => setForm({ ...form, newPassword: e.target.value })}
+                className="w-full rounded-md border border-white/10 bg-dark-900 px-3 py-1.5 text-xs text-gray-100"
+              />
+            )}
+            {mode !== 'disable' && (
+              <input
+                type="text"
+                placeholder="Hint (optional)"
+                value={form.hint}
+                onChange={(e) => setForm({ ...form, hint: e.target.value })}
+                className="w-full rounded-md border border-white/10 bg-dark-900 px-3 py-1.5 text-xs text-gray-100"
+              />
+            )}
+            {mode === 'enable' && (
+              <input
+                type="email"
+                placeholder="Recovery email (optional)"
+                value={form.email}
+                onChange={(e) => setForm({ ...form, email: e.target.value })}
+                className="w-full rounded-md border border-white/10 bg-dark-900 px-3 py-1.5 text-xs text-gray-100"
+              />
+            )}
+            <div className="flex gap-2">
+              <button
+                type="button"
+                onClick={submit2FA}
+                disabled={busy === '2fa'}
+                className="flex-1 rounded-md bg-blue-600 px-3 py-1.5 text-xs text-white hover:bg-blue-500 disabled:opacity-50"
+              >
+                {busy === '2fa' ? 'Saving…' : (mode === 'disable' ? 'Disable' : mode === 'change' ? 'Update' : 'Enable')}
+              </button>
+              <button
+                type="button"
+                onClick={() => { setMode(null); setForm({ currentPassword: '', newPassword: '', hint: '', email: '' }); }}
+                className="rounded-md border border-white/10 px-3 py-1.5 text-xs text-gray-300 hover:bg-white/5"
+              >
+                Cancel
+              </button>
+            </div>
+          </div>
+        )}
+      </div>
+
+      {/* Active sessions */}
+      <div className="rounded-lg border border-white/5 bg-dark-800/40 p-3">
+        <div className="mb-2 flex items-center gap-2 text-sm font-semibold text-gray-100">
+          <Smartphone className="h-4 w-4" /> Active sessions
+          {auths && (
+            <span className="text-[10px] text-gray-500">
+              {(auths.authorizations || []).length} device{(auths.authorizations || []).length === 1 ? '' : 's'}
+            </span>
+          )}
+        </div>
+
+        <div className="mb-2">
+          <div className="mb-1 text-[11px] text-gray-400">
+            Auto-terminate after:
+          </div>
+          <div className="grid grid-cols-4 gap-1 text-xs">
+            {[30, 90, 180, 365].map((d) => (
+              <button
+                key={d}
+                type="button"
+                onClick={() => onSetTtl(d)}
+                disabled={busy === 'ttl'}
+                className={`rounded-md px-2 py-1.5 ${
+                  auths?.authorizationTtlDays === d
+                    ? 'bg-blue-600 text-white'
+                    : 'bg-white/5 text-gray-200 hover:bg-white/10'
+                } disabled:opacity-50`}
+              >
+                {d === 365 ? '1y' : `${d}d`}
+              </button>
+            ))}
+          </div>
+        </div>
+
+        <div className="mt-3 max-h-72 space-y-2 overflow-y-auto pr-1">
+          {(auths?.authorizations || []).map((a) => (
+            <div key={a.hash} className="rounded-md border border-white/5 bg-dark-900/60 p-2">
+              <div className="flex items-center justify-between gap-2">
+                <div className="min-w-0 flex-1">
+                  <div className="flex items-center gap-2 text-xs font-medium text-gray-100">
+                    <span className="truncate">
+                      {a.appName || a.deviceModel || 'Telegram'}
+                      {a.appVersion && <span className="text-gray-500"> {a.appVersion}</span>}
+                    </span>
+                    {a.isCurrent && (
+                      <span className="rounded-full bg-green-500/20 px-1.5 py-0.5 text-[9px] font-semibold uppercase text-green-300">
+                        current
+                      </span>
+                    )}
+                  </div>
+                  <div className="text-[11px] text-gray-400">
+                    {[a.deviceModel, a.platform, a.systemVersion].filter(Boolean).join(' · ')}
+                  </div>
+                  <div className="text-[11px] text-gray-500">
+                    {[a.country, a.region, a.ip].filter(Boolean).join(' · ')}
+                  </div>
+                </div>
+                {!a.isCurrent && (
+                  <button
+                    type="button"
+                    onClick={() => onResetAuth(a.hash)}
+                    disabled={busy === `auth-${a.hash}`}
+                    className="rounded-md border border-red-500/30 p-1 text-red-300 hover:bg-red-500/10 disabled:opacity-50"
+                    title="Terminate"
+                  >
+                    {busy === `auth-${a.hash}` ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Trash2 className="h-3.5 w-3.5" />}
+                  </button>
+                )}
+              </div>
+            </div>
+          ))}
+        </div>
+
+        {(auths?.authorizations || []).filter((a) => !a.isCurrent).length > 0 && (
+          <button
+            type="button"
+            onClick={onResetOthers}
+            disabled={busy === 'reset-others'}
+            className="mt-2 flex w-full items-center justify-center gap-2 rounded-md bg-red-600/80 px-3 py-2 text-xs text-white hover:bg-red-500 disabled:opacity-50"
+          >
+            <LogOut className="h-3.5 w-3.5" />
+            {busy === 'reset-others' ? 'Terminating…' : 'Terminate all other sessions'}
+          </button>
+        )}
+      </div>
     </div>
   );
 }

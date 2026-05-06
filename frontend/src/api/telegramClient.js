@@ -346,3 +346,29 @@ export const getLanguage = (sessionId) =>
 
 export const listLanguages = (sessionId) =>
   api.get(`${BASE}/sessions/${sessionId}/settings/languages`);
+
+// --- D8 — security (2FA + active sessions) -------------------------------
+
+export const get2FAState = (sessionId) =>
+  api.get(`${BASE}/sessions/${sessionId}/security/2fa`);
+
+export const enable2FA = (sessionId, payload) =>
+  api.post(`${BASE}/sessions/${sessionId}/security/2fa/enable`, payload);
+
+export const disable2FA = (sessionId, payload) =>
+  api.post(`${BASE}/sessions/${sessionId}/security/2fa/disable`, payload);
+
+export const change2FA = (sessionId, payload) =>
+  api.post(`${BASE}/sessions/${sessionId}/security/2fa/change`, payload);
+
+export const listAuthorizations = (sessionId) =>
+  api.get(`${BASE}/sessions/${sessionId}/security/authorizations`);
+
+export const resetAuthorization = (sessionId, hash) =>
+  api.delete(`${BASE}/sessions/${sessionId}/security/authorizations/${encodeURIComponent(hash)}`);
+
+export const resetOtherAuthorizations = (sessionId) =>
+  api.post(`${BASE}/sessions/${sessionId}/security/authorizations/reset-others`);
+
+export const setAuthorizationTtl = (sessionId, days) =>
+  api.patch(`${BASE}/sessions/${sessionId}/security/authorizations/ttl`, { days });

@@ -2481,6 +2481,291 @@ class TelegramClientService {
       throw new AppError(`listLanguages failed: ${err.message}`, 502, 'LIST_LANG_FAILED');
     }
   }
+
+  // -----------------------------------------------------------------------
+  // D8 — Security: 2FA + active sessions
+  // -----------------------------------------------------------------------
+
+  /**
+   * D8 — Current 2FA state. Returns whether a password is set, the
+   * hint, recovery-email status, and (if password is set) the SRP
+   * algo metadata the UI needs to skip re-asking for irrelevant fields.
+   */
+  async get2FAState(sessionId, userId) {
+    await _loadAndAuthSession(sessionId, userId);
+    await tgService._ensureConnected(sessionId);
+    const entry = tgService.clients.get(String(sessionId));
+    if (!entry) throw new AppError('Session client not loaded', 500, 'CLIENT_NOT_LOADED');
+
+    let p;
+    try {
+      p = await entry.client.invoke(new Api.account.GetPassword());
+    } catch (err) {
+      throw new AppError(`GetPassword failed: ${err.message}`, 502, 'GET_PASSWORD_FAILED');
+    }
+
+    return {
+      hasPassword: !!p.hasPassword,
+      hint: p.hint || '',
+      hasRecovery: !!p.hasRecovery,
+      hasSecureValues: !!p.hasSecureValues,
+      emailUnconfirmedPattern: p.emailUnconfirmedPattern || '',
+      pendingResetDate: p.pendingResetDate || 0,
+    };
+  }
+
+  /**
+   * D8 — Enable 2FA: set a new password (when none was set before).
+   * Body: { newPassword, hint?, email? }.
+   */
+  async enable2FA(sessionId, userId, { newPassword, hint = '', email = '' } = {}) {
+    if (!newPassword || String(newPassword).length < 1) {
+      throw new AppError('newPassword is required', 400, 'NO_PASSWORD');
+    }
+    await _loadAndAuthSession(sessionId, userId);
+    await tgService._ensureConnected(sessionId);
+    const entry = tgService.clients.get(String(sessionId));
+    if (!entry) throw new AppError('Session client not loaded', 500, 'CLIENT_NOT_LOADED');
+
+    const { computeDigest, computeCheck } = require('telegram/Password');
+
+    let p;
+    try {
+      p = await entry.client.invoke(new Api.account.GetPassword());
+    } catch (err) {
+      throw new AppError(`GetPassword failed: ${err.message}`, 502, 'GET_PASSWORD_FAILED');
+    }
+    if (p.hasPassword) {
+      throw new AppError('A password is already set; use change instead', 400, 'PASSWORD_ALREADY_SET');
+    }
+    let passwordHash;
+    try {
+      passwordHash = await computeDigest(p.newAlgo, String(newPassword));
+    } catch (err) {
+      throw new AppError(`Password hash failed: ${err.message}`, 500, 'HASH_FAILED');
+    }
+    const newSettings = new Api.account.PasswordInputSettings({
+      newAlgo: p.newAlgo,
+      newPasswordHash: passwordHash,
+      hint: String(hint || '').slice(0, 128),
+      email: String(email || ''),
+    });
+    try {
+      await entry.client.invoke(new Api.account.UpdatePasswordSettings({
+        password: await computeCheck(p, ''), // empty since hasPassword=false
+        newSettings,
+      }));
+    } catch (err) {
+      throw new AppError(`UpdatePasswordSettings failed: ${err.message}`, 502, 'UPDATE_PASSWORD_FAILED');
+    }
+    return this.get2FAState(sessionId, userId);
+  }
+
+  /**
+   * D8 — Disable 2FA: requires current password.
+   */
+  async disable2FA(sessionId, userId, { currentPassword } = {}) {
+    if (!currentPassword) throw new AppError('currentPassword is required', 400, 'NO_PASSWORD');
+    await _loadAndAuthSession(sessionId, userId);
+    await tgService._ensureConnected(sessionId);
+    const entry = tgService.clients.get(String(sessionId));
+    if (!entry) throw new AppError('Session client not loaded', 500, 'CLIENT_NOT_LOADED');
+
+    const { computeCheck } = require('telegram/Password');
+    let p;
+    try {
+      p = await entry.client.invoke(new Api.account.GetPassword());
+    } catch (err) {
+      throw new AppError(`GetPassword failed: ${err.message}`, 502, 'GET_PASSWORD_FAILED');
+    }
+    if (!p.hasPassword) {
+      throw new AppError('No password is set', 400, 'NO_PASSWORD_SET');
+    }
+    let check;
+    try {
+      check = await computeCheck(p, String(currentPassword));
+    } catch (err) {
+      throw new AppError(`Password check failed: ${err.message}`, 500, 'CHECK_FAILED');
+    }
+    try {
+      await entry.client.invoke(new Api.account.UpdatePasswordSettings({
+        password: check,
+        newSettings: new Api.account.PasswordInputSettings({
+          newAlgo: new Api.PasswordKdfAlgoUnknown(),
+          newPasswordHash: Buffer.alloc(0),
+          hint: '',
+          email: '',
+        }),
+      }));
+    } catch (err) {
+      const m = (err && err.message) || '';
+      if (/PASSWORD_HASH_INVALID/i.test(m)) {
+        throw new AppError('Current password is incorrect', 400, 'BAD_PASSWORD');
+      }
+      throw new AppError(`UpdatePasswordSettings failed: ${m}`, 502, 'UPDATE_PASSWORD_FAILED');
+    }
+    return this.get2FAState(sessionId, userId);
+  }
+
+  /**
+   * D8 — Change 2FA password: current + new + optional new hint / email.
+   */
+  async change2FA(sessionId, userId, { currentPassword, newPassword, hint = '', email } = {}) {
+    if (!currentPassword) throw new AppError('currentPassword is required', 400, 'NO_PASSWORD');
+    if (!newPassword) throw new AppError('newPassword is required', 400, 'NO_NEW_PASSWORD');
+
+    await _loadAndAuthSession(sessionId, userId);
+    await tgService._ensureConnected(sessionId);
+    const entry = tgService.clients.get(String(sessionId));
+    if (!entry) throw new AppError('Session client not loaded', 500, 'CLIENT_NOT_LOADED');
+
+    const { computeCheck, computeDigest } = require('telegram/Password');
+    let p;
+    try {
+      p = await entry.client.invoke(new Api.account.GetPassword());
+    } catch (err) {
+      throw new AppError(`GetPassword failed: ${err.message}`, 502, 'GET_PASSWORD_FAILED');
+    }
+    if (!p.hasPassword) throw new AppError('No password is set', 400, 'NO_PASSWORD_SET');
+
+    let check;
+    try {
+      check = await computeCheck(p, String(currentPassword));
+    } catch (err) {
+      throw new AppError(`Password check failed: ${err.message}`, 500, 'CHECK_FAILED');
+    }
+
+    let newHash;
+    try {
+      newHash = await computeDigest(p.newAlgo, String(newPassword));
+    } catch (err) {
+      throw new AppError(`Password hash failed: ${err.message}`, 500, 'HASH_FAILED');
+    }
+    const settings = {
+      newAlgo: p.newAlgo,
+      newPasswordHash: newHash,
+      hint: String(hint || '').slice(0, 128),
+    };
+    if (email !== undefined) settings.email = String(email || '');
+    try {
+      await entry.client.invoke(new Api.account.UpdatePasswordSettings({
+        password: check,
+        newSettings: new Api.account.PasswordInputSettings(settings),
+      }));
+    } catch (err) {
+      const m = (err && err.message) || '';
+      if (/PASSWORD_HASH_INVALID/i.test(m)) {
+        throw new AppError('Current password is incorrect', 400, 'BAD_PASSWORD');
+      }
+      throw new AppError(`UpdatePasswordSettings failed: ${m}`, 502, 'UPDATE_PASSWORD_FAILED');
+    }
+    return this.get2FAState(sessionId, userId);
+  }
+
+  /**
+   * D8 — List active authorizations (browser/device sessions).
+   */
+  async listAuthorizations(sessionId, userId) {
+    await _loadAndAuthSession(sessionId, userId);
+    await tgService._ensureConnected(sessionId);
+    const entry = tgService.clients.get(String(sessionId));
+    if (!entry) throw new AppError('Session client not loaded', 500, 'CLIENT_NOT_LOADED');
+
+    let res;
+    try {
+      res = await entry.client.invoke(new Api.account.GetAuthorizations());
+    } catch (err) {
+      throw new AppError(`GetAuthorizations failed: ${err.message}`, 502, 'GET_AUTHS_FAILED');
+    }
+    return {
+      authorizationTtlDays: res?.authorizationTtlDays || 365,
+      authorizations: (res?.authorizations || []).map(_normalizeAuthorization),
+    };
+  }
+
+  /**
+   * D8 — Reset (terminate) a single authorization by hash.
+   */
+  async resetAuthorization(sessionId, userId, hash) {
+    if (!hash) throw new AppError('hash is required', 400, 'NO_HASH');
+    await _loadAndAuthSession(sessionId, userId);
+    await tgService._ensureConnected(sessionId);
+    const entry = tgService.clients.get(String(sessionId));
+    if (!entry) throw new AppError('Session client not loaded', 500, 'CLIENT_NOT_LOADED');
+
+    try {
+      await entry.client.invoke(new Api.account.ResetAuthorization({ hash: String(hash) }));
+    } catch (err) {
+      const m = (err && err.message) || '';
+      if (/FRESH_RESET_AUTHORISATION_FORBIDDEN/i.test(m)) {
+        throw new AppError(
+          'You can only reset sessions older than 24 hours.',
+          400, 'FRESH_RESET_FORBIDDEN',
+        );
+      }
+      throw new AppError(`ResetAuthorization failed: ${m}`, 502, 'RESET_AUTH_FAILED');
+    }
+    return this.listAuthorizations(sessionId, userId);
+  }
+
+  /**
+   * D8 — Terminate every other session (keeps the current one).
+   */
+  async resetOtherAuthorizations(sessionId, userId) {
+    await _loadAndAuthSession(sessionId, userId);
+    await tgService._ensureConnected(sessionId);
+    const entry = tgService.clients.get(String(sessionId));
+    if (!entry) throw new AppError('Session client not loaded', 500, 'CLIENT_NOT_LOADED');
+
+    try {
+      await entry.client.invoke(new Api.auth.ResetAuthorizations());
+    } catch (err) {
+      throw new AppError(`ResetAuthorizations failed: ${err.message}`, 502, 'RESET_OTHERS_FAILED');
+    }
+    return this.listAuthorizations(sessionId, userId);
+  }
+
+  /**
+   * D8 — Update the global authorization TTL (auto-terminate inactive
+   * sessions after N days).
+   */
+  async setAuthorizationTtl(sessionId, userId, days) {
+    const d = Math.max(30, Math.min(Number(days) || 365, 366));
+    await _loadAndAuthSession(sessionId, userId);
+    await tgService._ensureConnected(sessionId);
+    const entry = tgService.clients.get(String(sessionId));
+    if (!entry) throw new AppError('Session client not loaded', 500, 'CLIENT_NOT_LOADED');
+
+    try {
+      await entry.client.invoke(new Api.account.SetAuthorizationTTL({ authorizationTtlDays: d }));
+    } catch (err) {
+      throw new AppError(`SetAuthorizationTTL failed: ${err.message}`, 502, 'SET_TTL_FAILED');
+    }
+    return this.listAuthorizations(sessionId, userId);
+  }
+}
+
+function _normalizeAuthorization(a) {
+  if (!a) return null;
+  return {
+    hash: String(a.hash),
+    deviceModel: a.deviceModel || '',
+    platform: a.platform || '',
+    systemVersion: a.systemVersion || '',
+    apiId: a.apiId || 0,
+    appName: a.appName || '',
+    appVersion: a.appVersion || '',
+    dateCreated: a.dateCreated || 0,
+    dateActive: a.dateActive || 0,
+    ip: a.ip || '',
+    country: a.country || '',
+    region: a.region || '',
+    isCurrent: !!a.current,
+    isOfficialApp: !!a.officialApp,
+    passwordPending: !!a.passwordPending,
+    encryptedRequestsDisabled: !!a.encryptedRequestsDisabled,
+    callRequestsDisabled: !!a.callRequestsDisabled,
+  };
 }
 
 /**

@@ -152,6 +152,8 @@ const capabilities = {
   tgc_chat_admin:         true,
   // D7 — settings (notifications, privacy, language, theme).
   tgc_settings:           true,
+  // D8 — security (2FA + active sessions / log out other devices).
+  tgc_security:           true,
 };
 
 // ---------------------------------------------------------------------------
