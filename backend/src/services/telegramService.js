@@ -1091,7 +1091,7 @@ class TelegramService {
         accessHash: userEntity.accessHash,
       });
 
-      await this._withFloodRetry(sessionId, async () => {
+      const inviteResult = await this._withFloodRetry(sessionId, async () => {
         return await this.clients.get(String(sessionId)).client.invoke(
           new Api.channels.InviteToChannel({
             channel: getInputPeer(groupEntity),
@@ -1099,6 +1099,21 @@ class TelegramService {
           })
         );
       });
+
+      // Telegram's InviteToChannel does not throw when a user can't be
+      // added because of privacy settings — it returns the user inside
+      // `missing_invitees` / `missingInvitees` and the call "succeeds".
+      // Surface that as a real error so callers can mark it skipped.
+      const missing = (inviteResult && (inviteResult.missingInvitees || inviteResult.missing_invitees)) || [];
+      if (Array.isArray(missing) && missing.length > 0) {
+        const missedId = missing[0] && (missing[0].userId || missing[0].user_id);
+        const missedStr = missedId ? String(missedId) : String(userEntity.id);
+        const expectedStr = String(userEntity.id);
+        if (missedStr === expectedStr) {
+          logger.warn(`Telegram dropped invite (privacy/restricted) for ${userId}`, { sessionId, groupId });
+          throw new Error('USER_PRIVACY_RESTRICT');
+        }
+      }
 
       logger.info(`Added user ${userId} to group ${groupId}`, { sessionId });
 
