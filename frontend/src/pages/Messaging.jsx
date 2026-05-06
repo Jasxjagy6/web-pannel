@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
+import { useSearchParams } from 'react-router-dom';
 import { useWebSocket } from '../hooks/useWebSocket';
 import { listSessions } from '../api/sessions';
 import {
@@ -801,6 +802,7 @@ function ActiveJobsPanel({ jobs, onCancel }) {
 export default function Messaging() {
   const { success: showSuccess, error: showError } = useToast();
   const { connect, on, off, connected } = useWebSocket();
+  const [searchParams, setSearchParams] = useSearchParams();
 
   const [activeTab, setActiveTab] = useState('users'); // 'users' or 'groups'
 
@@ -892,6 +894,25 @@ export default function Messaging() {
     fetchActiveJobs();
     fetchHistory();
   }, [fetchSessions, fetchLists, fetchActiveJobs, fetchHistory]);
+
+  // Pre-select a target list when navigated from /lists with ?listId=...
+  // Also flips into "Target list" mode so the "Send DM" button on the
+  // Lists page lands the operator directly on the right composer.
+  useEffect(() => {
+    const listIdFromQuery = searchParams.get('listId');
+    if (!listIdFromQuery) return;
+    if (targetLists.length === 0) return;
+    const exists = targetLists.some(
+      (l) => String(l.id) === String(listIdFromQuery)
+    );
+    if (!exists) return;
+    setTargetMode('list');
+    setSelectedList(String(listIdFromQuery));
+    // Clear the param so a refresh doesn't keep re-applying it.
+    const next = new URLSearchParams(searchParams);
+    next.delete('listId');
+    setSearchParams(next, { replace: true });
+  }, [searchParams, targetLists, setSearchParams]);
 
   // WebSocket connection for live progress
   useEffect(() => {

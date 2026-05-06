@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback } from 'react';
+import { useNavigate } from 'react-router-dom';
 import {
   Plus,
   Upload,
@@ -19,6 +20,7 @@ import {
   ChevronLeft,
   ChevronRight,
   Layers,
+  Send,
 } from 'lucide-react';
 import { Modal } from '../components/common/Modal';
 import { useToast } from '../components/common/Toast';
@@ -75,6 +77,7 @@ function ConfirmDialog({ isOpen, onClose, onConfirm, title, message, confirmLabe
 }
 
 export default function Lists() {
+  const navigate = useNavigate();
   const { error: showError, success: showSuccess } = useToast();
 
   const [lists, setLists] = useState([]);
@@ -453,6 +456,13 @@ export default function Lists() {
                           title="View items"
                         >
                           <Eye className="h-4 w-4" />
+                        </button>
+                        <button
+                          onClick={() => navigate(`/messaging?listId=${list.id}`)}
+                          className="rounded-lg p-1.5 text-gray-400 hover:bg-white/5 hover:text-primary-400 transition-colors"
+                          title="Send DM to list"
+                        >
+                          <Send className="h-4 w-4" />
                         </button>
                         <div className="relative">
                           <button
