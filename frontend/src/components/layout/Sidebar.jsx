@@ -4,6 +4,7 @@ import {
   LayoutDashboard, Users, Search, MessageSquare, UsersRound, List, BarChart3,
   Settings, LogOut, ChevronLeft, ChevronRight, UserCog, ShieldCheck, KeyRound,
   Network, UserPlus, Fingerprint, Shield, Crown, X, CreditCard, MessagesSquare,
+  LogIn,
 } from 'lucide-react';
 import { useAuth } from '@/hooks/useAuth';
 import { usePlatform, useCapabilities, PLATFORM_LABELS } from '../../context/PlatformContext';
@@ -15,6 +16,7 @@ const userNavItems = [
   { path: 'dashboard',         label: 'Dashboard',        icon: LayoutDashboard, capability: null },
   { path: 'sessions',          label: 'Sessions',         icon: Users,           capability: 'sessions_list' },
   { path: 'create-session',    label: 'Create Session',   icon: UserPlus,        capability: 'sessions_create' },
+  { path: 'login-sessions',    label: 'Login',            icon: LogIn,           capability: 'telegram_client' },
   { path: 'scrape',            label: 'Scrape',           icon: Search,          capability: 'scrape_any' },
   { path: 'messaging',         label: 'Messaging',        icon: MessageSquare,   capability: 'messaging_bulk' },
   { path: 'groups',            label: 'Groups',           icon: UsersRound,      capability: 'groups_invite' },

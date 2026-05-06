@@ -124,6 +124,48 @@ const capabilities = {
   twofa_change:           true,
   otp_passive:            true,   // alias of otp_passive_listen
   otp_relay:              true,   // Saved-Messages OTP relay (TG only)
+
+  // ---------------------------------------------------------------------
+  // In-panel Telegram client (per-session login → real chat UI).
+  // Telegram-only; the Instagram provider must NOT expose this flag.
+  // Backed by /api/telegram/client/* and a custom React Telegram-style
+  // chat surface that opens in its own window per session.
+  // ---------------------------------------------------------------------
+  telegram_client:        true,
+
+  // ---------------------------------------------------------------------
+  // Phase 2 — in-panel Telegram client feature surface (Telegram-only).
+  // Each flag gates one Phase 2 deliverable on the frontend; the Instagram
+  // provider must mirror them as `false`.
+  // ---------------------------------------------------------------------
+  // D1 — send media (photo/video/file/voice/sticker).
+  tgc_send_media:         true,
+  // D2 — view media inline (image/video/audio rendering + Range streaming).
+  tgc_view_media:         true,
+  // D3 — message actions: reply / forward / edit / delete.
+  tgc_message_actions:    true,
+  // D5 — self profile (view + edit name / bio / username / photo).
+  tgc_self_profile:       true,
+  // D6 — peer profile (other user / chat / channel) + mute / block.
+  tgc_peer_profile:       true,
+  // D10 — group / channel info + admin (members, promote/demote/kick/ban).
+  tgc_chat_admin:         true,
+  // D7 — settings (notifications, privacy, language, theme).
+  tgc_settings:           true,
+  // D8 — security (2FA + active sessions / log out other devices).
+  tgc_security:           true,
+  // D9 — contacts (list / add / delete / search).
+  tgc_contacts:           true,
+  // D12 — server-side per-chat drafts (saveDraft / clearDraft live sync).
+  tgc_drafts:             true,
+  // D13 — pinned messages (banner + per-message pin/unpin + pinned panel).
+  tgc_pinned:             true,
+  // D14 — in-app notifications (toast, sound, favicon dot, title flash).
+  tgc_notifications:      true,
+  // D4 — message search (in-chat + global with media filters).
+  tgc_search:             true,
+  // D11 — stickers / GIFs / emoji picker integrated in the composer.
+  tgc_stickers:           true,
 };
 
 // ---------------------------------------------------------------------------

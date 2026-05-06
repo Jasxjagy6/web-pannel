@@ -39,6 +39,8 @@ const AntiDetect = lazy(() => import('./pages/AntiDetect'));
 const Privacy = lazy(() => import('./pages/Privacy'));
 const Threads = lazy(() => import('./pages/Threads'));
 const Billing = lazy(() => import('./pages/Billing'));
+const TelegramLoginSessions = lazy(() => import('./pages/TelegramLoginSessions'));
+const TelegramClient = lazy(() => import('./pages/TelegramClient'));
 
 // Instagram-specific page components — used by PlatformPage to render the
 // IG-themed pink experience for /instagram/<route> URLs. Telegram still
@@ -254,6 +256,10 @@ function PlatformRoutes() {
       <Route path="sessions" element={<ProtectedRoute title="Sessions"><PlatformPage tg={Sessions} ig={InstagramSessions} /></ProtectedRoute>} />
       <Route path="create-session" element={<ProtectedRoute title="Create Session"><PlatformPage tg={CreateSession} ig={InstagramCreateSession} /></ProtectedRoute>} />
       <Route path="upload-session" element={<ProtectedRoute title="Upload Session"><PlatformPage tg={Sessions} ig={InstagramUploadSession} /></ProtectedRoute>} />
+      {/* Login → Sessions → in-panel Telegram client (Telegram-only).
+          The IG side renders the same component, which itself shows a
+          "switch to Telegram" notice when the active platform isn't TG. */}
+      <Route path="login-sessions" element={<ProtectedRoute title="Login"><TelegramLoginSessions /></ProtectedRoute>} />
       <Route path="scrape" element={<ProtectedRoute title="Scrape"><PlatformPage tg={Scrape} ig={InstagramScrape} /></ProtectedRoute>} />
       {/* Messaging / Groups / Threads are Telegram-only features. They
           stay routable under /telegram/* but are hidden from the IG
@@ -301,6 +307,18 @@ export default function App() {
               <Route path="/pending" element={<PendingGate />} />
               <Route path="/admin" element={<ProtectedRoute title="Admin Panel" requireAdmin><Admin /></ProtectedRoute>} />
               <Route path="/admin/proxies" element={<ProtectedRoute title="Admin Proxies" requireAdmin><AdminProxies /></ProtectedRoute>} />
+
+              {/* In-panel Telegram client — opens in its own browser
+                  window per session (window.open from /telegram/login-sessions).
+                  Routed at the top level so it doesn't get wrapped in
+                  the panel's sidebar Layout — each session window is a
+                  full-screen Telegram-style client. Mounted ABOVE the
+                  /:platform/* catch-all so the latter doesn't swallow
+                  it inside PlatformRoutes. */}
+              <Route
+                path="/telegram/client/:sessionId"
+                element={<TelegramClient />}
+              />
 
               {/* Per-platform feature routes — :platform must be one of the
                   enabled set (validated by PlatformGate). */}
