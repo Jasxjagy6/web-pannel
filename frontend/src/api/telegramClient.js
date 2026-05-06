@@ -372,3 +372,17 @@ export const resetOtherAuthorizations = (sessionId) =>
 
 export const setAuthorizationTtl = (sessionId, days) =>
   api.patch(`${BASE}/sessions/${sessionId}/security/authorizations/ttl`, { days });
+
+// --- D9 — contacts -------------------------------------------------------
+
+export const listContacts = (sessionId, search) =>
+  api.get(`${BASE}/sessions/${sessionId}/contacts`, { params: search ? { search } : undefined });
+
+export const searchContactsApi = (sessionId, q, limit = 20) =>
+  api.get(`${BASE}/sessions/${sessionId}/contacts/search`, { params: { q, limit } });
+
+export const addContact = (sessionId, payload) =>
+  api.post(`${BASE}/sessions/${sessionId}/contacts`, payload);
+
+export const deleteContacts = (sessionId, ids) =>
+  api.delete(`${BASE}/sessions/${sessionId}/contacts`, { data: { ids } });

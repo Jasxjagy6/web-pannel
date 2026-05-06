@@ -154,6 +154,8 @@ const capabilities = {
   tgc_settings:           true,
   // D8 — security (2FA + active sessions / log out other devices).
   tgc_security:           true,
+  // D9 — contacts (list / add / delete / search).
+  tgc_contacts:           true,
 };
 
 // ---------------------------------------------------------------------------

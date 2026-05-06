@@ -111,6 +111,7 @@ const capabilities = {
   tgc_chat_admin:         false,
   tgc_settings:           false,
   tgc_security:           false,
+  tgc_contacts:           false,
 };
 
 // Lazy module loaders — keeps the IG runtime out of the cold-start path.

@@ -872,6 +872,45 @@ const telegramClientController = {
     const data = await tcService.setAuthorizationTtl(req.params.id, req.user.id, req.body?.days);
     res.json({ success: true, data });
   }),
+
+  // ---------------------------------------------------------------------
+  // D9 — Contacts
+  // ---------------------------------------------------------------------
+
+  listContacts: asyncHandler(async (req, res) => {
+    const data = await tcService.listContacts(req.params.id, req.user.id, {
+      search: req.query.search,
+    });
+    res.json({ success: true, data });
+  }),
+
+  searchContacts: asyncHandler(async (req, res) => {
+    const data = await tcService.searchContacts(req.params.id, req.user.id, req.query.q, {
+      limit: Number(req.query.limit) || 20,
+    });
+    res.json({ success: true, data });
+  }),
+
+  addContact: asyncHandler(async (req, res) => {
+    const data = await tcService.addContact(req.params.id, req.user.id, req.body || {});
+    await reportService
+      .logActivity(req.user.id, 'tg_client_add_contact', 'session', req.params.id, {
+        platform: 'telegram',
+      })
+      .catch(() => {});
+    res.json({ success: true, data });
+  }),
+
+  deleteContacts: asyncHandler(async (req, res) => {
+    const ids = Array.isArray(req.body?.ids) ? req.body.ids : [];
+    const data = await tcService.deleteContacts(req.params.id, req.user.id, ids);
+    await reportService
+      .logActivity(req.user.id, 'tg_client_delete_contacts', 'session', req.params.id, {
+        platform: 'telegram', count: ids.length,
+      })
+      .catch(() => {});
+    res.json({ success: true, data });
+  }),
 };
 
 module.exports = telegramClientController;

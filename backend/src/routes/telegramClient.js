@@ -143,4 +143,10 @@ router.delete('/sessions/:id/security/authorizations/:hash',              contro
 router.post('/sessions/:id/security/authorizations/reset-others',         controller.resetOtherAuthorizations);
 router.patch('/sessions/:id/security/authorizations/ttl',                 controller.setAuthorizationTtl);
 
+// --- Contacts (D9) -------------------------------------------------------
+router.get('/sessions/:id/contacts',          controller.listContacts);
+router.get('/sessions/:id/contacts/search',   controller.searchContacts);
+router.post('/sessions/:id/contacts',         controller.addContact);
+router.delete('/sessions/:id/contacts',       controller.deleteContacts);
+
 module.exports = router;

@@ -2743,6 +2743,249 @@ class TelegramClientService {
     }
     return this.listAuthorizations(sessionId, userId);
   }
+
+  // -----------------------------------------------------------------------
+  // D9 — Contacts
+  // -----------------------------------------------------------------------
+
+  /**
+   * D9 — List contacts. contacts.GetContacts returns Users + Contacts;
+   * we merge into a single normalized array sorted by mutual / firstName.
+   */
+  async listContacts(sessionId, userId, { search = '' } = {}) {
+    await _loadAndAuthSession(sessionId, userId);
+    await tgService._ensureConnected(sessionId);
+    const entry = tgService.clients.get(String(sessionId));
+    if (!entry) throw new AppError('Session client not loaded', 500, 'CLIENT_NOT_LOADED');
+
+    let res;
+    try {
+      res = await entry.client.invoke(new Api.contacts.GetContacts({ hash: BigInt(0) }));
+    } catch (err) {
+      throw new AppError(`GetContacts failed: ${err.message}`, 502, 'GET_CONTACTS_FAILED');
+    }
+    if (res?.className === 'contacts.contactsNotModified') return { contacts: [] };
+
+    const userById = new Map();
+    for (const u of res.users || []) userById.set(String(_toIdNum(u.id)), u);
+
+    const out = (res.contacts || []).map((c) => {
+      const u = userById.get(String(_toIdNum(c.userId)));
+      if (!u) return null;
+      return {
+        id: _toIdNum(u.id),
+        accessHash: u.accessHash != null ? String(u.accessHash) : null,
+        firstName: u.firstName || '',
+        lastName: u.lastName || '',
+        username: u.username || null,
+        usernames: Array.isArray(u.usernames) ? u.usernames.map((un) => un.username) : [],
+        phone: u.phone || null,
+        mutual: !!c.mutual,
+        verified: !!u.verified,
+        premium: !!u.premium,
+        bot: !!u.bot,
+        deleted: !!u.deleted,
+        photoId: u.photo?.photoId != null ? String(u.photo.photoId) : null,
+      };
+    }).filter(Boolean);
+
+    const q = String(search || '').toLowerCase().trim();
+    const filtered = q
+      ? out.filter((c) => {
+        const hay = [
+          c.firstName, c.lastName, c.username, ...(c.usernames || []), c.phone,
+        ].filter(Boolean).join(' ').toLowerCase();
+        return hay.includes(q);
+      })
+      : out;
+
+    filtered.sort((a, b) => {
+      if (a.mutual !== b.mutual) return a.mutual ? -1 : 1;
+      const an = `${a.firstName} ${a.lastName}`.trim().toLowerCase();
+      const bn = `${b.firstName} ${b.lastName}`.trim().toLowerCase();
+      return an.localeCompare(bn);
+    });
+
+    return { count: filtered.length, contacts: filtered };
+  }
+
+  /**
+   * D9 — Search the user's contacts + global directory by query.
+   */
+  async searchContacts(sessionId, userId, q, { limit = 20 } = {}) {
+    if (!q || String(q).trim().length < 1) {
+      throw new AppError('q is required', 400, 'NO_QUERY');
+    }
+    await _loadAndAuthSession(sessionId, userId);
+    await tgService._ensureConnected(sessionId);
+    const entry = tgService.clients.get(String(sessionId));
+    if (!entry) throw new AppError('Session client not loaded', 500, 'CLIENT_NOT_LOADED');
+
+    let res;
+    try {
+      res = await entry.client.invoke(new Api.contacts.Search({
+        q: String(q).trim(),
+        limit: Math.max(1, Math.min(Number(limit) || 20, 50)),
+      }));
+    } catch (err) {
+      throw new AppError(`Search failed: ${err.message}`, 502, 'SEARCH_CONTACTS_FAILED');
+    }
+
+    const users = new Map();
+    for (const u of res.users || []) users.set(String(_toIdNum(u.id)), u);
+    const chats = new Map();
+    for (const c of res.chats || []) chats.set(String(_toIdNum(c.id)), c);
+
+    const myContactIds = new Set((res.myResults || [])
+      .filter((p) => p.className === 'PeerUser')
+      .map((p) => String(_toIdNum(p.userId))));
+
+    const results = (res.results || []).map((p) => {
+      if (p.className === 'PeerUser') {
+        const u = users.get(String(_toIdNum(p.userId)));
+        if (!u) return null;
+        return {
+          kind: 'user',
+          id: _toIdNum(u.id),
+          accessHash: u.accessHash != null ? String(u.accessHash) : null,
+          firstName: u.firstName || '',
+          lastName: u.lastName || '',
+          username: u.username || null,
+          phone: u.phone || null,
+          isContact: myContactIds.has(String(_toIdNum(u.id))),
+          verified: !!u.verified,
+          premium: !!u.premium,
+          bot: !!u.bot,
+          photoId: u.photo?.photoId != null ? String(u.photo.photoId) : null,
+        };
+      }
+      if (p.className === 'PeerChannel') {
+        const c = chats.get(String(_toIdNum(p.channelId)));
+        if (!c) return null;
+        return {
+          kind: c.broadcast ? 'channel' : 'chat',
+          id: _toIdNum(c.id),
+          accessHash: c.accessHash != null ? String(c.accessHash) : null,
+          title: c.title || '',
+          username: c.username || null,
+          membersCount: c.participantsCount || 0,
+          verified: !!c.verified,
+          photoId: c.photo?.photoId != null ? String(c.photo.photoId) : null,
+        };
+      }
+      return null;
+    }).filter(Boolean);
+
+    return { results };
+  }
+
+  /**
+   * D9 — Add a contact. Body: { phone, firstName?, lastName? } OR
+   * { userId, firstName?, lastName? }. Telegram's contacts.AddContact
+   * needs a user input — we call ImportContacts when only a phone is
+   * given (server resolves the user); otherwise we use AddContact.
+   */
+  async addContact(sessionId, userId, payload = {}) {
+    await _loadAndAuthSession(sessionId, userId);
+    await tgService._ensureConnected(sessionId);
+    const entry = tgService.clients.get(String(sessionId));
+    if (!entry) throw new AppError('Session client not loaded', 500, 'CLIENT_NOT_LOADED');
+
+    const firstName = String(payload.firstName || '').slice(0, 64);
+    const lastName  = String(payload.lastName  || '').slice(0, 64);
+    const sharePhone = !!payload.sharePhone;
+    let resultUser = null;
+
+    if (payload.userId) {
+      let inputUser;
+      try {
+        inputUser = await entry.client.getInputEntity(_buildPeerInput('user', _toIdNum(payload.userId)));
+      } catch (err) {
+        throw new AppError(`Resolve user failed: ${err.message}`, 502, 'RESOLVE_FAILED');
+      }
+      let updates;
+      try {
+        updates = await entry.client.invoke(new Api.contacts.AddContact({
+          id: inputUser,
+          firstName,
+          lastName,
+          phone: String(payload.phone || ''),
+          addPhonePrivacyException: sharePhone,
+        }));
+      } catch (err) {
+        throw new AppError(`AddContact failed: ${err.message}`, 502, 'ADD_CONTACT_FAILED');
+      }
+      resultUser = (updates?.users || []).find((u) => String(_toIdNum(u.id)) === String(_toIdNum(payload.userId)));
+    } else if (payload.phone) {
+      let res;
+      try {
+        res = await entry.client.invoke(new Api.contacts.ImportContacts({
+          contacts: [
+            new Api.InputPhoneContact({
+              clientId: BigInt(Date.now() & 0x7fffffff),
+              phone: String(payload.phone),
+              firstName,
+              lastName,
+            }),
+          ],
+        }));
+      } catch (err) {
+        throw new AppError(`ImportContacts failed: ${err.message}`, 502, 'IMPORT_CONTACT_FAILED');
+      }
+      if (!res || (res.imported || []).length === 0) {
+        throw new AppError('Phone is not on Telegram', 404, 'PHONE_NOT_FOUND');
+      }
+      const importedUserId = String(_toIdNum(res.imported[0].userId));
+      resultUser = (res.users || []).find((u) => String(_toIdNum(u.id)) === importedUserId);
+    } else {
+      throw new AppError('phone or userId is required', 400, 'NO_TARGET');
+    }
+
+    this._broadcastContactsChanged(userId, sessionId, 'add', resultUser ? _toIdNum(resultUser.id) : null);
+    return this.listContacts(sessionId, userId);
+  }
+
+  /**
+   * D9 — Delete one or more contacts.
+   */
+  async deleteContacts(sessionId, userId, ids) {
+    if (!Array.isArray(ids) || ids.length === 0) {
+      throw new AppError('ids is required', 400, 'NO_IDS');
+    }
+    await _loadAndAuthSession(sessionId, userId);
+    await tgService._ensureConnected(sessionId);
+    const entry = tgService.clients.get(String(sessionId));
+    if (!entry) throw new AppError('Session client not loaded', 500, 'CLIENT_NOT_LOADED');
+
+    const inputs = [];
+    for (const uid of ids) {
+      try {
+        inputs.push(await entry.client.getInputEntity(_buildPeerInput('user', _toIdNum(uid))));
+      } catch (_) { /* skip unresolved */ }
+    }
+    if (inputs.length === 0) throw new AppError('No valid users', 400, 'NO_VALID');
+
+    try {
+      await entry.client.invoke(new Api.contacts.DeleteContacts({ id: inputs }));
+    } catch (err) {
+      throw new AppError(`DeleteContacts failed: ${err.message}`, 502, 'DELETE_CONTACTS_FAILED');
+    }
+    for (const uid of ids) this._broadcastContactsChanged(userId, sessionId, 'remove', _toIdNum(uid));
+    return this.listContacts(sessionId, userId);
+  }
+
+  _broadcastContactsChanged(userId, sessionId, action, userIdChanged) {
+    try {
+      const io = global.io;
+      if (!io) return;
+      io.to(`tg-client:u${userId}:s${sessionId}`).emit('tg-client:contactsChanged', {
+        sessionId: String(sessionId), action, userId: userIdChanged,
+        timestamp: Date.now(),
+      });
+    } catch (err) {
+      logger.debug(`tg-client contacts broadcast failed: ${err.message}`);
+    }
+  }
 }
 
 function _normalizeAuthorization(a) {
