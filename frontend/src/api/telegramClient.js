@@ -323,3 +323,26 @@ export const editChatPhoto = (sessionId, peerType, peerId, file) => {
 
 export const leaveChat = (sessionId, peerType, peerId) =>
   api.post(`${BASE}/sessions/${sessionId}/dialogs/${peerType}/${peerId}/leave`);
+
+// --- D7 — settings -------------------------------------------------------
+
+export const getDefaultNotifySettings = (sessionId) =>
+  api.get(`${BASE}/sessions/${sessionId}/settings/notifications`);
+
+export const setDefaultNotifySettings = (sessionId, kind, payload) =>
+  api.patch(`${BASE}/sessions/${sessionId}/settings/notifications/${kind}`, payload);
+
+export const resetNotifySettings = (sessionId) =>
+  api.post(`${BASE}/sessions/${sessionId}/settings/notifications/reset`);
+
+export const getPrivacy = (sessionId, key) =>
+  api.get(`${BASE}/sessions/${sessionId}/settings/privacy/${key}`);
+
+export const setPrivacy = (sessionId, key, payload) =>
+  api.patch(`${BASE}/sessions/${sessionId}/settings/privacy/${key}`, payload);
+
+export const getLanguage = (sessionId) =>
+  api.get(`${BASE}/sessions/${sessionId}/settings/language`);
+
+export const listLanguages = (sessionId) =>
+  api.get(`${BASE}/sessions/${sessionId}/settings/languages`);

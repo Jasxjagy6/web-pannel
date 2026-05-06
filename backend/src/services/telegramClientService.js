@@ -2274,6 +2274,250 @@ class TelegramClientService {
     }
     return { ok: true };
   }
+
+  // -----------------------------------------------------------------------
+  // D7 — Settings: notifications, privacy, language
+  // -----------------------------------------------------------------------
+
+  /**
+   * D7 — Default notification settings for the three peer kinds plus
+   * silent-content-types flag. Returns a normalized object the UI can
+   * render directly.
+   */
+  async getDefaultNotifySettings(sessionId, userId) {
+    await _loadAndAuthSession(sessionId, userId);
+    await tgService._ensureConnected(sessionId);
+    const entry = tgService.clients.get(String(sessionId));
+    if (!entry) throw new AppError('Session client not loaded', 500, 'CLIENT_NOT_LOADED');
+
+    const out = {};
+    for (const kind of ['users', 'chats', 'broadcasts']) {
+      try {
+        const r = await entry.client.invoke(new Api.account.GetNotifySettings({
+          peer: kind === 'users'
+            ? new Api.InputNotifyUsers()
+            : kind === 'chats'
+            ? new Api.InputNotifyChats()
+            : new Api.InputNotifyBroadcasts(),
+        }));
+        out[kind] = _normalizeNotifySettings(r);
+      } catch (err) {
+        logger.debug(`tg-client GetNotifySettings(${kind}) failed: ${err.message}`);
+        out[kind] = { muteUntil: 0, silent: false, showPreviews: true, sound: null };
+      }
+    }
+    return out;
+  }
+
+  /**
+   * D7 — Update default notification settings for one peer kind.
+   * Body: { muteUntilSec?, silent?, showPreviews?, sound?: '' or string }.
+   * Telegram uses InputPeerNotifySettings — fields not passed are kept
+   * unchanged.
+   */
+  async setDefaultNotifySettings(sessionId, userId, kind, payload = {}) {
+    if (!['users', 'chats', 'broadcasts'].includes(kind)) {
+      throw new AppError('Invalid kind', 400, 'INVALID_KIND');
+    }
+    await _loadAndAuthSession(sessionId, userId);
+    await tgService._ensureConnected(sessionId);
+    const entry = tgService.clients.get(String(sessionId));
+    if (!entry) throw new AppError('Session client not loaded', 500, 'CLIENT_NOT_LOADED');
+
+    const settings = {};
+    if (typeof payload.silent === 'boolean') settings.silent = payload.silent;
+    if (typeof payload.showPreviews === 'boolean') settings.showPreviews = payload.showPreviews;
+    if (Number.isFinite(Number(payload.muteUntilSec))) {
+      settings.muteUntil = Math.max(0, Math.floor(Number(payload.muteUntilSec)));
+    }
+
+    try {
+      await entry.client.invoke(new Api.account.UpdateNotifySettings({
+        peer: kind === 'users'
+          ? new Api.InputNotifyUsers()
+          : kind === 'chats'
+          ? new Api.InputNotifyChats()
+          : new Api.InputNotifyBroadcasts(),
+        settings: new Api.InputPeerNotifySettings(settings),
+      }));
+    } catch (err) {
+      throw new AppError(`UpdateNotifySettings failed: ${err.message}`, 502, 'NOTIFY_FAILED');
+    }
+    return this.getDefaultNotifySettings(sessionId, userId);
+  }
+
+  /**
+   * D7 — Reset all custom per-peer notification overrides.
+   * messages.account.ResetNotifySettings.
+   */
+  async resetNotifySettings(sessionId, userId) {
+    await _loadAndAuthSession(sessionId, userId);
+    await tgService._ensureConnected(sessionId);
+    const entry = tgService.clients.get(String(sessionId));
+    if (!entry) throw new AppError('Session client not loaded', 500, 'CLIENT_NOT_LOADED');
+
+    try {
+      await entry.client.invoke(new Api.account.ResetNotifySettings());
+    } catch (err) {
+      throw new AppError(`ResetNotifySettings failed: ${err.message}`, 502, 'RESET_NOTIFY_FAILED');
+    }
+    return this.getDefaultNotifySettings(sessionId, userId);
+  }
+
+  /**
+   * D7 — Privacy rules. `key` is one of statusTimestamp, chatInvite,
+   * phoneCall, phoneP2P, forwards, profilePhoto, phoneNumber, addedByPhone,
+   * voiceMessages. Returns the current rule list as a normalized array.
+   */
+  async getPrivacy(sessionId, userId, key) {
+    await _loadAndAuthSession(sessionId, userId);
+    await tgService._ensureConnected(sessionId);
+    const entry = tgService.clients.get(String(sessionId));
+    if (!entry) throw new AppError('Session client not loaded', 500, 'CLIENT_NOT_LOADED');
+
+    const inputKey = _privacyInputKey(key);
+    if (!inputKey) throw new AppError('Invalid privacy key', 400, 'INVALID_PRIVACY_KEY');
+    let res;
+    try {
+      res = await entry.client.invoke(new Api.account.GetPrivacy({ key: inputKey }));
+    } catch (err) {
+      throw new AppError(`GetPrivacy failed: ${err.message}`, 502, 'GET_PRIVACY_FAILED');
+    }
+    return { key, rules: (res?.rules || []).map(_normalizePrivacyRule) };
+  }
+
+  /**
+   * D7 — Update one privacy rule. `value` is the high-level option
+   * the UI sends ('everybody' | 'contacts' | 'nobody') plus optional
+   * 'allow' / 'disallow' user-id arrays.
+   */
+  async setPrivacy(sessionId, userId, key, payload = {}) {
+    await _loadAndAuthSession(sessionId, userId);
+    await tgService._ensureConnected(sessionId);
+    const entry = tgService.clients.get(String(sessionId));
+    if (!entry) throw new AppError('Session client not loaded', 500, 'CLIENT_NOT_LOADED');
+
+    const inputKey = _privacyInputKey(key);
+    if (!inputKey) throw new AppError('Invalid privacy key', 400, 'INVALID_PRIVACY_KEY');
+
+    const rules = [];
+    const value = String(payload.value || 'everybody').toLowerCase();
+    if (value === 'everybody') rules.push(new Api.InputPrivacyValueAllowAll());
+    else if (value === 'nobody') rules.push(new Api.InputPrivacyValueDisallowAll());
+    else rules.push(new Api.InputPrivacyValueAllowContacts());
+
+    if (Array.isArray(payload.allowUsers) && payload.allowUsers.length > 0) {
+      const users = await Promise.all(payload.allowUsers.map(async (uid) => {
+        try { return await entry.client.getInputEntity(_buildPeerInput('user', _toIdNum(uid))); }
+        catch (_) { return null; }
+      }));
+      const valid = users.filter(Boolean);
+      if (valid.length > 0) rules.push(new Api.InputPrivacyValueAllowUsers({ users: valid }));
+    }
+    if (Array.isArray(payload.disallowUsers) && payload.disallowUsers.length > 0) {
+      const users = await Promise.all(payload.disallowUsers.map(async (uid) => {
+        try { return await entry.client.getInputEntity(_buildPeerInput('user', _toIdNum(uid))); }
+        catch (_) { return null; }
+      }));
+      const valid = users.filter(Boolean);
+      if (valid.length > 0) rules.push(new Api.InputPrivacyValueDisallowUsers({ users: valid }));
+    }
+
+    let res;
+    try {
+      res = await entry.client.invoke(new Api.account.SetPrivacy({ key: inputKey, rules }));
+    } catch (err) {
+      throw new AppError(`SetPrivacy failed: ${err.message}`, 502, 'SET_PRIVACY_FAILED');
+    }
+    return { key, rules: (res?.rules || []).map(_normalizePrivacyRule) };
+  }
+
+  /**
+   * D7 — Account language. Telegram stores the active lang per session
+   * via the account API; account.UpdateLangPack lets us change it.
+   * `langCode` is an ISO short code (e.g. 'en', 'de', 'pt-br').
+   */
+  async getLanguage(sessionId, userId) {
+    await _loadAndAuthSession(sessionId, userId);
+    await tgService._ensureConnected(sessionId);
+    const entry = tgService.clients.get(String(sessionId));
+    if (!entry) throw new AppError('Session client not loaded', 500, 'CLIENT_NOT_LOADED');
+
+    try {
+      const me = await entry.client.getMe();
+      return { langCode: me?.langCode || null };
+    } catch (err) {
+      throw new AppError(`getLanguage failed: ${err.message}`, 502, 'GET_LANG_FAILED');
+    }
+  }
+
+  /**
+   * D7 — List available languages from the official langpack.
+   */
+  async listLanguages(sessionId, userId) {
+    await _loadAndAuthSession(sessionId, userId);
+    await tgService._ensureConnected(sessionId);
+    const entry = tgService.clients.get(String(sessionId));
+    if (!entry) throw new AppError('Session client not loaded', 500, 'CLIENT_NOT_LOADED');
+
+    try {
+      const r = await entry.client.invoke(new Api.langpack.GetLanguages({ langPack: 'android' }));
+      return {
+        languages: (r || []).map((l) => ({
+          name: l.name,
+          nativeName: l.nativeName,
+          langCode: l.langCode,
+          baseLangCode: l.baseLangCode || null,
+          official: !!l.official,
+          rtl: !!l.rtl,
+          beta: !!l.beta,
+          pluralCode: l.pluralCode || null,
+          stringsCount: l.stringsCount || 0,
+          translatedCount: l.translatedCount || 0,
+          translationsUrl: l.translationsUrl || null,
+        })),
+      };
+    } catch (err) {
+      throw new AppError(`listLanguages failed: ${err.message}`, 502, 'LIST_LANG_FAILED');
+    }
+  }
+}
+
+/**
+ * Normalize an InputNotify response.
+ */
+function _normalizeNotifySettings(r) {
+  if (!r) return { muteUntil: 0, silent: false, showPreviews: true, sound: null };
+  return {
+    muteUntil: r.muteUntil || 0,
+    silent: !!r.silent,
+    showPreviews: r.showPreviews !== false,
+    sound: r.sound?.title || r.sound?.fileReference ? '(custom)' : null,
+  };
+}
+
+function _privacyInputKey(key) {
+  switch (key) {
+    case 'statusTimestamp': return new Api.InputPrivacyKeyStatusTimestamp();
+    case 'chatInvite':      return new Api.InputPrivacyKeyChatInvite();
+    case 'phoneCall':       return new Api.InputPrivacyKeyPhoneCall();
+    case 'phoneP2P':        return new Api.InputPrivacyKeyPhoneP2P();
+    case 'forwards':        return new Api.InputPrivacyKeyForwards();
+    case 'profilePhoto':    return new Api.InputPrivacyKeyProfilePhoto();
+    case 'phoneNumber':     return new Api.InputPrivacyKeyPhoneNumber();
+    case 'addedByPhone':    return new Api.InputPrivacyKeyAddedByPhone();
+    case 'voiceMessages':   return new Api.InputPrivacyKeyVoiceMessages();
+    default: return null;
+  }
+}
+
+function _normalizePrivacyRule(r) {
+  if (!r) return null;
+  return {
+    type: r.className,
+    users: Array.isArray(r.users) ? r.users.map((u) => _toIdNum(u)).filter((v) => v != null) : undefined,
+    chats: Array.isArray(r.chats) ? r.chats.map((c) => _toIdNum(c)).filter((v) => v != null) : undefined,
+  };
 }
 
 /**

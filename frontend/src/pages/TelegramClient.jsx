@@ -11,7 +11,7 @@
 
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
-import { Loader2, AlertCircle, Wifi, WifiOff } from 'lucide-react';
+import { Loader2, AlertCircle, Wifi, WifiOff, Settings } from 'lucide-react';
 import {
   connectClientSession,
   getClientDialogs,
@@ -23,6 +23,7 @@ import DialogList from '../components/telegramClient/DialogList';
 import ChatPane from '../components/telegramClient/ChatPane';
 import Avatar from '../components/telegramClient/Avatar';
 import SelfProfileDrawer from '../components/telegramClient/SelfProfileDrawer';
+import SettingsDrawer from '../components/telegramClient/SettingsDrawer';
 
 export default function TelegramClient() {
   const { sessionId } = useParams();
@@ -98,6 +99,7 @@ export default function TelegramClient() {
 
   const [activeDialogTitle, setActiveDialogTitle] = useState(null);
   const [profileOpen, setProfileOpen] = useState(false);
+  const [settingsOpen, setSettingsOpen] = useState(false);
   useEffect(() => {
     const parts = [activeDialogTitle, accountLabel].filter(Boolean);
     document.title =
@@ -142,6 +144,14 @@ export default function TelegramClient() {
             <div className="text-sm text-gray-400">Connecting…</div>
           )}
           <div className="ml-auto flex items-center gap-2">
+            <button
+              type="button"
+              onClick={() => setSettingsOpen(true)}
+              className="rounded-md p-1.5 text-gray-400 hover:bg-white/5 hover:text-gray-200"
+              title="Settings"
+            >
+              <Settings className="h-4 w-4" />
+            </button>
             <ConnectionPill socketStatus={socketStatus} status={status} />
           </div>
         </header>
@@ -186,6 +196,12 @@ export default function TelegramClient() {
         isOpen={profileOpen}
         onClose={() => setProfileOpen(false)}
         onProfileLoaded={(p) => p && useStore.getState().setMe({ ...useStore.getState().me, ...p })}
+      />
+
+      <SettingsDrawer
+        sessionId={sessionId}
+        isOpen={settingsOpen}
+        onClose={() => setSettingsOpen(false)}
       />
     </div>
   );

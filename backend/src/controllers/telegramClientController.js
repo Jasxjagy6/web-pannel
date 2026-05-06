@@ -744,6 +744,65 @@ const telegramClientController = {
       .catch(() => {});
     res.json({ success: true, data });
   }),
+
+  // ---------------------------------------------------------------------
+  // D7 — Settings (notifications, privacy, language)
+  // ---------------------------------------------------------------------
+
+  getDefaultNotifySettings: asyncHandler(async (req, res) => {
+    const data = await tcService.getDefaultNotifySettings(req.params.id, req.user.id);
+    res.json({ success: true, data });
+  }),
+
+  setDefaultNotifySettings: asyncHandler(async (req, res) => {
+    const data = await tcService.setDefaultNotifySettings(
+      req.params.id,
+      req.user.id,
+      req.params.kind,
+      req.body || {},
+    );
+    await reportService
+      .logActivity(req.user.id, 'tg_client_update_notify', 'session', req.params.id, {
+        platform: 'telegram', kind: req.params.kind,
+      })
+      .catch(() => {});
+    res.json({ success: true, data });
+  }),
+
+  resetNotifySettings: asyncHandler(async (req, res) => {
+    const data = await tcService.resetNotifySettings(req.params.id, req.user.id);
+    await reportService
+      .logActivity(req.user.id, 'tg_client_reset_notify', 'session', req.params.id, {
+        platform: 'telegram',
+      })
+      .catch(() => {});
+    res.json({ success: true, data });
+  }),
+
+  getPrivacy: asyncHandler(async (req, res) => {
+    const data = await tcService.getPrivacy(req.params.id, req.user.id, req.params.key);
+    res.json({ success: true, data });
+  }),
+
+  setPrivacy: asyncHandler(async (req, res) => {
+    const data = await tcService.setPrivacy(req.params.id, req.user.id, req.params.key, req.body || {});
+    await reportService
+      .logActivity(req.user.id, 'tg_client_set_privacy', 'session', req.params.id, {
+        platform: 'telegram', key: req.params.key,
+      })
+      .catch(() => {});
+    res.json({ success: true, data });
+  }),
+
+  getLanguage: asyncHandler(async (req, res) => {
+    const data = await tcService.getLanguage(req.params.id, req.user.id);
+    res.json({ success: true, data });
+  }),
+
+  listLanguages: asyncHandler(async (req, res) => {
+    const data = await tcService.listLanguages(req.params.id, req.user.id);
+    res.json({ success: true, data });
+  }),
 };
 
 module.exports = telegramClientController;

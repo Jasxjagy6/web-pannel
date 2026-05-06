@@ -150,6 +150,8 @@ const capabilities = {
   tgc_peer_profile:       true,
   // D10 — group / channel info + admin (members, promote/demote/kick/ban).
   tgc_chat_admin:         true,
+  // D7 — settings (notifications, privacy, language, theme).
+  tgc_settings:           true,
 };
 
 // ---------------------------------------------------------------------------

@@ -124,4 +124,13 @@ router.patch('/sessions/:id/dialogs/:peerType/:peerId/about', controller.editCha
 router.post('/sessions/:id/dialogs/:peerType/:peerId/photo', uploadPhoto, controller.editChatPhoto);
 router.post('/sessions/:id/dialogs/:peerType/:peerId/leave', controller.leaveChat);
 
+// --- Settings (D7) -------------------------------------------------------
+router.get('/sessions/:id/settings/notifications', controller.getDefaultNotifySettings);
+router.patch('/sessions/:id/settings/notifications/:kind', controller.setDefaultNotifySettings);
+router.post('/sessions/:id/settings/notifications/reset', controller.resetNotifySettings);
+router.get('/sessions/:id/settings/privacy/:key', controller.getPrivacy);
+router.patch('/sessions/:id/settings/privacy/:key', controller.setPrivacy);
+router.get('/sessions/:id/settings/language', controller.getLanguage);
+router.get('/sessions/:id/settings/languages', controller.listLanguages);
+
 module.exports = router;
