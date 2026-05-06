@@ -1,0 +1,226 @@
+/**
+ * Per-session Zustand store for the in-panel Telegram client.
+ *
+ * One store instance per browser window — sessions in different windows
+ * therefore have completely isolated state. We keep the per-store factory
+ * exported so each window can call `createTgClientStore(sessionId)` once
+ * on mount and pass the resulting hook to its subtree.
+ *
+ * Shape:
+ *   - me                     normalized self user
+ *   - dialogs                Map<peerKey, Dialog>
+ *   - dialogOrder            string[]   (peer keys, sorted by recency)
+ *   - selectedPeerKey        string | null
+ *   - messagesByPeer         Map<peerKey, Message[]>   (descending: newest first)
+ *   - sendersByKey           Map<peerKey, Sender>      (cached from getMessages)
+ *   - typingByPeer           Map<peerKey, { fromId, expiresAt }>
+ *   - status                 'idle' | 'connecting' | 'ready' | 'error'
+ *   - errorMessage           string | null
+ *
+ * peerKey format: `${peerType}:${peerId}` so user 5 and chat 5 don't collide.
+ */
+
+import { create } from 'zustand';
+
+export function peerKey(peerType, peerId) {
+  return `${peerType}:${peerId}`;
+}
+
+export function peerKeyOf(obj) {
+  if (!obj) return null;
+  if (obj.peerType && obj.peerId != null) return peerKey(obj.peerType, obj.peerId);
+  return null;
+}
+
+const DIALOG_INITIAL = () => ({
+  me: null,
+  status: 'idle',
+  errorMessage: null,
+  socketStatus: 'idle', // 'idle' | 'connecting' | 'connected' | 'disconnected' | 'error'
+
+  dialogs: new Map(),
+  dialogOrder: [],
+  dialogsLoaded: false,
+  dialogsLoading: false,
+
+  selectedPeerKey: null,
+
+  messagesByPeer: new Map(),
+  messageLoadingByPeer: new Map(),
+
+  sendersByKey: new Map(),
+  typingByPeer: new Map(),
+
+  // Optimistic outgoing messages keyed by clientMsgId (uuid). Cleared on ack.
+  pendingOutgoing: new Map(),
+});
+
+function _sortDialogOrder(dialogs) {
+  // Most recent message first; pinned dialogs always at the top.
+  const arr = Array.from(dialogs.values());
+  arr.sort((a, b) => {
+    if (a.pinned && !b.pinned) return -1;
+    if (!a.pinned && b.pinned) return 1;
+    const ad = a.lastMessage?.date ? new Date(a.lastMessage.date).getTime() : 0;
+    const bd = b.lastMessage?.date ? new Date(b.lastMessage.date).getTime() : 0;
+    return bd - ad;
+  });
+  return arr.map((d) => peerKey(d.peerType, d.peerId));
+}
+
+export function createTgClientStore() {
+  return create((set, get) => ({
+    ...DIALOG_INITIAL(),
+
+    setStatus: (status, errorMessage = null) => set({ status, errorMessage }),
+    setSocketStatus: (socketStatus) => set({ socketStatus }),
+    setMe: (me) => set({ me }),
+
+    // Replace the entire dialog list (initial fetch).
+    setDialogs: (list) => {
+      const next = new Map();
+      for (const d of list || []) {
+        next.set(peerKey(d.peerType, d.peerId), d);
+      }
+      set({
+        dialogs: next,
+        dialogOrder: _sortDialogOrder(next),
+        dialogsLoaded: true,
+        dialogsLoading: false,
+      });
+    },
+
+    setDialogsLoading: (v) => set({ dialogsLoading: !!v }),
+
+    upsertDialog: (dialog) => {
+      const k = peerKey(dialog.peerType, dialog.peerId);
+      const next = new Map(get().dialogs);
+      const prev = next.get(k);
+      next.set(k, { ...(prev || {}), ...dialog });
+      set({
+        dialogs: next,
+        dialogOrder: _sortDialogOrder(next),
+      });
+    },
+
+    selectPeer: (peerType, peerId) => {
+      const k = peerKey(peerType, peerId);
+      set({ selectedPeerKey: k });
+    },
+
+    setMessages: (peerType, peerId, messages, senders) => {
+      const k = peerKey(peerType, peerId);
+      const nextMessages = new Map(get().messagesByPeer);
+      // Backend returns newest-first; flip to oldest-first for rendering.
+      const flipped = [...(messages || [])].sort((a, b) => (a.id ?? 0) - (b.id ?? 0));
+      nextMessages.set(k, flipped);
+
+      const nextSenders = new Map(get().sendersByKey);
+      for (const s of senders || []) {
+        nextSenders.set(peerKey(s.peerType, s.peerId), s);
+      }
+      set({ messagesByPeer: nextMessages, sendersByKey: nextSenders });
+    },
+
+    prependMessages: (peerType, peerId, olderMessages) => {
+      const k = peerKey(peerType, peerId);
+      const nextMessages = new Map(get().messagesByPeer);
+      const existing = nextMessages.get(k) || [];
+      const seen = new Set(existing.map((m) => m.id));
+      const incoming = [...(olderMessages || [])]
+        .filter((m) => m && m.id != null && !seen.has(m.id))
+        .sort((a, b) => (a.id ?? 0) - (b.id ?? 0));
+      nextMessages.set(k, [...incoming, ...existing]);
+      set({ messagesByPeer: nextMessages });
+    },
+
+    appendMessage: (peerType, peerId, message) => {
+      const k = peerKey(peerType, peerId);
+      const nextMessages = new Map(get().messagesByPeer);
+      const existing = nextMessages.get(k) || [];
+      if (message && message.id != null && existing.some((m) => m.id === message.id)) {
+        return;
+      }
+      nextMessages.set(k, [...existing, message]);
+      set({ messagesByPeer: nextMessages });
+    },
+
+    replaceMessage: (peerType, peerId, edited) => {
+      if (!edited || edited.id == null) return;
+      const k = peerKey(peerType, peerId);
+      const nextMessages = new Map(get().messagesByPeer);
+      const existing = nextMessages.get(k);
+      if (!existing) return;
+      const idx = existing.findIndex((m) => m.id === edited.id);
+      if (idx === -1) return;
+      const copy = existing.slice();
+      copy[idx] = { ...existing[idx], ...edited };
+      nextMessages.set(k, copy);
+      set({ messagesByPeer: nextMessages });
+    },
+
+    addPendingOutgoing: (peerType, peerId, clientMsgId, message) => {
+      const next = new Map(get().pendingOutgoing);
+      next.set(clientMsgId, { peerType, peerId, message });
+      set({ pendingOutgoing: next });
+    },
+
+    resolvePendingOutgoing: (clientMsgId, finalMessage) => {
+      const pending = get().pendingOutgoing.get(clientMsgId);
+      if (!pending) return;
+      const next = new Map(get().pendingOutgoing);
+      next.delete(clientMsgId);
+      // Append the finalised message; the optimistic version will be
+      // filtered out by id-equality on the next selector run.
+      const k = peerKey(pending.peerType, pending.peerId);
+      const nextMessages = new Map(get().messagesByPeer);
+      const existing = nextMessages.get(k) || [];
+      const filtered = existing.filter((m) => m.clientMsgId !== clientMsgId);
+      nextMessages.set(k, [...filtered, finalMessage]);
+      set({ pendingOutgoing: next, messagesByPeer: nextMessages });
+    },
+
+    failPendingOutgoing: (clientMsgId, errorMessage) => {
+      const pending = get().pendingOutgoing.get(clientMsgId);
+      if (!pending) return;
+      const next = new Map(get().pendingOutgoing);
+      next.delete(clientMsgId);
+      const k = peerKey(pending.peerType, pending.peerId);
+      const nextMessages = new Map(get().messagesByPeer);
+      const existing = nextMessages.get(k) || [];
+      const idx = existing.findIndex((m) => m.clientMsgId === clientMsgId);
+      if (idx !== -1) {
+        const copy = existing.slice();
+        copy[idx] = { ...existing[idx], failed: true, error: errorMessage };
+        nextMessages.set(k, copy);
+      }
+      set({ pendingOutgoing: next, messagesByPeer: nextMessages });
+    },
+
+    bumpDialogPreview: (peerType, peerId, lastMessage, unreadDelta = 0) => {
+      const k = peerKey(peerType, peerId);
+      const next = new Map(get().dialogs);
+      const prev = next.get(k);
+      if (!prev) {
+        // Dialog isn't in our cache — ignore. The next fetchDialogs() pulls it in.
+        return;
+      }
+      const updated = {
+        ...prev,
+        lastMessage,
+        unreadCount: Math.max(0, (prev.unreadCount || 0) + (unreadDelta || 0)),
+      };
+      next.set(k, updated);
+      set({ dialogs: next, dialogOrder: _sortDialogOrder(next) });
+    },
+
+    clearUnread: (peerType, peerId) => {
+      const k = peerKey(peerType, peerId);
+      const next = new Map(get().dialogs);
+      const prev = next.get(k);
+      if (!prev) return;
+      next.set(k, { ...prev, unreadCount: 0, unreadMentionsCount: 0 });
+      set({ dialogs: next });
+    },
+  }));
+}

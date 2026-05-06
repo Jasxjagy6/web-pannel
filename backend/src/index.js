@@ -34,6 +34,7 @@ const adminRoutes = require('./routes/admin');
 const billingRoutes = require('./routes/billing');
 const userCredentialsRoutes = require('./routes/userCredentials');
 const otpRelayRoutes = require('./routes/otpRelays');
+const telegramClientRoutes = require('./routes/telegramClient');
 const billingController = require('./controllers/billingController');
 const { parsePlatform, resolvePlatform } = require('./middleware/platform');
 const healthRoutes = require('./routes/health');
@@ -185,6 +186,16 @@ app.use(`${apiPrefix}/user-credentials`, userCredentialsRoutes);
 app.use(`${apiPrefix}/telegram/otp-relays`, parsePlatform('telegram'), otpRelayRoutes);
 app.use(`${apiPrefix}/otp-relays`, resolvePlatform, otpRelayRoutes);
 
+// In-panel Telegram client (per-session login → real chat UI). Mounted
+// ONLY under the Telegram namespace so the Instagram surface never
+// exposes it. Backed by `services/telegramClientService.js` and the
+// per-session GramJS clients already maintained by telegramService.
+app.use(
+  `${apiPrefix}/telegram/client`,
+  parsePlatform('telegram'),
+  telegramClientRoutes
+);
+
 // Instagram-only per-account 2FA (TOTP enable/disable/status). Telegram
 // has its own bulk-job model under /2fa-jobs which doesn't apply here.
 const instagramTwoFactorRoutes = require('./routes/instagramTwoFactor');
@@ -286,7 +297,65 @@ io.on('connection', (socket) => {
     socket.emit('notification', { type: 'info', message: 'Disconnect request received' });
   });
 
+  // ------------------------------------------------------------------
+  // In-panel Telegram client live-update subscription.
+  //
+  // The browser-side TG client window calls `tg-client:subscribe` after
+  // it connects (ack-style). The handler authorizes the session against
+  // the panel JWT's userId, joins the per-session room, and ensures the
+  // GramJS event handlers are attached on the backend client (via
+  // `telegramClientStream`). On disconnect we tear the subscription
+  // back down with refcount semantics so multiple windows for the same
+  // session share one set of handlers.
+  // ------------------------------------------------------------------
+  const tgClientStream = require('./services/telegramClientStream');
+  /** @type {Set<string>} sessionIds this socket is subscribed to */
+  const tgClientSubs = new Set();
+
+  socket.on('tg-client:subscribe', async (data, ack) => {
+    try {
+      const sessionId = data?.sessionId != null ? String(data.sessionId) : null;
+      if (!sessionId) {
+        const err = { ok: false, error: 'sessionId is required' };
+        if (typeof ack === 'function') ack(err);
+        return;
+      }
+      const result = await tgClientStream.attach(socket, sessionId, socket.userId);
+      tgClientSubs.add(sessionId);
+      if (typeof ack === 'function') ack({ ok: true, ...result });
+    } catch (err) {
+      logger.warn(`tg-client:subscribe failed: ${err.message}`);
+      if (typeof ack === 'function') ack({ ok: false, error: err.message });
+    }
+  });
+
+  socket.on('tg-client:unsubscribe', async (data, ack) => {
+    try {
+      const sessionId = data?.sessionId != null ? String(data.sessionId) : null;
+      if (!sessionId) {
+        if (typeof ack === 'function') ack({ ok: false, error: 'sessionId is required' });
+        return;
+      }
+      const result = await tgClientStream.detach(socket, sessionId, socket.userId);
+      tgClientSubs.delete(sessionId);
+      if (typeof ack === 'function') ack({ ok: true, ...result });
+    } catch (err) {
+      logger.warn(`tg-client:unsubscribe failed: ${err.message}`);
+      if (typeof ack === 'function') ack({ ok: false, error: err.message });
+    }
+  });
+
   socket.on('disconnect', () => {
+    // Tear down any tg-client subscriptions this socket left behind so
+    // GramJS event handlers aren't kept alive for an account no one is
+    // looking at anymore.
+    if (tgClientSubs.size > 0) {
+      const ids = Array.from(tgClientSubs);
+      tgClientSubs.clear();
+      Promise.all(
+        ids.map((sid) => tgClientStream.detach(socket, sid, socket.userId).catch(() => {}))
+      ).catch(() => {});
+    }
     logger.info(`User disconnected: ${socket.userId}`);
   });
 });

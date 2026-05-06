@@ -97,6 +97,10 @@ const capabilities = {
   twofa_change:           true,
   otp_passive:            false,  // IG has no passive OTP inbox
   otp_relay:              false,  // Saved-Messages relay is Telegram-only
+
+  // In-panel Telegram client — Telegram-only capability. Always false
+  // here so the IG sidebar never renders the "Login" entry.
+  telegram_client:        false,
 };
 
 // Lazy module loaders — keeps the IG runtime out of the cold-start path.

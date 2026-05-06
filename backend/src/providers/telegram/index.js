@@ -124,6 +124,14 @@ const capabilities = {
   twofa_change:           true,
   otp_passive:            true,   // alias of otp_passive_listen
   otp_relay:              true,   // Saved-Messages OTP relay (TG only)
+
+  // ---------------------------------------------------------------------
+  // In-panel Telegram client (per-session login → real chat UI).
+  // Telegram-only; the Instagram provider must NOT expose this flag.
+  // Backed by /api/telegram/client/* and a custom React Telegram-style
+  // chat surface that opens in its own window per session.
+  // ---------------------------------------------------------------------
+  telegram_client:        true,
 };
 
 // ---------------------------------------------------------------------------
