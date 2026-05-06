@@ -313,12 +313,22 @@ const scrapeController = {
     const format = req.body.format || req.query.format || 'csv';
     const ig = _isInstagram(req);
 
-    // Get filters
+    // Get filters. v19: default excludeBots to FALSE so the export
+    // reflects exactly what the scrape captured — operators were
+    // running scrapes with bot-filtering off and then getting CSVs
+    // that silently stripped every bot row anyway because the export
+    // endpoint was opt-out instead of opt-in. Callers that want a
+    // bots-removed CSV can still pass `excludeBots: true` explicitly.
+    const _bool = (v, fallback) => {
+      if (v === undefined || v === null) return fallback;
+      if (typeof v === 'boolean') return v;
+      return String(v).toLowerCase() === 'true';
+    };
     const filters = {
-      excludeBots: req.body.excludeBots !== undefined ? req.body.excludeBots === 'true' : true,
-      requireUsername: req.body.requireUsername === 'true',
-      requirePhone: req.body.requirePhone === 'true',
-      requirePhoto: req.body.requirePhoto === 'true',
+      excludeBots: _bool(req.body.excludeBots, false),
+      requireUsername: _bool(req.body.requireUsername, false),
+      requirePhone: _bool(req.body.requirePhone, false),
+      requirePhoto: _bool(req.body.requirePhoto, false),
       minBotScore: 0,
       maxBotScore: parseFloat(req.body.maxBotScore) || 1.0,
       columns: req.body.columns || null, // null = all columns

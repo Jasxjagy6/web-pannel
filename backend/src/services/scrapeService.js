@@ -370,7 +370,13 @@ class ScrapeService {
       const endTime = Date.now();
       const finalStatus = this._isCancelled(jobId) ? 'cancelled' : (results.errors > 0 ? 'completed_with_errors' : 'completed');
       
-      await this._updateJobStatus(jobId, finalStatus, { targetResults: results.targetResults });
+      await this._updateJobStatus(jobId, finalStatus, {
+        targetResults: results.targetResults,
+        // History page uses scraping_jobs.total_found for the "Users"
+        // column — make it equal to the rows actually persisted so the
+        // headline number matches the export contents.
+        totalFound: results.newUsers,
+      });
       await this._updateProgress(jobId, {
         status: finalStatus,
         endTime: new Date().toISOString(),
@@ -781,8 +787,16 @@ class ScrapeService {
       `;
 
       const result = await pool.query(query, values);
-      inserted += batch.length - parseInt(result.rowCount || 0);
-      duplicates += parseInt(result.rowCount || 0);
+      // Postgres returns rowCount = rows actually written, so for an
+      // INSERT ... ON CONFLICT DO NOTHING the inserted count IS rowCount
+      // and the duplicate count is whatever fell on the floor. The
+      // original code had these swapped, which made every successful
+      // scrape report `usersSaved: 0` even though every row was in fact
+      // persisted (you could see them in the export). Operators were
+      // taking that 0 to mean the scrape silently failed.
+      const written = parseInt(result.rowCount || 0);
+      inserted += written;
+      duplicates += batch.length - written;
     }
 
     // Best-effort: also persist the has_profile_photo / restriction_reason
