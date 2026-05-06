@@ -267,6 +267,12 @@ async function _executeScrapeJob(jobId) {
   const sessionIds = job.session_ids || [];
   const targets = job.target_ids || [];
   const limit = Number(job.options?.limit || job.options?.scrape_limit || 1000);
+  // Per-job proxy override. Default true (use the bound proxy);
+  // when the operator unticked "Use proxy" on the form the job
+  // runs from the panel IP. We mark each session row clone with
+  // _bypassProxy so igClient/igFetch skip the require_proxy gate
+  // for this execution only.
+  const bypassProxy = job.options?.use_proxy === false;
 
   const sessRows = await pool.query(
     `SELECT id, user_id, username, proxy_url, session_data, platform_state,
@@ -278,6 +284,15 @@ async function _executeScrapeJob(jobId) {
             NOT IN ('needs_attention', 'dead')`,
     [sessionIds]
   );
+  if (bypassProxy) {
+    for (const row of sessRows.rows) {
+      row._bypassProxy = true;
+    }
+    logger.info(
+      `IG.scrape job ${jobId}: proxy bypass enabled — running from panel IP ` +
+      `(operator unticked "Use proxy" on the form).`
+    );
+  }
   if (sessRows.rows.length === 0) {
     // Distinguish "no sessions at all" from "all flagged" so the
     // operator gets a clearer error in the job row.

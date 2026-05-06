@@ -226,6 +226,10 @@ async function sessionContext(sessionRow) {
     sessionId: sessionRow.id,
     username: sessionRow.username,
     proxyUrl: sessionRow.proxy_url || null,
+    // bypassProxy: when true, igFetch skips the require_proxy gate and
+    // sends requests directly from the panel host. Set on a session
+    // row clone by scrape jobs whose operator unticked "Use proxy".
+    bypassProxy: !!(sessionRow && sessionRow._bypassProxy === true),
     cookieHeader: header,
     csrftoken,
     dsUserId,
@@ -357,11 +361,16 @@ async function igFetch(ctx, url, opts = {}) {
     });
   }
 
-  if (!ctx.proxyUrl && (await _isProxyRequired())) {
+  // Per-call bypass takes precedence over the global require_proxy
+  // setting. When ctx.bypassProxy is true the request is sent direct
+  // from the panel host; the operator opted in via the scrape form's
+  // "Use proxy" checkbox.
+  if (!ctx.bypassProxy && !ctx.proxyUrl && (await _isProxyRequired())) {
     const e = new Error(
       `Instagram session ${ctx.sessionId || ''} has no proxy assigned. ` +
       `Direct egress from the panel host trips Instagram's data-centre filter on the first request. ` +
-      `Assign a residential proxy or disable security.instagram.require_proxy in system_settings to override.`
+      `Assign a residential proxy, untick "Use proxy" on the scrape form to run this single ` +
+      `job from the panel IP, or disable security.instagram.require_proxy in system_settings to override globally.`
     );
     e.kind = 'forbidden';
     e.statusCode = 400;
@@ -369,7 +378,7 @@ async function igFetch(ctx, url, opts = {}) {
     throw e;
   }
 
-  const dispatcher = _getDispatcher(ctx.proxyUrl);
+  const dispatcher = ctx.bypassProxy ? undefined : _getDispatcher(ctx.proxyUrl);
   const headers = browserHeaders(ctx, opts);
   const init = {
     method: opts.method || 'GET',

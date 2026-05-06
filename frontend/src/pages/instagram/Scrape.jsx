@@ -14,6 +14,7 @@ import {
   Trash2,
   RefreshCw,
   ListPlus,
+  ShieldAlert,
 } from 'lucide-react';
 import {
   scrapeGroup,
@@ -61,7 +62,22 @@ export default function InstagramScrape() {
   const [selectedSessions, setSelectedSessions] = useState([]);
   const [targetType, setTargetType] = useState('followers');
   const [targetUsernames, setTargetUsernames] = useState('');
-  const [limit, setLimit] = useState(1000);
+  // Pull defaults from the IG Settings page (localStorage). The
+  // `showProxyByDefault` flag is the operator's per-panel preference;
+  // it can still be flipped per-job by unticking the checkbox below.
+  const igPrefs = (() => {
+    try {
+      const raw = localStorage.getItem('ig:settings:v1');
+      if (!raw) return {};
+      return JSON.parse(raw) || {};
+    } catch (_) { return {}; }
+  })();
+  const [limit, setLimit] = useState(
+    Number(igPrefs.defaultScrapeLimit) > 0 ? Number(igPrefs.defaultScrapeLimit) : 1000
+  );
+  const [useProxy, setUseProxy] = useState(
+    typeof igPrefs.showProxyByDefault === 'boolean' ? igPrefs.showProxyByDefault : true
+  );
   const [submitting, setSubmitting] = useState(false);
 
   const [jobs, setJobs] = useState([]);
@@ -149,8 +165,14 @@ export default function InstagramScrape() {
         targetIds: targets,
         targetType,
         limit: Number(limit) || 1000,
+        useProxy,
       });
-      showToast('Scrape job queued', 'success');
+      showToast(
+        useProxy
+          ? 'Scrape job queued'
+          : 'Scrape job queued — running from panel IP (no proxy)',
+        useProxy ? 'success' : 'info'
+      );
       setTargetUsernames('');
       await reloadJobs();
     } catch (err) {
@@ -322,6 +344,37 @@ export default function InstagramScrape() {
                 </div>
               </div>
             </div>
+          </div>
+
+          <div className="rounded-lg border border-pink-100 bg-pink-50/40 p-3 dark:border-pink-900/30 dark:bg-pink-900/10">
+            <label className="flex items-start gap-2 cursor-pointer">
+              <input
+                type="checkbox"
+                className="mt-0.5 h-4 w-4 rounded border-pink-300 text-pink-600 focus:ring-pink-400"
+                checked={useProxy}
+                onChange={(e) => setUseProxy(e.target.checked)}
+              />
+              <div className="text-sm">
+                <div className="font-medium text-gray-800 dark:text-gray-100">
+                  Use proxy for this job
+                </div>
+                <div className="mt-0.5 text-xs text-gray-600 dark:text-gray-300">
+                  Recommended. Uses each session's bound proxy. Untick to run this single
+                  job from the panel's IP — useful when no proxy is available, but
+                  data-centre IPs may trip checkpoints faster.
+                </div>
+              </div>
+            </label>
+            {!useProxy && (
+              <div className="mt-2 flex items-start gap-2 rounded-md bg-amber-50 px-3 py-2 text-xs text-amber-900 dark:bg-amber-900/20 dark:text-amber-200">
+                <ShieldAlert className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+                <span>
+                  Proxy bypassed — this job will egress directly from the panel host. If
+                  Instagram flags the session, switch back to a residential proxy and rotate
+                  the cookies.
+                </span>
+              </div>
+            )}
           </div>
 
           <div className="flex items-center justify-end gap-2">

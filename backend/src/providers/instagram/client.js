@@ -89,20 +89,35 @@ async function _isProxyRequired() {
  * Return (or create) an IgApiClient for a given session row.
  *
  *   await provider.client.getClient(session) → IgApiClient
+ *   await provider.client.getClient(session, { bypassProxy: true }) → IgApiClient
+ *     built with proxyUrl=null and NOT cached, so subsequent normal
+ *     calls still receive the proxied long-lived client.
  *
  * Restores cookies + per-session pinned device/locale/version state
  * from `session_data` and `platform_state.fingerprint`. Throws clean
  * errors if the session is missing a proxy (and one is required) or
  * if the cookie blob doesn't carry valid auth cookies.
+ *
+ * `opts.bypassProxy` is the per-call override used by scrape jobs that
+ * the operator explicitly asked to run from the panel's egress IP.
+ * The session row itself is not mutated; the bypass applies to this
+ * call only.
  */
-async function getClient(session) {
+async function getClient(session, opts = {}) {
   _loadIgRuntime();
   if (!session || !session.id) {
     throw new Error('getClient(): session row required');
   }
+  const bypassProxy =
+    opts && opts.bypassProxy === true
+      ? true
+      : !!(session && session._bypassProxy === true);
 
+  // Cache hit only honoured for the default (proxied) path. A
+  // bypassProxy call always builds a fresh, non-cached client so
+  // we never serve a no-proxy client to a later non-bypass caller.
   const cached = _clientPool.get(session.id);
-  if (cached && cached.client) {
+  if (cached && cached.client && !bypassProxy) {
     cached.lastUsed = _now();
     return cached.client;
   }
@@ -116,24 +131,28 @@ async function getClient(session) {
   const pinned = await identity.getOrCreatePlatformState(session);
 
   // Proxy enforcement — data-centre egress is the #1 cause of
-  // checkpoint_required on uploaded sessions.
-  if (!session.proxy_url && (await _isProxyRequired())) {
+  // checkpoint_required on uploaded sessions. Skipped when the caller
+  // explicitly asked to bypass proxy for this call (operator-driven
+  // scrape from the panel IP).
+  if (!bypassProxy && !session.proxy_url && (await _isProxyRequired())) {
     const e = new Error(
       `Instagram session ${session.id} (${session.username || ''}) has no proxy assigned. ` +
       `Direct egress from the panel host trips Instagram's data-centre filter on the first ` +
-      `request. Assign a residential proxy via /api/proxies or disable ` +
-      `security.instagram.require_proxy in system_settings to override.`
+      `request. Assign a residential proxy via /api/proxies, untick "Use proxy" on the ` +
+      `scrape form to run this single job from the panel IP, or disable ` +
+      `security.instagram.require_proxy in system_settings to override globally.`
     );
     e.statusCode = 400;
     e.code = 'PROXY_REQUIRED';
     throw e;
   }
 
+  const effectiveProxyUrl = bypassProxy ? null : (session.proxy_url || null);
   const { client, appVersion, locale } = clientFactory.createPinnedClient({
     seed: pinned.seed,
     appVersion: pinned.appVersion,
     locale: pinned.locale,
-    proxyUrl: session.proxy_url || null,
+    proxyUrl: effectiveProxyUrl,
   });
 
   // Restore previous cookies + device blob if we have one. Atomic:
@@ -243,19 +262,21 @@ async function getClient(session) {
     }
   }
 
-  _clientPool.set(session.id, {
-    client,
-    lastUsed: _now(),
-    warmed: false,
-    apiMode: pinned.apiMode,
-    appVersion: appVersion.app_version,
-    language: locale.language,
-  });
+  if (!bypassProxy) {
+    _clientPool.set(session.id, {
+      client,
+      lastUsed: _now(),
+      warmed: false,
+      apiMode: pinned.apiMode,
+      appVersion: appVersion.app_version,
+      language: locale.language,
+    });
+  }
 
   logger.info(
     `IG.getClient sessionId=${session.id} username=${session.username} ` +
     `apiMode=${pinned.apiMode} appVersion=${appVersion.app_version} ` +
-    `language=${locale.language} proxy=${session.proxy_url ? 'yes' : 'no'}`
+    `language=${locale.language} proxy=${effectiveProxyUrl ? 'yes' : (bypassProxy ? 'bypassed' : 'no')}`
   );
   return client;
 }

@@ -63,13 +63,25 @@ const scrapeController = {
       const igTargetType = ['followers', 'following', 'likers', 'commenters', 'tagged']
         .includes(bodyTargetType) ? bodyTargetType : 'followers';
 
+      // Per-job proxy override (frontend "Use proxy" checkbox). Default
+      // is true (respect the per-session proxy binding); when the
+      // operator unticks the box we propagate use_proxy=false through
+      // the job options so the scrape executor skips proxy enforcement
+      // for this single job. Accept any body shape — `useProxy`,
+      // `use_proxy`, or `proxy: false` — to be defensive.
+      const bodyUseProxy =
+        typeof req.body.useProxy !== 'undefined' ? req.body.useProxy
+          : typeof req.body.use_proxy !== 'undefined' ? req.body.use_proxy
+            : (req.body.proxy === false ? false : undefined);
+      const useProxy = bodyUseProxy === false ? false : true;
+
       const job = await req.provider.scrape.createScrapeJob({
         userId,
         sessionIds: sessions.map((x) => parseInt(x, 10)),
         targetType: igTargetType,
         targetIdentifiers: targets.map(String),
         limit: parseInt(limit, 10) || 1000,
-        options: { saveToList, listName },
+        options: { saveToList, listName, use_proxy: useProxy },
       });
 
       await reportService.logActivity(userId, 'scrape_start', 'scrape_job', job.id, {
@@ -78,6 +90,7 @@ const scrapeController = {
         sessionCount: sessions.length,
         targetCount: targets.length,
         limit,
+        useProxy,
       });
 
       return res.status(202).json({
