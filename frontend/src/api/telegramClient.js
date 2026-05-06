@@ -386,3 +386,94 @@ export const addContact = (sessionId, payload) =>
 
 export const deleteContacts = (sessionId, ids) =>
   api.delete(`${BASE}/sessions/${sessionId}/contacts`, { data: { ids } });
+
+// --- D12 — drafts --------------------------------------------------------
+
+export const getAllDrafts = (sessionId) =>
+  api.get(`${BASE}/sessions/${sessionId}/drafts`);
+
+export const saveDraft = (sessionId, peerType, peerId, payload) =>
+  api.post(`${BASE}/sessions/${sessionId}/drafts/${peerType}/${peerId}`, payload);
+
+export const clearDraft = (sessionId, peerType, peerId) =>
+  api.delete(`${BASE}/sessions/${sessionId}/drafts/${peerType}/${peerId}`);
+
+// --- D13 — pinned messages ----------------------------------------------
+
+export const getPinnedMessages = (sessionId, peerType, peerId, params = {}) =>
+  api.get(
+    `${BASE}/sessions/${sessionId}/dialogs/${peerType}/${peerId}/pinned`,
+    { params }
+  );
+
+export const pinMessage = (sessionId, peerType, peerId, messageId, payload = {}) =>
+  api.post(
+    `${BASE}/sessions/${sessionId}/dialogs/${peerType}/${peerId}/pinned/${messageId}`,
+    payload
+  );
+
+export const unpinMessage = (sessionId, peerType, peerId, messageId) =>
+  api.delete(
+    `${BASE}/sessions/${sessionId}/dialogs/${peerType}/${peerId}/pinned/${messageId}`
+  );
+
+export const unpinAllMessages = (sessionId, peerType, peerId) =>
+  api.delete(
+    `${BASE}/sessions/${sessionId}/dialogs/${peerType}/${peerId}/pinned`
+  );
+
+// --- D4 — search ---------------------------------------------------------
+
+export const searchInChat = (sessionId, peerType, peerId, params = {}) =>
+  api.get(
+    `${BASE}/sessions/${sessionId}/dialogs/${peerType}/${peerId}/search`,
+    { params }
+  );
+
+export const searchGlobal = (sessionId, params = {}) =>
+  api.get(`${BASE}/sessions/${sessionId}/search`, { params });
+
+// --- D11 — stickers / GIFs ----------------------------------------------
+
+export const getStickerSets = (sessionId) =>
+  api.get(`${BASE}/sessions/${sessionId}/stickers/sets`);
+
+export const getRecentStickers = (sessionId) =>
+  api.get(`${BASE}/sessions/${sessionId}/stickers/recent`);
+
+export const getFavoriteStickers = (sessionId) =>
+  api.get(`${BASE}/sessions/${sessionId}/stickers/favorite`);
+
+export const searchStickers = (sessionId, q) =>
+  api.get(`${BASE}/sessions/${sessionId}/stickers/search`, { params: { q } });
+
+export const getSavedGifs = (sessionId) =>
+  api.get(`${BASE}/sessions/${sessionId}/gifs/saved`);
+
+export const searchGifs = (sessionId, q, offset) =>
+  api.get(`${BASE}/sessions/${sessionId}/gifs/search`, {
+    params: { q, ...(offset ? { offset } : {}) },
+  });
+
+/**
+ * Fetch a sticker / GIF document by id+accessHash+fileReference.
+ * Returns a blob URL or null on 204. Used by the picker thumbnails.
+ */
+export const getClientMedia = async (sessionId, payload = {}) => {
+  if (!payload.documentId || !payload.accessHash || !payload.fileReference) return null;
+  const params = {
+    accessHash: String(payload.accessHash),
+    fileReference: String(payload.fileReference),
+    ...(payload.thumb ? { thumb: 1 } : {}),
+  };
+  const { data, status } = await api.get(
+    `${BASE}/sessions/${sessionId}/documents/${payload.documentId}/media`,
+    {
+      responseType: 'blob',
+      params,
+      validateStatus: (s) => (s >= 200 && s < 300) || s === 204,
+    }
+  );
+  if (status === 204 || !data || (data.size != null && data.size === 0)) return null;
+  return URL.createObjectURL(data);
+};

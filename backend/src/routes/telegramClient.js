@@ -149,4 +149,28 @@ router.get('/sessions/:id/contacts/search',   controller.searchContacts);
 router.post('/sessions/:id/contacts',         controller.addContact);
 router.delete('/sessions/:id/contacts',       controller.deleteContacts);
 
+// --- Drafts (D12) --------------------------------------------------------
+router.get('/sessions/:id/drafts',                                       controller.getAllDrafts);
+router.post('/sessions/:id/drafts/:peerType/:peerId',                    controller.saveDraft);
+router.delete('/sessions/:id/drafts/:peerType/:peerId',                  controller.clearDraft);
+
+// --- Pinned messages (D13) ----------------------------------------------
+router.get('/sessions/:id/dialogs/:peerType/:peerId/pinned',                    controller.getPinnedMessages);
+router.post('/sessions/:id/dialogs/:peerType/:peerId/pinned/:messageId',        controller.pinMessage);
+router.delete('/sessions/:id/dialogs/:peerType/:peerId/pinned/:messageId',      controller.unpinMessage);
+router.delete('/sessions/:id/dialogs/:peerType/:peerId/pinned',                 controller.unpinAllMessages);
+
+// --- Search (D4) ---------------------------------------------------------
+router.get('/sessions/:id/dialogs/:peerType/:peerId/search',  controller.searchInChat);
+router.get('/sessions/:id/search',                            controller.searchGlobal);
+
+// --- Stickers / GIFs (D11) ----------------------------------------------
+router.get('/sessions/:id/stickers/sets',         controller.getStickerSets);
+router.get('/sessions/:id/stickers/recent',       controller.getRecentStickers);
+router.get('/sessions/:id/stickers/favorite',     controller.getFavoriteStickers);
+router.get('/sessions/:id/stickers/search',       controller.searchStickers);
+router.get('/sessions/:id/gifs/saved',            controller.getSavedGifs);
+router.get('/sessions/:id/gifs/search',           controller.searchGifs);
+router.get('/sessions/:id/documents/:documentId/media', controller.getDocumentMedia);
+
 module.exports = router;

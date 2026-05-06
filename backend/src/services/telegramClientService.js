@@ -166,6 +166,28 @@ function _normalizeDialog(dialog, ownId) {
     pinned: !!dialog.pinned,
     folderId: dialog.folderId ?? null,
     lastMessage,
+    draft: _normalizeDraft(dialog.draft),
+  };
+}
+
+/**
+ * Normalize a GramJS DraftMessage / DraftMessageEmpty.
+ *
+ * Returns null for empty drafts so the UI can use truthiness to decide
+ * whether to render the "Draft: …" preview.
+ */
+function _normalizeDraft(draft) {
+  if (!draft) return null;
+  if (draft.className === 'DraftMessageEmpty') return null;
+  const text = String(draft.message || '').trim();
+  if (!text && !draft.media) return null;
+  return {
+    text: draft.message || '',
+    date: _toIsoDate(draft.date),
+    replyToMsgId: _toIdNum(
+      draft.replyTo?.replyToMsgId ?? draft.replyToMsgId ?? null
+    ),
+    noWebpage: !!draft.noWebpage,
   };
 }
 
@@ -1104,6 +1126,102 @@ class TelegramClientService {
         if (n >= drop) break;
       }
     }
+    return value;
+  }
+
+  /**
+   * Download a sticker / GIF / saved-document by (id, accessHash,
+   * fileReference). Used by the in-panel emoji/sticker/GIF picker.
+   *
+   * Uses the same per-session cache as message media so a sticker
+   * thumb fetched in the picker is reused when the same sticker is
+   * received in a chat.
+   */
+  async downloadDocumentMedia(sessionId, userId, documentId, accessHash, fileReference, opts = {}) {
+    const thumb = opts.thumb === true;
+    if (documentId == null || accessHash == null || !fileReference) {
+      throw new AppError(
+        'documentId, accessHash and fileReference are required',
+        400,
+        'DOC_REF_REQUIRED'
+      );
+    }
+    const cacheKey = `doc:${sessionId}:${documentId}:${thumb ? 1 : 0}`;
+    const cached = _MEDIA_CACHE.get(cacheKey);
+    if (cached && Date.now() - cached.t < MEDIA_CACHE_TTL_MS) {
+      return cached.v;
+    }
+    await _loadAndAuthSession(sessionId, userId);
+    await tgService._ensureConnected(sessionId);
+    const entry = tgService.clients.get(String(sessionId));
+    if (!entry) throw new AppError('Session client not loaded', 500, 'CLIENT_NOT_LOADED');
+
+    let inputDoc;
+    try {
+      inputDoc = new Api.InputDocument({
+        id: _toBigInt(documentId),
+        accessHash: _toBigInt(accessHash),
+        fileReference: _decodeFileRef(fileReference),
+      });
+    } catch (err) {
+      throw new AppError(`Invalid document reference: ${err.message}`, 400, 'DOC_REF_INVALID');
+    }
+
+    let buf = null;
+    try {
+      if (thumb) {
+        // Fetch the smallest preview (gif/sticker thumbnails are
+        // already tiny — telegram serves an embedded thumb on the
+        // message wrapper). For raw documents we ask for thumb 'm'.
+        buf = await entry.client.downloadFile(
+          new Api.InputDocumentFileLocation({
+            id: inputDoc.id,
+            accessHash: inputDoc.accessHash,
+            fileReference: inputDoc.fileReference,
+            thumbSize: 'm',
+          }),
+          { dcId: undefined, fileSize: undefined, partSizeKb: 64 }
+        );
+      } else {
+        buf = await entry.client.downloadFile(
+          new Api.InputDocumentFileLocation({
+            id: inputDoc.id,
+            accessHash: inputDoc.accessHash,
+            fileReference: inputDoc.fileReference,
+            thumbSize: '',
+          }),
+          { dcId: undefined, fileSize: undefined }
+        );
+      }
+    } catch (err) {
+      logger.warn(`downloadDocumentMedia failed for doc ${documentId} (thumb=${thumb}): ${err.message}`);
+      // Try the alternate thumbSize as a fallback.
+      try {
+        buf = await entry.client.downloadFile(
+          new Api.InputDocumentFileLocation({
+            id: inputDoc.id,
+            accessHash: inputDoc.accessHash,
+            fileReference: inputDoc.fileReference,
+            thumbSize: thumb ? '' : 'm',
+          }),
+          {}
+        );
+      } catch (_) { buf = null; }
+    }
+    if (!buf || (buf.length != null && buf.length === 0)) return null;
+
+    const value = {
+      buffer: Buffer.isBuffer(buf) ? buf : Buffer.from(buf),
+      mimeType: thumb ? 'image/jpeg' : 'application/octet-stream',
+      fileName: `doc-${documentId}`,
+      kind: 'document',
+      width: null,
+      height: null,
+      duration: null,
+      isThumb: !!thumb,
+      docId: String(documentId),
+    };
+    _MEDIA_CACHE.set(cacheKey, { t: Date.now(), v: value });
     return value;
   }
 
@@ -2986,6 +3104,806 @@ class TelegramClientService {
       logger.debug(`tg-client contacts broadcast failed: ${err.message}`);
     }
   }
+
+  // ---------------------------------------------------------------------
+  // D12 — Drafts
+  // ---------------------------------------------------------------------
+
+  /**
+   * Save a per-chat draft on Telegram's servers.
+   *
+   * Telegram exposes drafts as a server-side feature so the same chat
+   * shows the same draft on every device. We use messages.SaveDraft
+   * which both writes the draft and broadcasts an UpdateDraftMessage to
+   * other listening sessions.
+   */
+  async saveDraft(sessionId, userId, peerType, peerId, payload = {}) {
+    if (!PEER_TYPES.has(peerType)) {
+      throw new AppError('Invalid peer type', 400, 'INVALID_PEER_TYPE');
+    }
+    const text = String(payload.text ?? '').slice(0, 4096);
+    await _loadAndAuthSession(sessionId, userId);
+    await tgService._ensureConnected(sessionId);
+    const entry = tgService.clients.get(String(sessionId));
+    if (!entry) throw new AppError('Session client not loaded', 500, 'CLIENT_NOT_LOADED');
+
+    let inputPeer;
+    try {
+      inputPeer = await entry.client.getInputEntity(_buildPeerInput(peerType, peerId));
+    } catch (err) {
+      throw new AppError(`Could not resolve peer: ${err.message}`, 404, 'PEER_NOT_FOUND');
+    }
+
+    const params = {
+      peer: inputPeer,
+      message: text,
+      noWebpage: !!payload.noWebpage,
+    };
+    const replyToMsgId = parseInt(payload.replyToMsgId, 10);
+    if (Number.isFinite(replyToMsgId) && replyToMsgId > 0) {
+      params.replyTo = new Api.InputReplyToMessage({ replyToMsgId });
+    }
+
+    try {
+      await entry.client.invoke(new Api.messages.SaveDraft(params));
+    } catch (err) {
+      throw new AppError(`SaveDraft failed: ${err.message}`, 502, 'SAVE_DRAFT_FAILED');
+    }
+
+    return {
+      peerType,
+      peerId: _toIdNum(peerId),
+      draft: text || (params.replyTo)
+        ? {
+            text,
+            date: new Date().toISOString(),
+            replyToMsgId: params.replyTo ? replyToMsgId : null,
+            noWebpage: !!payload.noWebpage,
+          }
+        : null,
+    };
+  }
+
+  /**
+   * Clear the draft for a single chat.
+   *
+   * Telegram does this with messages.SaveDraft({ message: '' }), which
+   * server-side maps to DraftMessageEmpty.
+   */
+  async clearDraft(sessionId, userId, peerType, peerId) {
+    return this.saveDraft(sessionId, userId, peerType, peerId, { text: '' });
+  }
+
+  /**
+   * Get every draft the account has across all chats.
+   *
+   * Returns a list keyed by peerType/peerId so the UI can render them
+   * inline in the dialog list (the DialogList already gets per-row
+   * drafts via getDialogs, but a fresh page-load — or a cross-window
+   * sync — uses this endpoint to refresh).
+   */
+  async getAllDrafts(sessionId, userId) {
+    await _loadAndAuthSession(sessionId, userId);
+    await tgService._ensureConnected(sessionId);
+    const entry = tgService.clients.get(String(sessionId));
+    if (!entry) throw new AppError('Session client not loaded', 500, 'CLIENT_NOT_LOADED');
+
+    let res;
+    try {
+      res = await entry.client.invoke(new Api.messages.GetAllDrafts());
+    } catch (err) {
+      throw new AppError(`GetAllDrafts failed: ${err.message}`, 502, 'GET_ALL_DRAFTS_FAILED');
+    }
+
+    const updates = res?.updates || [];
+    const drafts = [];
+    for (const u of updates) {
+      if (u?.className !== 'UpdateDraftMessage') continue;
+      const peer = u.peer;
+      let peerType = null;
+      let peerIdNum = null;
+      if (peer?.userId != null) { peerType = 'user'; peerIdNum = _toIdNum(peer.userId); }
+      else if (peer?.chatId != null) { peerType = 'chat'; peerIdNum = _toIdNum(peer.chatId); }
+      else if (peer?.channelId != null) { peerType = 'channel'; peerIdNum = _toIdNum(peer.channelId); }
+      if (!peerType || peerIdNum == null) continue;
+      const norm = _normalizeDraft(u.draft);
+      if (!norm) continue;
+      drafts.push({ peerType, peerId: peerIdNum, draft: norm });
+    }
+    return { drafts };
+  }
+
+  // ---------------------------------------------------------------------
+  // D13 — Pinned messages
+  // ---------------------------------------------------------------------
+
+  /**
+   * Toggle the pinned flag on one message.
+   *
+   * @param {boolean} unpin    if true, unpin the message
+   * @param {boolean} silent   if true, don't notify chat members
+   * @param {boolean} pmOneside  in 1-on-1 chats, pin only on the caller's side
+   */
+  async setMessagePin(sessionId, userId, peerType, peerId, messageId, opts = {}) {
+    if (!PEER_TYPES.has(peerType)) {
+      throw new AppError('Invalid peer type', 400, 'INVALID_PEER_TYPE');
+    }
+    const idNum = parseInt(messageId, 10);
+    if (!Number.isFinite(idNum) || idNum <= 0) {
+      throw new AppError('Invalid messageId', 400, 'INVALID_MESSAGE_ID');
+    }
+    await _loadAndAuthSession(sessionId, userId);
+    await tgService._ensureConnected(sessionId);
+    const entry = tgService.clients.get(String(sessionId));
+    if (!entry) throw new AppError('Session client not loaded', 500, 'CLIENT_NOT_LOADED');
+
+    let inputPeer;
+    try {
+      inputPeer = await entry.client.getInputEntity(_buildPeerInput(peerType, peerId));
+    } catch (err) {
+      throw new AppError(`Could not resolve peer: ${err.message}`, 404, 'PEER_NOT_FOUND');
+    }
+
+    try {
+      await entry.client.invoke(new Api.messages.UpdatePinnedMessage({
+        peer: inputPeer,
+        id: idNum,
+        unpin: !!opts.unpin,
+        silent: !!opts.silent,
+        pmOneside: !!opts.pmOneside,
+      }));
+    } catch (err) {
+      throw new AppError(`UpdatePinnedMessage failed: ${err.message}`, 502, 'PIN_FAILED');
+    }
+
+    return {
+      peerType,
+      peerId: _toIdNum(peerId),
+      messageId: idNum,
+      pinned: !opts.unpin,
+    };
+  }
+
+  async pinMessage(sessionId, userId, peerType, peerId, messageId, opts = {}) {
+    return this.setMessagePin(sessionId, userId, peerType, peerId, messageId, {
+      ...opts, unpin: false,
+    });
+  }
+
+  async unpinMessage(sessionId, userId, peerType, peerId, messageId) {
+    return this.setMessagePin(sessionId, userId, peerType, peerId, messageId, {
+      unpin: true,
+    });
+  }
+
+  /**
+   * Unpin every pinned message in a chat in one round-trip.
+   */
+  async unpinAllMessages(sessionId, userId, peerType, peerId) {
+    if (!PEER_TYPES.has(peerType)) {
+      throw new AppError('Invalid peer type', 400, 'INVALID_PEER_TYPE');
+    }
+    await _loadAndAuthSession(sessionId, userId);
+    await tgService._ensureConnected(sessionId);
+    const entry = tgService.clients.get(String(sessionId));
+    if (!entry) throw new AppError('Session client not loaded', 500, 'CLIENT_NOT_LOADED');
+
+    let inputPeer;
+    try {
+      inputPeer = await entry.client.getInputEntity(_buildPeerInput(peerType, peerId));
+    } catch (err) {
+      throw new AppError(`Could not resolve peer: ${err.message}`, 404, 'PEER_NOT_FOUND');
+    }
+
+    try {
+      await entry.client.invoke(new Api.messages.UnpinAllMessages({ peer: inputPeer }));
+    } catch (err) {
+      throw new AppError(`UnpinAllMessages failed: ${err.message}`, 502, 'UNPIN_ALL_FAILED');
+    }
+
+    return {
+      peerType,
+      peerId: _toIdNum(peerId),
+      pinned: false,
+    };
+  }
+
+  /**
+   * Fetch every pinned message in a chat (newest first).
+   *
+   * Telegram exposes this as messages.Search with InputMessagesFilterPinned;
+   * the response is the same shape as a regular message list, so we can
+   * reuse `_normalizeMessage`.
+   */
+  async getPinnedMessages(sessionId, userId, peerType, peerId, opts = {}) {
+    if (!PEER_TYPES.has(peerType)) {
+      throw new AppError('Invalid peer type', 400, 'INVALID_PEER_TYPE');
+    }
+    await _loadAndAuthSession(sessionId, userId);
+    await tgService._ensureConnected(sessionId);
+    const entry = tgService.clients.get(String(sessionId));
+    if (!entry) throw new AppError('Session client not loaded', 500, 'CLIENT_NOT_LOADED');
+
+    const me = await tgService.getMe(sessionId).catch(() => null);
+    const ownId = me ? _toIdNum(me.id) : null;
+
+    let entity;
+    try {
+      entity = await entry.client.getEntity(_buildPeerInput(peerType, peerId));
+    } catch (err) {
+      throw new AppError(`Could not resolve peer: ${err.message}`, 404, 'PEER_NOT_FOUND');
+    }
+
+    const limit = Math.min(
+      Math.max(1, parseInt(opts.limit, 10) || 50),
+      100
+    );
+    const offsetId = parseInt(opts.offsetId, 10) || 0;
+
+    let res;
+    try {
+      res = await entry.client.invoke(new Api.messages.Search({
+        peer: entity,
+        q: '',
+        filter: new Api.InputMessagesFilterPinned(),
+        minDate: 0,
+        maxDate: 0,
+        offsetId,
+        addOffset: 0,
+        limit,
+        maxId: 0,
+        minId: 0,
+        hash: BigInt(0),
+      }));
+    } catch (err) {
+      throw new AppError(`Search(pinned) failed: ${err.message}`, 502, 'GET_PINNED_FAILED');
+    }
+
+    const dialogPeer = entity.id != null ? { [`${peerType}Id`]: entity.id } : null;
+    const messages = (res.messages || [])
+      .map((m) => _normalizeMessage(m, ownId, dialogPeer))
+      .filter(Boolean);
+
+    const senders = new Map();
+    for (const u of res.users || []) {
+      const sn = _normalizeSender(u);
+      if (sn) senders.set(`${sn.peerType}:${sn.peerId}`, sn);
+    }
+    for (const c of res.chats || []) {
+      const sn = _normalizeSender(c);
+      if (sn) senders.set(`${sn.peerType}:${sn.peerId}`, sn);
+    }
+
+    return {
+      peerType,
+      peerId: _toIdNum(entity.id),
+      messages,
+      senders: Array.from(senders.values()),
+      total: res.count ?? messages.length,
+    };
+  }
+
+  // ---------------------------------------------------------------------
+  // D4 — Search
+  // ---------------------------------------------------------------------
+
+  /**
+   * Search messages within one chat (messages.Search with default filter).
+   */
+  async searchInChat(sessionId, userId, peerType, peerId, q, opts = {}) {
+    if (!PEER_TYPES.has(peerType)) {
+      throw new AppError('Invalid peer type', 400, 'INVALID_PEER_TYPE');
+    }
+    const query = String(q || '').trim();
+    if (!query && !opts.filter) {
+      throw new AppError('Search query is required', 400, 'SEARCH_QUERY_REQUIRED');
+    }
+    await _loadAndAuthSession(sessionId, userId);
+    await tgService._ensureConnected(sessionId);
+    const entry = tgService.clients.get(String(sessionId));
+    if (!entry) throw new AppError('Session client not loaded', 500, 'CLIENT_NOT_LOADED');
+
+    const me = await tgService.getMe(sessionId).catch(() => null);
+    const ownId = me ? _toIdNum(me.id) : null;
+
+    let entity;
+    try {
+      entity = await entry.client.getEntity(_buildPeerInput(peerType, peerId));
+    } catch (err) {
+      throw new AppError(`Could not resolve peer: ${err.message}`, 404, 'PEER_NOT_FOUND');
+    }
+
+    const limit = Math.min(
+      Math.max(1, parseInt(opts.limit, 10) || 30),
+      100
+    );
+    const offsetId = parseInt(opts.offsetId, 10) || 0;
+    const filter = _buildSearchFilter(opts.filter);
+
+    let res;
+    try {
+      res = await entry.client.invoke(new Api.messages.Search({
+        peer: entity,
+        q: query,
+        filter,
+        minDate: 0,
+        maxDate: 0,
+        offsetId,
+        addOffset: 0,
+        limit,
+        maxId: 0,
+        minId: 0,
+        hash: BigInt(0),
+        fromId: opts.fromId
+          ? await entry.client.getInputEntity(_buildPeerInput('user', opts.fromId)).catch(() => null)
+          : undefined,
+      }));
+    } catch (err) {
+      throw new AppError(`Search failed: ${err.message}`, 502, 'SEARCH_FAILED');
+    }
+
+    const dialogPeer = entity.id != null ? { [`${peerType}Id`]: entity.id } : null;
+    const messages = (res.messages || [])
+      .map((m) => _normalizeMessage(m, ownId, dialogPeer))
+      .filter(Boolean);
+
+    const senders = new Map();
+    for (const u of res.users || []) {
+      const sn = _normalizeSender(u);
+      if (sn) senders.set(`${sn.peerType}:${sn.peerId}`, sn);
+    }
+    for (const c of res.chats || []) {
+      const sn = _normalizeSender(c);
+      if (sn) senders.set(`${sn.peerType}:${sn.peerId}`, sn);
+    }
+
+    const nextOffsetId = messages.length
+      ? Math.min(...messages.map((m) => Number(m.id)).filter((n) => Number.isFinite(n)))
+      : 0;
+
+    return {
+      peerType,
+      peerId: _toIdNum(entity.id),
+      query,
+      filter: opts.filter || 'all',
+      messages,
+      senders: Array.from(senders.values()),
+      total: res.count ?? messages.length,
+      nextOffsetId,
+    };
+  }
+
+  /**
+   * Search messages across every chat the account participates in
+   * (messages.SearchGlobal).
+   */
+  async searchGlobal(sessionId, userId, q, opts = {}) {
+    const query = String(q || '').trim();
+    if (!query) {
+      throw new AppError('Search query is required', 400, 'SEARCH_QUERY_REQUIRED');
+    }
+    await _loadAndAuthSession(sessionId, userId);
+    await tgService._ensureConnected(sessionId);
+    const entry = tgService.clients.get(String(sessionId));
+    if (!entry) throw new AppError('Session client not loaded', 500, 'CLIENT_NOT_LOADED');
+
+    const me = await tgService.getMe(sessionId).catch(() => null);
+    const ownId = me ? _toIdNum(me.id) : null;
+
+    const limit = Math.min(
+      Math.max(1, parseInt(opts.limit, 10) || 30),
+      100
+    );
+    const filter = _buildSearchFilter(opts.filter);
+
+    let res;
+    try {
+      res = await entry.client.invoke(new Api.messages.SearchGlobal({
+        q: query,
+        filter,
+        minDate: 0,
+        maxDate: 0,
+        offsetRate: parseInt(opts.offsetRate, 10) || 0,
+        offsetPeer: new Api.InputPeerEmpty(),
+        offsetId: parseInt(opts.offsetId, 10) || 0,
+        limit,
+      }));
+    } catch (err) {
+      throw new AppError(`SearchGlobal failed: ${err.message}`, 502, 'SEARCH_GLOBAL_FAILED');
+    }
+
+    const userById = new Map();
+    for (const u of res.users || []) userById.set(String(_toIdNum(u.id)), u);
+    const chatById = new Map();
+    for (const c of res.chats || []) chatById.set(String(_toIdNum(c.id)), c);
+
+    const messages = [];
+    const chatHints = new Map();
+    for (const m of res.messages || []) {
+      const peer = m.peerId;
+      const chatPeerType = peer?.channelId ? 'channel'
+        : peer?.chatId ? 'chat'
+        : peer?.userId ? 'user'
+        : null;
+      const chatPeerId = _toIdNum(peer?.channelId ?? peer?.chatId ?? peer?.userId ?? null);
+      const norm = _normalizeMessage(m, ownId, peer);
+      if (!norm) continue;
+      let chat = null;
+      if (chatPeerType && chatPeerId != null) {
+        const lookup = chatPeerType === 'user'
+          ? userById.get(String(chatPeerId))
+          : chatById.get(String(chatPeerId));
+        if (lookup) {
+          chat = {
+            peerType: chatPeerType,
+            peerId: chatPeerId,
+            title: _entityTitle(lookup),
+            username: lookup.username || null,
+          };
+          chatHints.set(`${chatPeerType}:${chatPeerId}`, chat);
+        } else {
+          chat = { peerType: chatPeerType, peerId: chatPeerId, title: '', username: null };
+        }
+      }
+      messages.push({ ...norm, chat });
+    }
+
+    const senders = new Map();
+    for (const u of res.users || []) {
+      const sn = _normalizeSender(u);
+      if (sn) senders.set(`${sn.peerType}:${sn.peerId}`, sn);
+    }
+    for (const c of res.chats || []) {
+      const sn = _normalizeSender(c);
+      if (sn) senders.set(`${sn.peerType}:${sn.peerId}`, sn);
+    }
+
+    const nextOffsetRate = res.nextRate || 0;
+    const nextOffsetId = messages.length ? Math.min(...messages.map((m) => Number(m.id)).filter(Number.isFinite)) : 0;
+
+    return {
+      query,
+      filter: opts.filter || 'all',
+      messages,
+      chats: Array.from(chatHints.values()),
+      senders: Array.from(senders.values()),
+      total: res.count ?? messages.length,
+      nextOffsetRate,
+      nextOffsetId,
+    };
+  }
+
+  // ---------------------------------------------------------------------
+  // D11 — Stickers / GIFs
+  // ---------------------------------------------------------------------
+
+  /**
+   * Internal cache for sticker / GIF responses. Telegram's sticker
+   * endpoints are slow (50–200 KB payload, several DB hits server-side)
+   * and the data only changes when the user installs / uninstalls a
+   * pack, so we keep a 5-minute per-session memo.
+   */
+  _stickerCacheGet(sessionId, key) {
+    if (!this._stickerCache) this._stickerCache = new Map();
+    const k = `${sessionId}|${key}`;
+    const entry = this._stickerCache.get(k);
+    if (!entry) return null;
+    if (entry.expires < Date.now()) {
+      this._stickerCache.delete(k);
+      return null;
+    }
+    return entry.value;
+  }
+
+  _stickerCacheSet(sessionId, key, value, ttlMs = 5 * 60 * 1000) {
+    if (!this._stickerCache) this._stickerCache = new Map();
+    const k = `${sessionId}|${key}`;
+    this._stickerCache.set(k, { value, expires: Date.now() + ttlMs });
+  }
+
+  _stickerCacheInvalidate(sessionId) {
+    if (!this._stickerCache) return;
+    const prefix = `${sessionId}|`;
+    for (const key of this._stickerCache.keys()) {
+      if (key.startsWith(prefix)) this._stickerCache.delete(key);
+    }
+  }
+
+  /**
+   * Installed sticker sets (messages.GetAllStickers).
+   */
+  async getStickerSets(sessionId, userId) {
+    await _loadAndAuthSession(sessionId, userId);
+    const cached = this._stickerCacheGet(sessionId, 'sets');
+    if (cached) return cached;
+    await tgService._ensureConnected(sessionId);
+    const entry = tgService.clients.get(String(sessionId));
+    if (!entry) throw new AppError('Session client not loaded', 500, 'CLIENT_NOT_LOADED');
+
+    let res;
+    try {
+      res = await entry.client.invoke(new Api.messages.GetAllStickers({ hash: BigInt(0) }));
+    } catch (err) {
+      throw new AppError(`GetAllStickers failed: ${err.message}`, 502, 'STICKERS_FAILED');
+    }
+    const sets = (res?.sets || []).map((s) => _normalizeStickerSet(s));
+    const out = { sets };
+    this._stickerCacheSet(sessionId, 'sets', out);
+    return out;
+  }
+
+  /**
+   * Recently used stickers (messages.GetRecentStickers).
+   */
+  async getRecentStickers(sessionId, userId) {
+    await _loadAndAuthSession(sessionId, userId);
+    const cached = this._stickerCacheGet(sessionId, 'recent');
+    if (cached) return cached;
+    await tgService._ensureConnected(sessionId);
+    const entry = tgService.clients.get(String(sessionId));
+    if (!entry) throw new AppError('Session client not loaded', 500, 'CLIENT_NOT_LOADED');
+
+    let res;
+    try {
+      res = await entry.client.invoke(new Api.messages.GetRecentStickers({ hash: BigInt(0) }));
+    } catch (err) {
+      throw new AppError(`GetRecentStickers failed: ${err.message}`, 502, 'RECENT_STICKERS_FAILED');
+    }
+    const stickers = (res?.stickers || []).map((d) => _normalizeStickerDoc(d)).filter(Boolean);
+    const out = { stickers };
+    this._stickerCacheSet(sessionId, 'recent', out);
+    return out;
+  }
+
+  /**
+   * Favorite stickers (messages.GetFavedStickers).
+   */
+  async getFavoriteStickers(sessionId, userId) {
+    await _loadAndAuthSession(sessionId, userId);
+    const cached = this._stickerCacheGet(sessionId, 'faved');
+    if (cached) return cached;
+    await tgService._ensureConnected(sessionId);
+    const entry = tgService.clients.get(String(sessionId));
+    if (!entry) throw new AppError('Session client not loaded', 500, 'CLIENT_NOT_LOADED');
+
+    let res;
+    try {
+      res = await entry.client.invoke(new Api.messages.GetFavedStickers({ hash: BigInt(0) }));
+    } catch (err) {
+      throw new AppError(`GetFavedStickers failed: ${err.message}`, 502, 'FAVED_STICKERS_FAILED');
+    }
+    const stickers = (res?.stickers || []).map((d) => _normalizeStickerDoc(d)).filter(Boolean);
+    const out = { stickers };
+    this._stickerCacheSet(sessionId, 'faved', out);
+    return out;
+  }
+
+  /**
+   * Search public sticker sets by short name / title (messages.SearchStickerSets).
+   */
+  async searchStickerSets(sessionId, userId, q) {
+    await _loadAndAuthSession(sessionId, userId);
+    const query = String(q || '').trim();
+    if (!query) return { sets: [] };
+    const cached = this._stickerCacheGet(sessionId, `search:${query}`);
+    if (cached) return cached;
+    await tgService._ensureConnected(sessionId);
+    const entry = tgService.clients.get(String(sessionId));
+    if (!entry) throw new AppError('Session client not loaded', 500, 'CLIENT_NOT_LOADED');
+
+    let res;
+    try {
+      res = await entry.client.invoke(new Api.messages.SearchStickerSets({
+        q: query, hash: BigInt(0),
+      }));
+    } catch (err) {
+      throw new AppError(`SearchStickerSets failed: ${err.message}`, 502, 'SEARCH_STICKERS_FAILED');
+    }
+    const sets = (res?.sets || []).map((s) => _normalizeStickerSet(s));
+    const out = { sets };
+    this._stickerCacheSet(sessionId, `search:${query}`, out, 60 * 1000);
+    return out;
+  }
+
+  /**
+   * Saved GIFs (messages.GetSavedGifs).
+   */
+  async getSavedGifs(sessionId, userId) {
+    await _loadAndAuthSession(sessionId, userId);
+    const cached = this._stickerCacheGet(sessionId, 'gifs:saved');
+    if (cached) return cached;
+    await tgService._ensureConnected(sessionId);
+    const entry = tgService.clients.get(String(sessionId));
+    if (!entry) throw new AppError('Session client not loaded', 500, 'CLIENT_NOT_LOADED');
+
+    let res;
+    try {
+      res = await entry.client.invoke(new Api.messages.GetSavedGifs({ hash: BigInt(0) }));
+    } catch (err) {
+      throw new AppError(`GetSavedGifs failed: ${err.message}`, 502, 'SAVED_GIFS_FAILED');
+    }
+    const gifs = (res?.gifs || []).map((d) => _normalizeGifDoc(d)).filter(Boolean);
+    const out = { gifs };
+    this._stickerCacheSet(sessionId, 'gifs:saved', out);
+    return out;
+  }
+
+  /**
+   * Search the public GIF directory via @gif inline bot (the same
+   * mechanism the official client uses).
+   */
+  async searchGifs(sessionId, userId, q, opts = {}) {
+    await _loadAndAuthSession(sessionId, userId);
+    const query = String(q || '').trim();
+    if (!query) return { gifs: [], nextOffset: '' };
+    const cacheKey = `gifs:search:${query}|${opts.offset || ''}`;
+    const cached = this._stickerCacheGet(sessionId, cacheKey);
+    if (cached) return cached;
+    await tgService._ensureConnected(sessionId);
+    const entry = tgService.clients.get(String(sessionId));
+    if (!entry) throw new AppError('Session client not loaded', 500, 'CLIENT_NOT_LOADED');
+
+    let bot;
+    try {
+      bot = await entry.client.getInputEntity('gif');
+    } catch (err) {
+      throw new AppError(`GIF bot unreachable: ${err.message}`, 502, 'GIFS_BOT_FAILED');
+    }
+
+    let res;
+    try {
+      res = await entry.client.invoke(new Api.messages.GetInlineBotResults({
+        bot,
+        peer: new Api.InputPeerEmpty(),
+        query,
+        offset: String(opts.offset || ''),
+      }));
+    } catch (err) {
+      throw new AppError(`GIF search failed: ${err.message}`, 502, 'GIFS_SEARCH_FAILED');
+    }
+
+    const gifs = (res?.results || [])
+      .map((r) => _normalizeInlineGif(r))
+      .filter(Boolean);
+    const out = { gifs, nextOffset: res.nextOffset || '' };
+    this._stickerCacheSet(sessionId, cacheKey, out, 60 * 1000);
+    return out;
+  }
+}
+
+/**
+ * Map a UI filter name to a Telegram InputMessagesFilter constructor.
+ * Used by D4 search.
+ */
+function _buildSearchFilter(name) {
+  switch (String(name || 'all').toLowerCase()) {
+    case 'photo':       return new Api.InputMessagesFilterPhotos();
+    case 'video':       return new Api.InputMessagesFilterVideo();
+    case 'media':       return new Api.InputMessagesFilterPhotoVideo();
+    case 'document':    return new Api.InputMessagesFilterDocument();
+    case 'url':         return new Api.InputMessagesFilterUrl();
+    case 'gif':         return new Api.InputMessagesFilterGif();
+    case 'voice':       return new Api.InputMessagesFilterVoice();
+    case 'audio':       return new Api.InputMessagesFilterMusic();
+    case 'mention':     return new Api.InputMessagesFilterMyMentions();
+    case 'pinned':      return new Api.InputMessagesFilterPinned();
+    case 'all':
+    default:            return new Api.InputMessagesFilterEmpty();
+  }
+}
+
+/**
+ * Best-effort sticker-set summary — enough for the picker to render
+ * the cover, title, and request individual stickers later by id.
+ */
+function _normalizeStickerSet(item) {
+  const set = item?.set || item;
+  if (!set) return null;
+  const cover = item?.cover || item?.covers?.[0] || null;
+  return {
+    id: set.id != null ? String(set.id) : null,
+    accessHash: set.accessHash != null ? String(set.accessHash) : null,
+    title: set.title || '',
+    shortName: set.shortName || '',
+    count: set.count || 0,
+    archived: !!set.archived,
+    official: !!set.official,
+    masks: !!set.masks,
+    animated: !!set.animated,
+    videos: !!set.videos,
+    emojis: !!set.emojis,
+    thumbDocId: set.thumbDocumentId != null ? String(set.thumbDocumentId) : null,
+    cover: cover ? _normalizeStickerDoc(cover) : null,
+  };
+}
+
+/**
+ * Best-effort sticker / animated-sticker / video-sticker summary.
+ *
+ * The shape is sufficient for the picker UI and for the existing
+ * /send-sticker endpoint (which takes documentId + accessHash + fileRef).
+ */
+function _normalizeStickerDoc(doc) {
+  if (!doc || doc.className === 'DocumentEmpty') return null;
+  const attrs = doc.attributes || [];
+  const sticker = attrs.find((a) => a.className === 'DocumentAttributeSticker');
+  const dim = attrs.find((a) => a.className === 'DocumentAttributeImageSize')
+    || attrs.find((a) => a.className === 'DocumentAttributeVideo');
+  const fileRef = doc.fileReference
+    ? Buffer.from(doc.fileReference).toString('base64')
+    : null;
+  return {
+    id: String(doc.id),
+    accessHash: String(doc.accessHash),
+    fileReference: fileRef,
+    mimeType: doc.mimeType || 'image/webp',
+    size: doc.size != null ? Number(doc.size) : 0,
+    width: dim?.w || 0,
+    height: dim?.h || 0,
+    alt: sticker?.alt || '',
+    setId: sticker?.stickerset?.id != null ? String(sticker.stickerset.id) : null,
+    animated: doc.mimeType === 'application/x-tgsticker',
+    video: doc.mimeType === 'video/webm',
+    thumbId: doc.thumbs?.[0]?.type || null,
+  };
+}
+
+/**
+ * Best-effort GIF document (animated MP4 / video) summary.
+ */
+function _normalizeGifDoc(doc) {
+  if (!doc || doc.className === 'DocumentEmpty') return null;
+  const attrs = doc.attributes || [];
+  const dim = attrs.find((a) => a.className === 'DocumentAttributeVideo');
+  const fileRef = doc.fileReference
+    ? Buffer.from(doc.fileReference).toString('base64')
+    : null;
+  return {
+    id: String(doc.id),
+    accessHash: String(doc.accessHash),
+    fileReference: fileRef,
+    mimeType: doc.mimeType || 'video/mp4',
+    size: doc.size != null ? Number(doc.size) : 0,
+    width: dim?.w || 0,
+    height: dim?.h || 0,
+    duration: dim?.duration || 0,
+    isVideo: !!dim,
+  };
+}
+
+/**
+ * Best-effort BotInlineMediaResult / BotInlineResult summary for GIFs.
+ *
+ * Inline GIF results come back from the @gif inline bot wrapped in a
+ * BotInlineMediaResult that carries the underlying Document so we
+ * normalize it the same way as a saved GIF, plus the mp4/thumb URLs.
+ */
+function _normalizeInlineGif(r) {
+  if (!r) return null;
+  const doc = r.document;
+  if (doc && doc.className !== 'DocumentEmpty') {
+    return {
+      ..._normalizeGifDoc(doc),
+      title: r.title || '',
+      queryId: r.queryId != null ? String(r.queryId) : null,
+      resultId: r.id || null,
+    };
+  }
+  // Inline-only result: surface URLs so the UI can preview but the
+  // sender can't relay it as a saved-GIF (no document handle).
+  const content = r.content || r.thumb || null;
+  if (!content) return null;
+  return {
+    id: r.id || null,
+    title: r.title || '',
+    inline: true,
+    url: content.url || null,
+    mimeType: content.mimeType || 'video/mp4',
+    width: content.w || 0,
+    height: content.h || 0,
+    queryId: r.queryId != null ? String(r.queryId) : null,
+    resultId: r.id || null,
+  };
 }
 
 function _normalizeAuthorization(a) {

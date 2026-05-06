@@ -911,6 +911,197 @@ const telegramClientController = {
       .catch(() => {});
     res.json({ success: true, data });
   }),
+
+  // ---------------------------------------------------------------------
+  // D12 — Drafts
+  // ---------------------------------------------------------------------
+
+  saveDraft: asyncHandler(async (req, res) => {
+    const { peerType, peerId } = _parsePeer(req);
+    const data = await tcService.saveDraft(req.params.id, req.user.id, peerType, peerId, {
+      text: req.body?.text,
+      replyToMsgId: req.body?.replyToMsgId,
+      noWebpage: req.body?.noWebpage,
+    });
+    res.json({ success: true, data });
+  }),
+
+  clearDraft: asyncHandler(async (req, res) => {
+    const { peerType, peerId } = _parsePeer(req);
+    const data = await tcService.clearDraft(req.params.id, req.user.id, peerType, peerId);
+    res.json({ success: true, data });
+  }),
+
+  getAllDrafts: asyncHandler(async (req, res) => {
+    const data = await tcService.getAllDrafts(req.params.id, req.user.id);
+    res.json({ success: true, data });
+  }),
+
+  // ---------------------------------------------------------------------
+  // D13 — Pinned messages
+  // ---------------------------------------------------------------------
+
+  pinMessage: asyncHandler(async (req, res) => {
+    const { peerType, peerId } = _parsePeer(req);
+    const data = await tcService.pinMessage(
+      req.params.id, req.user.id, peerType, peerId, req.params.messageId, {
+        silent: req.body?.silent,
+        pmOneside: req.body?.pmOneside,
+      },
+    );
+    await reportService
+      .logActivity(req.user.id, 'tg_client_pin', 'session', req.params.id, {
+        platform: 'telegram', peerType, peerId: String(peerId), messageId: req.params.messageId,
+      })
+      .catch(() => {});
+    res.json({ success: true, data });
+  }),
+
+  unpinMessage: asyncHandler(async (req, res) => {
+    const { peerType, peerId } = _parsePeer(req);
+    const data = await tcService.unpinMessage(
+      req.params.id, req.user.id, peerType, peerId, req.params.messageId,
+    );
+    res.json({ success: true, data });
+  }),
+
+  unpinAllMessages: asyncHandler(async (req, res) => {
+    const { peerType, peerId } = _parsePeer(req);
+    const data = await tcService.unpinAllMessages(
+      req.params.id, req.user.id, peerType, peerId,
+    );
+    await reportService
+      .logActivity(req.user.id, 'tg_client_unpin_all', 'session', req.params.id, {
+        platform: 'telegram', peerType, peerId: String(peerId),
+      })
+      .catch(() => {});
+    res.json({ success: true, data });
+  }),
+
+  getPinnedMessages: asyncHandler(async (req, res) => {
+    const { peerType, peerId } = _parsePeer(req);
+    const data = await tcService.getPinnedMessages(
+      req.params.id, req.user.id, peerType, peerId, {
+        limit: req.query.limit,
+        offsetId: req.query.offsetId,
+      },
+    );
+    res.json({ success: true, data });
+  }),
+
+  // ---------------------------------------------------------------------
+  // D4 — Search
+  // ---------------------------------------------------------------------
+
+  searchInChat: asyncHandler(async (req, res) => {
+    const { peerType, peerId } = _parsePeer(req);
+    const data = await tcService.searchInChat(
+      req.params.id, req.user.id, peerType, peerId, req.query.q, {
+        limit: req.query.limit,
+        offsetId: req.query.offsetId,
+        filter: req.query.filter,
+        fromId: req.query.fromId,
+      },
+    );
+    res.json({ success: true, data });
+  }),
+
+  searchGlobal: asyncHandler(async (req, res) => {
+    const data = await tcService.searchGlobal(req.params.id, req.user.id, req.query.q, {
+      limit: req.query.limit,
+      offsetId: req.query.offsetId,
+      offsetRate: req.query.offsetRate,
+      filter: req.query.filter,
+    });
+    res.json({ success: true, data });
+  }),
+
+  // ---------------------------------------------------------------------
+  // D11 — Stickers / GIFs
+  // ---------------------------------------------------------------------
+
+  getStickerSets: asyncHandler(async (req, res) => {
+    const data = await tcService.getStickerSets(req.params.id, req.user.id);
+    res.json({ success: true, data });
+  }),
+
+  getRecentStickers: asyncHandler(async (req, res) => {
+    const data = await tcService.getRecentStickers(req.params.id, req.user.id);
+    res.json({ success: true, data });
+  }),
+
+  getFavoriteStickers: asyncHandler(async (req, res) => {
+    const data = await tcService.getFavoriteStickers(req.params.id, req.user.id);
+    res.json({ success: true, data });
+  }),
+
+  searchStickers: asyncHandler(async (req, res) => {
+    const data = await tcService.searchStickerSets(req.params.id, req.user.id, req.query.q);
+    res.json({ success: true, data });
+  }),
+
+  getSavedGifs: asyncHandler(async (req, res) => {
+    const data = await tcService.getSavedGifs(req.params.id, req.user.id);
+    res.json({ success: true, data });
+  }),
+
+  searchGifs: asyncHandler(async (req, res) => {
+    const data = await tcService.searchGifs(req.params.id, req.user.id, req.query.q, {
+      offset: req.query.offset,
+    });
+    res.json({ success: true, data });
+  }),
+
+  // GET /sessions/:id/documents/:documentId/media?accessHash=&fileReference=
+  getDocumentMedia: asyncHandler(async (req, res) => {
+    const documentId = req.params.documentId;
+    const accessHash = req.query.accessHash;
+    const fileReference = req.query.fileReference;
+    const wantThumb = req.query.thumb === '1' || req.query.thumb === 'true';
+
+    const result = await tcService.downloadDocumentMedia(
+      req.params.id,
+      req.user.id,
+      documentId,
+      accessHash,
+      fileReference,
+      { thumb: wantThumb }
+    );
+    if (!result) return res.status(204).end();
+
+    const buf = result.buffer;
+    const total = buf.length;
+    const etag = `W/"tgdoc-${result.docId}-${wantThumb ? 't' : 'f'}-${total}"`;
+    const ifNoneMatch = req.headers['if-none-match'];
+    if (ifNoneMatch && ifNoneMatch === etag) {
+      res.status(304).end();
+      return;
+    }
+    res.setHeader('Content-Type', result.mimeType || 'application/octet-stream');
+    res.setHeader('Cache-Control', 'private, max-age=300');
+    res.setHeader('Accept-Ranges', 'bytes');
+    res.setHeader('ETag', etag);
+    if (result.isThumb) res.setHeader('X-Tg-Media-Is-Thumb', '1');
+
+    const range = req.headers.range;
+    if (range && /^bytes=/.test(range)) {
+      const m = /bytes=(\d*)-(\d*)/.exec(range);
+      const start = m && m[1] ? parseInt(m[1], 10) : 0;
+      const end = m && m[2] ? parseInt(m[2], 10) : total - 1;
+      if (Number.isFinite(start) && Number.isFinite(end) && start >= 0 && end >= start && start < total) {
+        const clampedEnd = Math.min(end, total - 1);
+        res.status(206);
+        res.setHeader('Content-Range', `bytes ${start}-${clampedEnd}/${total}`);
+        res.setHeader('Content-Length', String(clampedEnd - start + 1));
+        return res.end(buf.slice(start, clampedEnd + 1));
+      }
+      res.status(416);
+      res.setHeader('Content-Range', `bytes */${total}`);
+      return res.end();
+    }
+    res.setHeader('Content-Length', String(total));
+    return res.end(buf);
+  }),
 };
 
 module.exports = telegramClientController;

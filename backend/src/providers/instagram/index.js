@@ -112,6 +112,11 @@ const capabilities = {
   tgc_settings:           false,
   tgc_security:           false,
   tgc_contacts:           false,
+  tgc_drafts:             false,
+  tgc_pinned:             false,
+  tgc_notifications:      false,
+  tgc_search:             false,
+  tgc_stickers:           false,
 };
 
 // Lazy module loaders — keeps the IG runtime out of the cold-start path.

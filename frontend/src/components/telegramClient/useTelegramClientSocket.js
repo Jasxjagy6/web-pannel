@@ -78,6 +78,12 @@ export function useTelegramClientSocket(sessionId, store) {
         nextSenders.set(`${data.sender.peerType}:${data.sender.peerId}`, data.sender);
         store.setState({ sendersByKey: nextSenders });
       }
+      // D14 — re-broadcast as a window-level CustomEvent so the
+      // NotificationCenter (mounted at the top of TelegramClient.jsx)
+      // can react regardless of where it lives in the tree.
+      try {
+        window.dispatchEvent(new CustomEvent('tg-client:newMessage', { detail: data }));
+      } catch (_) { /* ignore */ }
     });
 
     socket.on('tg-client:editMessage', (data) => {
@@ -177,6 +183,37 @@ export function useTelegramClientSocket(sessionId, store) {
       // panel window, or as a side-effect of addContact/deleteContacts).
       try {
         window.dispatchEvent(new CustomEvent('tg-client:contactsChanged', { detail: data }));
+      } catch (_) { /* ignore */ }
+    });
+
+    socket.on('tg-client:draftUpdate', (data) => {
+      if (!data || String(data.sessionId) !== String(sessionId)) return;
+      const peer = data.peer;
+      if (!peer) return;
+      // Push the draft into the dialog row so DialogList can render
+      // "Draft: …", and forward as a window event so the composer can
+      // restore it if it's currently focused on this peer.
+      try {
+        store.getState().setDraft(peer.peerType, peer.peerId, data.draft || null);
+      } catch (_) { /* ignore */ }
+      try {
+        window.dispatchEvent(new CustomEvent('tg-client:draftUpdate', { detail: data }));
+      } catch (_) { /* ignore */ }
+    });
+
+    socket.on('tg-client:pinnedUpdate', (data) => {
+      if (!data || String(data.sessionId) !== String(sessionId)) return;
+      const peer = data.peer;
+      if (!peer || !Array.isArray(data.messageIds) || data.messageIds.length === 0) return;
+      try {
+        if (data.pinned) {
+          store.getState().addPinnedIds(peer.peerType, peer.peerId, data.messageIds);
+        } else {
+          store.getState().removePinnedIds(peer.peerType, peer.peerId, data.messageIds);
+        }
+      } catch (_) { /* ignore */ }
+      try {
+        window.dispatchEvent(new CustomEvent('tg-client:pinnedUpdate', { detail: data }));
       } catch (_) { /* ignore */ }
     });
 

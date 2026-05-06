@@ -1,8 +1,9 @@
 import React, { useEffect, useRef, useState } from 'react';
 import {
   Send, Loader2, Paperclip, Image as ImageIcon, Film, FileText, Mic, Square,
-  X, Reply, Pencil,
+  X, Reply, Pencil, Smile,
 } from 'lucide-react';
+import StickerGifPicker from './StickerGifPicker';
 
 const KIND_ICONS = {
   photo: ImageIcon,
@@ -57,10 +58,17 @@ export default function Composer({
   onSend,
   onSendMedia,
   onSendVoice,
+  onSendSticker,
+  onSendGif,
   uploadProgressByClientId,
   replyTarget,
   editTarget,
   onClearComposeTarget,
+  draftKey,
+  initialDraftText,
+  onDraftChange,
+  showStickerButton,
+  sessionId,
 }) {
   const [text, setText] = useState('');
   const [sending, setSending] = useState(false);
@@ -69,12 +77,16 @@ export default function Composer({
   const [recording, setRecording] = useState(false);
   const [recordError, setRecordError] = useState(null);
   const [showMenu, setShowMenu] = useState(false);
+  const [pickerOpen, setPickerOpen] = useState(null); // 'emoji' | 'sticker' | 'gif' | null
 
   const ref = useRef(null);
   const fileInputRef = useRef(null);
   const recorderRef = useRef(null);
   const recorderChunksRef = useRef([]);
   const recordStartRef = useRef(0);
+  const draftTimerRef = useRef(null);
+  const lastSavedDraftRef = useRef('');
+  const draftKeyRef = useRef(null);
 
   useEffect(() => {
     const el = ref.current;
@@ -83,6 +95,39 @@ export default function Composer({
     const next = Math.min(el.scrollHeight, 24 * 6);
     el.style.height = `${next}px`;
   }, [text]);
+
+  // D12 — restore the saved draft when the chat changes. We compare
+  // the previous draftKey so re-renders that don't change the chat
+  // don't blow away whatever the user is currently typing.
+  useEffect(() => {
+    if (!draftKey) return;
+    if (draftKeyRef.current === draftKey) return;
+    draftKeyRef.current = draftKey;
+    const restored = String(initialDraftText || '');
+    setText(restored);
+    lastSavedDraftRef.current = restored;
+  }, [draftKey, initialDraftText]);
+
+  // D12 — debounce-save the draft 600ms after the last keystroke. The
+  // server clears the draft when text becomes empty (and Telegram
+  // emits UpdateDraftMessage so other windows mirror immediately).
+  useEffect(() => {
+    if (!draftKey || !onDraftChange) return undefined;
+    if (editTarget) return undefined; // editing an existing message, not drafting
+    if (draftTimerRef.current) {
+      clearTimeout(draftTimerRef.current);
+      draftTimerRef.current = null;
+    }
+    if (text === lastSavedDraftRef.current) return undefined;
+    draftTimerRef.current = setTimeout(() => {
+      const value = text;
+      lastSavedDraftRef.current = value;
+      try { onDraftChange(value); } catch (_) { /* ignore */ }
+    }, 600);
+    return () => {
+      if (draftTimerRef.current) clearTimeout(draftTimerRef.current);
+    };
+  }, [text, draftKey, onDraftChange, editTarget]);
 
   const progress = activeUploadId
     ? uploadProgressByClientId?.get(activeUploadId) ?? null
@@ -119,7 +164,13 @@ export default function Composer({
     setSending(true);
     try {
       const ok = await onSend(trimmed);
-      if (ok) setText('');
+      if (ok) {
+        setText('');
+        if (draftKey && onDraftChange) {
+          lastSavedDraftRef.current = '';
+          onDraftChange('');
+        }
+      }
     } finally {
       setSending(false);
     }
@@ -138,6 +189,10 @@ export default function Composer({
       if (ok) {
         setStaged(null);
         setText('');
+        if (draftKey && onDraftChange) {
+          lastSavedDraftRef.current = '';
+          onDraftChange('');
+        }
       }
     } finally {
       setSending(false);
@@ -308,6 +363,43 @@ export default function Composer({
         </div>
       )}
       <div className="flex items-end gap-2 rounded-2xl bg-dark-800 px-3 py-2">
+        {showStickerButton && (
+          <div className="relative">
+            <button
+              type="button"
+              disabled={disabled || sending || recording}
+              onClick={() => setPickerOpen((p) => (p ? null : 'emoji'))}
+              className={`inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-full hover:bg-white/5 disabled:cursor-not-allowed disabled:opacity-50 ${
+                pickerOpen ? 'bg-white/10 text-blue-300' : 'text-gray-400 hover:text-gray-100'
+              }`}
+              title="Emoji / sticker / GIF"
+            >
+              <Smile className="h-5 w-5" />
+            </button>
+            {pickerOpen && (
+              <StickerGifPicker
+                sessionId={sessionId}
+                onPickEmoji={(e) => {
+                  setText((t) => `${t}${e}`);
+                  if (ref.current) ref.current.focus();
+                }}
+                onPickSticker={async (s) => {
+                  if (!onSendSticker) return;
+                  setPickerOpen(null);
+                  setSending(true);
+                  try { await onSendSticker(s); } finally { setSending(false); }
+                }}
+                onPickGif={async (g) => {
+                  if (!onSendGif) return;
+                  setPickerOpen(null);
+                  setSending(true);
+                  try { await onSendGif(g); } finally { setSending(false); }
+                }}
+                onClose={() => setPickerOpen(null)}
+              />
+            )}
+          </div>
+        )}
         {(onSendMedia || onSendVoice) && (
           <div className="relative">
             <button

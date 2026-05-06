@@ -156,6 +156,16 @@ const capabilities = {
   tgc_security:           true,
   // D9 — contacts (list / add / delete / search).
   tgc_contacts:           true,
+  // D12 — server-side per-chat drafts (saveDraft / clearDraft live sync).
+  tgc_drafts:             true,
+  // D13 — pinned messages (banner + per-message pin/unpin + pinned panel).
+  tgc_pinned:             true,
+  // D14 — in-app notifications (toast, sound, favicon dot, title flash).
+  tgc_notifications:      true,
+  // D4 — message search (in-chat + global with media filters).
+  tgc_search:             true,
+  // D11 — stickers / GIFs / emoji picker integrated in the composer.
+  tgc_stickers:           true,
 };
 
 // ---------------------------------------------------------------------------

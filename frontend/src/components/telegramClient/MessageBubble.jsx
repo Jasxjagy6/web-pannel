@@ -1,5 +1,5 @@
 import React, { useState, useRef, useEffect } from 'react';
-import { Check, CheckCheck, AlertCircle, Reply, Forward, Pencil, Trash2, Copy, MoreHorizontal } from 'lucide-react';
+import { Check, CheckCheck, AlertCircle, Reply, Forward, Pencil, Trash2, Copy, MoreHorizontal, Pin, PinOff } from 'lucide-react';
 import Avatar from './Avatar';
 import MediaInline from './MediaInline';
 
@@ -57,6 +57,10 @@ export default function MessageBubble({
   onEdit,
   onDelete,
   onJumpToMessage,
+  isPinned,
+  canPinned,
+  onPin,
+  onUnpin,
 }) {
   const out = !!message.out;
   const isService = !!message.isService;
@@ -112,18 +116,22 @@ export default function MessageBubble({
             message.failed ? 'opacity-70 ring-1 ring-red-500/60' : ''
           } ${message.pending ? 'opacity-80' : ''}`}
         >
-          {(canReply || canForward || canEdit || canDelete) && (
+          {(canReply || canForward || canEdit || canDelete || (canPinned && !isLocalPending)) && (
             <BubbleMenu
               out={out}
               canReply={canReply}
               canForward={canForward}
               canEdit={canEdit}
               canDelete={canDelete}
+              canPin={!!canPinned && !isLocalPending && !isPinned}
+              canUnpin={!!canPinned && !isLocalPending && !!isPinned}
               hasText={!!message.text}
               onReply={() => onReply?.(message)}
               onForward={() => onForward?.(message)}
               onEdit={() => onEdit?.(message)}
               onDelete={() => onDelete?.(message)}
+              onPin={() => onPin?.(message)}
+              onUnpin={() => onUnpin?.(message)}
             />
           )}
           {message.replyToMsgId && (
@@ -187,8 +195,8 @@ export default function MessageBubble({
 }
 
 function BubbleMenu({
-  out, canReply, canForward, canEdit, canDelete, hasText,
-  onReply, onForward, onEdit, onDelete,
+  out, canReply, canForward, canEdit, canDelete, canPin, canUnpin, hasText,
+  onReply, onForward, onEdit, onDelete, onPin, onUnpin,
 }) {
   const [open, setOpen] = useState(false);
   const ref = useRef(null);
@@ -238,6 +246,8 @@ function BubbleMenu({
           {canReply && <MenuRow icon={Reply} label="Reply" onClick={() => { setOpen(false); onReply?.(); }} />}
           {canForward && <MenuRow icon={Forward} label="Forward" onClick={() => { setOpen(false); onForward?.(); }} />}
           {canEdit && <MenuRow icon={Pencil} label="Edit" onClick={() => { setOpen(false); onEdit?.(); }} />}
+          {canPin && <MenuRow icon={Pin} label="Pin" onClick={() => { setOpen(false); onPin?.(); }} />}
+          {canUnpin && <MenuRow icon={PinOff} label="Unpin" onClick={() => { setOpen(false); onUnpin?.(); }} />}
           {hasText && <MenuRow icon={Copy} label="Copy text" onClick={onCopy} />}
           {canDelete && (
             <MenuRow

@@ -285,6 +285,43 @@ class TelegramClientStream {
             });
             return;
           }
+          if (cn === 'UpdateDraftMessage') {
+            const peer = _peerFromUpdate(update.peer);
+            if (!peer) return;
+            const d = update.draft;
+            const isEmpty = !d || d.className === 'DraftMessageEmpty';
+            emit('tg-client:draftUpdate', {
+              sessionId: sid,
+              peer,
+              draft: isEmpty
+                ? null
+                : {
+                    text: d.message || '',
+                    date: d.date ? new Date(d.date * 1000).toISOString() : null,
+                    replyToMsgId: tcService._toIdNum(
+                      d.replyTo?.replyToMsgId ?? d.replyToMsgId ?? null
+                    ),
+                    noWebpage: !!d.noWebpage,
+                  },
+            });
+            return;
+          }
+          if (cn === 'UpdatePinnedMessages' || cn === 'UpdatePinnedChannelMessages') {
+            const peer = cn === 'UpdatePinnedChannelMessages'
+              ? { peerType: 'channel', peerId: tcService._toIdNum(update.channelId) }
+              : _peerFromUpdate(update.peer);
+            const messageIds = Array.isArray(update.messages)
+              ? update.messages.map((v) => tcService._toIdNum(v)).filter((v) => v != null)
+              : [];
+            if (!peer || messageIds.length === 0) return;
+            emit('tg-client:pinnedUpdate', {
+              sessionId: sid,
+              peer,
+              messageIds,
+              pinned: !!update.pinned,
+            });
+            return;
+          }
           if (cn === 'UpdateUserTyping' || cn === 'UpdateChannelUserTyping' ||
               cn === 'UpdateChatUserTyping') {
             emit('tg-client:typing', {

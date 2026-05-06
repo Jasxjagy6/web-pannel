@@ -325,5 +325,73 @@ export function createTgClientStore() {
       next.delete(clientMsgId);
       set({ uploadProgressByClientId: next });
     },
+
+    // D12 — set the in-memory draft for a chat. The dialog row uses
+    // it to render the "Draft: …" preview; the composer reads it on
+    // open to repopulate the input.
+    setDraft: (peerType, peerId, draft) => {
+      const k = peerKey(peerType, peerId);
+      const next = new Map(get().dialogs);
+      const prev = next.get(k);
+      if (prev) {
+        next.set(k, { ...prev, draft });
+      } else {
+        // No dialog in cache yet; insert a placeholder so the
+        // sidebar shows the draft until a real dialog payload arrives.
+        next.set(k, {
+          peerType,
+          peerId,
+          title: '',
+          unreadCount: 0,
+          lastMessage: null,
+          draft,
+        });
+      }
+      set({ dialogs: next, dialogOrder: _sortDialogOrder(next) });
+    },
+
+    // D13 — pinned message ids for the open chat (live-updated by
+    // tg-client:pinnedUpdate). PinnedBanner shows the most recent.
+    pinnedByPeer: new Map(),
+
+    setPinnedIds: (peerType, peerId, ids) => {
+      const k = peerKey(peerType, peerId);
+      const next = new Map(get().pinnedByPeer);
+      const dedup = Array.from(new Set(
+        (ids || []).map((v) => Number(v)).filter(Number.isFinite)
+      )).sort((a, b) => b - a);
+      next.set(k, dedup);
+      set({ pinnedByPeer: next });
+    },
+
+    addPinnedIds: (peerType, peerId, ids) => {
+      const k = peerKey(peerType, peerId);
+      const next = new Map(get().pinnedByPeer);
+      const cur = new Set(next.get(k) || []);
+      for (const v of ids || []) {
+        const n = Number(v);
+        if (Number.isFinite(n)) cur.add(n);
+      }
+      next.set(k, Array.from(cur).sort((a, b) => b - a));
+      set({ pinnedByPeer: next });
+    },
+
+    removePinnedIds: (peerType, peerId, ids) => {
+      const k = peerKey(peerType, peerId);
+      const next = new Map(get().pinnedByPeer);
+      const cur = next.get(k);
+      if (!cur) return;
+      const drop = new Set((ids || []).map((v) => Number(v)).filter(Number.isFinite));
+      const filtered = cur.filter((v) => !drop.has(Number(v)));
+      next.set(k, filtered);
+      set({ pinnedByPeer: next });
+    },
+
+    clearPinnedIds: (peerType, peerId) => {
+      const k = peerKey(peerType, peerId);
+      const next = new Map(get().pinnedByPeer);
+      next.set(k, []);
+      set({ pinnedByPeer: next });
+    },
   }));
 }

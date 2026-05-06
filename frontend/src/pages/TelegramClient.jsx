@@ -26,6 +26,7 @@ import Avatar from '../components/telegramClient/Avatar';
 import SelfProfileDrawer from '../components/telegramClient/SelfProfileDrawer';
 import SettingsDrawer from '../components/telegramClient/SettingsDrawer';
 import ContactsDrawer from '../components/telegramClient/ContactsDrawer';
+import NotificationCenter from '../components/telegramClient/NotificationCenter';
 
 export default function TelegramClient() {
   const { sessionId } = useParams();
@@ -105,6 +106,7 @@ export default function TelegramClient() {
   const [contactsOpen, setContactsOpen] = useState(false);
   const capabilities = useCapabilities();
   const canContacts = !!capabilities?.tgc_contacts;
+  const canNotifications = !!capabilities?.tgc_notifications;
   useEffect(() => {
     const parts = [activeDialogTitle, accountLabel].filter(Boolean);
     document.title =
@@ -148,7 +150,7 @@ export default function TelegramClient() {
           ) : (
             <div className="text-sm text-gray-400">Connecting…</div>
           )}
-          <div className="ml-auto flex items-center gap-2">
+          <div className="relative ml-auto flex items-center gap-2">
             {canContacts && (
               <button
                 type="button"
@@ -158,6 +160,13 @@ export default function TelegramClient() {
               >
                 <Users className="h-4 w-4" />
               </button>
+            )}
+            {canNotifications && (
+              <NotificationCenter
+                sessionId={sessionId}
+                store={useStore}
+                currentDialogTitle={activeDialogTitle}
+              />
             )}
             <button
               type="button"
