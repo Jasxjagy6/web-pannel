@@ -11,12 +11,13 @@
 
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
-import { Loader2, AlertCircle, Wifi, WifiOff, Settings } from 'lucide-react';
+import { Loader2, AlertCircle, Wifi, WifiOff, Settings, Users } from 'lucide-react';
 import {
   connectClientSession,
   getClientDialogs,
 } from '../api/telegramClient';
 import { useAuth } from '../context/AuthContext';
+import { useCapabilities } from '../context/PlatformContext';
 import { createTgClientStore } from '../components/telegramClient/tgClientStore';
 import { useTelegramClientSocket } from '../components/telegramClient/useTelegramClientSocket';
 import DialogList from '../components/telegramClient/DialogList';
@@ -24,6 +25,7 @@ import ChatPane from '../components/telegramClient/ChatPane';
 import Avatar from '../components/telegramClient/Avatar';
 import SelfProfileDrawer from '../components/telegramClient/SelfProfileDrawer';
 import SettingsDrawer from '../components/telegramClient/SettingsDrawer';
+import ContactsDrawer from '../components/telegramClient/ContactsDrawer';
 
 export default function TelegramClient() {
   const { sessionId } = useParams();
@@ -100,6 +102,9 @@ export default function TelegramClient() {
   const [activeDialogTitle, setActiveDialogTitle] = useState(null);
   const [profileOpen, setProfileOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [contactsOpen, setContactsOpen] = useState(false);
+  const capabilities = useCapabilities();
+  const canContacts = !!capabilities?.tgc_contacts;
   useEffect(() => {
     const parts = [activeDialogTitle, accountLabel].filter(Boolean);
     document.title =
@@ -144,6 +149,16 @@ export default function TelegramClient() {
             <div className="text-sm text-gray-400">Connecting…</div>
           )}
           <div className="ml-auto flex items-center gap-2">
+            {canContacts && (
+              <button
+                type="button"
+                onClick={() => setContactsOpen(true)}
+                className="rounded-md p-1.5 text-gray-400 hover:bg-white/5 hover:text-gray-200"
+                title="Contacts"
+              >
+                <Users className="h-4 w-4" />
+              </button>
+            )}
             <button
               type="button"
               onClick={() => setSettingsOpen(true)}
@@ -202,6 +217,29 @@ export default function TelegramClient() {
         sessionId={sessionId}
         isOpen={settingsOpen}
         onClose={() => setSettingsOpen(false)}
+      />
+
+      <ContactsDrawer
+        sessionId={sessionId}
+        isOpen={contactsOpen}
+        onClose={() => setContactsOpen(false)}
+        onOpenChat={({ peerType, peerId }) => {
+          // Reuse the existing dialog when present, otherwise insert a
+          // minimal placeholder so the chat pane resolves the entity on
+          // first message-fetch and the row appears in the left rail.
+          const state = useStore.getState();
+          const k = `${peerType}:${peerId}`;
+          if (!state.dialogs.has(k)) {
+            state.upsertDialog({
+              peerType,
+              peerId,
+              title: '',
+              unreadCount: 0,
+              lastMessage: null,
+            });
+          }
+          state.selectPeer(peerType, peerId);
+        }}
       />
     </div>
   );

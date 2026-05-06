@@ -170,6 +170,16 @@ export function useTelegramClientSocket(sessionId, store) {
       } catch (_) { /* ignore */ }
     });
 
+    socket.on('tg-client:contactsChanged', (data) => {
+      if (!data || String(data.sessionId) !== String(sessionId)) return;
+      // The contacts drawer listens on the window to refresh its list
+      // when our contacts change side-channel (another device, another
+      // panel window, or as a side-effect of addContact/deleteContacts).
+      try {
+        window.dispatchEvent(new CustomEvent('tg-client:contactsChanged', { detail: data }));
+      } catch (_) { /* ignore */ }
+    });
+
     socket.on('tg-client:typing', (data) => {
       if (!data || String(data.sessionId) !== String(sessionId)) return;
       // Typing indicators are best-effort; we just record them with a
