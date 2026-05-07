@@ -34,6 +34,7 @@ const Change2FA = lazy(() => import('./pages/Change2FA'));
 const GetOTP = lazy(() => import('./pages/GetOTP'));
 const OtpRelay = lazy(() => import('./pages/OtpRelay'));
 const Proxies = lazy(() => import('./pages/Proxies'));
+const ProxyProviders = lazy(() => import('./pages/ProxyProviders'));
 const CreateSession = lazy(() => import('./pages/CreateSession'));
 const AntiDetect = lazy(() => import('./pages/AntiDetect'));
 const Privacy = lazy(() => import('./pages/Privacy'));
@@ -284,6 +285,7 @@ function PlatformRoutes() {
       <Route path="get-otp" element={<ProtectedRoute title="Get OTP"><GetOTP /></ProtectedRoute>} />
       <Route path="otp-relay" element={<ProtectedRoute title="OTP Relay"><PlatformPage tg={OtpRelay} ig={InstagramWorkInProgress} /></ProtectedRoute>} />
       <Route path="proxies" element={<ProtectedRoute title="Proxies"><PlatformPage tg={Proxies} ig={InstagramProxies} /></ProtectedRoute>} />
+      <Route path="proxy-providers" element={<ProtectedRoute title="Auto-rotating proxy providers"><ProxyProviders /></ProtectedRoute>} />
       <Route path="anti-detect" element={<ProtectedRoute title="Anti-Detect"><PlatformPage tg={AntiDetect} ig={InstagramAntiDetect} /></ProtectedRoute>} />
       <Route path="privacy" element={<ProtectedRoute title="Privacy"><PlatformPage tg={Privacy} ig={InstagramPrivacy} /></ProtectedRoute>} />
       <Route path="settings" element={<ProtectedRoute title="Settings" allowWithoutSubscription><PlatformPage tg={Settings} ig={InstagramSettings} /></ProtectedRoute>} />

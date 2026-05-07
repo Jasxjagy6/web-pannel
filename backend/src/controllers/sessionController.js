@@ -126,7 +126,18 @@ const sessionController = {
     const userId = req.user.id;
 
     const page = req.query.page ? parseInt(req.query.page, 10) : 1;
-    const limit = req.query.limit ? parseInt(req.query.limit, 10) : 20;
+    // Sessions tab supports "limit=0" or "limit=all" to fetch every row
+    // owned by this user (no pagination). Anything else parses as an
+    // integer and falls back to the default 20.
+    let limit;
+    if (req.query.limit === 'all' || req.query.limit === '0') {
+      limit = 0;
+    } else if (req.query.limit) {
+      const parsed = parseInt(req.query.limit, 10);
+      limit = Number.isFinite(parsed) ? parsed : 20;
+    } else {
+      limit = 20;
+    }
     const sort = req.query.sort || 'created_at';
     const order = req.query.order || 'DESC';
     const filter = req.query.filter || undefined;

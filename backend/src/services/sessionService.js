@@ -1377,7 +1377,13 @@ class SessionService {
 
     const validSortFields = ['created_at', 'last_active', 'status', 'phone', 'id'];
     const { field: sortField, order: sortOrder } = applySorting(sort, order, validSortFields);
-    const { offset, limit: pageSize } = applyPagination(null, page, limit);
+    // Sessions tab is the only list in the panel that's allowed to render
+    // every row at once (operators routinely upload 100s–1000s of session
+    // files in one go and want them all visible). Pass allowUnbounded so
+    // limit=0 / limit='all' bypass the default 100-row cap and fall back
+    // only to the MAX_UNBOUNDED_LIST safety belt.
+    const { offset, limit: pageSize, unbounded } =
+      applyPagination(null, page, limit, { allowUnbounded: true });
 
     // Hard-scope to a single platform when requested. Legacy callers
     // (no platform argument) keep their previous Telegram-only behaviour
@@ -1512,7 +1518,10 @@ class SessionService {
     });
 
     const { buildPagination } = require('../utils/pagination');
-    const pagination = buildPagination(page, limit, total);
+    const pagination = buildPagination(page, limit, total, { allowUnbounded: true });
+    if (unbounded) {
+      pagination.pageSize = sessions.length;
+    }
 
     return {
       sessions,

@@ -162,6 +162,7 @@ const PLATFORM_ROUTERS = [
   ['/otp',              otpRoutes],
   ['/proxies',          proxyRoutes],
   ['/me/proxies',       userProxyRoutes],
+  ['/me/proxy-providers', require('./routes/proxyProviders')],
   ['/anti-detect',      antiDetectRoutes],
   ['/privacy',          privacyRoutes],
   ['/session-lists',    sessionListRoutes],

@@ -26,6 +26,7 @@ const userNavItems = [
   { path: 'get-otp',           label: 'Get OTP',          icon: KeyRound,        capability: 'otp_passive' },
   { path: 'otp-relay',         label: 'OTP Relay',        icon: ShieldCheck,     capability: 'otp_relay' },
   { path: 'proxies',           label: 'Proxies',          icon: Network,         capability: 'proxies' },
+  { path: 'proxy-providers',   label: 'Auto-rotating proxy', icon: Network,      capability: 'proxies' },
   { path: 'anti-detect',       label: 'Anti-Detect',      icon: Fingerprint,     capability: 'identity_device' },
   { path: 'reports',           label: 'Reports',          icon: BarChart3,       capability: 'reports' },
   { path: 'account-settings',  label: 'Account Settings', icon: UserCog,         capability: 'account_settings' },
