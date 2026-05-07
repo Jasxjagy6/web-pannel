@@ -337,6 +337,107 @@ const telegramClientController = {
   }),
 
   /**
+   * POST /sessions/clear-history
+   *
+   * Body: { sessionIds: (string|number)[], revoke?: bool }
+   *
+   * Bulk action triggered from the Telegram Login page. Wipes the chat
+   * history of every dialog in every selected session in parallel and
+   * returns per-session results so the UI can show a per-account
+   * succeeded / failed breakdown.
+   *
+   * `revoke=true` translates to "delete from both sides" everywhere it
+   * is allowed by Telegram (private chats / basic groups always; channels
+   * only if the caller is an admin with delete_messages rights).
+   */
+  clearAllChatsHistory: asyncHandler(async (req, res) => {
+    const userId = req.user.id;
+    const sessionIds = Array.isArray(req.body?.sessionIds)
+      ? req.body.sessionIds
+      : [];
+    const revoke = req.body?.revoke === true || req.body?.revoke === 'true';
+
+    if (sessionIds.length === 0) {
+      throw new AppError('sessionIds is required', 400, 'SESSION_IDS_REQUIRED');
+    }
+    if (sessionIds.length > 50) {
+      throw new AppError(
+        'At most 50 sessions can be cleared at once',
+        400,
+        'TOO_MANY_SESSIONS',
+      );
+    }
+
+    // De-dupe while preserving order so the response matches the UI's
+    // expected ordering, and reject obviously bad ids early.
+    const seen = new Set();
+    const ids = [];
+    for (const raw of sessionIds) {
+      const id = String(raw || '').trim();
+      if (!id || seen.has(id)) continue;
+      seen.add(id);
+      ids.push(id);
+    }
+    if (ids.length === 0) {
+      throw new AppError('sessionIds is required', 400, 'SESSION_IDS_REQUIRED');
+    }
+
+    // Run per-session in parallel — each session has its own GramJS
+    // client so they don't share rate limits. We always resolve so a
+    // single bad session never poisons the response.
+    const settled = await Promise.all(
+      ids.map((sessionId) =>
+        tcService
+          .deleteAllChatsHistory(sessionId, userId, { revoke })
+          .then((data) => ({ ok: true, sessionId, data }))
+          .catch((err) => ({
+            ok: false,
+            sessionId,
+            error: err?.message || 'Failed to clear chats',
+            code: err?.code || err?.errorCode || null,
+            status: err?.statusCode || err?.status || 500,
+          })),
+      ),
+    );
+
+    let totalSucceeded = 0;
+    let totalFailed = 0;
+    let totalDialogs = 0;
+    for (const r of settled) {
+      if (r.ok) {
+        totalSucceeded += r.data.succeeded;
+        totalFailed += r.data.failed;
+        totalDialogs += r.data.total;
+      }
+    }
+
+    await reportService
+      .logActivity(userId, 'tg_client_clear_all_chats', 'session', null, {
+        platform: 'telegram',
+        sessionCount: ids.length,
+        revoke,
+        totalDialogs,
+        totalSucceeded,
+        totalFailed,
+      })
+      .catch((err) =>
+        logger.debug(`logActivity tg_client_clear_all_chats failed: ${err.message}`),
+      );
+
+    res.json({
+      success: true,
+      data: {
+        revoke,
+        sessionCount: ids.length,
+        totalDialogs,
+        totalSucceeded,
+        totalFailed,
+        sessions: settled,
+      },
+    });
+  }),
+
+  /**
    * POST /sessions/:id/forward
    * Body: { fromPeerType, fromPeerId, toPeerType, toPeerId, messageIds, dropAuthor?, silent? }
    */

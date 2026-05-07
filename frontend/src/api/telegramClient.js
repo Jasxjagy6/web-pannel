@@ -228,6 +228,26 @@ export const deleteClientMessages = (sessionId, peerType, peerId, messageIds, re
   );
 
 /**
+ * Bulk wipe chat history across N Telegram sessions ("Delete chats" on the
+ * Login page). `revoke=true` asks Telegram to also remove the history on
+ * the other side wherever Telegram allows it; `revoke=false` is the
+ * "Delete for me" semantic.
+ *
+ * Returns the per-session results from the backend so the UI can show
+ * which sessions / dialogs cleared and which failed.
+ *
+ * The request can take a while when many dialogs are involved, so we
+ * disable the per-request timeout — the backend processes sessions in
+ * parallel and dialogs sequentially within each session.
+ */
+export const clearAllSessionsChats = (sessionIds, revoke = false) =>
+  api.post(
+    `${BASE}/sessions/clear-history`,
+    { sessionIds, revoke: !!revoke },
+    { timeout: 0 },
+  );
+
+/**
  * D3 — forward messages from one chat into another.
  */
 export const forwardClientMessages = (sessionId, payload) =>
