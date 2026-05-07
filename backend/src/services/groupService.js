@@ -3,6 +3,10 @@ const telegramService = require('./telegramService');
 const logger = require('../utils/logger');
 const { AppError } = require('../utils/errorHandler');
 const { redisClient } = require('../config/redis');
+const {
+  normalizeTelegramTarget,
+  collectTelegramTargetCandidates,
+} = require('../utils/telegramTargetNormalizer');
 
 /**
  * Default delay in milliseconds between batch operations.
@@ -152,6 +156,38 @@ class GroupService {
       throw new AppError('At least one target group/channel is required', 400, 'NO_TARGETS');
     }
 
+    // Normalize each user-list entry into the full candidate chain
+    // (numeric id → @username → +phone) and skip unaddressable rows
+    // up-front. We keep ALL candidates because scraped numeric ids
+    // typically can't be resolved without a cached access_hash, while
+    // a sibling @username on the same row often resolves cleanly via
+    // contacts.ResolveUsername — so falling through is a real win.
+    const preparedUsers = [];
+    const unaddressable = [];
+    for (const entry of userList) {
+      const candidates = collectTelegramTargetCandidates(entry);
+      if (candidates.length > 0) {
+        preparedUsers.push({ entry, identifier: candidates[0], candidates });
+      } else {
+        unaddressable.push(entry);
+      }
+    }
+
+    if (preparedUsers.length === 0) {
+      throw new AppError(
+        'No usable identifiers found in userList (every row was empty, a UUID placeholder, or otherwise unaddressable).',
+        400,
+        'NO_VALID_USERS'
+      );
+    }
+
+    if (unaddressable.length > 0) {
+      logger.warn(
+        `addMembersToGroups: dropping ${unaddressable.length} unaddressable userList entries`,
+        { sample: unaddressable.slice(0, 3) }
+      );
+    }
+
     // Verify session ownership
     const verifiedSessions = await validateSessionsOwnership(sessionIds, userId);
     if (verifiedSessions.length === 0) {
@@ -205,6 +241,24 @@ class GroupService {
     let failedCount = 0;
     let skippedCount = 0;
 
+    // Surface the dropped rows in the response so the UI can show why
+    // the count is lower than the input list size.
+    for (const dropped of unaddressable) {
+      const idForLog = dropped && typeof dropped === 'object'
+        ? (dropped.telegram_id ?? dropped.id ?? dropped.username ?? 'unknown')
+        : String(dropped);
+      for (const targetId of targetIds) {
+        results.push({
+          userId: String(idForLog),
+          targetId,
+          success: false,
+          error: 'Unaddressable list entry (no usable telegram_id, username, or phone)',
+          skipped: true,
+        });
+        skippedCount++;
+      }
+    }
+
     const tgService = telegramService;
 
     try {
@@ -236,14 +290,14 @@ class GroupService {
 
       // Step 2: Build round-robin distribution plan
       // Distribute users across sessions: session1 gets users[0,3,6...], session2 gets [1,4,7...], etc.
-      const sessionChunks = {}; // sessionId -> [user1, user2, ...]
+      const sessionChunks = {}; // sessionId -> [{entry, identifier}, ...]
       for (let i = 0; i < verifiedSessions.length; i++) {
         sessionChunks[verifiedSessions[i].id] = [];
       }
-      
-      for (let i = 0; i < userList.length; i++) {
+
+      for (let i = 0; i < preparedUsers.length; i++) {
         const sessionIdx = i % verifiedSessions.length;
-        sessionChunks[verifiedSessions[sessionIdx].id].push(userList[i]);
+        sessionChunks[verifiedSessions[sessionIdx].id].push(preparedUsers[i]);
       }
 
       // Step 3: Process each target
@@ -256,9 +310,9 @@ class GroupService {
         if (availableSessions.length === 0) {
           logger.error(`No available sessions for target ${targetId}, skipping`);
           // Mark all users as failed for this target
-          for (const user of userList) {
+          for (const prepared of preparedUsers) {
             results.push({
-              userId: String(user.telegram_id || user.id || 'unknown'),
+              userId: prepared.identifier,
               targetId,
               success: false,
               error: 'No session is a member of this target',
@@ -274,9 +328,9 @@ class GroupService {
         for (const s of availableSessions) {
           targetSessionChunks[s.id] = [];
         }
-        for (let i = 0; i < userList.length; i++) {
+        for (let i = 0; i < preparedUsers.length; i++) {
           const sIdx = i % availableSessions.length;
-          targetSessionChunks[availableSessions[sIdx].id].push(userList[i]);
+          targetSessionChunks[availableSessions[sIdx].id].push(preparedUsers[i]);
         }
 
         // Step 4: Process each session's chunk for this target
@@ -295,36 +349,131 @@ class GroupService {
             }
 
             const batch = usersChunk.slice(b, b + batchSize);
-            
-            for (const userEntry of batch) {
-              const userTelegramId = userEntry.telegram_id || userEntry.id;
+
+            for (const prepared of batch) {
+              const candidates = prepared.candidates && prepared.candidates.length > 0
+                ? prepared.candidates
+                : [prepared.identifier];
               const userResult = {
-                userId: String(userTelegramId || 'unknown'),
+                userId: prepared.identifier,
                 targetId,
                 sessionId: session.id,
                 success: false,
               };
 
-              try {
-                // Try to add the user
-                await tgService.addMemberToGroup(session.id, targetId, userTelegramId);
-                userResult.success = true;
+              // Some Telegram errors mean "this identifier won't work,
+              // try the next one" rather than "this user is unreachable".
+              // Examples: scraped numeric id with no cached access_hash
+              // (PEER_ID_INVALID / "Could not find the input entity"),
+              // or a username that no longer exists. We move on to the
+              // next candidate in those cases.
+              const isResolutionError = (msg) => {
+                if (!msg) return false;
+                const m = String(msg);
+                return (
+                  m.includes('Could not resolve user') ||
+                  m.includes('Could not find the input entity') ||
+                  m.includes('PEER_ID_INVALID') ||
+                  m.includes('USERNAME_NOT_OCCUPIED') ||
+                  m.includes('USERNAME_INVALID') ||
+                  m.includes('USER_ID_INVALID')
+                );
+              };
+
+              let addErr = null;
+              let resolvedIdent = null;
+              for (let cIdx = 0; cIdx < candidates.length; cIdx++) {
+                const userTelegramId = candidates[cIdx];
+                try {
+                  await tgService.addMemberToGroup(session.id, targetId, userTelegramId);
+                  userResult.success = true;
+                  resolvedIdent = userTelegramId;
+                  addErr = null;
+                  break;
+                } catch (e) {
+                  addErr = e;
+                  if (cIdx + 1 < candidates.length && isResolutionError(e && e.message)) {
+                    continue; // try next identifier
+                  }
+                  break; // real failure or last candidate
+                }
+              }
+
+              if (userResult.success) {
+                if (resolvedIdent && resolvedIdent !== userResult.userId) {
+                  userResult.userId = resolvedIdent;
+                }
                 addedCount++;
-              } catch (addErr) {
+              } else if (addErr) {
+                const e2 = { message: (addErr && addErr.message) || String(addErr) };
+                addErr = e2;
+              }
+              if (!userResult.success && addErr) {
                 const errMsg = addErr.message || String(addErr);
 
-                // Handle FLOOD_WAIT
-                if (errMsg.includes('FLOOD_WAIT') || errMsg.includes('PEER_FLOOD')) {
+                // PEER_FLOOD is account-level: once Telegram has decided
+                // this session is spamming, every subsequent invite from
+                // the same session will fail too. Abort the operation
+                // for this session/target instead of grinding through
+                // hundreds of guaranteed failures, and surface a clear
+                // reason to the UI.
+                const isPeerFlood =
+                  errMsg.includes('PEER_FLOOD') ||
+                  errMsg.includes('Too many actions performed');
+                if (isPeerFlood) {
+                  logger.error(
+                    `PEER_FLOOD: session ${session.id} is rate-limited by Telegram, aborting target ${targetId}`,
+                    { opId }
+                  );
+                  userResult.error =
+                    'Telegram rate limit (PEER_FLOOD) — session has been flagged for spam. Wait a few hours, use a warmed-up session, or reduce batch size / increase delay.';
+                  failedCount++;
+                  results.push(userResult);
+                  // Mark every remaining user in this session's chunk as
+                  // skipped with the same reason so the totals are honest.
+                  const remainder = b + batchSize;
+                  for (let r = batch.indexOf(prepared) + 1; r < batch.length; r++) {
+                    results.push({
+                      userId: batch[r].identifier,
+                      targetId,
+                      sessionId: session.id,
+                      success: false,
+                      skipped: true,
+                      error: 'Skipped: session hit PEER_FLOOD earlier in this batch',
+                    });
+                    skippedCount++;
+                  }
+                  for (let i = remainder; i < usersChunk.length; i++) {
+                    results.push({
+                      userId: usersChunk[i].identifier,
+                      targetId,
+                      sessionId: session.id,
+                      success: false,
+                      skipped: true,
+                      error: 'Skipped: session hit PEER_FLOOD earlier in this run',
+                    });
+                    skippedCount++;
+                  }
+                  // Break out of all loops for this session.
+                  b = usersChunk.length;
+                  break;
+                }
+
+                // Handle FLOOD_WAIT (numeric, transient)
+                if (errMsg.includes('FLOOD_WAIT')) {
                   const floodSeconds = extractFloodSeconds(errMsg);
                   logger.warn(`FLOOD_WAIT: waiting ${floodSeconds}s`, { opId, sessionId: session.id });
                   await sleep(floodSeconds * 1000);
 
-                  // Retry once after flood wait
+                  // Retry once after flood wait. Use the candidate that
+                  // most recently produced a non-resolution error (most
+                  // likely the original numeric id).
+                  const retryIdent = candidates[candidates.length - 1];
                   let retrySuccess = false;
                   let retryAttempts = 0;
                   while (!retrySuccess && retryAttempts < MAX_FLOOD_RETRIES) {
                     try {
-                      await tgService.addMemberToGroup(session.id, targetId, userTelegramId);
+                      await tgService.addMemberToGroup(session.id, targetId, retryIdent);
                       retrySuccess = true;
                       userResult.success = true;
                       addedCount++;

@@ -94,25 +94,32 @@ const schemas = {
     sessionIds: Joi.array().items(Joi.number().integer().positive()).min(1).optional(),
     // Old single-session mode (backward compat)
     sessionId: Joi.number().integer().positive().optional(),
+    // The frontend may also resolve sessions via a saved session list.
+    sessionListId: Joi.alternatives().try(Joi.number().integer().positive(), Joi.string()).optional(),
     // New multi-target mode
     targetIds: Joi.array().items(Joi.string()).min(1).optional(),
     // Old single-target mode (backward compat)
     targetGroupId: Joi.string().optional(),
     // Target type
     targetType: Joi.string().valid('group', 'channel').default('group'),
-    // User list (required)
+    // User list (required). Items can be a bare string/number target, or an
+    // object with any combination of identifiers — telegram_id may legitimately
+    // be null when the row is a handle-only entry from a scrape export.
     userList: Joi.array().items(
       Joi.alternatives().try(
         Joi.string(),
         Joi.number(),
         Joi.object({
-          telegram_id: Joi.alternatives().try(Joi.string(), Joi.number()),
-          id: Joi.alternatives().try(Joi.string(), Joi.number()),
-          username: Joi.string().allow(null),
-          first_name: Joi.string().allow(null),
-          last_name: Joi.string().allow(null),
-          phone: Joi.string().allow(null),
-        })
+          telegram_id: Joi.alternatives().try(Joi.string(), Joi.number()).allow(null, ''),
+          telegramId: Joi.alternatives().try(Joi.string(), Joi.number()).allow(null, ''),
+          id: Joi.alternatives().try(Joi.string(), Joi.number()).allow(null, ''),
+          username: Joi.string().allow(null, ''),
+          first_name: Joi.string().allow(null, ''),
+          firstName: Joi.string().allow(null, ''),
+          last_name: Joi.string().allow(null, ''),
+          lastName: Joi.string().allow(null, ''),
+          phone: Joi.string().allow(null, ''),
+        }).unknown(true)
       )
     ).min(1).required(),
     // Delay settings
@@ -122,7 +129,9 @@ const schemas = {
     batchSize: Joi.number().integer().min(1).max(100).default(5),
     // Async mode
     async: Joi.alternatives().try(Joi.boolean(), Joi.string()).optional(),
-  }).or('sessionIds', 'sessionId').or('targetIds', 'targetGroupId'),
+  })
+    .or('sessionIds', 'sessionId', 'sessionListId')
+    .or('targetIds', 'targetGroupId'),
 
   joinLeaveChannels: Joi.object({
     sessionIds: Joi.array().items(Joi.number().integer().positive()).min(1).required(),
