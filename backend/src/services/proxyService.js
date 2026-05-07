@@ -988,7 +988,7 @@ class ProxyService {
     if (!userId) throw new AppError('userId required', 400, 'PROXY_USER_ID_REQUIRED');
     const role = opts.role || null;
 
-    // 1. Existing binding still good?
+    // 1. Existing binding still good (and not an expired sticky)?
     if (sessionId) {
       const existing = await pool.query(
         `SELECT p.* FROM proxies p
@@ -997,10 +997,26 @@ class ProxyService {
             AND p.is_working = TRUE
             AND p.active_assignments <= $2
             AND (p.user_id IS NULL OR p.user_id = $3)
+            AND (
+              p.sticky_expires_at IS NULL
+              OR p.sticky_expires_at > NOW()
+            )
           LIMIT 1`,
         [sessionId, MAX_SESSIONS_PER_PROXY, userId]
       );
       if (existing.rows[0]) return existing.rows[0];
+    }
+
+    // 1.5. Auto-rotating provider configured for this user?
+    //      Mint a sticky proxy via the driver and bind it.
+    //      This is the new auto-proxy path. When no provider is enabled
+    //      it's a no-op and steps 2/3 run as before. The driver layer
+    //      handles vendor-specific suffix / API contracts; everything
+    //      below this method (URL building, health, anti-detect) keeps
+    //      working unchanged.
+    if (sessionId && opts.skipProvider !== true) {
+      const minted = await tryProvisionFromProvider(userId, sessionId);
+      if (minted) return minted;
     }
 
     // 2. Highest-priority working user proxy.
@@ -1606,6 +1622,48 @@ function safeDecrypt(text) {
     logger.warn('Failed to decrypt proxy password', { error: err.message });
     return undefined;
   }
+}
+
+/**
+ * Auto-rotating provider hook. Called from pickProxyForSession when no
+ * existing binding is good. Loads the user's enabled provider row (if
+ * any) and asks proxyProviderService to mint a fresh sticky `proxies`
+ * row for this session. Returns the row, or `null` when:
+ *   - no provider row is configured / enabled for the user
+ *   - the driver lookup fails
+ *   - any persistence error occurs (we soft-fail so the legacy
+ *     fallback path can still pick a BYO proxy).
+ */
+async function tryProvisionFromProvider(userId, sessionId) {
+  if (!userId || !sessionId) return null;
+  let providerService;
+  try {
+    providerService = require('./proxyProviderService');
+  } catch (err) {
+    logger.warn('proxyProviderService unavailable', { error: err.message });
+    return null;
+  }
+  let provider = null;
+  try {
+    provider = await providerService.getActiveProvider(userId);
+  } catch (err) {
+    logger.warn('Failed to load active proxy provider', {
+      userId, error: err.message,
+    });
+    return null;
+  }
+  if (!provider) return null;
+
+  let row;
+  try {
+    row = await providerService.provisionForSession(provider, { sessionId });
+  } catch (err) {
+    logger.warn('Auto-proxy provision failed', {
+      userId, sessionId, vendor: provider.vendor, error: err.message,
+    });
+    return null;
+  }
+  return row;
 }
 
 /**
