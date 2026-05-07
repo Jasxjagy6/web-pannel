@@ -868,17 +868,19 @@ export default function Sessions() {
   const [detailSession, setDetailSession] = useState(null);
   const [detailOpen, setDetailOpen] = useState(false);
 
-  // Show 50/page so a typical bulk upload (e.g. 50 .session files at once)
-  // fits on the first page without the operator having to think about
-  // pagination at all. Past 50, the standard pager kicks in. The backend
-  // hard-caps the per-page limit at 100 in `buildPagination`.
+  // The Sessions tab lists every uploaded row in one shot — operators
+  // routinely upload hundreds at a time and have asked for "no limit, list
+  // all". The backend honours `limit=0` as "unbounded" (capped at
+  // MAX_UNBOUNDED_LIST as a safety belt) and the table renders fine into
+  // the thousands. `pageSize` is kept for the paginate-when-tiny fallback
+  // path used by the count summary line.
   const pageSize = 50;
 
   const fetchSessions = useCallback(async () => {
     try {
       const response = await listSessions({
-        page: currentPage,
-        limit: pageSize,
+        page: 1,
+        limit: 0,
         filter: searchTerm || undefined,
         status: statusFilter !== 'all' ? statusFilter : undefined,
       });
@@ -889,7 +891,7 @@ export default function Sessions() {
     } finally {
       setLoading(false);
     }
-  }, [currentPage, searchTerm, statusFilter]);
+  }, [searchTerm, statusFilter]);
 
   useEffect(() => {
     fetchSessions();

@@ -151,8 +151,18 @@ async function listSessions(userId, opts = {}) {
     params.push(`%${filter.search}%`);
   }
 
-  const offset = Math.max(0, (page - 1) * limit);
-  params.push(limit, offset);
+  // Mirror the unbounded contract from utils/pagination so the IG
+  // Sessions tab can also list every row in one request when the
+  // controller forwards limit=0/'all'. Capped at MAX_UNBOUNDED_LIST as a
+  // belt-and-braces safety against pathological queries.
+  const { MAX_UNBOUNDED_LIST } = require('../../utils/pagination');
+  const isUnbounded = limit === 0 || limit === '0' || limit === 'all'
+    || (typeof limit === 'number' && limit < 0);
+  const effectiveLimit = isUnbounded
+    ? MAX_UNBOUNDED_LIST
+    : Math.max(1, parseInt(limit, 10) || 20);
+  const offset = isUnbounded ? 0 : Math.max(0, (page - 1) * effectiveLimit);
+  params.push(effectiveLimit, offset);
 
   const sql = `
     SELECT id, user_id, platform, username, status, is_logged_in,
@@ -171,8 +181,8 @@ async function listSessions(userId, opts = {}) {
   return {
     sessions: rows.rows,
     total: count.rows[0].n,
-    page,
-    limit,
+    page: isUnbounded ? 1 : page,
+    limit: isUnbounded ? count.rows[0].n : limit,
   };
 }
 
