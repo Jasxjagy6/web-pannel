@@ -38,6 +38,7 @@ router.get('/sessions', controller.listSessions);
 router.get('/sessions/clear-history/jobs', controller.listClearChatsJobs);
 router.get('/sessions/clear-history/jobs/:jobId', controller.getClearChatsJob);
 router.post('/sessions/clear-history', controller.clearAllChatsHistory);
+router.post('/sessions/clear-history/jobs/:jobId/cancel', controller.cancelClearChatsJob);
 router.post('/sessions/:id/connect', controller.connect);
 router.get('/sessions/:id/me', controller.getMe);
 

@@ -45,6 +45,49 @@ function sleep(ms) {
 }
 
 /**
+ * Default per-attempt timeout for an MTProto connect / pre-flight call,
+ * in milliseconds. With a dead SOCKS5 proxy gramJS will retry the
+ * underlying socket internally for 15s+ a pop and never resolve, so we
+ * race every connect / `getMe` we care about against this deadline and
+ * fail fast.
+ *
+ * Tunable via env so operators can dial it down on a fast network or
+ * up if they have unusually slow but legitimate proxies.
+ */
+const TG_CONNECT_TIMEOUT_MS = (() => {
+  const v = parseInt(process.env.TG_CONNECT_TIMEOUT_MS, 10);
+  if (Number.isFinite(v) && v >= 1000) return v;
+  return 10_000;
+})();
+
+/**
+ * Race `promise` against a hard timer. If the promise hasn't settled
+ * by `ms`, the returned promise rejects with an error labelled
+ * `TIMEOUT_<label>` so callers can distinguish between "Telegram said
+ * no" and "Telegram never answered".
+ *
+ * @template T
+ * @param {Promise<T>} promise
+ * @param {number} ms
+ * @param {string} [label='OPERATION']
+ * @returns {Promise<T>}
+ */
+function withTimeout(promise, ms, label = 'OPERATION') {
+  let timer = null;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => {
+      const err = new Error(`Operation timed out after ${ms}ms (${label})`);
+      err.code = `TIMEOUT_${label}`;
+      err.isTimeout = true;
+      reject(err);
+    }, ms);
+  });
+  return Promise.race([promise, timeout]).finally(() => {
+    if (timer) clearTimeout(timer);
+  });
+}
+
+/**
  * Extract the flood wait seconds from an error message.
  * @param {string} errorMessage - The Telegram error message
  * @returns {number} Seconds to wait
@@ -1990,13 +2033,10 @@ class TelegramService {
    * @throws {Error} If the session does not exist or cannot be reconnected
    * @private
    */
-  async _ensureConnected(sessionId) {
+  async _ensureConnected(sessionId, opts = {}) {
     const sessionIdStr = String(sessionId);
     let entry = this.clients.get(sessionIdStr);
-//    // DEBUG console.log('[_ensureConnected] START, sessionId:', sessionId, '->', sessionIdStr);
-//    // DEBUG console.log('[_ensureConnected] Entry:', entry ? JSON.stringify(Object.keys(entry)) : 'UNDEFINED');
-//    // DEBUG console.log('[_ensureConnected] Clients Map:', Array.from(this.clients.entries()).map(([k,v]) => `${k}=${JSON.stringify(Object.keys(v))}`).join(', '));
-    
+
     logger.debug(`_ensureConnected called for sessionId: "${sessionIdStr}", found: ${!!entry}`);
     logger.debug(`Current clients keys: ${Array.from(this.clients.keys()).join(', ')}`);
 
@@ -2005,8 +2045,7 @@ class TelegramService {
       logger.info(`Session ${sessionId} not in memory, loading from database...`);
       await this._loadSessionFromDB(sessionId);
       entry = this.clients.get(sessionIdStr);
-//      // DEBUG console.log('[_ensureConnected] After get with string key, entry found:', !!entry);
-      
+
       if (!entry) {
         logger.error(`Session ${sessionId} still not found after loading from DB`);
         throw new Error(`Session ${sessionId} not found. Create or load the session first.`);
@@ -2016,6 +2055,14 @@ class TelegramService {
     const { client, apiId, apiHash } = entry;
     const proxyConf = entry.proxy || null;
     const idOpts = fingerprint.toClientOptions(entry.identity);
+    const timeoutMs = Number.isFinite(opts.timeoutMs) && opts.timeoutMs > 0
+      ? opts.timeoutMs
+      : TG_CONNECT_TIMEOUT_MS;
+    // When the caller asks for proxy fallback we'll retry once without
+    // the configured proxy if the proxied connect times out. Default
+    // off so legacy callers retain today's "stick to the bound proxy"
+    // behaviour; the clear-chats job opts in.
+    const allowProxyFallback = !!opts.allowProxyFallback;
 
     // Check if the client is still connected
     let isConnected = false;
@@ -2026,13 +2073,84 @@ class TelegramService {
     }
 
     if (!isConnected) {
-      logger.info(`Reconnecting session ${sessionId}`);
+      logger.info(`Reconnecting session ${sessionId} (timeout=${timeoutMs}ms)`);
+      let connectError = null;
       try {
-        await client.connect();
+        await withTimeout(
+          client.connect(),
+          timeoutMs,
+          'TG_CONNECT',
+        );
         entry.connected = true;
         this.clients.set(sessionId, entry);
-      } catch (connectError) {
-        // If reconnect fails, try to create a new client from stored session
+      } catch (err) {
+        connectError = err;
+        // Best-effort: tell gramJS to stop the in-flight reconnect
+        // loop so its retry-forever behaviour doesn't keep the
+        // backend pinned on a dead proxy after we've already given
+        // up on this attempt.
+        try { await client.disconnect(); } catch (_) { /* ignore */ }
+      }
+
+      if (connectError) {
+        // First fallback path: when the bound proxy times out and
+        // the caller opted into a direct-IP retry, rebuild a fresh
+        // client without the proxy and try once more on this VM's
+        // egress IP. This is the "added proxies didn't respond in
+        // 10s, use the present device IP" behaviour.
+        const isProxyTimeout =
+          allowProxyFallback
+          && proxyConf
+          && (connectError.isTimeout || /timed out|timeout/i.test(connectError.message || ''));
+        if (isProxyTimeout) {
+          const sessionData = this.sessionStore.get(sessionId);
+          if (sessionData) {
+            try {
+              const sessionString = decrypt(sessionData);
+              const stringSession = new StringSession(sessionString);
+              const directClient = new TelegramClient(stringSession, apiId, apiHash, {
+                connectionRetries: 1,
+                timeout: telegramConfig.timeout,
+                deviceModel: idOpts.deviceModel || telegramConfig.deviceModel,
+                systemVersion: idOpts.systemVersion || telegramConfig.systemVersion,
+                appVersion: idOpts.appVersion || telegramConfig.appVersion,
+                langCode: idOpts.langCode || telegramConfig.langCode,
+                systemLangCode: idOpts.systemLangCode || idOpts.langCode || telegramConfig.langCode,
+                baseLogger: telegramConfig.baseLogger,
+                useWSS: telegramConfig.useWSS,
+                autoReconnect: true,
+                // No proxy — use the panel's egress IP directly.
+                proxy: undefined,
+              });
+              await withTimeout(
+                directClient.connect(),
+                timeoutMs,
+                'TG_CONNECT_DIRECT',
+              );
+              entry.client = directClient;
+              entry.connected = true;
+              entry.proxyBypassed = true;
+              this.clients.set(sessionId, entry);
+              logger.warn(
+                `Session ${sessionId} bound proxy unreachable in ${timeoutMs}ms; reconnected directly`,
+              );
+              return entry;
+            } catch (directErr) {
+              logger.error(
+                `Session ${sessionId} direct-IP fallback also failed: ${directErr.message}`,
+              );
+              try { /* best-effort cleanup */ } catch (_) {}
+              throw new Error(
+                `Session ${sessionId} could not connect via proxy or direct IP: ${directErr.message}`,
+              );
+            }
+          }
+        }
+
+        // Second fallback (legacy): if reconnect fails, try to
+        // create a new client from stored session, still respecting
+        // the bound proxy. Wrapped in a timeout so a dead proxy
+        // doesn't stall here either.
         const sessionData = this.sessionStore.get(sessionId);
         if (sessionData) {
           try {
@@ -2052,7 +2170,11 @@ class TelegramService {
               proxy: proxyConf || undefined,
             });
 
-            await newClient.connect();
+            await withTimeout(
+              newClient.connect(),
+              timeoutMs,
+              'TG_RECONNECT',
+            );
 
             entry.client = newClient;
             entry.connected = true;
@@ -2069,7 +2191,7 @@ class TelegramService {
           }
         } else {
           throw new Error(
-            `Session ${sessionId} is disconnected and no stored session data is available`
+            `Session ${sessionId} is disconnected and no stored session data is available: ${connectError.message}`
           );
         }
       }

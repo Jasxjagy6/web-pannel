@@ -260,6 +260,21 @@ export const getClearChatsJob = (jobId) =>
   api.get(`${BASE}/sessions/clear-history/jobs/${encodeURIComponent(jobId)}`);
 
 /**
+ * Stop a still-running "Delete chats" job. Idempotent: returns the
+ * current job snapshot whether or not the job was already finished.
+ *
+ * Sessions that hadn't started flip to `cancelled` immediately on the
+ * server side; in-flight workers observe the AbortSignal and bail out
+ * without waiting for their dialog scans / DeleteHistory loops to time
+ * out.
+ */
+export const cancelClearChatsJob = (jobId, opts = {}) =>
+  api.post(
+    `${BASE}/sessions/clear-history/jobs/${encodeURIComponent(jobId)}/cancel`,
+    opts.reason ? { reason: String(opts.reason) } : {},
+  );
+
+/**
  * D3 — forward messages from one chat into another.
  */
 export const forwardClientMessages = (sessionId, payload) =>

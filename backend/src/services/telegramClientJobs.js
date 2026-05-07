@@ -32,6 +32,21 @@ const _jobsById = new Map();
 /** @type {Map<string, string[]>} userId -> jobIds (newest first) */
 const _jobsByUser = new Map();
 
+/**
+ * Per-job AbortController registry.
+ *
+ * The controller registers one AbortController per session before it
+ * kicks off the background work, then `cancelJob(...)` aborts every
+ * outstanding controller so the in-flight clear-chats workers can
+ * fail-fast and mark themselves as cancelled.
+ *
+ * Stored separately from the job snapshot so we never accidentally
+ * leak the controller object over the socket / REST API.
+ *
+ * @type {Map<string, Map<string, AbortController>>}
+ */
+const _jobAbortControllers = new Map();
+
 function _newJobId() {
   return `cc_${crypto.randomBytes(10).toString('hex')}`;
 }
@@ -61,6 +76,7 @@ function publicJob(job) {
     id: job.id,
     revoke: job.revoke,
     status: job.status,
+    cancelRequested: !!job.cancelRequested,
     createdAt: job.createdAt,
     startedAt: job.startedAt,
     finishedAt: job.finishedAt,
@@ -70,6 +86,7 @@ function publicJob(job) {
       displayName: s.displayName,
       phone: s.phone,
       status: s.status,
+      stage: s.stage || null,
       total: s.total,
       done: s.done,
       succeeded: s.succeeded,
@@ -111,6 +128,7 @@ function createJob({ userId, revoke, sessions }) {
     userId: String(userId),
     revoke: !!revoke,
     status: 'queued',
+    cancelRequested: false,
     createdAt: Date.now(),
     startedAt: null,
     finishedAt: null,
@@ -119,6 +137,7 @@ function createJob({ userId, revoke, sessions }) {
       displayName: s.displayName || null,
       phone: s.phone || null,
       status: 'queued',
+      stage: 'queued',
       total: 0,
       done: 0,
       succeeded: 0,
@@ -183,7 +202,12 @@ function _recomputeTotals(job) {
     totals.deleted += s.deleted || 0;
     totals.bots += s.bots || 0;
     totals.blocked += s.blocked || 0;
-    if (s.status === 'done' || s.status === 'failed' || s.status === 'partial') {
+    if (
+      s.status === 'done'
+      || s.status === 'failed'
+      || s.status === 'partial'
+      || s.status === 'cancelled'
+    ) {
       totals.completedSessions += 1;
     }
   }
@@ -191,8 +215,14 @@ function _recomputeTotals(job) {
 
   if (totals.completedSessions === totals.totalSessions && totals.totalSessions > 0) {
     if (job.sessions.every((s) => s.status === 'done')) job.status = 'done';
+    else if (job.sessions.every((s) => s.status === 'cancelled')) job.status = 'cancelled';
     else if (job.sessions.every((s) => s.status === 'failed')) job.status = 'failed';
-    else job.status = 'partial';
+    else if (
+      job.cancelRequested
+      && job.sessions.every((s) => s.status === 'cancelled' || s.status === 'failed')
+    ) {
+      job.status = 'cancelled';
+    } else job.status = 'partial';
     if (!job.finishedAt) job.finishedAt = Date.now();
   } else if (totals.completedSessions > 0 || job.sessions.some((s) => s.status === 'running')) {
     job.status = 'running';
@@ -276,7 +306,93 @@ function failJob(jobId, errorMessage) {
   job.status = 'failed';
   job.finishedAt = Date.now();
   _emit(job);
+  _disposeAbortControllers(jobId);
   return job;
+}
+
+/**
+ * Register an AbortController for one (job, session) pair. The
+ * controller's signal is consumed by the service-layer dialog scan +
+ * pre-flight calls so `cancelJob` can break them out of any wait.
+ */
+function registerAbortController(jobId, sessionId, controller) {
+  if (!jobId || !sessionId || !controller) return;
+  let perSession = _jobAbortControllers.get(jobId);
+  if (!perSession) {
+    perSession = new Map();
+    _jobAbortControllers.set(jobId, perSession);
+  }
+  perSession.set(String(sessionId), controller);
+}
+
+function unregisterAbortController(jobId, sessionId) {
+  if (!jobId) return;
+  const perSession = _jobAbortControllers.get(jobId);
+  if (!perSession) return;
+  perSession.delete(String(sessionId));
+  if (perSession.size === 0) _jobAbortControllers.delete(jobId);
+}
+
+function _disposeAbortControllers(jobId) {
+  if (!jobId) return;
+  _jobAbortControllers.delete(jobId);
+}
+
+/**
+ * Mark a job as "cancel requested" and abort every in-flight session.
+ * Returns `null` if the job doesn't exist or doesn't belong to the
+ * caller; otherwise returns the latest snapshot. Per-session state is
+ * patched to `cancelled` for every session that hadn't started yet, so
+ * the History tab paints the correct status immediately even before
+ * the worker tasks notice the abort.
+ */
+function cancelJob(jobId, userId, { reason = 'Cancelled by user' } = {}) {
+  const job = _jobsById.get(jobId);
+  if (!job) return null;
+  if (String(job.userId) !== String(userId)) return null;
+  if (
+    job.status === 'done'
+    || job.status === 'partial'
+    || job.status === 'failed'
+    || job.status === 'cancelled'
+  ) {
+    return job;
+  }
+
+  job.cancelRequested = true;
+
+  // Mark anything still queued as cancelled up-front; the worker
+  // tasks will flip 'running' rows to 'cancelled' as they observe the
+  // AbortSignal.
+  for (const s of job.sessions) {
+    if (s.status === 'queued') {
+      s.status = 'cancelled';
+      s.error = s.error || reason;
+      s.finishedAt = Date.now();
+    }
+  }
+
+  // Abort every registered controller. The signal is consumed by the
+  // dialog scan + pre-flight wrappers in the service layer, which
+  // throw a CANCELLED AppError that the controller maps to a
+  // 'cancelled' per-session status.
+  const perSession = _jobAbortControllers.get(jobId);
+  if (perSession) {
+    for (const [, controller] of perSession.entries()) {
+      try {
+        controller.abort(reason);
+      } catch (_) { /* ignore */ }
+    }
+  }
+
+  _recomputeTotals(job);
+  _emit(job);
+  return job;
+}
+
+function isCancelRequested(jobId) {
+  const job = _jobsById.get(jobId);
+  return !!(job && job.cancelRequested);
 }
 
 module.exports = {
@@ -286,6 +402,10 @@ module.exports = {
   patchJobSession,
   appendSessionResult,
   failJob,
+  cancelJob,
+  isCancelRequested,
+  registerAbortController,
+  unregisterAbortController,
   publicJob,
   userJobsRoom,
 };

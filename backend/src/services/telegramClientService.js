@@ -1461,6 +1461,8 @@ class TelegramClientService {
    * once instead of failing the dialog.
    *
    * `opts.onProgress(event)` is called with one of:
+   *   - { type: 'connecting' }
+   *   - { type: 'scanning', dialogsSoFar }
    *   - { type: 'started', total }
    *   - { type: 'progress', total, done, peerType, peerId, title, ok,
    *       action, cleared, left, deleted, error, code }
@@ -1479,6 +1481,12 @@ class TelegramClientService {
    *   History tab can correlate emits with its job id
    * @param {(event: object) => void} [opts.onProgress] callback invoked
    *   with per-peer + lifecycle events (see above)
+   * @param {AbortSignal} [opts.signal] aborts the run between
+   *   dialogs / before pre-flight; surfaces as `CANCELLED` errors
+   * @param {number} [opts.connectTimeoutMs=10000] hard cap for the
+   *   pre-flight connect + getMe race
+   * @param {number} [opts.scanTimeoutMs=120000] hard cap for the
+   *   total dialog-scan loop
    */
   async deleteAllChatsHistory(sessionId, userId, opts = {}) {
     const revoke = !!opts.revoke;
@@ -1487,6 +1495,13 @@ class TelegramClientService {
       Math.min(16, parseInt(opts.concurrency, 10) || 8),
     );
     const jobId = opts.jobId || null;
+    const signal = opts.signal && typeof opts.signal === 'object' ? opts.signal : null;
+    const connectTimeoutMs = Number.isFinite(opts.connectTimeoutMs) && opts.connectTimeoutMs > 0
+      ? opts.connectTimeoutMs
+      : 10_000;
+    const scanTimeoutMs = Number.isFinite(opts.scanTimeoutMs) && opts.scanTimeoutMs > 0
+      ? opts.scanTimeoutMs
+      : 120_000;
     const onProgress =
       typeof opts.onProgress === 'function' ? opts.onProgress : null;
     const _emitProgress = (ev) => {
@@ -1496,35 +1511,168 @@ class TelegramClientService {
       }
     };
 
+    const _throwIfAborted = () => {
+      if (signal && signal.aborted) {
+        const reason = (signal.reason && (signal.reason.message || String(signal.reason)))
+          || 'Cancelled';
+        const err = new AppError(reason, 499, 'CANCELLED');
+        err.cancelled = true;
+        throw err;
+      }
+    };
+
+    const _withTimeoutAndAbort = (promise, ms, label) => {
+      let timer = null;
+      const timeoutP = new Promise((_, reject) => {
+        timer = setTimeout(() => {
+          const err = new AppError(`Operation timed out (${label})`, 504, `TIMEOUT_${label}`);
+          err.isTimeout = true;
+          reject(err);
+        }, ms);
+      });
+      const abortP = signal
+        ? new Promise((_, reject) => {
+            const onAbort = () => {
+              const reason = (signal.reason && (signal.reason.message || String(signal.reason)))
+                || 'Cancelled';
+              const err = new AppError(reason, 499, 'CANCELLED');
+              err.cancelled = true;
+              reject(err);
+            };
+            if (signal.aborted) {
+              onAbort();
+              return;
+            }
+            signal.addEventListener('abort', onAbort, { once: true });
+          })
+        : null;
+      const racers = abortP ? [promise, timeoutP, abortP] : [promise, timeoutP];
+      return Promise.race(racers).finally(() => {
+        if (timer) clearTimeout(timer);
+      });
+    };
+
+    _throwIfAborted();
+
+    // ---- Pre-flight: load + connect ---------------------------------
+    // The controller emits `tg-client:clearChatsStart` only after we
+    // know how many dialogs there are, so the History tab paints
+    // "Scanning…" until that event lands. Surface a `connecting`
+    // lifecycle event up-front so the operator sees that the worker
+    // actually started doing something instead of staring at "queued".
+    _emitProgress({ type: 'connecting' });
+
     await _loadAndAuthSession(sessionId, userId);
-    await tgService._ensureConnected(sessionId);
+    // 10s hard cap on the (re)connect with proxy → direct-IP fallback
+    // when the bound proxy is unreachable. With a dead SOCKS5 proxy
+    // gramJS retries the underlying socket internally for 15s+ a pop
+    // and never resolves on its own.
+    await tgService._ensureConnected(sessionId, {
+      timeoutMs: connectTimeoutMs,
+      allowProxyFallback: true,
+    });
+    _throwIfAborted();
     const entry = tgService.clients.get(String(sessionId));
     if (!entry) throw new AppError('Session client not loaded', 500, 'CLIENT_NOT_LOADED');
 
+    // Pre-flight `getMe` so the worker fails fast when MTProto can't
+    // actually round-trip even though `client.connect()` reported
+    // success (typical of a proxy that opens TCP but corrupts msg_keys
+    // — see "Security error while unpacking …" in the bug report).
     let selfId = null;
     try {
-      const me = await entry.client.getMe();
+      const me = await _withTimeoutAndAbort(
+        entry.client.getMe(),
+        connectTimeoutMs,
+        'GETME',
+      );
       selfId = _toIdNum(me?.id);
     } catch (err) {
+      if (err && err.cancelled) throw err;
+      // Network-level pre-flight failure (timeout / mtproto desync) —
+      // fail the whole session rather than spend minutes on dialog
+      // scan that will also hang.
+      if (err && (err.isTimeout || /TIMEOUT_/.test(err.code || ''))) {
+        throw new AppError(
+          `Pre-flight check failed for session ${sessionId}: ${err.message}`,
+          504,
+          'PREFLIGHT_TIMEOUT',
+        );
+      }
       logger.debug(`clearChats getMe failed (continuing without self id): ${err.message}`);
     }
 
+    _throwIfAborted();
+
+    // ---- Dialog scan with hard cap + heartbeats --------------------
     // Pull as many dialogs as Telegram will give us for the account in
     // one call. The `iterDialogs` helper is the "no limit" sibling of
     // getDialogs and returns every dialog the account has on the panel
     // side. We collect into an array so we can fan out concurrently
     // and emit progress events as each dialog completes.
+    //
+    // Wrapped in a hard timeout because gramJS's iterator silently
+    // retries internally on socket errors; without a deadline the
+    // whole job can sit on "Scanning chats" forever when the proxy
+    // misbehaves mid-stream.
+    _emitProgress({ type: 'scanning', dialogsSoFar: 0 });
+    const io = global.io;
+    const room = `tg-client:u${userId}:s${sessionId}`;
+    if (io) {
+      try {
+        io.to(room).emit('tg-client:clearChatsScanning', {
+          sessionId: String(sessionId),
+          jobId,
+        });
+      } catch (_) { /* ignore */ }
+    }
     const dialogs = [];
-    try {
+    let lastHeartbeatMs = Date.now();
+    const HEARTBEAT_MS = 1_500;
+
+    const _scanDialogs = async () => {
       for await (const d of entry.client.iterDialogs({})) {
+        if (signal && signal.aborted) {
+          const reason = (signal.reason && (signal.reason.message || String(signal.reason)))
+            || 'Cancelled';
+          const err = new AppError(reason, 499, 'CANCELLED');
+          err.cancelled = true;
+          throw err;
+        }
         if (d && d.entity) dialogs.push(d);
+        const now = Date.now();
+        if (now - lastHeartbeatMs >= HEARTBEAT_MS) {
+          lastHeartbeatMs = now;
+          _emitProgress({ type: 'scanning', dialogsSoFar: dialogs.length });
+          if (io) {
+            try {
+              io.to(room).emit('tg-client:clearChatsScanning', {
+                sessionId: String(sessionId),
+                jobId,
+                dialogsSoFar: dialogs.length,
+              });
+            } catch (_) { /* ignore */ }
+          }
+        }
       }
+    };
+
+    try {
+      await _withTimeoutAndAbort(_scanDialogs(), scanTimeoutMs, 'DIALOGS');
     } catch (err) {
+      if (err && err.cancelled) throw err;
+      if (err && (err.isTimeout || /TIMEOUT_/.test(err.code || ''))) {
+        throw new AppError(
+          `Dialog scan timed out after ${Math.round(scanTimeoutMs / 1000)}s (proxy may be unreachable)`,
+          504,
+          'DIALOG_SCAN_TIMEOUT',
+        );
+      }
       throw new AppError(`Failed to list dialogs: ${err.message}`, 502, 'DIALOGS_FETCH_FAILED');
     }
 
-    const io = global.io;
-    const room = `tg-client:u${userId}:s${sessionId}`;
+    _throwIfAborted();
+
     const total = dialogs.length;
     const results = new Array(total);
     let succeeded = 0;
@@ -1554,6 +1702,32 @@ class TelegramClientService {
     // so the Promise-pool workers can run in any order without stepping
     // on each other.
     const _processDialog = async (idx) => {
+      // Cancellation: when the controller has flipped the AbortSignal
+      // on us, mark this peer as cancelled instead of attempting
+      // another DeleteHistory round-trip on a possibly-dead proxy.
+      if (signal && signal.aborted) {
+        failed += 1;
+        done += 1;
+        const reason = (signal.reason && (signal.reason.message || String(signal.reason)))
+          || 'Cancelled';
+        const r = {
+          peerType: _peerTypeOf(dialogs[idx]?.entity) || 'unknown',
+          peerId: _toIdNum(dialogs[idx]?.entity?.id),
+          title: _entityTitle(dialogs[idx]?.entity),
+          ok: false,
+          action: null,
+          cleared: false,
+          left: false,
+          deleted: false,
+          error: reason,
+          code: 'CANCELLED',
+          warnings: [],
+        };
+        results[idx] = r;
+        _emitProgress({ type: 'progress', total, done, ...r });
+        return;
+      }
+
       const dialog = dialogs[idx];
       const entity = dialog.entity;
       const peerType = _peerTypeOf(entity);
@@ -1815,17 +1989,50 @@ class TelegramClientService {
     // processes it; when the index pointer overruns the array, the
     // worker exits. `Promise.all` then resolves once every worker is
     // idle, i.e. every dialog has been processed.
+    //
+    // Workers also bail out as soon as the AbortSignal fires so that
+    // an operator clicking Cancel doesn't have to wait for every
+    // already-queued peer to round-trip Telegram.
     let nextIdx = 0;
     const workerCount = Math.min(concurrency, total);
     await Promise.all(
       new Array(workerCount).fill(0).map(async () => {
         while (true) {
+          if (signal && signal.aborted) return;
           const i = nextIdx++;
           if (i >= total) return;
           await _processDialog(i);
         }
       })
     );
+
+    // If we exited early because of a cancel, mark every untouched
+    // dialog as cancelled so the UI per-session counters add up.
+    if (signal && signal.aborted) {
+      const reason = (signal.reason && (signal.reason.message || String(signal.reason)))
+        || 'Cancelled';
+      for (let i = 0; i < total; i += 1) {
+        if (results[i]) continue;
+        failed += 1;
+        done += 1;
+        const entity = dialogs[i]?.entity;
+        const r = {
+          peerType: _peerTypeOf(entity) || 'unknown',
+          peerId: _toIdNum(entity?.id),
+          title: _entityTitle(entity),
+          ok: false,
+          action: null,
+          cleared: false,
+          left: false,
+          deleted: false,
+          error: reason,
+          code: 'CANCELLED',
+          warnings: [],
+        };
+        results[i] = r;
+        _emitProgress({ type: 'progress', total, done, ...r });
+      }
+    }
 
     if (io) {
       try {
@@ -1836,6 +2043,7 @@ class TelegramClientService {
           failed,
           revoke,
           jobId,
+          cancelled: !!(signal && signal.aborted),
         });
       } catch (_) { /* ignore */ }
     }
@@ -1847,6 +2055,7 @@ class TelegramClientService {
       succeeded,
       failed,
       revoke,
+      cancelled: !!(signal && signal.aborted),
       results: results.filter(Boolean),
     };
   }
