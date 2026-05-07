@@ -8,9 +8,12 @@
  *
  * The page also doubles as the entry point for the bulk "Delete chats"
  * action: the user multi-selects sessions, picks "Delete for me" or
- * "Delete for both sides", and the panel wipes the chat history of every
- * dialog inside every selected session in parallel. See
- * `DeleteChatsModal` for the confirm + result UI.
+ * "Delete for both sides", and the panel kicks off an async job that
+ * wipes the chat history of every dialog inside every selected session.
+ *
+ * The page is split across two tabs:
+ *   - Sessions — the live list (default).
+ *   - History  — the job feed for the bulk "Delete chats" action.
  */
 
 import React, { useEffect, useMemo, useState } from 'react';
@@ -27,10 +30,13 @@ import {
   Trash2,
   CheckSquare,
   Square,
+  History as HistoryIcon,
+  ListChecks,
 } from 'lucide-react';
 import { listClientSessions, connectClientSession } from '../api/telegramClient';
 import Avatar from '../components/telegramClient/Avatar';
 import DeleteChatsModal from '../components/telegramClient/DeleteChatsModal';
+import ClearChatsHistoryTab from '../components/telegramClient/ClearChatsHistoryTab';
 import { usePlatform } from '../context/PlatformContext';
 import { useToast } from '../components/common/Toast';
 
@@ -86,6 +92,11 @@ export default function TelegramLoginSessions() {
   const [openingId, setOpeningId] = useState(null);
   const [selectedIds, setSelectedIds] = useState(() => new Set());
   const [showDeleteModal, setShowDeleteModal] = useState(false);
+  const [activeTab, setActiveTab] = useState('sessions');
+  // Seed the History tab with the just-created job so the user sees a
+  // card immediately, even before the first socket event arrives.
+  const [seedJob, setSeedJob] = useState(null);
+  const [autoExpandJobId, setAutoExpandJobId] = useState(null);
 
   const isTelegram = platform === 'telegram';
 
@@ -200,6 +211,15 @@ export default function TelegramLoginSessions() {
     refresh();
   };
 
+  const handleJobCreated = ({ jobId, job }) => {
+    if (job) setSeedJob(job);
+    if (jobId) setAutoExpandJobId(jobId);
+    // Drop selection so the action bar resets cleanly and switch the
+    // user to the History tab so they see live progress immediately.
+    setSelectedIds(new Set());
+    setActiveTab('history');
+  };
+
   const open = async (s) => {
     if (!s) return;
     if (!s.isLoginReady) {
@@ -253,6 +273,27 @@ export default function TelegramLoginSessions() {
 
   const SelectAllIcon = allFilteredSelected || someFilteredSelected ? CheckSquare : Square;
 
+  const renderTabButton = (key, label, Icon) => {
+    const active = activeTab === key;
+    return (
+      <button
+        key={key}
+        type="button"
+        role="tab"
+        aria-selected={active}
+        onClick={() => setActiveTab(key)}
+        className={`relative inline-flex items-center gap-1.5 rounded-md px-3 py-1.5 text-sm font-medium transition-colors ${
+          active
+            ? 'bg-white/10 text-gray-100'
+            : 'text-gray-400 hover:bg-white/5 hover:text-gray-200'
+        }`}
+      >
+        <Icon className="h-3.5 w-3.5" />
+        {label}
+      </button>
+    );
+  };
+
   return (
     <div className="flex h-full flex-col gap-4 p-6">
       <header className="flex items-start justify-between gap-3">
@@ -265,32 +306,52 @@ export default function TelegramLoginSessions() {
           </p>
         </div>
         <div className="flex items-center gap-2">
-          <button
-            type="button"
-            onClick={openDeleteModal}
-            disabled={selectedIds.size === 0}
-            className="inline-flex items-center gap-1.5 rounded-md border border-red-500/40 bg-red-500/10 px-3 py-1.5 text-sm font-medium text-red-200 transition-colors hover:bg-red-500/20 disabled:cursor-not-allowed disabled:border-white/10 disabled:bg-white/5 disabled:text-gray-500"
-            title={
-              selectedIds.size === 0
-                ? 'Select one or more sessions to clear their chat history'
-                : `Clear chat history for ${selectedIds.size} session${selectedIds.size === 1 ? '' : 's'}`
-            }
-          >
-            <Trash2 className="h-3.5 w-3.5" />
-            Delete chats
-            {selectedIds.size > 0 ? ` (${selectedIds.size})` : ''}
-          </button>
-          <button
-            onClick={refresh}
-            className="inline-flex items-center gap-1.5 rounded-md border border-white/10 bg-dark-800 px-3 py-1.5 text-sm text-gray-200 hover:bg-white/5"
-          >
-            <RefreshCcw className="h-3.5 w-3.5" />
-            Refresh
-          </button>
+          {activeTab === 'sessions' && (
+            <>
+              <button
+                type="button"
+                onClick={openDeleteModal}
+                disabled={selectedIds.size === 0}
+                className="inline-flex items-center gap-1.5 rounded-md border border-red-500/40 bg-red-500/10 px-3 py-1.5 text-sm font-medium text-red-200 transition-colors hover:bg-red-500/20 disabled:cursor-not-allowed disabled:border-white/10 disabled:bg-white/5 disabled:text-gray-500"
+                title={
+                  selectedIds.size === 0
+                    ? 'Select one or more sessions to clear their chat history'
+                    : `Clear chat history for ${selectedIds.size} session${selectedIds.size === 1 ? '' : 's'}`
+                }
+              >
+                <Trash2 className="h-3.5 w-3.5" />
+                Delete chats
+                {selectedIds.size > 0 ? ` (${selectedIds.size})` : ''}
+              </button>
+              <button
+                onClick={refresh}
+                className="inline-flex items-center gap-1.5 rounded-md border border-white/10 bg-dark-800 px-3 py-1.5 text-sm text-gray-200 hover:bg-white/5"
+              >
+                <RefreshCcw className="h-3.5 w-3.5" />
+                Refresh
+              </button>
+            </>
+          )}
         </div>
       </header>
 
-      <div className="relative">
+      <div
+        role="tablist"
+        aria-label="Login page tabs"
+        className="inline-flex w-fit gap-1 rounded-lg border border-white/10 bg-dark-900 p-1"
+      >
+        {renderTabButton('sessions', 'Sessions', ListChecks)}
+        {renderTabButton('history', 'History', HistoryIcon)}
+      </div>
+
+      {activeTab === 'history' ? (
+        <ClearChatsHistoryTab
+          initialJob={seedJob}
+          autoExpandJobId={autoExpandJobId}
+        />
+      ) : (
+        <>
+          <div className="relative">
         <Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-gray-500" />
         <input
           type="text"
@@ -455,10 +516,14 @@ export default function TelegramLoginSessions() {
         </ul>
       )}
 
+        </>
+      )}
+
       <DeleteChatsModal
         isOpen={showDeleteModal}
         onClose={closeDeleteModal}
         sessions={selectedSessions}
+        onJobCreated={handleJobCreated}
       />
     </div>
   );

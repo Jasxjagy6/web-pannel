@@ -33,6 +33,46 @@ const DEFAULT_MESSAGES_LIMIT = 50;
 const MAX_MESSAGES_LIMIT = 100;
 
 /**
+ * Extract the FLOOD_WAIT seconds value from a GramJS error, or null
+ * when the error isn't a flood-wait. GramJS surfaces FLOOD_WAIT in
+ * a few shapes depending on the entrypoint, so we cover all of them.
+ */
+function _floodWaitSeconds(err) {
+  if (!err) return null;
+  if (typeof err.seconds === 'number' && err.seconds >= 0) return err.seconds;
+  const tag = err.errorMessage || err.message || '';
+  const m = String(tag).match(/FLOOD[_ ]?WAIT[_ ]?(\d+)/i);
+  if (m) return parseInt(m[1], 10);
+  return null;
+}
+
+/**
+ * Run `fn`. If Telegram answers with FLOOD_WAIT_X for X ≤ 120 seconds,
+ * sleep X+1 seconds and retry once. Larger waits are surfaced
+ * unchanged so the caller can fail the dialog and move on instead of
+ * blocking the whole job for minutes.
+ */
+async function _withFloodRetry(fn, opts = {}) {
+  const maxRetries = opts.maxRetries != null ? opts.maxRetries : 1;
+  const maxFloodSeconds = opts.maxFloodSeconds != null ? opts.maxFloodSeconds : 120;
+  let attempt = 0;
+  while (true) {
+    try {
+      return await fn();
+    } catch (err) {
+      const wait = _floodWaitSeconds(err);
+      if (wait != null && wait <= maxFloodSeconds && attempt < maxRetries) {
+        logger.debug(`FLOOD_WAIT_${wait}s — sleeping then retrying`);
+        await new Promise((r) => setTimeout(r, (wait + 1) * 1000));
+        attempt += 1;
+        continue;
+      }
+      throw err;
+    }
+  }
+}
+
+/**
  * Look up `{ id, user_id, status, is_logged_in, account_info, platform }`
  * for one session and authorize it against the caller. Throws AppError
  * (404) on miss, (403) on cross-user access.
@@ -1414,34 +1454,48 @@ class TelegramClientService {
    * there (e.g. CHAT_ADMIN_REQUIRED on a non-admin channel) is not
    * fatal, the leave/delete step still runs so the dialog disappears.
    *
+   * Dialogs run through a bounded Promise pool (default concurrency 8)
+   * so 100s of dialogs finish in seconds rather than minutes. Each
+   * GramJS invoke is wrapped in a FLOOD_WAIT-aware retry: when Telegram
+   * tells us to back off for ≤ `maxFloodSeconds`, we sleep and retry
+   * once instead of failing the dialog.
+   *
+   * `opts.onProgress(event)` is called with one of:
+   *   - { type: 'started', total }
+   *   - { type: 'progress', total, done, peerType, peerId, title, ok,
+   *       action, cleared, left, deleted, error, code }
+   *   - { type: 'finished', total, succeeded, failed }
+   * It is the only mechanism the caller has to receive per-peer state
+   * during the run; the controller uses it to feed the in-memory job.
+   *
    * @param {string|number} sessionId
    * @param {string|number} userId
    * @param {object} [opts]
    * @param {boolean} [opts.revoke=false] true = delete from both sides /
    *   try to fully delete groups & channels where allowed
-   * @returns {Promise<{
-   *   sessionId: string,
-   *   total: number,
-   *   succeeded: number,
-   *   failed: number,
-   *   revoke: boolean,
-   *   results: Array<{
-   *     peerType: string,
-   *     peerId: number|null,
-   *     title: string|null,
-   *     ok: boolean,
-   *     action: 'cleared'|'left'|'deleted'|null,
-   *     cleared: boolean,
-   *     left: boolean,
-   *     deleted: boolean,
-   *     error: string|null,
-   *     code: string|null,
-   *     warnings: Array<{ stage: string, code: string|null, error: string }>,
-   *   }>
-   * }>}
+   * @param {number} [opts.concurrency=8] in-flight dialog calls per
+   *   session (clamped to [1, 16])
+   * @param {string} [opts.jobId] echoed onto socket events so the
+   *   History tab can correlate emits with its job id
+   * @param {(event: object) => void} [opts.onProgress] callback invoked
+   *   with per-peer + lifecycle events (see above)
    */
   async deleteAllChatsHistory(sessionId, userId, opts = {}) {
     const revoke = !!opts.revoke;
+    const concurrency = Math.max(
+      1,
+      Math.min(16, parseInt(opts.concurrency, 10) || 8),
+    );
+    const jobId = opts.jobId || null;
+    const onProgress =
+      typeof opts.onProgress === 'function' ? opts.onProgress : null;
+    const _emitProgress = (ev) => {
+      if (!onProgress) return;
+      try { onProgress(ev); } catch (err) {
+        logger.debug(`clearChats onProgress threw: ${err.message}`);
+      }
+    };
+
     await _loadAndAuthSession(sessionId, userId);
     await tgService._ensureConnected(sessionId);
     const entry = tgService.clients.get(String(sessionId));
@@ -1458,8 +1512,8 @@ class TelegramClientService {
     // Pull as many dialogs as Telegram will give us for the account in
     // one call. The `iterDialogs` helper is the "no limit" sibling of
     // getDialogs and returns every dialog the account has on the panel
-    // side. We collect into an array so we can iterate sequentially and
-    // emit progress events.
+    // side. We collect into an array so we can fan out concurrently
+    // and emit progress events as each dialog completes.
     const dialogs = [];
     try {
       for await (const d of entry.client.iterDialogs({})) {
@@ -1472,9 +1526,10 @@ class TelegramClientService {
     const io = global.io;
     const room = `tg-client:u${userId}:s${sessionId}`;
     const total = dialogs.length;
-    const results = [];
+    const results = new Array(total);
     let succeeded = 0;
     let failed = 0;
+    let done = 0;
 
     if (io && total > 0) {
       try {
@@ -1482,9 +1537,11 @@ class TelegramClientService {
           sessionId: String(sessionId),
           total,
           revoke,
+          jobId,
         });
       } catch (_) { /* ignore */ }
     }
+    _emitProgress({ type: 'started', total });
 
     const _errStr = (e) => (e && (e.message || e.errorMessage)) || String(e);
     const _errCode = (e) => {
@@ -1492,10 +1549,12 @@ class TelegramClientService {
       return typeof c === 'string' ? c : null;
     };
 
-    // Sequential per-dialog so we never exceed the per-session MTProto
-    // rate limit. Concurrency across sessions is the caller's concern.
-    for (let i = 0; i < dialogs.length; i++) {
-      const dialog = dialogs[i];
+    // Process one dialog: clear history, then leave/delete for groups
+    // & channels. Records into `results[idx]` and bumps shared counters
+    // so the Promise-pool workers can run in any order without stepping
+    // on each other.
+    const _processDialog = async (idx) => {
+      const dialog = dialogs[idx];
       const entity = dialog.entity;
       const peerType = _peerTypeOf(entity);
       const peerIdNum = _toIdNum(entity?.id);
@@ -1503,7 +1562,8 @@ class TelegramClientService {
 
       if (!peerType || peerIdNum == null) {
         failed += 1;
-        results.push({
+        done += 1;
+        const r = {
           peerType: peerType || 'unknown',
           peerId: peerIdNum,
           title,
@@ -1515,8 +1575,10 @@ class TelegramClientService {
           error: 'Unrecognized dialog entity',
           code: 'BAD_PEER',
           warnings: [],
-        });
-        continue;
+        };
+        results[idx] = r;
+        _emitProgress({ type: 'progress', total, done, ...r });
+        return;
       }
 
       // Skip the account's own "Saved Messages" chat — it can't be left,
@@ -1535,39 +1597,38 @@ class TelegramClientService {
       try {
         if (peerType === 'channel') {
           const inputChannel = await entry.client.getInputEntity(entity);
-          await entry.client.invoke(new Api.channels.DeleteHistory({
-            channel: inputChannel,
-            maxId: 0,
-            forEveryone: revoke,
-          }));
+          await _withFloodRetry(() =>
+            entry.client.invoke(new Api.channels.DeleteHistory({
+              channel: inputChannel,
+              maxId: 0,
+              forEveryone: revoke,
+            }))
+          );
         } else {
           const inputPeer = await entry.client.getInputEntity(entity);
-          await entry.client.invoke(new Api.messages.DeleteHistory({
-            peer: inputPeer,
-            maxId: 0,
-            // For private chats we keep the historical semantic:
-            // revoke=false ⇒ just_clear (caller-only), revoke=true ⇒
-            // also remove the dialog and delete for the other side.
-            // For basic chats we always just_clear here because the
-            // dialog is removed by the explicit DeleteChatUser /
-            // DeleteChat step below — using just_clear=false here would
-            // make Telegram report CHAT_ADMIN_REQUIRED on some basic
-            // groups.
-            justClear: peerType === 'user' ? !revoke : true,
-            revoke,
-          }));
+          await _withFloodRetry(() =>
+            entry.client.invoke(new Api.messages.DeleteHistory({
+              peer: inputPeer,
+              maxId: 0,
+              // Private chats keep the historical semantic:
+              // revoke=false ⇒ just_clear (caller-only), revoke=true ⇒
+              // also remove the dialog and delete for the other side.
+              // Basic chats always just_clear here because the dialog
+              // is removed by the explicit DeleteChatUser / DeleteChat
+              // step below — using just_clear=false here would make
+              // Telegram report CHAT_ADMIN_REQUIRED on some basic groups.
+              justClear: peerType === 'user' ? !revoke : true,
+              revoke,
+            }))
+          );
         }
         cleared = true;
       } catch (err) {
         const code = _errCode(err);
         const msg = _errStr(err);
         if (peerType === 'user') {
-          // For private chats clearing is the entire operation, so a
-          // failure here is fatal for this peer.
           fatalErr = { msg, code, stage: 'clearHistory' };
         } else {
-          // For groups/channels, clearing is best-effort. We still
-          // attempt to leave below so the dialog disappears.
           warnings.push({ stage: 'clearHistory', code, error: msg });
           logger.debug(
             `clearChats session=${sessionId} peer=${peerType}/${peerIdNum} clear failed (will still try leave): ${msg}`
@@ -1577,27 +1638,31 @@ class TelegramClientService {
 
       // ---- Step 2: leave / delete groups & channels ------------------
       if (!fatalErr && peerType === 'chat' && !isSelfChat) {
-        // Basic group: delete the whole chat as creator if revoke,
-        // otherwise (or on failure) just leave.
         if (revoke) {
           try {
-            await entry.client.invoke(new Api.messages.DeleteChat({
-              chatId: peerIdNum,
-            }));
+            await _withFloodRetry(() =>
+              entry.client.invoke(new Api.messages.DeleteChat({
+                chatId: peerIdNum,
+              }))
+            );
             deleted = true;
           } catch (err) {
-            const code = _errCode(err);
-            const msg = _errStr(err);
-            warnings.push({ stage: 'deleteChat', code, error: msg });
+            warnings.push({
+              stage: 'deleteChat',
+              code: _errCode(err),
+              error: _errStr(err),
+            });
           }
         }
         if (!deleted) {
           try {
-            await entry.client.invoke(new Api.messages.DeleteChatUser({
-              chatId: peerIdNum,
-              userId: new Api.InputUserSelf(),
-              revokeHistory: revoke,
-            }));
+            await _withFloodRetry(() =>
+              entry.client.invoke(new Api.messages.DeleteChatUser({
+                chatId: peerIdNum,
+                userId: new Api.InputUserSelf(),
+                revokeHistory: revoke,
+              }))
+            );
             left = true;
           } catch (err) {
             fatalErr = {
@@ -1611,21 +1676,27 @@ class TelegramClientService {
         const inputChannel = await entry.client.getInputEntity(entity);
         if (revoke) {
           try {
-            await entry.client.invoke(new Api.channels.DeleteChannel({
-              channel: inputChannel,
-            }));
+            await _withFloodRetry(() =>
+              entry.client.invoke(new Api.channels.DeleteChannel({
+                channel: inputChannel,
+              }))
+            );
             deleted = true;
           } catch (err) {
-            const code = _errCode(err);
-            const msg = _errStr(err);
-            warnings.push({ stage: 'deleteChannel', code, error: msg });
+            warnings.push({
+              stage: 'deleteChannel',
+              code: _errCode(err),
+              error: _errStr(err),
+            });
           }
         }
         if (!deleted) {
           try {
-            await entry.client.invoke(new Api.channels.LeaveChannel({
-              channel: inputChannel,
-            }));
+            await _withFloodRetry(() =>
+              entry.client.invoke(new Api.channels.LeaveChannel({
+                channel: inputChannel,
+              }))
+            );
             left = true;
           } catch (err) {
             fatalErr = {
@@ -1642,6 +1713,7 @@ class TelegramClientService {
       const action = deleted ? 'deleted' : left ? 'left' : ok ? 'cleared' : null;
       if (ok) succeeded += 1;
       else failed += 1;
+      done += 1;
 
       if (!ok) {
         logger.warn(
@@ -1649,7 +1721,7 @@ class TelegramClientService {
         );
       }
 
-      results.push({
+      const r = {
         peerType,
         peerId: peerIdNum,
         title,
@@ -1661,20 +1733,24 @@ class TelegramClientService {
         error: ok ? null : fatalErr.msg,
         code: ok ? null : fatalErr.code,
         warnings,
-      });
+      };
+      results[idx] = r;
+
+      _emitProgress({ type: 'progress', total, done, ...r });
 
       if (io) {
         try {
           io.to(room).emit('tg-client:clearChatsProgress', {
             sessionId: String(sessionId),
             total,
-            done: i + 1,
+            done,
             peerType,
             peerId: peerIdNum,
             title,
             ok,
             action,
-            error: ok ? null : fatalErr.msg,
+            error: r.error,
+            jobId,
           });
           if (cleared) {
             io.to(room).emit('tg-client:dialogHistoryCleared', {
@@ -1694,7 +1770,23 @@ class TelegramClientService {
           }
         } catch (_) { /* ignore */ }
       }
-    }
+    };
+
+    // Bounded-concurrency pool. Each "worker" pulls the next index and
+    // processes it; when the index pointer overruns the array, the
+    // worker exits. `Promise.all` then resolves once every worker is
+    // idle, i.e. every dialog has been processed.
+    let nextIdx = 0;
+    const workerCount = Math.min(concurrency, total);
+    await Promise.all(
+      new Array(workerCount).fill(0).map(async () => {
+        while (true) {
+          const i = nextIdx++;
+          if (i >= total) return;
+          await _processDialog(i);
+        }
+      })
+    );
 
     if (io) {
       try {
@@ -1704,9 +1796,11 @@ class TelegramClientService {
           succeeded,
           failed,
           revoke,
+          jobId,
         });
       } catch (_) { /* ignore */ }
     }
+    _emitProgress({ type: 'finished', total, succeeded, failed });
 
     return {
       sessionId: String(sessionId),
@@ -1714,7 +1808,7 @@ class TelegramClientService {
       succeeded,
       failed,
       revoke,
-      results,
+      results: results.filter(Boolean),
     };
   }
 

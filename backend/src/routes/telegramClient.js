@@ -33,6 +33,10 @@ function maybeMultipart(mw) {
 router.get('/sessions', controller.listSessions);
 // Bulk "Clear chat history across N sessions" — declared before
 // /sessions/:id/* so the static path wins over the param route.
+// Job-based: POST kicks off the work asynchronously and returns the
+// job id; the History tab on Login uses GET /jobs to render progress.
+router.get('/sessions/clear-history/jobs', controller.listClearChatsJobs);
+router.get('/sessions/clear-history/jobs/:jobId', controller.getClearChatsJob);
 router.post('/sessions/clear-history', controller.clearAllChatsHistory);
 router.post('/sessions/:id/connect', controller.connect);
 router.get('/sessions/:id/me', controller.getMe);
