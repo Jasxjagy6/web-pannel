@@ -13,6 +13,7 @@ const logger = require('../utils/logger');
 const { AppError } = require('../utils/errorHandler');
 const { buildPagination, applyPagination, applySorting } = require('../utils/pagination');
 const { redisClient } = require('../config/redis');
+const distributionPlanner = require('./distributionPlanner');
 
 // =========================================================================
 // Constants
@@ -326,6 +327,12 @@ class DistributionEngine {
       messageType = 'text',
       mediaPath = null,
       messageOptions = {},
+      // Rotation/cooldown distribution plan. When omitted the job
+      // processes each session's chunk sequentially (legacy
+      // behaviour). When provided, the runner switches to a rotation
+      // loop: each round every session sends `perSessionBurst`
+      // messages, then everyone cools down for cooldownSec.
+      plan = null,
     } = options;
 
     const jobId = job.id;
@@ -437,137 +444,254 @@ class DistributionEngine {
       return false;
     };
 
-    // Process each session's chunk
-    const sessions = [...sessionMap.entries()];
+    // Track which sessions have hit a hard rate-limit / fatal error so
+    // we can skip them in subsequent rounds (rotation mode).
+    const deadSessions = new Set();
 
-    for (const [sessionId, targets] of sessions) {
-      // Check cancellation before starting each session
-      if (await isCancelled()) {
-        // Skip remaining targets
-        totalSkipped += targets.length;
-        for (const targetId of targets) {
-          await addLog(sessionId, targetId, 'skipped', 'Job was cancelled');
+    /**
+     * Send a single target with retry/fallback. Updates counters,
+     * adds log entries, and respects cancellation. Returns true on
+     * success.
+     */
+    const processOneTarget = async (sessionId, targetId) => {
+      let success = false;
+      let lastError = null;
+      let usedSessionId = sessionId;
+
+      for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+        try {
+          // On retry, try a different (live) session if available.
+          if (attempt > 0) {
+            const otherSessions = [...sessionMap.keys()].filter(
+              (s) => s !== usedSessionId && !deadSessions.has(s)
+            );
+            if (otherSessions.length > 0) {
+              usedSessionId = otherSessions[
+                Math.floor(Math.random() * otherSessions.length)
+              ];
+              logger.info(
+                `Retry ${attempt}: switching to session ${usedSessionId} for target ${targetId}`
+              );
+            }
+          }
+
+          if (messageType === 'text' || messageType === 'markdown') {
+            await telegramService.sendMessage(
+              usedSessionId,
+              targetId,
+              messageContent,
+              messageOptions
+            );
+          } else if (messageType === 'forward') {
+            const forwardOpts = parseJson(messageContent);
+            const sourceId = forwardOpts?.sourceId || forwardOpts?.source_id || '';
+            const msgId = forwardOpts?.messageId || forwardOpts?.message_id || 0;
+            await telegramService.forwardMessage(
+              usedSessionId,
+              targetId,
+              parseInt(msgId, 10),
+              sourceId
+            );
+          } else {
+            await telegramService.sendMessage(
+              usedSessionId,
+              targetId,
+              messageContent,
+              messageOptions
+            );
+          }
+
+          success = true;
+          break;
+        } catch (sendError) {
+          lastError = sendError.message || String(sendError);
+
+          if (isFatalSessionError(lastError)) {
+            logger.error(`Fatal error on session ${usedSessionId}: ${lastError}`);
+            deadSessions.add(usedSessionId);
+            break;
+          }
+
+          // PEER_FLOOD on a session in rotation mode: retire that
+          // session for the rest of the run (subsequent rounds will
+          // skip it). Other retries can still pick a different one.
+          if (lastError.includes('PEER_FLOOD')) {
+            deadSessions.add(usedSessionId);
+          }
+
+          if (!isRetryableError(lastError)) {
+            break;
+          }
+
+          if (attempt < MAX_RETRIES) {
+            const backoffMs = Math.min(
+              delayMin * Math.pow(2, attempt) + randomInt(0, 500),
+              30000
+            );
+            logger.warn(
+              `Retry ${attempt + 1}/${MAX_RETRIES} for target ${targetId} after ${backoffMs}ms: ${lastError}`
+            );
+            await sleep(backoffMs);
+          }
         }
-        await updateProgress('cancelled');
-        break;
       }
 
-      let sessionSent = 0;
-      let sessionFailed = 0;
-      let sessionSkipped = 0;
+      if (success) {
+        totalSent++;
+        await addLog(usedSessionId, targetId, 'sent');
+      } else {
+        totalFailed++;
+        await addLog(sessionId, targetId, 'failed', lastError);
+      }
 
-      for (const targetId of targets) {
-        // Check cancellation between each message
+      if ((totalSent + totalFailed + totalSkipped) % 50 === 0) {
+        await updateProgress('running');
+      }
+
+      return success;
+    };
+
+    if (plan && plan.perSessionBurst > 0) {
+      // ROTATION MODE
+      //
+      // Build per-session queues from sessionMap, then loop:
+      //   for round in 0..rounds:
+      //     for each session: send up to `perSessionBurst` messages
+      //       (per-item delay sampled from itemDelayMs range)
+      //     sleep cooldownSec
+      //
+      // This is the institutional pattern: spread load across
+      // sessions evenly, then pause every rotation so no single
+      // account exceeds Telegram's per-action limits.
+      const sessionIds = [...sessionMap.keys()];
+      const queues = sessionIds.map((sid) => sessionMap.get(sid).slice());
+      const burst = plan.perSessionBurst;
+      const maxQueueLen = queues.reduce((m, q) => Math.max(m, q.length), 0);
+      const totalRounds = Math.max(1, Math.ceil(maxQueueLen / burst));
+
+      // Honour caller-supplied delay/cooldown over the plan's defaults
+      // when the caller passed explicit values via options. The
+      // controller already merges them into the plan, but this keeps
+      // the runner robust to stale callers.
+      const itemMin = plan.itemDelayMsMin ?? delayMin;
+      const itemMax = plan.itemDelayMsMax ?? delayMax;
+      const cdMin = plan.cooldownSecMin ?? 0;
+      const cdMax = plan.cooldownSecMax ?? 0;
+
+      for (let round = 0; round < totalRounds; round++) {
         if (await isCancelled()) {
-          totalSkipped += 1 + targets.slice(targets.indexOf(targetId) + 1).length;
-          await addLog(sessionId, targetId, 'skipped', 'Job was cancelled');
-          for (const remainingTarget of targets.slice(targets.indexOf(targetId) + 1)) {
-            await addLog(sessionId, remainingTarget, 'skipped', 'Job was cancelled');
+          await updateProgress('cancelled');
+          break;
+        }
+
+        for (let sIdx = 0; sIdx < sessionIds.length; sIdx++) {
+          const sid = sessionIds[sIdx];
+          if (deadSessions.has(sid)) continue;
+
+          const queue = queues[sIdx];
+          const burstSlice = queue.splice(0, burst);
+          if (burstSlice.length === 0) continue;
+
+          for (let i = 0; i < burstSlice.length; i++) {
+            if (await isCancelled()) {
+              for (let j = i; j < burstSlice.length; j++) {
+                await addLog(sid, burstSlice[j], 'skipped', 'Job was cancelled');
+                totalSkipped++;
+              }
+              for (let r = sIdx + 1; r < sessionIds.length; r++) {
+                for (const t of queues[r]) {
+                  await addLog(sessionIds[r], t, 'skipped', 'Job was cancelled');
+                  totalSkipped++;
+                }
+                queues[r] = [];
+              }
+              await updateProgress('cancelled');
+              return { sent: totalSent, failed: totalFailed, skipped: totalSkipped };
+            }
+
+            const success = await processOneTarget(sid, burstSlice[i]);
+
+            // Per-item delay between sends within the same burst.
+            if (i < burstSlice.length - 1 && itemMax > 0) {
+              const d = itemMin + Math.random() * (itemMax - itemMin);
+              await sleep(d);
+            }
+            if (deadSessions.has(sid)) {
+              // Push back any remaining items so the rotation can
+              // re-route them via retries on the next round.
+              for (let j = i + 1; j < burstSlice.length; j++) {
+                queue.unshift(burstSlice[j]);
+              }
+              break;
+            }
+            // Mark unused successful target counter for diagnostics.
+            void success;
+          }
+
+          await updateProgress('running');
+        }
+
+        const liveQueueRemaining = queues.some((q) => q.length > 0);
+        const liveSessions = sessionIds.filter((s) => !deadSessions.has(s)).length;
+        if (round < totalRounds - 1 && liveQueueRemaining && liveSessions > 0 && cdMax > 0) {
+          const cooldownSec = cdMin + Math.random() * (cdMax - cdMin);
+          logger.info(
+            `Cooldown between rotations: ${cooldownSec.toFixed(0)}s (round ${round + 1}/${totalRounds})`,
+            { jobId }
+          );
+          await updateProgress('cooldown');
+          await sleep(cooldownSec * 1000);
+        }
+      }
+    } else {
+      // LEGACY MODE — process each session's chunk sequentially.
+      const sessions = [...sessionMap.entries()];
+
+      for (const [sessionId, targets] of sessions) {
+        if (await isCancelled()) {
+          totalSkipped += targets.length;
+          for (const targetId of targets) {
+            await addLog(sessionId, targetId, 'skipped', 'Job was cancelled');
           }
           await updateProgress('cancelled');
           break;
         }
 
-        // Attempt to send with retries
-        let success = false;
-        let lastError = null;
-        let usedSessionId = sessionId;
+        let sessionSent = 0;
+        let sessionFailed = 0;
+        const sessionSkipped = 0;
 
-        for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
-          try {
-            // On retry, try a different session if available
-            if (attempt > 0) {
-              const otherSessions = [...sessionMap.keys()].filter(
-                (s) => s !== usedSessionId
-              );
-              if (otherSessions.length > 0) {
-                usedSessionId = otherSessions[
-                  Math.floor(Math.random() * otherSessions.length)
-                ];
-                logger.info(`Retry ${attempt}: switching to session ${usedSessionId} for target ${targetId}`);
-              }
+        for (const targetId of targets) {
+          if (await isCancelled()) {
+            totalSkipped += 1 + targets.slice(targets.indexOf(targetId) + 1).length;
+            await addLog(sessionId, targetId, 'skipped', 'Job was cancelled');
+            for (const remainingTarget of targets.slice(targets.indexOf(targetId) + 1)) {
+              await addLog(sessionId, remainingTarget, 'skipped', 'Job was cancelled');
             }
-
-            if (messageType === 'text' || messageType === 'markdown') {
-              await telegramService.sendMessage(
-                usedSessionId,
-                targetId,
-                messageContent,
-                messageOptions
-              );
-            } else if (messageType === 'forward') {
-              const forwardOpts = parseJson(messageContent);
-              const sourceId = forwardOpts?.sourceId || forwardOpts?.source_id || '';
-              const msgId = forwardOpts?.messageId || forwardOpts?.message_id || 0;
-              await telegramService.forwardMessage(
-                usedSessionId,
-                targetId,
-                parseInt(msgId, 10),
-                sourceId
-              );
-            } else {
-              // Generic send for other types
-              await telegramService.sendMessage(
-                usedSessionId,
-                targetId,
-                messageContent,
-                messageOptions
-              );
-            }
-
-            success = true;
+            await updateProgress('cancelled');
             break;
-          } catch (sendError) {
-            lastError = sendError.message || String(sendError);
+          }
 
-            // If it's a fatal session error, don't retry
-            if (isFatalSessionError(lastError)) {
-              logger.error(`Fatal error on session ${usedSessionId}: ${lastError}`);
-              break;
-            }
+          const before = totalSent;
+          const success = await processOneTarget(sessionId, targetId);
+          if (success) {
+            sessionSent++;
+          } else {
+            sessionFailed++;
+          }
+          // (kept here so the existing log message reads well)
+          void before;
 
-            // If not retryable, stop retrying
-            if (!isRetryableError(lastError)) {
-              break;
-            }
-
-            // Wait before retry (exponential backoff with jitter)
-            if (attempt < MAX_RETRIES) {
-              const backoffMs = Math.min(
-                delayMin * Math.pow(2, attempt) + randomInt(0, 500),
-                30000
-              );
-              logger.warn(
-                `Retry ${attempt + 1}/${MAX_RETRIES} for target ${targetId} after ${backoffMs}ms: ${lastError}`
-              );
-              await sleep(backoffMs);
-            }
+          if (success) {
+            const delay = randomInt(delayMin, delayMax);
+            await sleep(delay);
           }
         }
 
-        if (success) {
-          totalSent++;
-          sessionSent++;
-          await addLog(usedSessionId, targetId, 'sent');
-        } else {
-          totalFailed++;
-          sessionFailed++;
-          await addLog(sessionId, targetId, 'failed', lastError);
-        }
-
-        // Update progress periodically
-        if ((totalSent + totalFailed + totalSkipped) % 50 === 0) {
-          await updateProgress('running');
-        }
-
-        // Rate limiting delay (only if successful, to avoid wasting time on failures)
-        if (success) {
-          const delay = randomInt(delayMin, delayMax);
-          await sleep(delay);
-        }
+        logger.info(
+          `Session ${sessionId} chunk complete: ${sessionSent} sent, ${sessionFailed} failed, ${sessionSkipped} skipped`
+        );
       }
-
-      logger.info(`Session ${sessionId} chunk complete: ${sessionSent} sent, ${sessionFailed} failed, ${sessionSkipped} skipped`);
     }
 
     // Flush any remaining logs
@@ -769,6 +893,16 @@ class MessageService {
       messageOptions = {},
       sourceType = 'manual',
       sourceId = null,
+      // Distribution-engine knobs. When `mode='auto'` the
+      // distributionPlanner picks safe defaults for the
+      // items / sessions ratio. When `mode='manual'` the operator's
+      // values are used (clamped to safe bounds).
+      mode = 'auto',
+      perSessionBurst,
+      cooldownSecMin,
+      cooldownSecMax,
+      itemDelayMsMin,
+      itemDelayMsMax,
     } = params;
 
     logger.info(`Starting bulk message job for user ${userId}`, {
@@ -845,6 +979,22 @@ class MessageService {
       throw new AppError('No valid targets in the target list', 400, 'NO_VALID_TARGETS');
     }
 
+    // Build the rotation plan up-front so we can persist it on the
+    // job record and feed it to the runner. The planner clamps every
+    // user-supplied value to safe bounds; auto mode picks them based
+    // on `targets / sessions`.
+    const bulkPlan = distributionPlanner.plan({
+      totalItems: normalizedTargets.length,
+      sessionIds: verifiedSessionIds,
+      workType: 'bulk_message',
+      mode,
+      perSessionBurst,
+      cooldownSecMin,
+      cooldownSecMax,
+      itemDelayMsMin: itemDelayMsMin != null ? itemDelayMsMin : delayMin,
+      itemDelayMsMax: itemDelayMsMax != null ? itemDelayMsMax : delayMax,
+    });
+
     // Create the messaging job record
     const jobResult = await pool.query(
       `INSERT INTO messaging_jobs (
@@ -883,6 +1033,7 @@ class MessageService {
           messageOptions,
           sourceType,
           sourceId,
+          plan: bulkPlan,
         }),
       ]
     );
@@ -947,6 +1098,7 @@ class MessageService {
           messageType,
           mediaPath,
           messageOptions,
+          plan: bulkPlan,
         }
       );
 
@@ -962,6 +1114,7 @@ class MessageService {
         totalTargets: normalizedTargets.length,
         sessionCount: sessionMap.size,
         distribution: distributionObj,
+        plan: bulkPlan,
         results: result,
       };
     } catch (executionError) {

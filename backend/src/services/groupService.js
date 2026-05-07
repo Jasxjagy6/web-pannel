@@ -7,6 +7,7 @@ const {
   normalizeTelegramTarget,
   collectTelegramTargetCandidates,
 } = require('../utils/telegramTargetNormalizer');
+const distributionPlanner = require('./distributionPlanner');
 
 /**
  * Default delay in milliseconds between batch operations.
@@ -142,6 +143,16 @@ class GroupService {
       delayMin = 30,
       delayMax = 60,
       batchSize = 5,
+      // New rotation/cooldown distribution knobs (Auto/Manual mode).
+      // When unset the planner picks safe defaults that match the
+      // legacy behaviour for small lists and add proper cooldowns
+      // for large ones.
+      mode = 'auto',
+      perSessionBurst,
+      cooldownSecMin,
+      cooldownSecMax,
+      itemDelayMsMin,
+      itemDelayMsMax,
     } = params;
 
     if (!userId) {
@@ -194,9 +205,51 @@ class GroupService {
       throw new AppError('No valid sessions found', 404, 'NO_VALID_SESSIONS');
     }
 
-    logger.info(`Starting add members operation: ${userList.length} users to ${targetIds.length} target(s) using ${verifiedSessions.length} session(s)`, {
-      userId, sessionCount: verifiedSessions.length, targetCount: targetIds.length, userType: userList.length,
-    });
+    // Build the rotation plan that the runner will follow. In auto
+    // mode the planner picks `perSessionBurst`, cooldown and per-item
+    // delay based on totalItems / sessionCount. In manual mode the
+    // operator's knobs are clamped to safe ranges and used as-is.
+    //
+    // For backward compatibility, when the caller still passes the
+    // legacy `batchSize`/`delayMin`/`delayMax` triplet without the new
+    // knobs we map them through so existing flows behave the same as
+    // before (auto-mode picks a burst that matches `batchSize` for
+    // small jobs anyway).
+    const planParams = {
+      totalItems: preparedUsers.length,
+      sessionIds: verifiedSessions.map((s) => s.id),
+      workType: 'group_add',
+      mode,
+      perSessionBurst: perSessionBurst != null
+        ? perSessionBurst
+        : (mode === 'manual' ? batchSize : undefined),
+      cooldownSecMin,
+      cooldownSecMax,
+      itemDelayMsMin: itemDelayMsMin != null
+        ? itemDelayMsMin
+        : (mode === 'manual' && delayMin != null ? delayMin * 1000 : undefined),
+      itemDelayMsMax: itemDelayMsMax != null
+        ? itemDelayMsMax
+        : (mode === 'manual' && delayMax != null ? delayMax * 1000 : undefined),
+    };
+    const plan = distributionPlanner.plan(planParams);
+
+    logger.info(
+      `Starting add members operation: ${userList.length} users to ${targetIds.length} target(s) using ${verifiedSessions.length} session(s)`,
+      {
+        userId,
+        sessionCount: verifiedSessions.length,
+        targetCount: targetIds.length,
+        userListSize: userList.length,
+        plan: {
+          mode: plan.mode,
+          perSessionBurst: plan.perSessionBurst,
+          rounds: plan.rounds,
+          cooldownSec: [plan.cooldownSecMin, plan.cooldownSecMax],
+          itemDelayMs: [plan.itemDelayMsMin, plan.itemDelayMsMax],
+        },
+      }
+    );
 
     // Create the operation record
     const opResult = await pool.query(
@@ -219,6 +272,7 @@ class GroupService {
           delayMin,
           delayMax,
           batchSize,
+          plan,
         }),
       ]
     );
@@ -288,28 +342,30 @@ class GroupService {
         }
       }
 
-      // Step 2: Build round-robin distribution plan
-      // Distribute users across sessions: session1 gets users[0,3,6...], session2 gets [1,4,7...], etc.
-      const sessionChunks = {}; // sessionId -> [{entry, identifier}, ...]
-      for (let i = 0; i < verifiedSessions.length; i++) {
-        sessionChunks[verifiedSessions[i].id] = [];
-      }
+      // Step 2/3/4 — rotation runner.
+      //
+      // For each target group/channel:
+      //   1. Filter to sessions that can actually access the target.
+      //   2. Build a per-session work queue using the planner's
+      //      round-robin layout (size = perSessionBurst per round).
+      //   3. Execute the rotation:
+      //        round 0: each session does its first burst,
+      //        sleep cooldownSec, round 1: same, ...
+      //      Per-item delay is sampled from
+      //      [itemDelayMsMin..itemDelayMsMax] each step. PEER_FLOOD
+      //      disables the offending session for the rest of the run
+      //      (subsequent rounds just skip it).
+      const peerFloodSessions = new Set(); // session.id values that hit PEER_FLOOD
 
-      for (let i = 0; i < preparedUsers.length; i++) {
-        const sessionIdx = i % verifiedSessions.length;
-        sessionChunks[verifiedSessions[sessionIdx].id].push(preparedUsers[i]);
-      }
-
-      // Step 3: Process each target
       for (let tIdx = 0; tIdx < targetIds.length; tIdx++) {
         const targetId = targetIds[tIdx];
-        
-        // Find sessions that are members of this target
-        const availableSessions = verifiedSessions.filter(s => sessionMemberships[`${s.id}:${targetId}`]);
-        
+
+        const availableSessions = verifiedSessions.filter(
+          (s) => sessionMemberships[`${s.id}:${targetId}`]
+        );
+
         if (availableSessions.length === 0) {
           logger.error(`No available sessions for target ${targetId}, skipping`);
-          // Mark all users as failed for this target
           for (const prepared of preparedUsers) {
             results.push({
               userId: prepared.identifier,
@@ -323,34 +379,37 @@ class GroupService {
           continue;
         }
 
-        // Re-distribute users among available sessions for this target
-        const targetSessionChunks = {};
-        for (const s of availableSessions) {
-          targetSessionChunks[s.id] = [];
-        }
-        for (let i = 0; i < preparedUsers.length; i++) {
-          const sIdx = i % availableSessions.length;
-          targetSessionChunks[availableSessions[sIdx].id].push(preparedUsers[i]);
-        }
+        const burst = plan.perSessionBurst;
+        const sessionsForRotation = availableSessions.map((s) => s.id);
 
-        // Step 4: Process each session's chunk for this target
-        for (const session of availableSessions) {
-          const usersChunk = targetSessionChunks[session.id];
-          if (!usersChunk || usersChunk.length === 0) continue;
+        // Total rounds for THIS target (depends on # available sessions).
+        const itemsPerRound = sessionsForRotation.length * burst;
+        const targetRounds = Math.max(1, Math.ceil(preparedUsers.length / itemsPerRound));
 
-          // Process in batches
-          for (let b = 0; b < usersChunk.length; b += batchSize) {
-            // Check cancellation
+        for (let round = 0; round < targetRounds; round++) {
+          for (let sIdx = 0; sIdx < availableSessions.length; sIdx++) {
+            const session = availableSessions[sIdx];
+            if (peerFloodSessions.has(session.id)) continue; // skip dead sessions
+
+            const start = round * itemsPerRound + sIdx * burst;
+            const usersChunk = preparedUsers.slice(start, start + burst);
+            if (usersChunk.length === 0) continue;
+
+            // Check cancellation at the top of every (round, session)
+            // burst so we abort promptly even mid-rotation.
             if (await isCancelled(opId)) {
-              logger.info(`Operation ${opId} cancelled at target ${targetId}, session ${session.id}, batch ${b}`);
+              logger.info(
+                `Operation ${opId} cancelled at target ${targetId}, session ${session.id}, round ${round + 1}`
+              );
               await updateProgress(opId, { status: 'cancelled' });
               await this._finalizeOperation(opId, 'cancelled', addedCount, failedCount, skippedCount, results);
               return { opId, total: userList.length, added: addedCount, failed: failedCount, skipped: skippedCount, results };
             }
 
-            const batch = usersChunk.slice(b, b + batchSize);
-
-            for (const prepared of batch) {
+          {
+            let burstHitPeerFlood = false;
+            for (let chunkIdx = 0; chunkIdx < usersChunk.length; chunkIdx++) {
+              const prepared = usersChunk[chunkIdx];
               const candidates = prepared.candidates && prepared.candidates.length > 0
                 ? prepared.candidates
                 : [prepared.identifier];
@@ -422,40 +481,29 @@ class GroupService {
                   errMsg.includes('Too many actions performed');
                 if (isPeerFlood) {
                   logger.error(
-                    `PEER_FLOOD: session ${session.id} is rate-limited by Telegram, aborting target ${targetId}`,
+                    `PEER_FLOOD: session ${session.id} is rate-limited by Telegram, disabling for the rest of run on target ${targetId}`,
                     { opId }
                   );
                   userResult.error =
                     'Telegram rate limit (PEER_FLOOD) — session has been flagged for spam. Wait a few hours, use a warmed-up session, or reduce batch size / increase delay.';
                   failedCount++;
                   results.push(userResult);
-                  // Mark every remaining user in this session's chunk as
-                  // skipped with the same reason so the totals are honest.
-                  const remainder = b + batchSize;
-                  for (let r = batch.indexOf(prepared) + 1; r < batch.length; r++) {
+                  // Mark every remaining user in this burst as skipped
+                  // (the rotation loop will skip this session in future
+                  // rounds via peerFloodSessions).
+                  for (let r = chunkIdx + 1; r < usersChunk.length; r++) {
                     results.push({
-                      userId: batch[r].identifier,
+                      userId: usersChunk[r].identifier,
                       targetId,
                       sessionId: session.id,
                       success: false,
                       skipped: true,
-                      error: 'Skipped: session hit PEER_FLOOD earlier in this batch',
+                      error: 'Skipped: session hit PEER_FLOOD earlier in this burst',
                     });
                     skippedCount++;
                   }
-                  for (let i = remainder; i < usersChunk.length; i++) {
-                    results.push({
-                      userId: usersChunk[i].identifier,
-                      targetId,
-                      sessionId: session.id,
-                      success: false,
-                      skipped: true,
-                      error: 'Skipped: session hit PEER_FLOOD earlier in this run',
-                    });
-                    skippedCount++;
-                  }
-                  // Break out of all loops for this session.
-                  b = usersChunk.length;
+                  peerFloodSessions.add(session.id);
+                  burstHitPeerFlood = true;
                   break;
                 }
 
@@ -535,6 +583,18 @@ class GroupService {
               }
 
               results.push(userResult);
+              if (burstHitPeerFlood) break;
+
+              // Per-item delay so we don't hammer Telegram from the
+              // same session within a burst. Skip the trailing sleep
+              // (after the last item) — the cooldown logic below will
+              // pause between rounds anyway.
+              if (chunkIdx < usersChunk.length - 1 && plan.itemDelayMsMax > 0) {
+                const delayMs =
+                  plan.itemDelayMsMin +
+                  Math.random() * (plan.itemDelayMsMax - plan.itemDelayMsMin);
+                await sleep(delayMs);
+              }
             }
 
             // Update progress
@@ -548,14 +608,44 @@ class GroupService {
               status: 'running',
               currentTarget: targetId,
               currentSession: session.id,
+              currentRound: round + 1,
+              totalRounds: targetRounds,
             });
+          }
+          } // end (round, session) block
 
-            // Delay between batches (random between delayMin and delayMax)
-            if (b + batchSize < usersChunk.length) {
-              const delaySec = delayMin + Math.random() * (delayMax - delayMin);
-              logger.info(`Waiting ${delaySec.toFixed(0)}s before next batch`);
-              await sleep(delaySec * 1000);
+          // Cooldown between rotations (skip after the last round and
+          // when no cooldown was configured).
+          const liveSessions = availableSessions.filter((s) => !peerFloodSessions.has(s.id));
+          if (
+            round < targetRounds - 1 &&
+            liveSessions.length > 0 &&
+            plan.cooldownSecMax > 0
+          ) {
+            if (await isCancelled(opId)) {
+              await updateProgress(opId, { status: 'cancelled' });
+              await this._finalizeOperation(opId, 'cancelled', addedCount, failedCount, skippedCount, results);
+              return { opId, total: userList.length, added: addedCount, failed: failedCount, skipped: skippedCount, results };
             }
+            const cooldownSec =
+              plan.cooldownSecMin + Math.random() * (plan.cooldownSecMax - plan.cooldownSecMin);
+            logger.info(
+              `Cooldown between rotations: ${cooldownSec.toFixed(0)}s (target=${targetId}, round=${round + 1}/${targetRounds})`,
+              { opId }
+            );
+            await updateProgress(opId, {
+              progress: addedCount + failedCount + skippedCount,
+              added: addedCount,
+              failed: failedCount,
+              skipped: skippedCount,
+              total: userList.length * targetIds.length,
+              status: 'cooldown',
+              currentTarget: targetId,
+              currentRound: round + 1,
+              totalRounds: targetRounds,
+              cooldownSec: Math.round(cooldownSec),
+            });
+            await sleep(cooldownSec * 1000);
           }
         }
       }

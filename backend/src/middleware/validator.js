@@ -87,6 +87,16 @@ const schemas = {
     async: Joi.alternatives().try(Joi.boolean(), Joi.string()).optional(),
     sourceType: Joi.string().valid('manual', 'list').default('manual'),
     sourceId: Joi.number().integer().positive().optional(),
+    // Distribution-engine knobs (see distributionPlanner.js). These
+    // are independent of `delayMin/delayMax` (which the legacy code
+    // path uses) and are accepted in their own units: cooldown in
+    // seconds, per-item delay in milliseconds.
+    mode: Joi.string().valid('auto', 'manual').default('auto'),
+    perSessionBurst: Joi.number().integer().min(1).max(500).optional(),
+    cooldownSecMin: Joi.number().integer().min(0).max(1800).optional(),
+    cooldownSecMax: Joi.number().integer().min(0).max(1800).optional(),
+    itemDelayMsMin: Joi.number().integer().min(0).max(600000).optional(),
+    itemDelayMsMax: Joi.number().integer().min(0).max(600000).optional(),
   }).or('sessionIds', 'sessionListId'),
 
   addMembersToGroup: Joi.object({
@@ -122,13 +132,23 @@ const schemas = {
         }).unknown(true)
       )
     ).min(1).required(),
-    // Delay settings
+    // Delay settings (legacy contract: seconds between batches)
     delayMin: Joi.number().min(1).max(600).default(30),
     delayMax: Joi.number().min(1).max(600).default(60),
     delay: Joi.number().min(1).max(600).optional(),
     batchSize: Joi.number().integer().min(1).max(100).default(5),
     // Async mode
     async: Joi.alternatives().try(Joi.boolean(), Joi.string()).optional(),
+    // Distribution-engine knobs (see distributionPlanner.js). When
+    // `mode='auto'` the panel sizes burst/cooldown automatically
+    // based on the items/sessions ratio. Otherwise the operator's
+    // values are clamped to safe bounds and used directly.
+    mode: Joi.string().valid('auto', 'manual').default('auto'),
+    perSessionBurst: Joi.number().integer().min(1).max(500).optional(),
+    cooldownSecMin: Joi.number().integer().min(0).max(1800).optional(),
+    cooldownSecMax: Joi.number().integer().min(0).max(1800).optional(),
+    itemDelayMsMin: Joi.number().integer().min(0).max(600000).optional(),
+    itemDelayMsMax: Joi.number().integer().min(0).max(600000).optional(),
   })
     .or('sessionIds', 'sessionId', 'sessionListId')
     .or('targetIds', 'targetGroupId'),
