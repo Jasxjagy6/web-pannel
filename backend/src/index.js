@@ -258,6 +258,11 @@ io.on('connection', (socket) => {
   // Join user-specific room (cross-platform notifications still flow here).
   socket.join(`user:${socket.userId}`);
 
+  // Per-user "Delete chats" job feed. Every panel window receives
+  // progress updates so the History tab on the Login page renders in
+  // real time without an extra opt-in roundtrip.
+  socket.join(`tg-client:u${socket.userId}:jobs`);
+
   // Per-platform rooms — services emit to `platform:<userId>:<platform>`
   // for events that should be scoped to a single panel (e.g. IG warmup
   // throttle decisions, TG group-invite progress). The frontend asks

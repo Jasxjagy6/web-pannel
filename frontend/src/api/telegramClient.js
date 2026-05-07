@@ -233,19 +233,31 @@ export const deleteClientMessages = (sessionId, peerType, peerId, messageIds, re
  * the other side wherever Telegram allows it; `revoke=false` is the
  * "Delete for me" semantic.
  *
- * Returns the per-session results from the backend so the UI can show
- * which sessions / dialogs cleared and which failed.
- *
- * The request can take a while when many dialogs are involved, so we
- * disable the per-request timeout — the backend processes sessions in
- * parallel and dialogs sequentially within each session.
+ * Backend behaviour: returns immediately with `{ jobId, job }`. The
+ * actual wipe runs asynchronously and progress flows through the
+ * History tab (REST + the per-user `tg-client:clearJobUpdate` socket
+ * event).
  */
-export const clearAllSessionsChats = (sessionIds, revoke = false) =>
-  api.post(
-    `${BASE}/sessions/clear-history`,
-    { sessionIds, revoke: !!revoke },
-    { timeout: 0 },
-  );
+export const clearAllSessionsChats = (sessionIds, revoke = false, opts = {}) =>
+  api.post(`${BASE}/sessions/clear-history`, {
+    sessionIds,
+    revoke: !!revoke,
+    ...(opts.concurrency != null ? { concurrency: opts.concurrency } : {}),
+  });
+
+/**
+ * List the most recent "Delete chats" jobs the panel user has started.
+ * Newest first; capped server-side at 200.
+ */
+export const listClearChatsJobs = (limit = 50) =>
+  api.get(`${BASE}/sessions/clear-history/jobs`, { params: { limit } });
+
+/**
+ * Fetch a single "Delete chats" job snapshot, including the per-session
+ * per-dialog results.
+ */
+export const getClearChatsJob = (jobId) =>
+  api.get(`${BASE}/sessions/clear-history/jobs/${encodeURIComponent(jobId)}`);
 
 /**
  * D3 — forward messages from one chat into another.

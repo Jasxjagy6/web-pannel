@@ -9,9 +9,11 @@
  */
 
 const tcService = require('../services/telegramClientService');
+const tcJobs = require('../services/telegramClientJobs');
 const reportService = require('../services/reportService');
 const { AppError, asyncHandler } = require('../utils/errorHandler');
 const logger = require('../utils/logger');
+const { pool } = require('../config/database');
 
 /**
  * Parse + validate (peerType, peerId) from request params. peerId is
@@ -339,16 +341,18 @@ const telegramClientController = {
   /**
    * POST /sessions/clear-history
    *
-   * Body: { sessionIds: (string|number)[], revoke?: bool }
+   * Body: { sessionIds: (string|number)[], revoke?: bool, concurrency?: number }
    *
-   * Bulk action triggered from the Telegram Login page. Wipes the chat
-   * history of every dialog in every selected session in parallel and
-   * returns per-session results so the UI can show a per-account
-   * succeeded / failed breakdown.
+   * Bulk action triggered from the Telegram Login page. Creates a
+   * background job that wipes chat history (and leaves / deletes
+   * groups & channels) across every selected session and returns the
+   * job id immediately. The frontend polls / listens to the per-user
+   * `tg-client:clearJobUpdate` socket events on the History tab to
+   * render progress.
    *
    * `revoke=true` translates to "delete from both sides" everywhere it
    * is allowed by Telegram (private chats / basic groups always; channels
-   * only if the caller is an admin with delete_messages rights).
+   * only if the caller is the creator).
    */
   clearAllChatsHistory: asyncHandler(async (req, res) => {
     const userId = req.user.id;
@@ -356,6 +360,9 @@ const telegramClientController = {
       ? req.body.sessionIds
       : [];
     const revoke = req.body?.revoke === true || req.body?.revoke === 'true';
+    const concurrency = Number.isFinite(parseInt(req.body?.concurrency, 10))
+      ? parseInt(req.body.concurrency, 10)
+      : undefined;
 
     if (sessionIds.length === 0) {
       throw new AppError('sessionIds is required', 400, 'SESSION_IDS_REQUIRED');
@@ -368,8 +375,6 @@ const telegramClientController = {
       );
     }
 
-    // De-dupe while preserving order so the response matches the UI's
-    // expected ordering, and reject obviously bad ids early.
     const seen = new Set();
     const ids = [];
     for (const raw of sessionIds) {
@@ -382,59 +387,202 @@ const telegramClientController = {
       throw new AppError('sessionIds is required', 400, 'SESSION_IDS_REQUIRED');
     }
 
-    // Run per-session in parallel — each session has its own GramJS
-    // client so they don't share rate limits. We always resolve so a
-    // single bad session never poisons the response.
-    const settled = await Promise.all(
-      ids.map((sessionId) =>
-        tcService
-          .deleteAllChatsHistory(sessionId, userId, { revoke })
-          .then((data) => ({ ok: true, sessionId, data }))
-          .catch((err) => ({
-            ok: false,
-            sessionId,
-            error: err?.message || 'Failed to clear chats',
-            code: err?.code || err?.errorCode || null,
-            status: err?.statusCode || err?.status || 500,
-          })),
-      ),
-    );
-
-    let totalSucceeded = 0;
-    let totalFailed = 0;
-    let totalDialogs = 0;
-    for (const r of settled) {
-      if (r.ok) {
-        totalSucceeded += r.data.succeeded;
-        totalFailed += r.data.failed;
-        totalDialogs += r.data.total;
+    // Pull per-session display info up front so the History card can
+    // render names / phones before any backend work runs.
+    let sessionMeta = new Map();
+    try {
+      const dbRes = await pool.query(
+        `SELECT id, phone, account_info
+           FROM sessions
+          WHERE user_id = $1 AND platform = 'telegram' AND id = ANY($2::int[])`,
+        [userId, ids.map((i) => parseInt(i, 10)).filter(Number.isFinite)],
+      );
+      for (const row of dbRes.rows) {
+        let acct = {};
+        try {
+          acct = typeof row.account_info === 'string'
+            ? JSON.parse(row.account_info)
+            : (row.account_info || {});
+        } catch (_) { acct = {}; }
+        const firstName = acct.firstName || acct.first_name || null;
+        const lastName = acct.lastName || acct.last_name || null;
+        const fullName = [firstName, lastName].filter(Boolean).join(' ').trim();
+        const displayName =
+          fullName || acct.username || row.phone || `Session #${row.id}`;
+        sessionMeta.set(String(row.id), {
+          displayName,
+          phone: row.phone || null,
+        });
       }
+    } catch (err) {
+      logger.debug(`clearAllChatsHistory session-meta lookup failed: ${err.message}`);
     }
 
-    await reportService
-      .logActivity(userId, 'tg_client_clear_all_chats', 'session', null, {
-        platform: 'telegram',
-        sessionCount: ids.length,
-        revoke,
-        totalDialogs,
-        totalSucceeded,
-        totalFailed,
-      })
-      .catch((err) =>
-        logger.debug(`logActivity tg_client_clear_all_chats failed: ${err.message}`),
-      );
+    const job = tcJobs.createJob({
+      userId,
+      revoke,
+      sessions: ids.map((id) => ({
+        sessionId: id,
+        displayName: sessionMeta.get(id)?.displayName || `Session #${id}`,
+        phone: sessionMeta.get(id)?.phone || null,
+      })),
+    });
+
+    // Kick off the work in the background. Each session has its own
+    // GramJS client so they don't share rate limits — we run them in
+    // parallel and a single bad session never aborts the others.
+    setImmediate(() => {
+      Promise.all(
+        ids.map((sessionId) => {
+          tcJobs.patchJobSession(job.id, sessionId, {
+            status: 'running',
+            startedAt: Date.now(),
+          });
+
+          return tcService
+            .deleteAllChatsHistory(sessionId, userId, {
+              revoke,
+              concurrency,
+              jobId: job.id,
+              onProgress: (ev) => {
+                if (!ev) return;
+                if (ev.type === 'started') {
+                  tcJobs.patchJobSession(job.id, sessionId, {
+                    total: ev.total,
+                    currentTitle: null,
+                  });
+                  return;
+                }
+                if (ev.type === 'progress') {
+                  const patch = {
+                    done_inc: 1,
+                    succeeded_inc: ev.ok ? 1 : 0,
+                    failed_inc: ev.ok ? 0 : 1,
+                    cleared_inc: ev.cleared ? 1 : 0,
+                    left_inc: ev.left ? 1 : 0,
+                    deleted_inc: ev.deleted ? 1 : 0,
+                    currentTitle: ev.title || null,
+                  };
+                  tcJobs.patchJobSession(job.id, sessionId, patch);
+                  tcJobs.appendSessionResult(job.id, sessionId, {
+                    peerType: ev.peerType,
+                    peerId: ev.peerId,
+                    title: ev.title,
+                    ok: !!ev.ok,
+                    action: ev.action || null,
+                    cleared: !!ev.cleared,
+                    left: !!ev.left,
+                    deleted: !!ev.deleted,
+                    error: ev.error || null,
+                    code: ev.code || null,
+                  });
+                  return;
+                }
+              },
+            })
+            .then((data) => {
+              tcJobs.patchJobSession(job.id, sessionId, {
+                status: data.failed > 0 && data.succeeded === 0
+                  ? 'failed'
+                  : data.failed > 0
+                    ? 'partial'
+                    : 'done',
+                total: data.total,
+                finishedAt: Date.now(),
+                currentTitle: null,
+              });
+            })
+            .catch((err) => {
+              const msg = err?.message || 'Failed to clear chats';
+              const code = err?.code || err?.errorCode || null;
+              logger.warn(
+                `clearAllChatsHistory session=${sessionId} job=${job.id} aborted: ${msg}`,
+              );
+              tcJobs.patchJobSession(job.id, sessionId, {
+                status: 'failed',
+                error: msg,
+                code,
+                finishedAt: Date.now(),
+                currentTitle: null,
+              });
+            });
+        }),
+      )
+        .catch((err) => {
+          logger.warn(
+            `clearAllChatsHistory job=${job.id} unexpected: ${err?.message || err}`,
+          );
+          tcJobs.failJob(job.id, err?.message || 'Job aborted');
+        })
+        .finally(async () => {
+          // Re-read the final job snapshot for the activity log so the
+          // /reports view shows real per-session totals.
+          const final = tcJobs.getJobForUser(job.id, userId);
+          if (!final) return;
+          await reportService
+            .logActivity(userId, 'tg_client_clear_all_chats', 'session', null, {
+              platform: 'telegram',
+              jobId: job.id,
+              sessionCount: ids.length,
+              revoke,
+              status: final.status,
+              totalDialogs: final.totals.totalDialogs,
+              totalSucceeded: final.totals.succeeded,
+              totalFailed: final.totals.failed,
+              totalCleared: final.totals.cleared,
+              totalLeft: final.totals.left,
+              totalDeleted: final.totals.deleted,
+            })
+            .catch((err) =>
+              logger.debug(
+                `logActivity tg_client_clear_all_chats failed: ${err.message}`,
+              ),
+            );
+        });
+    });
 
     res.json({
       success: true,
       data: {
-        revoke,
-        sessionCount: ids.length,
-        totalDialogs,
-        totalSucceeded,
-        totalFailed,
-        sessions: settled,
+        jobId: job.id,
+        job: tcJobs.publicJob(job),
       },
     });
+  }),
+
+  /**
+   * GET /sessions/clear-history/jobs?limit=50
+   *
+   * Returns the most recent "Delete chats" jobs the calling user has
+   * started, newest first. Used by the History tab on the Login page.
+   */
+  listClearChatsJobs: asyncHandler(async (req, res) => {
+    const limit = Math.min(
+      200,
+      Math.max(1, parseInt(req.query?.limit, 10) || 50),
+    );
+    const jobs = tcJobs.listJobsForUser(req.user.id, { limit });
+    res.json({
+      success: true,
+      data: {
+        jobs: jobs.map((j) => tcJobs.publicJob(j)),
+        total: jobs.length,
+      },
+    });
+  }),
+
+  /**
+   * GET /sessions/clear-history/jobs/:jobId
+   *
+   * Returns a single job's full snapshot, including the per-session
+   * per-dialog results (capped at the manager's retention limit).
+   */
+  getClearChatsJob: asyncHandler(async (req, res) => {
+    const job = tcJobs.getJobForUser(req.params.jobId, req.user.id);
+    if (!job) {
+      throw new AppError('Job not found', 404, 'JOB_NOT_FOUND');
+    }
+    res.json({ success: true, data: { job: tcJobs.publicJob(job) } });
   }),
 
   /**
