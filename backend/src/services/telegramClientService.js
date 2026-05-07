@@ -1387,31 +1387,38 @@ class TelegramClientService {
   }
 
   /**
-   * Clear the full message history of every dialog (chat / group / channel)
-   * the given session can see. Used by the "Delete chats" action on the
-   * Telegram Login page so a user can wipe a session's chats without
-   * opening each dialog one by one.
+   * Wipe a session: clear the message history of every dialog and, for
+   * groups / channels, leave (or delete, if the account is the creator)
+   * so the dialog itself is removed from the account's chat list.
    *
-   * Per-peer, the call is:
-   *   - user / chat peers   → messages.DeleteHistory(peer, max_id=0, just_clear, revoke)
-   *   - channel peers       → channels.DeleteHistory(channel, max_id=0, for_everyone)
+   * Used by the "Delete chats" action on the Telegram Login page so a
+   * user can clean a session without opening each dialog one by one.
    *
-   * `revoke=true` translates to the Telegram-side "delete from both sides"
-   * for users / basic chats and `for_everyone` for channels (admin
-   * required for broadcast / megagroup; non-admin attempts return
-   * `CHAT_ADMIN_REQUIRED`, which we record as a per-peer failure and
-   * keep going).
+   * Per-peer flow:
+   *   - user (private chat): messages.DeleteHistory(peer, max_id=0,
+   *     just_clear=!revoke, revoke). revoke=true also removes the
+   *     dialog from the caller's list and deletes for the other side.
+   *   - chat (basic group): messages.DeleteHistory clears messages,
+   *     then the account leaves via messages.DeleteChatUser(self,
+   *     revoke_history=revoke). When revoke=true and the account is
+   *     the creator, messages.DeleteChat is attempted first to delete
+   *     the whole group for everyone; if Telegram rejects it
+   *     (typically `CHAT_ADMIN_REQUIRED`) we fall back to leaving.
+   *   - channel / megagroup: channels.DeleteHistory clears messages,
+   *     then the account leaves via channels.LeaveChannel. When
+   *     revoke=true we first try channels.DeleteChannel (creator
+   *     only); on rejection we fall back to LeaveChannel.
    *
-   * `revoke=false` translates to `just_clear` for users / basic chats
-   * (history disappears from the caller's view only) and to a regular
-   * `channels.DeleteHistory(for_everyone=false)` for channels (also
-   * caller-only; this is what Telegram apps do for a non-admin "Delete
-   * for me" tap on a public channel).
+   * Per-peer failures never abort the run — they are recorded and the
+   * loop keeps going. The history-clear step is best-effort: a failure
+   * there (e.g. CHAT_ADMIN_REQUIRED on a non-admin channel) is not
+   * fatal, the leave/delete step still runs so the dialog disappears.
    *
    * @param {string|number} sessionId
    * @param {string|number} userId
    * @param {object} [opts]
-   * @param {boolean} [opts.revoke=false] true = delete from both sides
+   * @param {boolean} [opts.revoke=false] true = delete from both sides /
+   *   try to fully delete groups & channels where allowed
    * @returns {Promise<{
    *   sessionId: string,
    *   total: number,
@@ -1423,8 +1430,13 @@ class TelegramClientService {
    *     peerId: number|null,
    *     title: string|null,
    *     ok: boolean,
+   *     action: 'cleared'|'left'|'deleted'|null,
+   *     cleared: boolean,
+   *     left: boolean,
+   *     deleted: boolean,
    *     error: string|null,
    *     code: string|null,
+   *     warnings: Array<{ stage: string, code: string|null, error: string }>,
    *   }>
    * }>}
    */
@@ -1434,6 +1446,14 @@ class TelegramClientService {
     await tgService._ensureConnected(sessionId);
     const entry = tgService.clients.get(String(sessionId));
     if (!entry) throw new AppError('Session client not loaded', 500, 'CLIENT_NOT_LOADED');
+
+    let selfId = null;
+    try {
+      const me = await entry.client.getMe();
+      selfId = _toIdNum(me?.id);
+    } catch (err) {
+      logger.debug(`clearChats getMe failed (continuing without self id): ${err.message}`);
+    }
 
     // Pull as many dialogs as Telegram will give us for the account in
     // one call. The `iterDialogs` helper is the "no limit" sibling of
@@ -1466,6 +1486,12 @@ class TelegramClientService {
       } catch (_) { /* ignore */ }
     }
 
+    const _errStr = (e) => (e && (e.message || e.errorMessage)) || String(e);
+    const _errCode = (e) => {
+      const c = e && (e.errorMessage || e.code);
+      return typeof c === 'string' ? c : null;
+    };
+
     // Sequential per-dialog so we never exceed the per-session MTProto
     // rate limit. Concurrency across sessions is the caller's concern.
     for (let i = 0; i < dialogs.length; i++) {
@@ -1482,17 +1508,32 @@ class TelegramClientService {
           peerId: peerIdNum,
           title,
           ok: false,
+          action: null,
+          cleared: false,
+          left: false,
+          deleted: false,
           error: 'Unrecognized dialog entity',
           code: 'BAD_PEER',
+          warnings: [],
         });
         continue;
       }
 
+      // Skip the account's own "Saved Messages" chat — it can't be left,
+      // and we still want a successful "cleared" entry rather than a
+      // misleading leave failure.
+      const isSelfChat =
+        peerType === 'user' && selfId != null && peerIdNum === selfId;
+
+      const warnings = [];
+      let cleared = false;
+      let left = false;
+      let deleted = false;
+      let fatalErr = null;
+
+      // ---- Step 1: clear history (best-effort for groups/channels) ----
       try {
         if (peerType === 'channel') {
-          // channels.DeleteHistory(channel, max_id=0, for_everyone)
-          // for_everyone requires admin rights with delete_messages.
-          // max_id=0 means "all messages up to the latest one".
           const inputChannel = await entry.client.getInputEntity(entity);
           await entry.client.invoke(new Api.channels.DeleteHistory({
             channel: inputChannel,
@@ -1500,76 +1541,158 @@ class TelegramClientService {
             forEveryone: revoke,
           }));
         } else {
-          // user / chat: messages.DeleteHistory(peer, max_id=0, just_clear, revoke)
-          // just_clear=true is the "Delete for me" semantic; revoke=true is
-          // the "Also delete for the other side" toggle Telegram apps show.
           const inputPeer = await entry.client.getInputEntity(entity);
           await entry.client.invoke(new Api.messages.DeleteHistory({
             peer: inputPeer,
             maxId: 0,
-            justClear: !revoke,
+            // For private chats we keep the historical semantic:
+            // revoke=false ⇒ just_clear (caller-only), revoke=true ⇒
+            // also remove the dialog and delete for the other side.
+            // For basic chats we always just_clear here because the
+            // dialog is removed by the explicit DeleteChatUser /
+            // DeleteChat step below — using just_clear=false here would
+            // make Telegram report CHAT_ADMIN_REQUIRED on some basic
+            // groups.
+            justClear: peerType === 'user' ? !revoke : true,
             revoke,
           }));
         }
-        succeeded += 1;
-        results.push({
-          peerType,
-          peerId: peerIdNum,
-          title,
-          ok: true,
-          error: null,
-          code: null,
-        });
+        cleared = true;
+      } catch (err) {
+        const code = _errCode(err);
+        const msg = _errStr(err);
+        if (peerType === 'user') {
+          // For private chats clearing is the entire operation, so a
+          // failure here is fatal for this peer.
+          fatalErr = { msg, code, stage: 'clearHistory' };
+        } else {
+          // For groups/channels, clearing is best-effort. We still
+          // attempt to leave below so the dialog disappears.
+          warnings.push({ stage: 'clearHistory', code, error: msg });
+          logger.debug(
+            `clearChats session=${sessionId} peer=${peerType}/${peerIdNum} clear failed (will still try leave): ${msg}`
+          );
+        }
+      }
 
-        if (io) {
+      // ---- Step 2: leave / delete groups & channels ------------------
+      if (!fatalErr && peerType === 'chat' && !isSelfChat) {
+        // Basic group: delete the whole chat as creator if revoke,
+        // otherwise (or on failure) just leave.
+        if (revoke) {
           try {
-            io.to(room).emit('tg-client:clearChatsProgress', {
-              sessionId: String(sessionId),
-              total,
-              done: i + 1,
-              peerType,
-              peerId: peerIdNum,
-              title,
-              ok: true,
-            });
+            await entry.client.invoke(new Api.messages.DeleteChat({
+              chatId: peerIdNum,
+            }));
+            deleted = true;
+          } catch (err) {
+            const code = _errCode(err);
+            const msg = _errStr(err);
+            warnings.push({ stage: 'deleteChat', code, error: msg });
+          }
+        }
+        if (!deleted) {
+          try {
+            await entry.client.invoke(new Api.messages.DeleteChatUser({
+              chatId: peerIdNum,
+              userId: new Api.InputUserSelf(),
+              revokeHistory: revoke,
+            }));
+            left = true;
+          } catch (err) {
+            fatalErr = {
+              msg: _errStr(err),
+              code: _errCode(err),
+              stage: 'leaveChat',
+            };
+          }
+        }
+      } else if (!fatalErr && peerType === 'channel') {
+        const inputChannel = await entry.client.getInputEntity(entity);
+        if (revoke) {
+          try {
+            await entry.client.invoke(new Api.channels.DeleteChannel({
+              channel: inputChannel,
+            }));
+            deleted = true;
+          } catch (err) {
+            const code = _errCode(err);
+            const msg = _errStr(err);
+            warnings.push({ stage: 'deleteChannel', code, error: msg });
+          }
+        }
+        if (!deleted) {
+          try {
+            await entry.client.invoke(new Api.channels.LeaveChannel({
+              channel: inputChannel,
+            }));
+            left = true;
+          } catch (err) {
+            fatalErr = {
+              msg: _errStr(err),
+              code: _errCode(err),
+              stage: 'leaveChannel',
+            };
+          }
+        }
+      }
+
+      // ---- Step 3: record + emit ------------------------------------
+      const ok = !fatalErr;
+      const action = deleted ? 'deleted' : left ? 'left' : ok ? 'cleared' : null;
+      if (ok) succeeded += 1;
+      else failed += 1;
+
+      if (!ok) {
+        logger.warn(
+          `clearChats session=${sessionId} peer=${peerType}/${peerIdNum} stage=${fatalErr.stage} failed: ${fatalErr.msg}`
+        );
+      }
+
+      results.push({
+        peerType,
+        peerId: peerIdNum,
+        title,
+        ok,
+        action,
+        cleared,
+        left,
+        deleted,
+        error: ok ? null : fatalErr.msg,
+        code: ok ? null : fatalErr.code,
+        warnings,
+      });
+
+      if (io) {
+        try {
+          io.to(room).emit('tg-client:clearChatsProgress', {
+            sessionId: String(sessionId),
+            total,
+            done: i + 1,
+            peerType,
+            peerId: peerIdNum,
+            title,
+            ok,
+            action,
+            error: ok ? null : fatalErr.msg,
+          });
+          if (cleared) {
             io.to(room).emit('tg-client:dialogHistoryCleared', {
               sessionId: String(sessionId),
               peerType,
               peerId: peerIdNum,
               revoke,
             });
-          } catch (_) { /* ignore */ }
-        }
-      } catch (err) {
-        failed += 1;
-        const msg = err?.message || String(err);
-        const code = err?.errorMessage || err?.code || null;
-        logger.warn(
-          `clearChats session=${sessionId} peer=${peerType}/${peerIdNum} failed: ${msg}`
-        );
-        results.push({
-          peerType,
-          peerId: peerIdNum,
-          title,
-          ok: false,
-          error: msg,
-          code: typeof code === 'string' ? code : null,
-        });
-
-        if (io) {
-          try {
-            io.to(room).emit('tg-client:clearChatsProgress', {
+          }
+          if (left || deleted) {
+            io.to(room).emit('tg-client:dialogLeft', {
               sessionId: String(sessionId),
-              total,
-              done: i + 1,
               peerType,
               peerId: peerIdNum,
-              title,
-              ok: false,
-              error: msg,
+              deleted,
             });
-          } catch (_) { /* ignore */ }
-        }
+          }
+        } catch (_) { /* ignore */ }
       }
     }
 
