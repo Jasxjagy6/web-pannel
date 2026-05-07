@@ -19,4 +19,8 @@ router.post('/:id/sessions', ctrl.addSessions);
 router.delete('/:id/sessions', ctrl.removeSessions);
 router.put('/:id/sessions', ctrl.setSessions);
 
+// Bulk download as a ZIP archive of plain (decrypted) session files.
+// `?format=json` (default) or `?format=session`.
+router.get('/:id/download', ctrl.download);
+
 module.exports = router;

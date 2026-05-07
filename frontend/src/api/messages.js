@@ -4,6 +4,10 @@ export const sendMessage = (data) => api.post('/messages/send', data);
 
 export const sendBulk = (data) => api.post('/messages/bulk', data);
 
+// Dry-run for the bulk-message distribution plan. Returns the plan
+// the runner would use without sending anything.
+export const previewBulk = (data) => api.post('/messages/bulk/preview', data);
+
 export const sendMessageToGroup = (data) => api.post('/messages/send-group', data);
 
 export const forwardMessage = (data) => api.post('/messages/forward', data);

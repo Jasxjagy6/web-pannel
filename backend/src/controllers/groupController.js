@@ -5,6 +5,7 @@ const groupQueue = require('../queues/groupQueue');
 const { AppError, asyncHandler } = require('../utils/errorHandler');
 const { resolveSessionIdsFromRequest } = require('../utils/resolveSessions');
 const logger = require('../utils/logger');
+const distributionPlanner = require('../services/distributionPlanner');
 
 const groupController = {
   /**
@@ -37,7 +38,37 @@ const groupController = {
       batchSize,
       delay,
       async,
+      // Distribution controls
+      mode,
+      perSessionBurst,
+      cooldownSecMin,
+      cooldownSecMax,
+      itemDelayMsMin,
+      itemDelayMsMax,
     } = req.body;
+
+    if (
+      cooldownSecMin != null &&
+      cooldownSecMax != null &&
+      Number(cooldownSecMin) > Number(cooldownSecMax)
+    ) {
+      throw new AppError(
+        'cooldownSecMin must be <= cooldownSecMax',
+        400,
+        'INVALID_COOLDOWN_RANGE'
+      );
+    }
+    if (
+      itemDelayMsMin != null &&
+      itemDelayMsMax != null &&
+      Number(itemDelayMsMin) > Number(itemDelayMsMax)
+    ) {
+      throw new AppError(
+        'itemDelayMsMin must be <= itemDelayMsMax',
+        400,
+        'INVALID_ITEM_DELAY_RANGE'
+      );
+    }
 
     // Support both old and new API. If the caller passed `sessionListId`,
     // expand it; else honour the explicit IDs.
@@ -69,6 +100,12 @@ const groupController = {
       delayMin: delayMin !== undefined ? parseInt(delayMin, 10) : (delay !== undefined ? parseInt(delay, 10) : undefined),
       delayMax: delayMax !== undefined ? parseInt(delayMax, 10) : undefined,
       batchSize: batchSize ? parseInt(batchSize, 10) : undefined,
+      mode: mode || 'auto',
+      perSessionBurst: perSessionBurst != null ? parseInt(perSessionBurst, 10) : undefined,
+      cooldownSecMin: cooldownSecMin != null ? parseInt(cooldownSecMin, 10) : undefined,
+      cooldownSecMax: cooldownSecMax != null ? parseInt(cooldownSecMax, 10) : undefined,
+      itemDelayMsMin: itemDelayMsMin != null ? parseInt(itemDelayMsMin, 10) : undefined,
+      itemDelayMsMax: itemDelayMsMax != null ? parseInt(itemDelayMsMax, 10) : undefined,
     };
 
     // Async mode: add to BullMQ queue
@@ -682,6 +719,92 @@ const groupController = {
     logger.info(`Member ${targetUserId} removed from group ${groupId} by user ${userId}`, { groupId, targetUserId });
 
     return res.status(200).json({ success: true, data: result });
+  }),
+
+  /**
+   * Compute the distribution plan for a hypothetical add-members
+   * job. Pure / no Telegram I/O / no DB writes.
+   *
+   * Body:
+   *   sessionIds: number[]   (or sessionId, or sessionListId)
+   *   userCount: number      (or userList: array — counted server-side)
+   *   mode?: 'auto'|'manual'
+   *   perSessionBurst?, cooldownSecMin?, cooldownSecMax?,
+   *   itemDelayMsMin?, itemDelayMsMax?
+   */
+  previewAddMembers: asyncHandler(async (req, res) => {
+    const {
+      sessionIds: rawSessionIds,
+      sessionId,
+      userList,
+      userCount,
+      mode,
+      perSessionBurst,
+      cooldownSecMin,
+      cooldownSecMax,
+      itemDelayMsMin,
+      itemDelayMsMax,
+    } = req.body || {};
+
+    const explicitSessionIds = rawSessionIds || (sessionId ? [sessionId] : []);
+    const finalSessionIds = await resolveSessionIdsFromRequest(req, explicitSessionIds);
+    if (!finalSessionIds || finalSessionIds.length === 0) {
+      throw new AppError(
+        'sessionIds array, sessionId, or a non-empty sessionListId is required',
+        400,
+        'MISSING_SESSION_ID'
+      );
+    }
+
+    let totalItems;
+    if (Array.isArray(userList)) {
+      totalItems = userList.length;
+    } else if (Number.isFinite(Number(userCount))) {
+      totalItems = Math.max(0, parseInt(userCount, 10));
+    } else {
+      throw new AppError(
+        'userList or numeric userCount is required',
+        400,
+        'MISSING_USER_COUNT'
+      );
+    }
+
+    if (
+      cooldownSecMin != null &&
+      cooldownSecMax != null &&
+      Number(cooldownSecMin) > Number(cooldownSecMax)
+    ) {
+      throw new AppError(
+        'cooldownSecMin must be <= cooldownSecMax',
+        400,
+        'INVALID_COOLDOWN_RANGE'
+      );
+    }
+    if (
+      itemDelayMsMin != null &&
+      itemDelayMsMax != null &&
+      Number(itemDelayMsMin) > Number(itemDelayMsMax)
+    ) {
+      throw new AppError(
+        'itemDelayMsMin must be <= itemDelayMsMax',
+        400,
+        'INVALID_ITEM_DELAY_RANGE'
+      );
+    }
+
+    const plan = distributionPlanner.plan({
+      totalItems,
+      sessionIds: finalSessionIds,
+      workType: 'group_add',
+      mode: mode || 'auto',
+      perSessionBurst: perSessionBurst != null ? Number(perSessionBurst) : undefined,
+      cooldownSecMin: cooldownSecMin != null ? Number(cooldownSecMin) : undefined,
+      cooldownSecMax: cooldownSecMax != null ? Number(cooldownSecMax) : undefined,
+      itemDelayMsMin: itemDelayMsMin != null ? Number(itemDelayMsMin) : undefined,
+      itemDelayMsMax: itemDelayMsMax != null ? Number(itemDelayMsMax) : undefined,
+    });
+
+    return res.status(200).json({ success: true, data: { plan } });
   }),
 };
 

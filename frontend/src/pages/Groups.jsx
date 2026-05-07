@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import { useWebSocket } from '../hooks/useWebSocket';
 import { listSessions } from '../api/sessions';
 import { groupsAPI } from '../api/groups';
@@ -8,6 +8,8 @@ import { useToast } from '../components/common/Toast';
 import { Modal } from '../components/common/Modal';
 import StatusBadge from '../components/common/StatusBadge';
 import SessionListSwitcher from '../components/common/SessionListSwitcher';
+import DistributionControls from '../components/common/DistributionControls';
+import DistributionPreview from '../components/common/DistributionPreview';
 import {
   Loader2,
   X,
@@ -280,6 +282,80 @@ function AddMembersForm({ sessions, targetLists, onSubmit, submitting }) {
   const [batchSize, setBatchSize] = useState(5);
   const [errors, setErrors] = useState({});
   const [showAllSessions, setShowAllSessions] = useState(false);
+  // Distribution-engine state (rotation/cooldown). The shape mirrors
+  // the backend distributionPlanner.plan() inputs.
+  const [distribution, setDistribution] = useState({ mode: 'auto' });
+  const [previewPlan, setPreviewPlan] = useState(null);
+  const [previewLoading, setPreviewLoading] = useState(false);
+  const [previewError, setPreviewError] = useState(null);
+  const previewSeq = useRef(0);
+
+  // Resolve the source-list size so the preview can show realistic
+  // per-session burst counts. We re-use whatever the user already
+  // selected — no extra API hits unless the size isn't known yet.
+  const targetUserCount = useMemo(() => {
+    const sel = targetLists.find((l) => String(l.id) === String(sourceList));
+    if (!sel) return 0;
+    return Number(sel.user_count || sel.userCount || sel.member_count || 0);
+  }, [targetLists, sourceList]);
+
+  // Multiplied by however many target groups the operator pasted in.
+  const targetCount = useMemo(() => {
+    const tg = (targetIds || '')
+      .split('\n')
+      .map((s) => s.trim())
+      .filter(Boolean).length;
+    return targetUserCount * Math.max(1, tg);
+  }, [targetUserCount, targetIds]);
+
+  const previewSessionIds = useMemo(() => {
+    if (sessionPickMode === 'list' && selectedSessionListId) {
+      // We don't know the list's session count without an API call;
+      // fall back to the list's stored count if exposed in the row.
+      return [];
+    }
+    return selectedSessionIds.map((id) => String(id));
+  }, [sessionPickMode, selectedSessionListId, selectedSessionIds]);
+
+  // Debounced dry-run against the preview endpoint whenever the
+  // operator changes any input that affects the plan.
+  useEffect(() => {
+    const seq = ++previewSeq.current;
+    if (targetCount <= 0 || previewSessionIds.length === 0) {
+      setPreviewPlan(null);
+      setPreviewError(null);
+      setPreviewLoading(false);
+      return;
+    }
+    setPreviewLoading(true);
+    setPreviewError(null);
+    const handle = setTimeout(async () => {
+      try {
+        const body = {
+          sessionIds: previewSessionIds,
+          targetCount,
+          mode: distribution.mode || 'auto',
+        };
+        if (distribution.mode === 'manual') {
+          if (distribution.perSessionBurst != null) body.perSessionBurst = distribution.perSessionBurst;
+          if (distribution.cooldownSecMin != null) body.cooldownSecMin = distribution.cooldownSecMin;
+          if (distribution.cooldownSecMax != null) body.cooldownSecMax = distribution.cooldownSecMax;
+          if (distribution.itemDelayMsMin != null) body.itemDelayMsMin = distribution.itemDelayMsMin;
+          if (distribution.itemDelayMsMax != null) body.itemDelayMsMax = distribution.itemDelayMsMax;
+        }
+        const res = await groupsAPI.previewAddMembers(body);
+        if (previewSeq.current !== seq) return;
+        setPreviewPlan(res?.data?.data?.plan || null);
+      } catch (err) {
+        if (previewSeq.current !== seq) return;
+        setPreviewError(parseApiError(err));
+        setPreviewPlan(null);
+      } finally {
+        if (previewSeq.current === seq) setPreviewLoading(false);
+      }
+    }, 350);
+    return () => clearTimeout(handle);
+  }, [targetCount, previewSessionIds, distribution]);
 
   const validate = () => {
     const newErrors = {};
@@ -314,6 +390,7 @@ function AddMembersForm({ sessions, targetLists, onSubmit, submitting }) {
       delayMin: Number(delayMin),
       delayMax: Number(delayMax),
       batchSize: Number(batchSize),
+      distribution,
     };
     if (sessionPickMode === 'list' && selectedSessionListId) {
       submitPayload.sessionListId = Number(selectedSessionListId);
@@ -330,6 +407,7 @@ function AddMembersForm({ sessions, targetLists, onSubmit, submitting }) {
     setDelayMin(30);
     setDelayMax(60);
     setBatchSize(5);
+    setDistribution({ mode: 'auto' });
     setErrors({});
   };
 
@@ -570,6 +648,21 @@ function AddMembersForm({ sessions, targetLists, onSubmit, submitting }) {
         </div>
       </div>
 
+      {/* Distribution engine — auto/manual rotation+cooldown */}
+      <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
+        <DistributionControls
+          value={distribution}
+          onChange={setDistribution}
+          workType="group_add"
+        />
+        <DistributionPreview
+          plan={previewPlan}
+          loading={previewLoading}
+          error={previewError}
+          emptyHint="Pick a source list and at least one session to see how the work will rotate across sessions."
+        />
+      </div>
+
       {/* Submit Button */}
       <button
         type="submit"
@@ -803,6 +896,20 @@ export default function Groups() {
         batchSize: data.batchSize,
         async: false,
       };
+      // Distribution-engine knobs (new). Auto mode passes only `mode`;
+      // manual mode forwards every operator-supplied value so the
+      // backend planner clamps them and uses them directly.
+      if (data.distribution) {
+        const d = data.distribution;
+        addMembersPayload.mode = d.mode || 'auto';
+        if (d.mode === 'manual') {
+          if (d.perSessionBurst != null) addMembersPayload.perSessionBurst = d.perSessionBurst;
+          if (d.cooldownSecMin != null) addMembersPayload.cooldownSecMin = d.cooldownSecMin;
+          if (d.cooldownSecMax != null) addMembersPayload.cooldownSecMax = d.cooldownSecMax;
+          if (d.itemDelayMsMin != null) addMembersPayload.itemDelayMsMin = d.itemDelayMsMin;
+          if (d.itemDelayMsMax != null) addMembersPayload.itemDelayMsMax = d.itemDelayMsMax;
+        }
+      }
       if (data.sessionListId) {
         addMembersPayload.sessionListId = Number(data.sessionListId);
       } else {

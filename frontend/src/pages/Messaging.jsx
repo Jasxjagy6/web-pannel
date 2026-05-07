@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useRef } from 'react';
+import { useState, useEffect, useCallback, useRef, useMemo } from 'react';
 import { useSearchParams } from 'react-router-dom';
 import { useWebSocket } from '../hooks/useWebSocket';
 import { listSessions } from '../api/sessions';
@@ -7,10 +7,13 @@ import {
   getJobs,
   cancelJob,
   previewMessage,
+  previewBulk,
   getMessageHistory,
 } from '../api/messages';
 import { listsAPI } from '../api/lists';
 import SessionListSwitcher from '../components/common/SessionListSwitcher';
+import DistributionControls from '../components/common/DistributionControls';
+import DistributionPreview from '../components/common/DistributionPreview';
 import { parseApiError, formatNumber, formatRelativeTime, formatDateTime } from '../utils/formatters';
 import { useToast } from '../components/common/Toast';
 import { Modal } from '../components/common/Modal';
@@ -826,6 +829,12 @@ export default function Messaging() {
   const [delayMin, setDelayMin] = useState(2);
   const [delayMax, setDelayMax] = useState(5);
   const [msgsPerSession, setMsgsPerSession] = useState('');
+  // Distribution-engine state — auto/manual rotation+cooldown.
+  const [distribution, setDistribution] = useState({ mode: 'auto' });
+  const [distPlan, setDistPlan] = useState(null);
+  const [distLoading, setDistLoading] = useState(false);
+  const [distError, setDistError] = useState(null);
+  const distSeq = useRef(0);
 
   // Data state
   const [sessions, setSessions] = useState([]);
@@ -996,6 +1005,63 @@ export default function Messaging() {
     return 0;
   };
 
+  // Memoised inputs to the distribution preview, so we don't fire a
+  // request on every render — only when one of them actually changes.
+  const distTargetCount = useMemo(() => {
+    if (targetMode === 'list' && selectedList) {
+      const list = targetLists.find((l) => String(l.id) === String(selectedList));
+      return Number(list?.itemsCount || list?.count || 0);
+    }
+    if (targetMode === 'manual' && targetIds.trim()) {
+      return targetIds.split(',').filter((id) => id.trim()).length;
+    }
+    return 0;
+  }, [targetMode, selectedList, targetIds, targetLists]);
+
+  const distSessionIds = useMemo(() => {
+    if (sessionPickMode === 'list' && selectedSessionListId) return [];
+    return Array.from(selectedSessionIds).map(String);
+  }, [sessionPickMode, selectedSessionListId, selectedSessionIds]);
+
+  // Debounced dry-run for the bulk-message distribution plan.
+  useEffect(() => {
+    const seq = ++distSeq.current;
+    if (distTargetCount <= 0 || distSessionIds.length === 0) {
+      setDistPlan(null);
+      setDistError(null);
+      setDistLoading(false);
+      return;
+    }
+    setDistLoading(true);
+    setDistError(null);
+    const handle = setTimeout(async () => {
+      try {
+        const body = {
+          sessionIds: distSessionIds,
+          targetCount: distTargetCount,
+          mode: distribution.mode || 'auto',
+        };
+        if (distribution.mode === 'manual') {
+          if (distribution.perSessionBurst != null) body.perSessionBurst = distribution.perSessionBurst;
+          if (distribution.cooldownSecMin != null) body.cooldownSecMin = distribution.cooldownSecMin;
+          if (distribution.cooldownSecMax != null) body.cooldownSecMax = distribution.cooldownSecMax;
+          if (distribution.itemDelayMsMin != null) body.itemDelayMsMin = distribution.itemDelayMsMin;
+          if (distribution.itemDelayMsMax != null) body.itemDelayMsMax = distribution.itemDelayMsMax;
+        }
+        const res = await previewBulk(body);
+        if (distSeq.current !== seq) return;
+        setDistPlan(res?.data?.data?.plan || null);
+      } catch (err) {
+        if (distSeq.current !== seq) return;
+        setDistError(parseApiError(err));
+        setDistPlan(null);
+      } finally {
+        if (distSeq.current === seq) setDistLoading(false);
+      }
+    }, 350);
+    return () => clearTimeout(handle);
+  }, [distTargetCount, distSessionIds, distribution]);
+
   // --- Actions ---
   const handleBulkSend = async () => {
     // Validation
@@ -1076,6 +1142,17 @@ export default function Messaging() {
         payload.messagesPerSession = Number(msgsPerSession);
       }
 
+      // Distribution-engine controls. Auto mode passes only `mode`;
+      // manual mode forwards only the fields the operator has set.
+      payload.mode = distribution.mode || 'auto';
+      if (distribution.mode === 'manual') {
+        if (distribution.perSessionBurst != null) payload.perSessionBurst = distribution.perSessionBurst;
+        if (distribution.cooldownSecMin != null) payload.cooldownSecMin = distribution.cooldownSecMin;
+        if (distribution.cooldownSecMax != null) payload.cooldownSecMax = distribution.cooldownSecMax;
+        if (distribution.itemDelayMsMin != null) payload.itemDelayMsMin = distribution.itemDelayMsMin;
+        if (distribution.itemDelayMsMax != null) payload.itemDelayMsMax = distribution.itemDelayMsMax;
+      }
+
       if (mediaFile) {
         console.warn('Media attachment selected but not yet supported in bulk messaging');
       }
@@ -1107,6 +1184,7 @@ export default function Messaging() {
       setSelectedSessionIds(new Set());
       setSelectedList('');
       setTargetIds('');
+      setDistribution({ mode: 'auto' });
     } catch (err) {
       const elapsed = Date.now() - startTime;
       const remaining = Math.max(0, minLoadingTime - elapsed);
@@ -1290,6 +1368,21 @@ export default function Messaging() {
       </div>
 
       {/* Distribution Visualization + Send Button */}
+      {/* Distribution engine — auto/manual rotation+cooldown */}
+      <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
+        <DistributionControls
+          value={distribution}
+          onChange={setDistribution}
+          workType="bulk_message"
+        />
+        <DistributionPreview
+          plan={distPlan}
+          loading={distLoading}
+          error={distError}
+          emptyHint="Pick a target list and at least one session to see how the work will rotate across sessions."
+        />
+      </div>
+
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
         {/* Distribution Bar */}
         <div className="lg:col-span-2">

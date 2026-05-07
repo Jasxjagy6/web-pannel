@@ -19,4 +19,13 @@ export const sessionListsAPI = {
     api.delete(`/session-lists/${id}/sessions`, { data: { sessionIds } }),
   setSessions: (id, sessionIds) =>
     api.put(`/session-lists/${id}/sessions`, { sessionIds }),
+  // Streams a ZIP archive of every exportable session in the list.
+  // `format` is 'json' (default) or 'session'. Returns the raw axios
+  // response with `data` as a Blob — the caller is responsible for
+  // turning it into an object URL and triggering the download.
+  download: (id, { format = 'json' } = {}) =>
+    api.get(`/session-lists/${id}/download`, {
+      params: { format },
+      responseType: 'blob',
+    }),
 };

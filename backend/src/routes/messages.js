@@ -14,6 +14,11 @@ router.post('/send', messageLimiter, validate(schemas.sendMessage), messageContr
 // POST /api/messages/bulk - Bulk send
 router.post('/bulk', messageLimiter, validate(schemas.bulkMessage), messageController.sendBulk);
 
+// POST /api/messages/bulk/preview - Distribution-engine preview
+// Returns the rotation/cooldown plan that would be used for a bulk
+// send, without enqueueing or sending anything.
+router.post('/bulk/preview', messageController.previewBulk);
+
 // POST /api/messages/group - Send to group
 router.post('/group', messageLimiter, messageController.sendMessageToGroup);
 

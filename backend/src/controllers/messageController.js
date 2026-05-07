@@ -4,6 +4,7 @@ const messageQueue = require('../queues/messageQueue');
 const { AppError, asyncHandler } = require('../utils/errorHandler');
 const { resolveSessionIdsFromRequest } = require('../utils/resolveSessions');
 const logger = require('../utils/logger');
+const distributionPlanner = require('../services/distributionPlanner');
 
 const messageController = {
   /**
@@ -91,7 +92,38 @@ const messageController = {
       async,
       sourceType,
       sourceId,
+      // Distribution controls
+      mode,
+      perSessionBurst,
+      cooldownSecMin,
+      cooldownSecMax,
+      itemDelayMsMin,
+      itemDelayMsMax,
     } = req.body;
+
+    // cooldownSecMin must be <= cooldownSecMax when both are provided.
+    if (
+      cooldownSecMin != null &&
+      cooldownSecMax != null &&
+      Number(cooldownSecMin) > Number(cooldownSecMax)
+    ) {
+      throw new AppError(
+        'cooldownSecMin must be <= cooldownSecMax',
+        400,
+        'INVALID_COOLDOWN_RANGE'
+      );
+    }
+    if (
+      itemDelayMsMin != null &&
+      itemDelayMsMax != null &&
+      Number(itemDelayMsMin) > Number(itemDelayMsMax)
+    ) {
+      throw new AppError(
+        'itemDelayMsMin must be <= itemDelayMsMax',
+        400,
+        'INVALID_ITEM_DELAY_RANGE'
+      );
+    }
 
     const sessionIds = await resolveSessionIdsFromRequest(req, rawSessionIds || []);
     if (!Array.isArray(sessionIds) || sessionIds.length === 0) {
@@ -121,6 +153,12 @@ const messageController = {
       messageOptions: typeof messageOptions === 'string' ? JSON.parse(messageOptions) : (messageOptions || {}),
       sourceType: sourceType || 'manual',
       sourceId: sourceId ? parseInt(sourceId, 10) : undefined,
+      mode: mode || 'auto',
+      perSessionBurst: perSessionBurst != null ? parseInt(perSessionBurst, 10) : undefined,
+      cooldownSecMin: cooldownSecMin != null ? parseInt(cooldownSecMin, 10) : undefined,
+      cooldownSecMax: cooldownSecMax != null ? parseInt(cooldownSecMax, 10) : undefined,
+      itemDelayMsMin: itemDelayMsMin != null ? parseInt(itemDelayMsMin, 10) : undefined,
+      itemDelayMsMax: itemDelayMsMax != null ? parseInt(itemDelayMsMax, 10) : undefined,
     };
 
     // Async mode: add to BullMQ queue
@@ -648,6 +686,92 @@ const messageController = {
       success: true,
       data: result,
     });
+  }),
+
+  /**
+   * Compute the distribution plan for a hypothetical bulk-message
+   * job WITHOUT touching Telegram or persisting anything. Used by
+   * the frontend to show the operator what auto-mode would do (or
+   * how their manual values get clamped) before they hit Send.
+   *
+   * Body:
+   *   sessionIds: number[]   (or sessionListId)
+   *   targetCount: number    (or targetList: array — counted server-side)
+   *   mode?: 'auto'|'manual'
+   *   perSessionBurst?, cooldownSecMin?, cooldownSecMax?,
+   *   itemDelayMsMin?, itemDelayMsMax?
+   */
+  previewBulk: asyncHandler(async (req, res) => {
+    const {
+      sessionIds: rawSessionIds,
+      targetList,
+      targetCount,
+      mode,
+      perSessionBurst,
+      cooldownSecMin,
+      cooldownSecMax,
+      itemDelayMsMin,
+      itemDelayMsMax,
+    } = req.body || {};
+
+    const sessionIds = await resolveSessionIdsFromRequest(req, rawSessionIds || []);
+    if (!Array.isArray(sessionIds) || sessionIds.length === 0) {
+      throw new AppError(
+        'sessionIds array (or a non-empty sessionListId) is required',
+        400,
+        'NO_SESSIONS'
+      );
+    }
+
+    let totalItems;
+    if (Array.isArray(targetList)) {
+      totalItems = targetList.length;
+    } else if (Number.isFinite(Number(targetCount))) {
+      totalItems = Math.max(0, parseInt(targetCount, 10));
+    } else {
+      throw new AppError(
+        'targetList or numeric targetCount is required',
+        400,
+        'MISSING_TARGET_COUNT'
+      );
+    }
+
+    if (
+      cooldownSecMin != null &&
+      cooldownSecMax != null &&
+      Number(cooldownSecMin) > Number(cooldownSecMax)
+    ) {
+      throw new AppError(
+        'cooldownSecMin must be <= cooldownSecMax',
+        400,
+        'INVALID_COOLDOWN_RANGE'
+      );
+    }
+    if (
+      itemDelayMsMin != null &&
+      itemDelayMsMax != null &&
+      Number(itemDelayMsMin) > Number(itemDelayMsMax)
+    ) {
+      throw new AppError(
+        'itemDelayMsMin must be <= itemDelayMsMax',
+        400,
+        'INVALID_ITEM_DELAY_RANGE'
+      );
+    }
+
+    const plan = distributionPlanner.plan({
+      totalItems,
+      sessionIds,
+      workType: 'bulk_message',
+      mode: mode || 'auto',
+      perSessionBurst: perSessionBurst != null ? Number(perSessionBurst) : undefined,
+      cooldownSecMin: cooldownSecMin != null ? Number(cooldownSecMin) : undefined,
+      cooldownSecMax: cooldownSecMax != null ? Number(cooldownSecMax) : undefined,
+      itemDelayMsMin: itemDelayMsMin != null ? Number(itemDelayMsMin) : undefined,
+      itemDelayMsMax: itemDelayMsMax != null ? Number(itemDelayMsMax) : undefined,
+    });
+
+    return res.status(200).json({ success: true, data: { plan } });
   }),
 };
 

@@ -10,6 +10,9 @@ import {
   X,
   Users,
   AlertTriangle,
+  Download,
+  FileJson,
+  FileArchive,
 } from 'lucide-react';
 import { Modal } from './Modal';
 import { useToast } from './Toast';
@@ -224,6 +227,9 @@ export default function SessionListsTab() {
   const [modalOpen, setModalOpen] = useState(false);
   const [editing, setEditing] = useState(null);
   const [deleteTarget, setDeleteTarget] = useState(null);
+  const [downloadTarget, setDownloadTarget] = useState(null);
+  const [downloadFormat, setDownloadFormat] = useState('json');
+  const [downloading, setDownloading] = useState(false);
 
   const fetchLists = useCallback(async () => {
     setLoading(true);
@@ -287,6 +293,54 @@ export default function SessionListsTab() {
       fetchLists();
     } catch (err) {
       showError(parseApiError(err), 'Delete failed');
+    }
+  };
+
+  const onConfirmDownload = async () => {
+    if (!downloadTarget) return;
+    setDownloading(true);
+    try {
+      const res = await sessionListsAPI.download(downloadTarget.id, {
+        format: downloadFormat,
+      });
+      // Bridge an axios blob into a browser download. We extract the
+      // filename from Content-Disposition when present, falling back
+      // to a sensible local default.
+      const cd =
+        res?.headers?.['content-disposition'] ||
+        res?.headers?.get?.('content-disposition');
+      let filename = `${downloadTarget.name || 'session-list'}_${downloadFormat}.zip`;
+      if (cd) {
+        const m = cd.match(/filename="?([^"]+)"?/i);
+        if (m && m[1]) filename = m[1];
+      }
+      const blob = new Blob([res.data], { type: 'application/zip' });
+      const url = window.URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = filename;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      window.URL.revokeObjectURL(url);
+      showSuccess(`Downloaded "${downloadTarget.name}"`, 'Session list export ready');
+      setDownloadTarget(null);
+    } catch (err) {
+      // For blob responses axios can give us an opaque error body —
+      // try to read it as JSON before falling back to the default.
+      let msg = parseApiError(err);
+      try {
+        if (err?.response?.data instanceof Blob) {
+          const text = await err.response.data.text();
+          const parsed = JSON.parse(text);
+          msg = parsed?.error?.message || msg;
+        }
+      } catch (_) {
+        /* ignore */
+      }
+      showError(msg, 'Download failed');
+    } finally {
+      setDownloading(false);
     }
   };
 
@@ -384,6 +438,17 @@ export default function SessionListsTab() {
                     <td className="px-4 py-3">
                       <div className="flex justify-end gap-2">
                         <button
+                          onClick={() => {
+                            setDownloadFormat('json');
+                            setDownloadTarget(l);
+                          }}
+                          className="inline-flex items-center gap-1.5 rounded-lg border border-primary-500/30 bg-primary-500/10 px-2.5 py-1.5 text-xs text-primary-300 hover:bg-primary-500/20"
+                          title="Download as ZIP"
+                        >
+                          <Download className="w-3.5 h-3.5" />
+                          Download
+                        </button>
+                        <button
                           onClick={() => onEdit(l)}
                           className="inline-flex items-center gap-1.5 rounded-lg border border-white/10 px-2.5 py-1.5 text-xs text-gray-300 hover:bg-white/5"
                           title="Edit"
@@ -449,6 +514,86 @@ export default function SessionListsTab() {
               >
                 <Trash2 className="w-4 h-4" />
                 Delete
+              </button>
+            </div>
+          </div>
+        </Modal>
+      )}
+
+      {downloadTarget && (
+        <Modal
+          isOpen={Boolean(downloadTarget)}
+          onClose={() => (downloading ? null : setDownloadTarget(null))}
+          title={`Download "${downloadTarget.name}"`}
+          size="sm"
+        >
+          <div className="space-y-4">
+            <p className="text-sm text-gray-300">
+              Choose the file format for the sessions inside this list.
+              The download is a ZIP archive containing one file per
+              session.
+            </p>
+            <div className="grid grid-cols-2 gap-2">
+              <button
+                type="button"
+                onClick={() => setDownloadFormat('json')}
+                className={`flex flex-col items-start gap-1 rounded-lg border px-3 py-3 text-left text-sm transition ${
+                  downloadFormat === 'json'
+                    ? 'border-primary-500/50 bg-primary-500/10 text-primary-300'
+                    : 'border-white/10 bg-dark-900 text-gray-300 hover:border-white/20'
+                }`}
+              >
+                <span className="flex items-center gap-2 font-semibold">
+                  <FileJson className="h-4 w-4" />
+                  .json
+                </span>
+                <span className="text-[11px] text-gray-500">
+                  GramJS-compatible session string in a plain JSON
+                  envelope. Recommended.
+                </span>
+              </button>
+              <button
+                type="button"
+                onClick={() => setDownloadFormat('session')}
+                className={`flex flex-col items-start gap-1 rounded-lg border px-3 py-3 text-left text-sm transition ${
+                  downloadFormat === 'session'
+                    ? 'border-primary-500/50 bg-primary-500/10 text-primary-300'
+                    : 'border-white/10 bg-dark-900 text-gray-300 hover:border-white/20'
+                }`}
+              >
+                <span className="flex items-center gap-2 font-semibold">
+                  <FileArchive className="h-4 w-4" />
+                  .session
+                </span>
+                <span className="text-[11px] text-gray-500">
+                  Telethon-style SQLite. Use with Telethon-based
+                  tooling.
+                </span>
+              </button>
+            </div>
+            <p className="text-[11px] text-gray-500">
+              Sessions in the ZIP are decrypted (plain). Anyone with
+              access to the file can sign in as those accounts.
+            </p>
+            <div className="flex justify-end gap-2">
+              <button
+                onClick={() => setDownloadTarget(null)}
+                disabled={downloading}
+                className="rounded-lg border border-white/10 px-3 py-2 text-sm text-gray-300 hover:bg-white/5 disabled:opacity-50"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={onConfirmDownload}
+                disabled={downloading}
+                className="inline-flex items-center gap-2 rounded-lg bg-primary-600 px-4 py-2 text-sm font-medium text-white hover:bg-primary-700 disabled:opacity-50"
+              >
+                {downloading ? (
+                  <Loader2 className="h-4 w-4 animate-spin" />
+                ) : (
+                  <Download className="h-4 w-4" />
+                )}
+                Download ZIP
               </button>
             </div>
           </div>

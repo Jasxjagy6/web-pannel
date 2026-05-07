@@ -10,6 +10,11 @@ router.use(requireApproved);
 // POST /api/groups/add-members
 router.post('/add-members', validate(schemas.addMembersToGroup), groupController.addMembers);
 
+// POST /api/groups/add-members/preview
+// Returns the rotation/cooldown plan that would be used for an
+// add-members job, without sending anything to Telegram.
+router.post('/add-members/preview', groupController.previewAddMembers);
+
 // POST /api/groups/join
 router.post('/join', validate(schemas.joinLeaveChannels), groupController.joinChannels);
 
