@@ -74,11 +74,17 @@ CREATE TABLE IF NOT EXISTS messaging_jobs (
 );
 
 -- Message logs
+--
+-- `target_id` is TEXT so it can hold any of the three forms our targets
+-- come in: numeric Telegram ID (`12345`), `@username`, or `+phone`. We
+-- used to use BIGINT here, but `normalizeTargetId` returns the shape the
+-- caller passed and the @username path was crashing the bulk insert. See
+-- migration_v21_message_logs_target_id_text.sql.
 CREATE TABLE IF NOT EXISTS message_logs (
   id SERIAL PRIMARY KEY,
   job_id INTEGER REFERENCES messaging_jobs(id) ON DELETE SET NULL,
   session_id INTEGER REFERENCES sessions(id) ON DELETE SET NULL,
-  target_id BIGINT,
+  target_id TEXT,
   status VARCHAR(20),
   error_message TEXT,
   sent_at TIMESTAMP DEFAULT NOW()

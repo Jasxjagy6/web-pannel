@@ -55,6 +55,7 @@ const MIGRATION_ORDER = [
   'migration_v18_tg_otp_relay.sql',
   'migration_v19_rich_scrape_fields.sql',
   'migration_v20_session_lists.sql',
+  'migration_v21_message_logs_target_id_text.sql',
 ];
 
 function listMigrationFiles() {

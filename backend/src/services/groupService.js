@@ -954,12 +954,22 @@ class GroupService {
     const row = result.rows[0];
 
     let redisProgress = null;
+    let detailedResults = null;
     try {
       if (redisClient.isReady) {
         const progressKey = `group:add_progress:${opId}`;
         const progressData = await redisClient.get(progressKey);
         if (progressData) {
           redisProgress = JSON.parse(progressData);
+        }
+        const resultsKey = `group:results:${opId}`;
+        const resultsRaw = await redisClient.get(resultsKey);
+        if (resultsRaw) {
+          try {
+            detailedResults = JSON.parse(resultsRaw);
+          } catch {
+            detailedResults = null;
+          }
         }
       }
     } catch {
@@ -971,6 +981,23 @@ class GroupService {
       options = typeof row.options === 'string' ? JSON.parse(row.options) : row.options;
     } catch {
       options = row.options;
+    }
+
+    // The Redis blob stores every per-user attempt (both successes and
+    // failures). The "View Errors" modal in the UI only renders the failures,
+    // so we surface them as `errors`/`failed_users` (the two field names the
+    // frontend already reads from). We also expose the raw `results` for any
+    // future caller that wants the full picture.
+    let errors = [];
+    if (Array.isArray(detailedResults)) {
+      errors = detailedResults
+        .filter((r) => r && r.success === false)
+        .map((r) => ({
+          userId: r.userId,
+          targetId: r.targetId,
+          sessionId: r.sessionId,
+          error: r.error || 'Unknown error',
+        }));
     }
 
     return {
@@ -985,6 +1012,9 @@ class GroupService {
       createdAt: row.created_at,
       completedAt: row.completed_at,
       redisProgress,
+      results: Array.isArray(detailedResults) ? detailedResults : [],
+      errors,
+      failed_users: errors,
     };
   }
 
