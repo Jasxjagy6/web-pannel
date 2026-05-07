@@ -1587,10 +1587,17 @@ class TelegramClientService {
       const isSelfChat =
         peerType === 'user' && selfId != null && peerIdNum === selfId;
 
+      // Bots are User entities with `entity.bot === true`. We treat them
+      // like groups/channels for removal purposes: the dialog must be
+      // dropped from the caller's list (not just cleared) and the bot
+      // is blocked so it can't ping the user back.
+      const isBot = peerType === 'user' && !isSelfChat && !!entity?.bot;
+
       const warnings = [];
       let cleared = false;
       let left = false;
       let deleted = false;
+      let blocked = false;
       let fatalErr = null;
 
       // ---- Step 1: clear history (best-effort for groups/channels) ----
@@ -1613,16 +1620,25 @@ class TelegramClientService {
               // Private chats keep the historical semantic:
               // revoke=false ⇒ just_clear (caller-only), revoke=true ⇒
               // also remove the dialog and delete for the other side.
+              // Bots are forced to just_clear=false so the dialog is
+              // dropped from the caller's list — leaving a bot in the
+              // dialog list defeats the point of "delete bot".
               // Basic chats always just_clear here because the dialog
               // is removed by the explicit DeleteChatUser / DeleteChat
               // step below — using just_clear=false here would make
               // Telegram report CHAT_ADMIN_REQUIRED on some basic groups.
-              justClear: peerType === 'user' ? !revoke : true,
+              justClear: isBot ? false : peerType === 'user' ? !revoke : true,
               revoke,
             }))
           );
         }
         cleared = true;
+        if (isBot) {
+          // The DeleteHistory(justClear=false) call above already removed
+          // the bot dialog from the caller's list, so flag it as deleted
+          // for the per-action breakdown.
+          deleted = true;
+        }
       } catch (err) {
         const code = _errCode(err);
         const msg = _errStr(err);
@@ -1632,6 +1648,27 @@ class TelegramClientService {
           warnings.push({ stage: 'clearHistory', code, error: msg });
           logger.debug(
             `clearChats session=${sessionId} peer=${peerType}/${peerIdNum} clear failed (will still try leave): ${msg}`
+          );
+        }
+      }
+
+      // ---- Step 1b: block bots so they can't keep messaging us -------
+      // Best-effort: a Block failure shouldn't fail the whole peer.
+      if (!fatalErr && isBot) {
+        try {
+          const inputPeer = await entry.client.getInputEntity(entity);
+          await _withFloodRetry(() =>
+            entry.client.invoke(new Api.contacts.Block({ id: inputPeer }))
+          );
+          blocked = true;
+        } catch (err) {
+          warnings.push({
+            stage: 'blockBot',
+            code: _errCode(err),
+            error: _errStr(err),
+          });
+          logger.debug(
+            `clearChats session=${sessionId} bot=${peerIdNum} block failed (continuing): ${_errStr(err)}`
           );
         }
       }
@@ -1727,9 +1764,11 @@ class TelegramClientService {
         title,
         ok,
         action,
+        isBot,
         cleared,
         left,
         deleted,
+        blocked,
         error: ok ? null : fatalErr.msg,
         code: ok ? null : fatalErr.code,
         warnings,

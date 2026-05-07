@@ -167,6 +167,7 @@ function SessionRow({ session, revoke }) {
   if (session.cleared) breakdownParts.push(`${session.cleared} cleared`);
   if (session.left) breakdownParts.push(`${session.left} left`);
   if (session.deleted) breakdownParts.push(`${session.deleted} deleted`);
+  if (session.bots) breakdownParts.push(`${session.bots} bot${session.bots === 1 ? '' : 's'}`);
   const summary = hasTotal
     ? `${session.done || 0} / ${session.total || 0} processed`
     : session.status === 'queued'
@@ -258,6 +259,7 @@ function JobCard({ job, defaultExpanded, nowMs }) {
   const cleared = totals.cleared || 0;
   const left = totals.left || 0;
   const deleted = totals.deleted || 0;
+  const bots = totals.bots || 0;
   const completedSessions = totals.completedSessions || 0;
   const totalSessions = totals.totalSessions || (job.sessions || []).length;
 
@@ -265,6 +267,7 @@ function JobCard({ job, defaultExpanded, nowMs }) {
   if (cleared) breakdownParts.push(`${cleared} cleared`);
   if (left) breakdownParts.push(`${left} left`);
   if (deleted) breakdownParts.push(`${deleted} deleted`);
+  if (bots) breakdownParts.push(`${bots} bot${bots === 1 ? '' : 's'} removed`);
   if (failed) breakdownParts.push(`${failed} failed`);
 
   const inProgressSession = useMemo(

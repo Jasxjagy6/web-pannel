@@ -77,6 +77,8 @@ function publicJob(job) {
       cleared: s.cleared,
       left: s.left,
       deleted: s.deleted,
+      bots: s.bots,
+      blocked: s.blocked,
       currentTitle: s.currentTitle,
       error: s.error,
       code: s.code,
@@ -124,6 +126,8 @@ function createJob({ userId, revoke, sessions }) {
       cleared: 0,
       left: 0,
       deleted: 0,
+      bots: 0,
+      blocked: 0,
       currentTitle: null,
       error: null,
       code: null,
@@ -162,6 +166,8 @@ function _emptyTotals(totalSessions) {
     cleared: 0,
     left: 0,
     deleted: 0,
+    bots: 0,
+    blocked: 0,
   };
 }
 
@@ -175,6 +181,8 @@ function _recomputeTotals(job) {
     totals.cleared += s.cleared || 0;
     totals.left += s.left || 0;
     totals.deleted += s.deleted || 0;
+    totals.bots += s.bots || 0;
+    totals.blocked += s.blocked || 0;
     if (s.status === 'done' || s.status === 'failed' || s.status === 'partial') {
       totals.completedSessions += 1;
     }
