@@ -31,6 +31,9 @@ function maybeMultipart(mw) {
 
 // --- Sessions -------------------------------------------------------------
 router.get('/sessions', controller.listSessions);
+// Bulk "Clear chat history across N sessions" — declared before
+// /sessions/:id/* so the static path wins over the param route.
+router.post('/sessions/clear-history', controller.clearAllChatsHistory);
 router.post('/sessions/:id/connect', controller.connect);
 router.get('/sessions/:id/me', controller.getMe);
 

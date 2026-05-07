@@ -1387,6 +1387,215 @@ class TelegramClientService {
   }
 
   /**
+   * Clear the full message history of every dialog (chat / group / channel)
+   * the given session can see. Used by the "Delete chats" action on the
+   * Telegram Login page so a user can wipe a session's chats without
+   * opening each dialog one by one.
+   *
+   * Per-peer, the call is:
+   *   - user / chat peers   → messages.DeleteHistory(peer, max_id=0, just_clear, revoke)
+   *   - channel peers       → channels.DeleteHistory(channel, max_id=0, for_everyone)
+   *
+   * `revoke=true` translates to the Telegram-side "delete from both sides"
+   * for users / basic chats and `for_everyone` for channels (admin
+   * required for broadcast / megagroup; non-admin attempts return
+   * `CHAT_ADMIN_REQUIRED`, which we record as a per-peer failure and
+   * keep going).
+   *
+   * `revoke=false` translates to `just_clear` for users / basic chats
+   * (history disappears from the caller's view only) and to a regular
+   * `channels.DeleteHistory(for_everyone=false)` for channels (also
+   * caller-only; this is what Telegram apps do for a non-admin "Delete
+   * for me" tap on a public channel).
+   *
+   * @param {string|number} sessionId
+   * @param {string|number} userId
+   * @param {object} [opts]
+   * @param {boolean} [opts.revoke=false] true = delete from both sides
+   * @returns {Promise<{
+   *   sessionId: string,
+   *   total: number,
+   *   succeeded: number,
+   *   failed: number,
+   *   revoke: boolean,
+   *   results: Array<{
+   *     peerType: string,
+   *     peerId: number|null,
+   *     title: string|null,
+   *     ok: boolean,
+   *     error: string|null,
+   *     code: string|null,
+   *   }>
+   * }>}
+   */
+  async deleteAllChatsHistory(sessionId, userId, opts = {}) {
+    const revoke = !!opts.revoke;
+    await _loadAndAuthSession(sessionId, userId);
+    await tgService._ensureConnected(sessionId);
+    const entry = tgService.clients.get(String(sessionId));
+    if (!entry) throw new AppError('Session client not loaded', 500, 'CLIENT_NOT_LOADED');
+
+    // Pull as many dialogs as Telegram will give us for the account in
+    // one call. The `iterDialogs` helper is the "no limit" sibling of
+    // getDialogs and returns every dialog the account has on the panel
+    // side. We collect into an array so we can iterate sequentially and
+    // emit progress events.
+    const dialogs = [];
+    try {
+      for await (const d of entry.client.iterDialogs({})) {
+        if (d && d.entity) dialogs.push(d);
+      }
+    } catch (err) {
+      throw new AppError(`Failed to list dialogs: ${err.message}`, 502, 'DIALOGS_FETCH_FAILED');
+    }
+
+    const io = global.io;
+    const room = `tg-client:u${userId}:s${sessionId}`;
+    const total = dialogs.length;
+    const results = [];
+    let succeeded = 0;
+    let failed = 0;
+
+    if (io && total > 0) {
+      try {
+        io.to(room).emit('tg-client:clearChatsStart', {
+          sessionId: String(sessionId),
+          total,
+          revoke,
+        });
+      } catch (_) { /* ignore */ }
+    }
+
+    // Sequential per-dialog so we never exceed the per-session MTProto
+    // rate limit. Concurrency across sessions is the caller's concern.
+    for (let i = 0; i < dialogs.length; i++) {
+      const dialog = dialogs[i];
+      const entity = dialog.entity;
+      const peerType = _peerTypeOf(entity);
+      const peerIdNum = _toIdNum(entity?.id);
+      const title = _entityTitle(entity);
+
+      if (!peerType || peerIdNum == null) {
+        failed += 1;
+        results.push({
+          peerType: peerType || 'unknown',
+          peerId: peerIdNum,
+          title,
+          ok: false,
+          error: 'Unrecognized dialog entity',
+          code: 'BAD_PEER',
+        });
+        continue;
+      }
+
+      try {
+        if (peerType === 'channel') {
+          // channels.DeleteHistory(channel, max_id=0, for_everyone)
+          // for_everyone requires admin rights with delete_messages.
+          // max_id=0 means "all messages up to the latest one".
+          const inputChannel = await entry.client.getInputEntity(entity);
+          await entry.client.invoke(new Api.channels.DeleteHistory({
+            channel: inputChannel,
+            maxId: 0,
+            forEveryone: revoke,
+          }));
+        } else {
+          // user / chat: messages.DeleteHistory(peer, max_id=0, just_clear, revoke)
+          // just_clear=true is the "Delete for me" semantic; revoke=true is
+          // the "Also delete for the other side" toggle Telegram apps show.
+          const inputPeer = await entry.client.getInputEntity(entity);
+          await entry.client.invoke(new Api.messages.DeleteHistory({
+            peer: inputPeer,
+            maxId: 0,
+            justClear: !revoke,
+            revoke,
+          }));
+        }
+        succeeded += 1;
+        results.push({
+          peerType,
+          peerId: peerIdNum,
+          title,
+          ok: true,
+          error: null,
+          code: null,
+        });
+
+        if (io) {
+          try {
+            io.to(room).emit('tg-client:clearChatsProgress', {
+              sessionId: String(sessionId),
+              total,
+              done: i + 1,
+              peerType,
+              peerId: peerIdNum,
+              title,
+              ok: true,
+            });
+            io.to(room).emit('tg-client:dialogHistoryCleared', {
+              sessionId: String(sessionId),
+              peerType,
+              peerId: peerIdNum,
+              revoke,
+            });
+          } catch (_) { /* ignore */ }
+        }
+      } catch (err) {
+        failed += 1;
+        const msg = err?.message || String(err);
+        const code = err?.errorMessage || err?.code || null;
+        logger.warn(
+          `clearChats session=${sessionId} peer=${peerType}/${peerIdNum} failed: ${msg}`
+        );
+        results.push({
+          peerType,
+          peerId: peerIdNum,
+          title,
+          ok: false,
+          error: msg,
+          code: typeof code === 'string' ? code : null,
+        });
+
+        if (io) {
+          try {
+            io.to(room).emit('tg-client:clearChatsProgress', {
+              sessionId: String(sessionId),
+              total,
+              done: i + 1,
+              peerType,
+              peerId: peerIdNum,
+              title,
+              ok: false,
+              error: msg,
+            });
+          } catch (_) { /* ignore */ }
+        }
+      }
+    }
+
+    if (io) {
+      try {
+        io.to(room).emit('tg-client:clearChatsDone', {
+          sessionId: String(sessionId),
+          total,
+          succeeded,
+          failed,
+          revoke,
+        });
+      } catch (_) { /* ignore */ }
+    }
+
+    return {
+      sessionId: String(sessionId),
+      total,
+      succeeded,
+      failed,
+      revoke,
+      results,
+    };
+  }
+
+  /**
    * Forward a list of message ids from one peer to another.
    *
    * Emits `tg-client:newMessage` and `tg-client:dialogUpdate` for the
