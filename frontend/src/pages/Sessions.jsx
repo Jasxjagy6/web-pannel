@@ -864,10 +864,15 @@ export default function Sessions() {
   const [statusFilter, setStatusFilter] = useState('all');
   const [selectedIds, setSelectedIds] = useState(new Set());
   const [currentPage, setCurrentPage] = useState(1);
+  const [serverPagination, setServerPagination] = useState(null);
   const [detailSession, setDetailSession] = useState(null);
   const [detailOpen, setDetailOpen] = useState(false);
 
-  const pageSize = 10;
+  // Show 50/page so a typical bulk upload (e.g. 50 .session files at once)
+  // fits on the first page without the operator having to think about
+  // pagination at all. Past 50, the standard pager kicks in. The backend
+  // hard-caps the per-page limit at 100 in `buildPagination`.
+  const pageSize = 50;
 
   const fetchSessions = useCallback(async () => {
     try {
@@ -878,6 +883,7 @@ export default function Sessions() {
         status: statusFilter !== 'all' ? statusFilter : undefined,
       });
       setSessions(response.data.data?.sessions || []);
+      setServerPagination(response.data.data?.pagination || null);
     } catch (err) {
       console.warn('Failed to fetch sessions:', parseApiError(err));
     } finally {
@@ -1077,11 +1083,22 @@ export default function Sessions() {
   });
 
   // --- Pagination ---
-  const totalPages = Math.ceil(filteredSessions.length / pageSize);
-  const paginatedSessions = filteredSessions.slice(
-    (currentPage - 1) * pageSize,
-    currentPage * pageSize
+  //
+  // The backend already paginated for us — we just render the page it
+  // returned. Total counts come from the server's pagination metadata so
+  // the footer reflects the *whole dataset* (e.g. 50/50, not 10/10).
+  // The client-side filtered list narrows the current page; if the operator
+  // wants to search across the whole set, they should rely on the
+  // backend-side `filter` param (which is wired into `searchTerm`).
+  const totalPages = Math.max(
+    1,
+    serverPagination?.totalPages || Math.ceil(filteredSessions.length / pageSize)
   );
+  const totalResults =
+    typeof serverPagination?.total === 'number'
+      ? serverPagination.total
+      : filteredSessions.length;
+  const paginatedSessions = filteredSessions;
 
   const getPageNumbers = () => {
     const pages = [];
@@ -1107,7 +1124,7 @@ export default function Sessions() {
         <div>
           <h1 className="text-2xl font-bold tracking-tight text-white">Sessions</h1>
           <p className="mt-1 text-sm text-gray-400">
-            Manage your Telegram sessions &middot; {sessions.length} total
+            Manage your Telegram sessions &middot; {totalResults} total
           </p>
         </div>
       </div>
@@ -1499,15 +1516,15 @@ export default function Sessions() {
             <p className="text-sm text-gray-400">
               Showing{' '}
               <span className="text-gray-200 font-medium">
-                {(currentPage - 1) * pageSize + 1}
+                {totalResults === 0 ? 0 : (currentPage - 1) * pageSize + 1}
               </span>{' '}
               to{' '}
               <span className="text-gray-200 font-medium">
-                {Math.min(currentPage * pageSize, filteredSessions.length)}
+                {Math.min(currentPage * pageSize, totalResults)}
               </span>{' '}
               of{' '}
               <span className="text-gray-200 font-medium">
-                {filteredSessions.length}
+                {totalResults}
               </span>{' '}
               results
             </p>
