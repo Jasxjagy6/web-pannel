@@ -37,9 +37,13 @@ function _displayName(s) {
 
 function _SessionRow({ session, result }) {
   // result shape:
-  //   { ok: true, sessionId, data: { total, succeeded, failed, ... } }
+  //   { ok: true, sessionId, data: { total, succeeded, failed, results: [...] } }
   //   { ok: false, sessionId, error, code }
+  // Each per-peer entry now carries an `action` of 'cleared' | 'left' |
+  // 'deleted' (or null on failure) plus boolean cleared/left/deleted
+  // flags so the row can show what actually happened to groups & channels.
   let pill = null;
+  let breakdown = null;
   if (!result) {
     pill = (
       <span className="inline-flex items-center gap-1 rounded-full border border-white/10 bg-white/5 px-2 py-0.5 text-[10px] font-medium text-gray-300">
@@ -55,7 +59,28 @@ function _SessionRow({ session, result }) {
       </span>
     );
   } else {
-    const { total, succeeded, failed } = result.data;
+    const { total, succeeded, failed, results: rows = [] } = result.data;
+    let leftCount = 0;
+    let deletedCount = 0;
+    let clearedOnlyCount = 0;
+    for (const r of rows) {
+      if (!r || !r.ok) continue;
+      if (r.deleted) deletedCount += 1;
+      else if (r.left) leftCount += 1;
+      else if (r.cleared) clearedOnlyCount += 1;
+    }
+    const breakdownParts = [];
+    if (clearedOnlyCount) breakdownParts.push(`${clearedOnlyCount} cleared`);
+    if (leftCount) breakdownParts.push(`${leftCount} left`);
+    if (deletedCount) breakdownParts.push(`${deletedCount} deleted`);
+    if (breakdownParts.length > 0) {
+      breakdown = (
+        <p className="mt-1 truncate text-[11px] text-gray-400">
+          {breakdownParts.join(' · ')}
+        </p>
+      );
+    }
+
     if (total === 0) {
       pill = (
         <span className="inline-flex items-center gap-1 rounded-full border border-white/10 bg-white/5 px-2 py-0.5 text-[10px] font-medium text-gray-300">
@@ -66,21 +91,21 @@ function _SessionRow({ session, result }) {
       pill = (
         <span className="inline-flex items-center gap-1 rounded-full border border-emerald-500/30 bg-emerald-500/10 px-2 py-0.5 text-[10px] font-medium text-emerald-200">
           <CheckCircle2 className="h-3 w-3" />
-          {succeeded}/{total} cleared
+          {succeeded}/{total} done
         </span>
       );
     } else if (succeeded === 0) {
       pill = (
         <span className="inline-flex items-center gap-1 rounded-full border border-red-500/30 bg-red-500/10 px-2 py-0.5 text-[10px] font-medium text-red-200">
           <XCircle className="h-3 w-3" />
-          0/{total} cleared
+          0/{total} done
         </span>
       );
     } else {
       pill = (
         <span className="inline-flex items-center gap-1 rounded-full border border-amber-500/30 bg-amber-500/10 px-2 py-0.5 text-[10px] font-medium text-amber-200">
           <AlertTriangle className="h-3 w-3" />
-          {succeeded}/{total} cleared, {failed} failed
+          {succeeded}/{total} done, {failed} failed
         </span>
       );
     }
@@ -121,6 +146,7 @@ function _SessionRow({ session, result }) {
           {session.phone || ''}
           {' · '}#{session.id}
         </div>
+        {breakdown}
         {detail}
       </div>
       <div className="shrink-0">{pill}</div>
@@ -241,8 +267,10 @@ export default function DeleteChatsModal({ isOpen, onClose, sessions = [] }) {
                 <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-red-300" />
                 <div>
                   <p className="font-medium text-red-200">
-                    This will clear the entire chat history of every dialog in
-                    the selected session{sessionIds.length === 1 ? '' : 's'}.
+                    This wipes every dialog from the selected session
+                    {sessionIds.length === 1 ? '' : 's'}: private chats are
+                    cleared, groups and channels are left (or deleted if the
+                    account is the owner).
                   </p>
                   <p className="mt-1 text-red-300/80">
                     The action runs across {sessionIds.length} session
@@ -278,8 +306,9 @@ export default function DeleteChatsModal({ isOpen, onClose, sessions = [] }) {
                     Delete for me
                   </span>
                   <span className="block text-xs text-gray-400">
-                    Removes every chat&apos;s history from this account&apos;s
-                    view only. The other side still sees the messages.
+                    Clears private-chat history from this account&apos;s view
+                    only and leaves every group and channel. The other side
+                    still sees private messages.
                   </span>
                 </span>
               </label>
@@ -303,9 +332,10 @@ export default function DeleteChatsModal({ isOpen, onClose, sessions = [] }) {
                     Delete for both sides
                   </span>
                   <span className="block text-xs text-gray-400">
-                    Asks Telegram to also wipe the history on the other side
-                    wherever it&apos;s allowed (private chats &amp; basic
-                    groups always; channels only if the account is an admin).
+                    Wipes private-chat history on the other side too, and
+                    fully deletes any groups or channels this account owns
+                    (others are left). Channel history is wiped for everyone
+                    only if the account is an admin.
                   </span>
                 </span>
               </label>
