@@ -142,8 +142,9 @@ export default function DeleteChatsModal({
               <p className="font-medium text-red-200">
                 This wipes every dialog from the selected session
                 {sessionIds.length === 1 ? '' : 's'}: private chats are
-                cleared, groups and channels are left (or deleted if the
-                account is the owner).
+                cleared, bots are removed and blocked, and groups and
+                channels are left (or deleted if the account is the
+                owner).
               </p>
               <p className="mt-1 text-red-300/80">
                 The action runs across {sessionIds.length} session

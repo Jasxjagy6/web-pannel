@@ -461,6 +461,8 @@ const telegramClientController = {
                     cleared_inc: ev.cleared ? 1 : 0,
                     left_inc: ev.left ? 1 : 0,
                     deleted_inc: ev.deleted ? 1 : 0,
+                    bots_inc: ev.isBot ? 1 : 0,
+                    blocked_inc: ev.blocked ? 1 : 0,
                     currentTitle: ev.title || null,
                   };
                   tcJobs.patchJobSession(job.id, sessionId, patch);
@@ -470,9 +472,11 @@ const telegramClientController = {
                     title: ev.title,
                     ok: !!ev.ok,
                     action: ev.action || null,
+                    isBot: !!ev.isBot,
                     cleared: !!ev.cleared,
                     left: !!ev.left,
                     deleted: !!ev.deleted,
+                    blocked: !!ev.blocked,
                     error: ev.error || null,
                     code: ev.code || null,
                   });
