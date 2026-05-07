@@ -33,6 +33,7 @@ import {
   Loader2,
   PauseCircle,
   RefreshCcw,
+  StopCircle,
   Trash2,
   XCircle,
 } from 'lucide-react';
@@ -40,6 +41,7 @@ import { useWebSocket } from '../../hooks/useWebSocket';
 import {
   listClearChatsJobs,
   getClearChatsJob,
+  cancelClearChatsJob,
 } from '../../api/telegramClient';
 
 /* ------------------------------------------------------------------ */
@@ -114,6 +116,21 @@ const STATUS_META = {
     Icon: XCircle,
     spin: false,
   },
+  cancelled: {
+    label: 'Cancelled',
+    tone: 'bg-zinc-500/10 text-zinc-300 border-zinc-500/30',
+    Icon: StopCircle,
+    spin: false,
+  },
+};
+
+// Per-session stage labels surfaced for `running` rows. Maps the
+// `stage` field emitted by the service-layer lifecycle events.
+const STAGE_LABELS = {
+  queued: 'Waiting…',
+  connecting: 'Connecting…',
+  scanning: 'Scanning chats…',
+  running: 'Processing chats…',
 };
 
 function StatusPill({ status }) {
@@ -168,13 +185,25 @@ function SessionRow({ session, revoke }) {
   if (session.left) breakdownParts.push(`${session.left} left`);
   if (session.deleted) breakdownParts.push(`${session.deleted} deleted`);
   if (session.bots) breakdownParts.push(`${session.bots} bot${session.bots === 1 ? '' : 's'}`);
+  // Surface the lifecycle stage when we don't yet have a dialog total
+  // — otherwise the row sits on a stale "Scanning dialogs…" label
+  // even when the worker is still in the `connecting` step.
+  const stageLabel = session.stage && STAGE_LABELS[session.stage]
+    ? STAGE_LABELS[session.stage]
+    : null;
+  const scanningSoFar =
+    session.stage === 'scanning' && session.dialogsSoFar
+      ? ` (${session.dialogsSoFar} found)`
+      : '';
   const summary = hasTotal
     ? `${session.done || 0} / ${session.total || 0} processed`
     : session.status === 'queued'
       ? 'Waiting…'
       : session.status === 'running'
-        ? 'Scanning dialogs…'
-        : 'No chats';
+        ? `${stageLabel || 'Scanning dialogs…'}${scanningSoFar}`
+        : session.status === 'cancelled'
+          ? 'Cancelled'
+          : 'No chats';
 
   return (
     <li className="rounded-lg border border-white/10 bg-dark-900/60 p-3">
@@ -215,6 +244,11 @@ function SessionRow({ session, revoke }) {
           Processing: {session.currentTitle}
         </p>
       )}
+      {(session.status === 'running' && !session.currentTitle && stageLabel) && (
+        <p className="mt-1.5 truncate text-[11px] text-blue-200/90">
+          {stageLabel}{scanningSoFar}
+        </p>
+      )}
 
       {breakdownParts.length > 0 && (
         <p className="mt-1.5 text-[11px] text-gray-400">
@@ -248,8 +282,10 @@ function SessionRow({ session, revoke }) {
 /* job card                                                           */
 /* ------------------------------------------------------------------ */
 
-function JobCard({ job, defaultExpanded, nowMs }) {
+function JobCard({ job, defaultExpanded, nowMs, onCancel }) {
   const [expanded, setExpanded] = useState(!!defaultExpanded);
+  const [cancelling, setCancelling] = useState(false);
+  const [cancelError, setCancelError] = useState(null);
 
   const totals = job.totals || {};
   const totalDialogs = totals.totalDialogs || 0;
@@ -282,6 +318,34 @@ function JobCard({ job, defaultExpanded, nowMs }) {
       ? _fmtDuration(startedAt, finishedAt)
       : '';
 
+  // The Cancel button is only useful while there's still work in
+  // flight. Once a job is `done` / `partial` / `failed` / `cancelled`
+  // the AbortControllers have already been disposed server-side, so
+  // we hide the button to keep the UI honest.
+  const isCancellable =
+    !cancelling
+    && !job.cancelRequested
+    && (job.status === 'queued' || job.status === 'running');
+
+  const handleCancel = async (e) => {
+    if (e && typeof e.stopPropagation === 'function') e.stopPropagation();
+    if (cancelling) return;
+    setCancelling(true);
+    setCancelError(null);
+    try {
+      await cancelClearChatsJob(job.id);
+      if (typeof onCancel === 'function') onCancel(job.id);
+    } catch (err) {
+      setCancelError(
+        err?.response?.data?.error
+          || err?.message
+          || 'Failed to cancel job.',
+      );
+    } finally {
+      setCancelling(false);
+    }
+  };
+
   return (
     <li className="overflow-hidden rounded-xl border border-white/10 bg-dark-900/60">
       <button
@@ -294,6 +358,12 @@ function JobCard({ job, defaultExpanded, nowMs }) {
           <div className="min-w-0 flex-1">
             <div className="flex flex-wrap items-center gap-2">
               <StatusPill status={job.status} />
+              {job.cancelRequested && job.status !== 'cancelled' && (
+                <span className="inline-flex items-center gap-1 rounded-full border border-zinc-500/30 bg-zinc-500/10 px-2 py-0.5 text-[10px] font-medium text-zinc-200">
+                  <Loader2 className="h-3 w-3 animate-spin" />
+                  Cancelling…
+                </span>
+              )}
               <span className="truncate text-sm font-semibold text-gray-100">
                 {totalSessions} session{totalSessions === 1 ? '' : 's'} ·{' '}
                 {job.revoke ? 'Both sides' : 'For me'}
@@ -331,14 +401,35 @@ function JobCard({ job, defaultExpanded, nowMs }) {
               </p>
             )}
           </div>
-          <div className="shrink-0 self-start pt-0.5 text-gray-500">
-            {expanded ? (
-              <ChevronDown className="h-4 w-4" />
-            ) : (
-              <ChevronRight className="h-4 w-4" />
+          <div className="flex shrink-0 items-start gap-2 self-start pt-0.5">
+            {isCancellable && (
+              <button
+                type="button"
+                onClick={handleCancel}
+                disabled={cancelling}
+                className="inline-flex items-center gap-1 rounded-md border border-red-500/30 bg-red-500/10 px-2 py-1 text-[11px] font-medium text-red-200 transition-colors hover:bg-red-500/20 disabled:cursor-not-allowed disabled:opacity-60"
+                aria-label="Cancel this delete-chats job"
+              >
+                {cancelling ? (
+                  <Loader2 className="h-3 w-3 animate-spin" />
+                ) : (
+                  <StopCircle className="h-3 w-3" />
+                )}
+                <span>{cancelling ? 'Cancelling…' : 'Cancel'}</span>
+              </button>
             )}
+            <span className="text-gray-500">
+              {expanded ? (
+                <ChevronDown className="h-4 w-4" />
+              ) : (
+                <ChevronRight className="h-4 w-4" />
+              )}
+            </span>
           </div>
         </div>
+        {cancelError && (
+          <p className="mt-2 text-[11px] text-red-300/80">{cancelError}</p>
+        )}
 
         <div className="mt-3 flex items-center gap-3">
           <div className="flex-1">
@@ -358,6 +449,23 @@ function JobCard({ job, defaultExpanded, nowMs }) {
 
       {expanded && (
         <div className="border-t border-white/10 bg-black/20 px-4 py-3">
+          {isCancellable && (
+            <div className="mb-3 flex items-center justify-end">
+              <button
+                type="button"
+                onClick={handleCancel}
+                disabled={cancelling}
+                className="inline-flex items-center gap-1.5 rounded-md border border-red-500/30 bg-red-500/10 px-3 py-1.5 text-xs font-medium text-red-200 transition-colors hover:bg-red-500/20 disabled:cursor-not-allowed disabled:opacity-60"
+              >
+                {cancelling ? (
+                  <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                ) : (
+                  <StopCircle className="h-3.5 w-3.5" />
+                )}
+                <span>{cancelling ? 'Cancelling…' : 'Cancel job'}</span>
+              </button>
+            </div>
+          )}
           {(job.sessions || []).length === 0 ? (
             <p className="text-xs text-gray-400">No sessions in this job.</p>
           ) : (
@@ -560,6 +668,7 @@ export default function ClearChatsHistoryTab({ initialJob, autoExpandJobId }) {
               job={job}
               defaultExpanded={job.id === autoExpandJobId}
               nowMs={nowMs}
+              onCancel={refresh}
             />
           ))}
         </ul>

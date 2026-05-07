@@ -434,8 +434,16 @@ const telegramClientController = {
     setImmediate(() => {
       Promise.all(
         ids.map((sessionId) => {
+          // One AbortController per session so a single Cancel call
+          // can fire-and-forget abort every in-flight worker on this
+          // job without waiting for the dialog scan / DeleteHistory
+          // loops to time out.
+          const controller = new AbortController();
+          tcJobs.registerAbortController(job.id, sessionId, controller);
+
           tcJobs.patchJobSession(job.id, sessionId, {
             status: 'running',
+            stage: 'connecting',
             startedAt: Date.now(),
           });
 
@@ -444,10 +452,27 @@ const telegramClientController = {
               revoke,
               concurrency,
               jobId: job.id,
+              signal: controller.signal,
               onProgress: (ev) => {
                 if (!ev) return;
+                if (ev.type === 'connecting') {
+                  tcJobs.patchJobSession(job.id, sessionId, {
+                    stage: 'connecting',
+                    currentTitle: null,
+                  });
+                  return;
+                }
+                if (ev.type === 'scanning') {
+                  tcJobs.patchJobSession(job.id, sessionId, {
+                    stage: 'scanning',
+                    dialogsSoFar: ev.dialogsSoFar || 0,
+                    currentTitle: null,
+                  });
+                  return;
+                }
                 if (ev.type === 'started') {
                   tcJobs.patchJobSession(job.id, sessionId, {
+                    stage: 'running',
                     total: ev.total,
                     currentTitle: null,
                   });
@@ -485,12 +510,17 @@ const telegramClientController = {
               },
             })
             .then((data) => {
+              const wasCancelled = !!data.cancelled
+                || tcJobs.isCancelRequested(job.id);
               tcJobs.patchJobSession(job.id, sessionId, {
-                status: data.failed > 0 && data.succeeded === 0
-                  ? 'failed'
-                  : data.failed > 0
-                    ? 'partial'
-                    : 'done',
+                status: wasCancelled
+                  ? 'cancelled'
+                  : data.failed > 0 && data.succeeded === 0
+                    ? 'failed'
+                    : data.failed > 0
+                      ? 'partial'
+                      : 'done',
+                stage: wasCancelled ? 'cancelled' : 'done',
                 total: data.total,
                 finishedAt: Date.now(),
                 currentTitle: null,
@@ -499,16 +529,26 @@ const telegramClientController = {
             .catch((err) => {
               const msg = err?.message || 'Failed to clear chats';
               const code = err?.code || err?.errorCode || null;
+              const isCancelled =
+                !!err?.cancelled
+                || code === 'CANCELLED'
+                || tcJobs.isCancelRequested(job.id);
               logger.warn(
-                `clearAllChatsHistory session=${sessionId} job=${job.id} aborted: ${msg}`,
+                `clearAllChatsHistory session=${sessionId} job=${job.id} ${
+                  isCancelled ? 'cancelled' : 'aborted'
+                }: ${msg}`,
               );
               tcJobs.patchJobSession(job.id, sessionId, {
-                status: 'failed',
+                status: isCancelled ? 'cancelled' : 'failed',
+                stage: isCancelled ? 'cancelled' : 'failed',
                 error: msg,
                 code,
                 finishedAt: Date.now(),
                 currentTitle: null,
               });
+            })
+            .finally(() => {
+              tcJobs.unregisterAbortController(job.id, sessionId);
             });
         }),
       )
@@ -586,6 +626,40 @@ const telegramClientController = {
     if (!job) {
       throw new AppError('Job not found', 404, 'JOB_NOT_FOUND');
     }
+    res.json({ success: true, data: { job: tcJobs.publicJob(job) } });
+  }),
+
+  /**
+   * POST /sessions/clear-history/:jobId/cancel
+   *
+   * Stops a still-running "Delete chats" job. Idempotent: if the job
+   * is already finished it returns the current snapshot unchanged.
+   * Sessions that hadn't started yet flip to `cancelled` immediately;
+   * in-flight workers observe the AbortSignal and bail out without
+   * waiting for the dialog scan / DeleteHistory loops to time out.
+   */
+  cancelClearChatsJob: asyncHandler(async (req, res) => {
+    const userId = req.user.id;
+    const jobId = req.params.jobId;
+    const owned = tcJobs.getJobForUser(jobId, userId);
+    if (!owned) {
+      throw new AppError('Job not found', 404, 'JOB_NOT_FOUND');
+    }
+    const reason =
+      typeof req.body?.reason === 'string' && req.body.reason.trim()
+        ? req.body.reason.trim().slice(0, 200)
+        : 'Cancelled by user';
+    const job = tcJobs.cancelJob(jobId, userId, { reason });
+    if (!job) {
+      throw new AppError('Job not found', 404, 'JOB_NOT_FOUND');
+    }
+    await reportService
+      .logActivity(userId, 'tg_client_clear_all_chats_cancel', 'session', null, {
+        platform: 'telegram',
+        jobId,
+        reason,
+      })
+      .catch(() => {});
     res.json({ success: true, data: { job: tcJobs.publicJob(job) } });
   }),
 

@@ -10,6 +10,7 @@ import {
   downloadSession,
   recoverSession,
 } from '../api/sessions';
+import { sessionListsAPI } from '../api/sessionLists';
 import { parseApiError, formatRelativeTime, formatNumber } from '../utils/formatters';
 import { useToast } from '../components/common/Toast';
 import { Modal } from '../components/common/Modal';
@@ -198,8 +199,22 @@ function SessionUploadArea({ onUpload, uploading }) {
     const formData = new FormData();
     files.forEach((file) => formData.append('sessions', file));
     try {
-      await uploadSessions(formData);
-      onUpload(files.length, null);
+      // Capture the per-file results so the parent can offer to
+      // group every successfully-uploaded session into a session
+      // list right after the upload finishes (the "organise" prompt).
+      const resp = await uploadSessions(formData);
+      const result = resp?.data?.data || {};
+      const successfulIds = Array.isArray(result.results)
+        ? result.results
+            .filter((r) => r && (r.success || r.sessionId) && !r.error)
+            .map((r) => r.sessionId)
+            .filter((v) => v != null)
+        : [];
+      onUpload(files.length, null, {
+        successful: result.successful ?? successfulIds.length,
+        failed: result.failed ?? 0,
+        sessionIds: successfulIds,
+      });
       setFiles([]);
       if (fileInputRef.current) fileInputRef.current.value = '';
     } catch (err) {
@@ -868,6 +883,18 @@ export default function Sessions() {
   const [detailSession, setDetailSession] = useState(null);
   const [detailOpen, setDetailOpen] = useState(false);
 
+  // After a bulk upload finishes the user is offered to group every
+  // successfully-uploaded session into a single session_list (the
+  // "organise" flow). The modal is held in two pieces: an "ask"
+  // dialog (yes/no) and a "name" dialog (asks for a list name).
+  // `pendingOrganize` carries the session IDs that the modals will
+  // act on; the user can dismiss either dialog without losing the
+  // uploaded sessions themselves.
+  const [pendingOrganize, setPendingOrganize] = useState(null);
+  const [organizeStage, setOrganizeStage] = useState(null);
+  const [organizeName, setOrganizeName] = useState('');
+  const [organizeLoading, setOrganizeLoading] = useState(false);
+
   // The Sessions tab lists every uploaded row in one shot — operators
   // routinely upload hundreds at a time and have asked for "no limit, list
   // all". The backend honours `limit=0` as "unbounded" (capped at
@@ -901,7 +928,7 @@ export default function Sessions() {
   usePolling(fetchSessions, 10000, true);
 
   // --- Actions ---
-  const handleUploadComplete = async (count, error) => {
+  const handleUploadComplete = async (count, error, meta) => {
     if (error) {
       showError(parseApiError(error), 'Upload Failed');
       return;
@@ -914,6 +941,64 @@ export default function Sessions() {
       showError(parseApiError(err), 'Upload Failed');
     } finally {
       setUploading(false);
+    }
+
+    // Offer to organise the just-uploaded sessions into a single
+    // session_list. We only show the prompt when there are at least
+    // two successful uploads — grouping a single session into a list
+    // is operationally meaningless.
+    const ids = Array.isArray(meta?.sessionIds) ? meta.sessionIds : [];
+    if (ids.length >= 2) {
+      setPendingOrganize({
+        sessionIds: ids,
+        successful: meta?.successful ?? ids.length,
+      });
+      setOrganizeStage('ask');
+    }
+  };
+
+  const dismissOrganize = () => {
+    setOrganizeStage(null);
+    setPendingOrganize(null);
+    setOrganizeName('');
+  };
+
+  const handleConfirmOrganize = async () => {
+    if (!pendingOrganize?.sessionIds?.length) {
+      dismissOrganize();
+      return;
+    }
+    const name = organizeName.trim();
+    if (!name) {
+      showError('Please enter a name for the list.', 'Organise');
+      return;
+    }
+    setOrganizeLoading(true);
+    try {
+      // 1. Create an empty session list, 2. attach every uploaded
+      // session id to it. The dedicated /session-lists endpoint
+      // doesn't take inline session ids on create, so we do it in two
+      // calls. The list shows up on the Lists page immediately.
+      const created = await sessionListsAPI.create({
+        name,
+        description: `Organised from upload (${pendingOrganize.sessionIds.length} sessions)`,
+      });
+      const listId = created?.data?.data?.list?.id
+        ?? created?.data?.data?.id
+        ?? created?.data?.id;
+      if (!listId) {
+        throw new Error('Server did not return a list id.');
+      }
+      await sessionListsAPI.addSessions(listId, pendingOrganize.sessionIds);
+      showSuccess(
+        `Organised ${pendingOrganize.sessionIds.length} sessions into "${name}".`,
+        'Organise',
+      );
+      dismissOrganize();
+    } catch (err) {
+      showError(parseApiError(err), 'Organise failed');
+    } finally {
+      setOrganizeLoading(false);
     }
   };
 
@@ -1581,6 +1666,108 @@ export default function Sessions() {
           setDetailSession(null);
         }}
       />
+
+      {/*
+        Upload -> organise prompt. Two stages:
+          1) "ask"  - Yes/No "do you want to organise these N sessions?"
+          2) "name" - collect the session_list name and create it.
+        Dismissing either stage just leaves the uploaded sessions
+        ungrouped - it does NOT delete them. The user can always
+        organise them later from the Lists page.
+      */}
+      {organizeStage === 'ask' && pendingOrganize && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center p-4"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="organize-ask-title"
+        >
+          <div className="fixed inset-0 bg-black/60 backdrop-blur-sm" onClick={dismissOrganize} />
+          <div className="relative w-full max-w-md rounded-xl border border-white/10 bg-dark-800 p-6 shadow-2xl">
+            <h3 id="organize-ask-title" className="text-lg font-semibold text-white">
+              Organise these sessions?
+            </h3>
+            <p className="mt-2 text-sm text-gray-300">
+              You just uploaded{' '}
+              <span className="font-medium text-white">
+                {pendingOrganize.sessionIds.length} session{pendingOrganize.sessionIds.length === 1 ? '' : 's'}
+              </span>
+              . Do you want to group them into a single session list so you can
+              bulk-login or bulk-delete them later by selecting just the list?
+            </p>
+            <div className="mt-6 flex justify-end gap-2">
+              <button
+                onClick={dismissOrganize}
+                className="rounded-lg border border-white/10 px-4 py-2 text-sm font-medium text-gray-300 hover:bg-white/5 transition-colors"
+              >
+                No, leave them ungrouped
+              </button>
+              <button
+                onClick={() => setOrganizeStage('name')}
+                className="rounded-lg bg-primary-600 px-4 py-2 text-sm font-medium text-white hover:bg-primary-500 transition-colors"
+              >
+                Yes, organise
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {organizeStage === 'name' && pendingOrganize && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center p-4"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="organize-name-title"
+        >
+          <div className="fixed inset-0 bg-black/60 backdrop-blur-sm" onClick={dismissOrganize} />
+          <div className="relative w-full max-w-md rounded-xl border border-white/10 bg-dark-800 p-6 shadow-2xl">
+            <h3 id="organize-name-title" className="text-lg font-semibold text-white">
+              Name your session list
+            </h3>
+            <p className="mt-1 text-sm text-gray-400">
+              {pendingOrganize.sessionIds.length} session{pendingOrganize.sessionIds.length === 1 ? '' : 's'} will be added to this list.
+            </p>
+            <input
+              type="text"
+              autoFocus
+              value={organizeName}
+              onChange={(e) => setOrganizeName(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter' && !organizeLoading && organizeName.trim()) {
+                  handleConfirmOrganize();
+                }
+              }}
+              placeholder="e.g. Batch 2025-01-15"
+              className="mt-4 w-full rounded-lg border border-white/10 bg-dark-900 px-3 py-2 text-sm text-white placeholder-gray-500 outline-none focus:border-primary-500"
+            />
+            <div className="mt-6 flex justify-end gap-2">
+              <button
+                onClick={() => setOrganizeStage('ask')}
+                disabled={organizeLoading}
+                className="rounded-lg border border-white/10 px-4 py-2 text-sm font-medium text-gray-300 hover:bg-white/5 transition-colors disabled:opacity-60"
+              >
+                Back
+              </button>
+              <button
+                onClick={dismissOrganize}
+                disabled={organizeLoading}
+                className="rounded-lg border border-white/10 px-4 py-2 text-sm font-medium text-gray-300 hover:bg-white/5 transition-colors disabled:opacity-60"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={handleConfirmOrganize}
+                disabled={organizeLoading || !organizeName.trim()}
+                className="inline-flex items-center gap-2 rounded-lg bg-primary-600 px-4 py-2 text-sm font-medium text-white hover:bg-primary-500 transition-colors disabled:opacity-60 disabled:cursor-not-allowed"
+              >
+                {organizeLoading && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
+                Create list
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

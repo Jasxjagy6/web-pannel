@@ -308,89 +308,178 @@ export default function Proxies() {
             )}
           </div>
         ) : (
-          <table className="w-full text-sm">
-            <thead>
-              <tr className="text-xs uppercase tracking-wide text-gray-500 border-b border-white/5">
-                <th className="px-4 py-3 text-left">Proxy</th>
-                <th className="px-4 py-3 text-left">Egress</th>
-                <th className="px-4 py-3 text-left">Validated</th>
-                <th className="px-4 py-3 text-left">Sessions</th>
-                <th className="px-4 py-3 text-left">Last check</th>
-                <th className="px-4 py-3" />
-              </tr>
-            </thead>
-            <tbody>
-              {filtered.map((p) => (
-                <tr key={p.id} className="border-b border-white/5 last:border-b-0 hover:bg-white/2">
-                  <td className="px-4 py-3">
-                    <div className="flex items-center gap-2">
-                      <span className="text-lg leading-none">{countryFlag(p.country_code)}</span>
-                      <div>
-                        <div className="font-medium text-white">{p.label || `${p.host}:${p.port}`}</div>
-                        <div className="text-xs text-gray-500">
-                          {p.protocol.toUpperCase()} · {p.host}:{p.port}
-                          {p.username ? ` · ${p.username}` : ''}
+          <>
+            {/* Desktop table — visible on md+ where there's enough
+                horizontal space for six columns. */}
+            <table className="hidden md:table w-full text-sm">
+              <thead>
+                <tr className="text-xs uppercase tracking-wide text-gray-500 border-b border-white/5">
+                  <th className="px-4 py-3 text-left">Proxy</th>
+                  <th className="px-4 py-3 text-left">Egress</th>
+                  <th className="px-4 py-3 text-left">Validated</th>
+                  <th className="px-4 py-3 text-left">Sessions</th>
+                  <th className="px-4 py-3 text-left">Last check</th>
+                  <th className="px-4 py-3" />
+                </tr>
+              </thead>
+              <tbody>
+                {filtered.map((p) => (
+                  <tr key={p.id} className="border-b border-white/5 last:border-b-0 hover:bg-white/2">
+                    <td className="px-4 py-3">
+                      <div className="flex items-center gap-2">
+                        <span className="text-lg leading-none">{countryFlag(p.country_code)}</span>
+                        <div>
+                          <div className="font-medium text-white">{p.label || `${p.host}:${p.port}`}</div>
+                          <div className="text-xs text-gray-500">
+                            {p.protocol.toUpperCase()} · {p.host}:{p.port}
+                            {p.username ? ` · ${p.username}` : ''}
+                          </div>
                         </div>
                       </div>
-                    </div>
-                  </td>
-                  <td className="px-4 py-3">
-                    {p.metadata?.egress_ip ? (
-                      <span className="text-xs text-gray-200 font-mono">{p.metadata.egress_ip}</span>
-                    ) : (
-                      <span className="text-xs text-gray-500">—</span>
-                    )}
-                  </td>
-                  <td className="px-4 py-3">
-                    <div className="flex flex-wrap gap-1">
-                      <Chip ok={p.validated_for_telegram} label="TG" />
-                      <Chip ok={p.validated_for_instagram} label="IG" />
-                      <Chip ok={p.is_working}            label="L4" />
-                    </div>
-                  </td>
-                  <td className="px-4 py-3 text-xs text-gray-300">
-                    {p.active_assignments || 0}/{constants.MAX_SESSIONS_PER_PROXY}
-                  </td>
-                  <td className="px-4 py-3 text-xs text-gray-400">
-                    {p.last_health_check ? formatRelativeTime(p.last_health_check) : '—'}
-                    {p.health_message && (
-                      <div className="text-[10px] text-gray-500 truncate max-w-[160px]" title={p.health_message}>
-                        {p.health_message}
+                    </td>
+                    <td className="px-4 py-3">
+                      {p.metadata?.egress_ip ? (
+                        <span className="text-xs text-gray-200 font-mono">{p.metadata.egress_ip}</span>
+                      ) : (
+                        <span className="text-xs text-gray-500">—</span>
+                      )}
+                    </td>
+                    <td className="px-4 py-3">
+                      <div className="flex flex-wrap gap-1">
+                        <Chip ok={p.validated_for_telegram} label="TG" />
+                        <Chip ok={p.validated_for_instagram} label="IG" />
+                        <Chip ok={p.is_working}            label="L4" />
                       </div>
-                    )}
-                  </td>
-                  <td className="px-4 py-3">
-                    <div className="flex items-center justify-end gap-2">
-                      <button
-                        onClick={() => handleTest(p.id)}
-                        disabled={testingId === p.id}
-                        className="rounded-md border border-white/10 bg-dark-700 px-2 py-1 text-xs text-gray-200 hover:bg-white/10 disabled:opacity-50"
-                        title="Re-run health probe"
-                      >
-                        {testingId === p.id
-                          ? <Loader2 className="w-3 h-3 animate-spin" />
-                          : <PlayCircle className="w-3 h-3" />}
-                      </button>
-                      <button
-                        onClick={() => startEdit(p)}
-                        className="rounded-md border border-white/10 bg-dark-700 px-2 py-1 text-xs text-gray-200 hover:bg-white/10"
-                        title="Edit label / notes"
-                      >
-                        <Edit3 className="w-3 h-3" />
-                      </button>
-                      <button
-                        onClick={() => handleDelete(p.id)}
-                        className="rounded-md border border-red-500/40 bg-red-500/10 px-2 py-1 text-xs text-red-300 hover:bg-red-500/20"
-                        title="Delete proxy"
-                      >
-                        <Trash2 className="w-3 h-3" />
-                      </button>
+                    </td>
+                    <td className="px-4 py-3 text-xs text-gray-300">
+                      {p.active_assignments || 0}/{constants.MAX_SESSIONS_PER_PROXY}
+                    </td>
+                    <td className="px-4 py-3 text-xs text-gray-400">
+                      {p.last_health_check ? formatRelativeTime(p.last_health_check) : '—'}
+                      {p.health_message && (
+                        <div className="text-[10px] text-gray-500 truncate max-w-[160px]" title={p.health_message}>
+                          {p.health_message}
+                        </div>
+                      )}
+                    </td>
+                    <td className="px-4 py-3">
+                      <div className="flex items-center justify-end gap-2">
+                        <button
+                          onClick={() => handleTest(p.id)}
+                          disabled={testingId === p.id}
+                          className="rounded-md border border-white/10 bg-dark-700 px-2 py-1 text-xs text-gray-200 hover:bg-white/10 disabled:opacity-50"
+                          title="Re-run health probe"
+                        >
+                          {testingId === p.id
+                            ? <Loader2 className="w-3 h-3 animate-spin" />
+                            : <PlayCircle className="w-3 h-3" />}
+                        </button>
+                        <button
+                          onClick={() => startEdit(p)}
+                          className="rounded-md border border-white/10 bg-dark-700 px-2 py-1 text-xs text-gray-200 hover:bg-white/10"
+                          title="Edit label / notes"
+                        >
+                          <Edit3 className="w-3 h-3" />
+                        </button>
+                        <button
+                          onClick={() => handleDelete(p.id)}
+                          className="rounded-md border border-red-500/40 bg-red-500/10 px-2 py-1 text-xs text-red-300 hover:bg-red-500/20"
+                          title="Delete proxy"
+                        >
+                          <Trash2 className="w-3 h-3" />
+                        </button>
+                      </div>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+
+            {/* Mobile card layout — same data as the desktop table but
+                stacked so the Remove button stays inside the viewport
+                on a phone (the previous layout overflowed horizontally
+                and the trash icon was unreachable). */}
+            <ul className="md:hidden divide-y divide-white/5">
+              {filtered.map((p) => (
+                <li key={p.id} className="p-4 space-y-3">
+                  <div className="flex items-start gap-3">
+                    <span className="text-2xl leading-none mt-0.5">{countryFlag(p.country_code)}</span>
+                    <div className="min-w-0 flex-1">
+                      <div className="font-medium text-white truncate">
+                        {p.label || `${p.host}:${p.port}`}
+                      </div>
+                      <div className="text-xs text-gray-500 truncate">
+                        {p.protocol.toUpperCase()} · {p.host}:{p.port}
+                        {p.username ? ` · ${p.username}` : ''}
+                      </div>
                     </div>
-                  </td>
-                </tr>
+                  </div>
+
+                  <div className="grid grid-cols-2 gap-3 text-xs">
+                    <div>
+                      <div className="text-[10px] uppercase tracking-wide text-gray-500">Egress IP</div>
+                      <div className="mt-0.5 text-gray-200 font-mono truncate">
+                        {p.metadata?.egress_ip || '—'}
+                      </div>
+                    </div>
+                    <div>
+                      <div className="text-[10px] uppercase tracking-wide text-gray-500">Sessions</div>
+                      <div className="mt-0.5 text-gray-300">
+                        {p.active_assignments || 0}/{constants.MAX_SESSIONS_PER_PROXY}
+                      </div>
+                    </div>
+                    <div className="col-span-2">
+                      <div className="text-[10px] uppercase tracking-wide text-gray-500">Validated</div>
+                      <div className="mt-0.5 flex flex-wrap gap-1">
+                        <Chip ok={p.validated_for_telegram} label="TG" />
+                        <Chip ok={p.validated_for_instagram} label="IG" />
+                        <Chip ok={p.is_working}            label="L4" />
+                      </div>
+                    </div>
+                    <div className="col-span-2">
+                      <div className="text-[10px] uppercase tracking-wide text-gray-500">Last check</div>
+                      <div className="mt-0.5 text-gray-400">
+                        {p.last_health_check ? formatRelativeTime(p.last_health_check) : '—'}
+                      </div>
+                      {p.health_message && (
+                        <div className="text-[10px] text-gray-500 break-words" title={p.health_message}>
+                          {p.health_message}
+                        </div>
+                      )}
+                    </div>
+                  </div>
+
+                  <div className="flex items-center gap-2 pt-1">
+                    <button
+                      onClick={() => handleTest(p.id)}
+                      disabled={testingId === p.id}
+                      className="flex-1 inline-flex items-center justify-center gap-1.5 rounded-md border border-white/10 bg-dark-700 px-3 py-2 text-xs text-gray-200 hover:bg-white/10 disabled:opacity-50"
+                    >
+                      {testingId === p.id
+                        ? <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                        : <PlayCircle className="w-3.5 h-3.5" />}
+                      Test
+                    </button>
+                    <button
+                      onClick={() => startEdit(p)}
+                      className="flex-1 inline-flex items-center justify-center gap-1.5 rounded-md border border-white/10 bg-dark-700 px-3 py-2 text-xs text-gray-200 hover:bg-white/10"
+                    >
+                      <Edit3 className="w-3.5 h-3.5" />
+                      Edit
+                    </button>
+                    <button
+                      onClick={() => handleDelete(p.id)}
+                      className="flex-1 inline-flex items-center justify-center gap-1.5 rounded-md border border-red-500/40 bg-red-500/10 px-3 py-2 text-xs font-medium text-red-300 hover:bg-red-500/20"
+                      aria-label="Remove proxy"
+                    >
+                      <Trash2 className="w-3.5 h-3.5" />
+                      Remove
+                    </button>
+                  </div>
+                </li>
               ))}
-            </tbody>
-          </table>
+            </ul>
+          </>
         )}
       </div>
 
