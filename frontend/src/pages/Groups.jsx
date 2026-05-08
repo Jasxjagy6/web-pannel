@@ -820,6 +820,18 @@ export default function Groups() {
     fetchOperations();
   }, [fetchSessions, fetchLists, fetchOperations]);
 
+  // Poll the operation history every 10s as a fallback for missed
+  // websocket events. Without this, jobs that finish while the user
+  // is on another tab (or after a transient socket drop) leave the
+  // Operations panel showing stale `running`/`queued` rows. Mirrors
+  // the polling cadence used on the Sessions page.
+  useEffect(() => {
+    const interval = setInterval(() => {
+      fetchOperations();
+    }, 10000);
+    return () => clearInterval(interval);
+  }, [fetchOperations]);
+
   useEffect(() => {
     const token = localStorage.getItem('token');
     if (token) connect(token);
@@ -894,8 +906,24 @@ export default function Groups() {
         delayMin: data.delayMin,
         delayMax: data.delayMax,
         batchSize: data.batchSize,
-        async: false,
+        // Use the async/queued path so the request returns 202 with an
+        // opId immediately. The Operation History panel + WebSocket
+        // progress events drive the rest of the UI; this keeps the
+        // submit button from blocking on a long-running multi-session
+        // run and stops the spinner from being stuck after the worker
+        // finishes (the inline path used to swallow the completion
+        // event because the response only landed after the websocket
+        // fan-out).
+        async: true,
       };
+      // Forward the source list id so the backend audience filter can
+      // persist not_found / dm_only updates back into list_items.
+      if (data.sourceList) {
+        const listIdNum = parseInt(data.sourceList, 10);
+        if (Number.isFinite(listIdNum)) {
+          addMembersPayload.listId = listIdNum;
+        }
+      }
       // Distribution-engine knobs (new). Auto mode passes only `mode`;
       // manual mode forwards every operator-supplied value so the
       // backend planner clamps them and uses them directly.
@@ -921,18 +949,29 @@ export default function Groups() {
       const remaining = Math.max(0, minLoadingTime - elapsed);
       await new Promise(resolve => setTimeout(resolve, remaining));
 
-      const result = response.data.data;
-      const added = result.added || 0;
-      const failed = result.failed || 0;
-      const skipped = result.skipped || 0;
-      const total = result.total || 0;
+      const result = response.data.data || {};
 
-      if (failed === 0 && skipped === 0) {
-        showSuccess(`All ${added} user(s) added successfully to ${data.targetIds.length} target(s).`, 'Complete');
-      } else if (added > 0) {
-        showSuccess(`${added} added, ${failed} failed, ${skipped} skipped out of ${total} user(s).`, 'Partial Success');
+      if (result.opId && (result.status === 'queued' || response.status === 202)) {
+        // Async path: backend returned 202 + opId. The Operation History
+        // panel will surface progress + completion via the websocket
+        // listeners wired above (`add_progress`/`add_completed`).
+        showSuccess(
+          `Add operation queued for ${result.totalUsers || users.length} user(s) across ${data.targetIds.length} target(s). Tracking progress in Operation History.`,
+          'Add Members Queued',
+        );
       } else {
-        showError(`All ${failed} user(s) failed. Check logs for details.`, 'Failed');
+        const added = result.added || 0;
+        const failed = result.failed || 0;
+        const skipped = result.skipped || 0;
+        const total = result.total || 0;
+
+        if (failed === 0 && skipped === 0) {
+          showSuccess(`All ${added} user(s) added successfully to ${data.targetIds.length} target(s).`, 'Complete');
+        } else if (added > 0) {
+          showSuccess(`${added} added, ${failed} failed, ${skipped} skipped out of ${total} user(s).`, 'Partial Success');
+        } else {
+          showError(`All ${failed} user(s) failed. Check logs for details.`, 'Failed');
+        }
       }
 
       fetchOperations();

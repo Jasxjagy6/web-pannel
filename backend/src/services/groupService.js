@@ -8,6 +8,8 @@ const {
   collectTelegramTargetCandidates,
 } = require('../utils/telegramTargetNormalizer');
 const distributionPlanner = require('./distributionPlanner');
+const audienceFilter = require('./audienceFilterService');
+const sessionCooldown = require('./sessionCooldown');
 
 /**
  * Default delay in milliseconds between batch operations.
@@ -81,19 +83,58 @@ async function updateProgress(opId, progressData) {
 
 /**
  * Validate that the given sessions belong to the specified user.
- * Returns array of verified session objects.
+ *
+ * By default, sessions whose `cooldown_until` is in the future are
+ * filtered out of the returned rows (they're held in flood/peer-flood
+ * lockout from `_withFloodRetry`). The dropped sessions are attached
+ * to the returned array as a non-enumerable `cooldownSkipped` property
+ * so callers can include them in the operation result for UX
+ * surfacing without changing the function signature.
+ *
+ * If every requested session is on cooldown, throws
+ * `ALL_SESSIONS_ON_COOLDOWN` (409). Callers that legitimately need to
+ * operate on a cooldown session (e.g. privacy / 2FA / login menus)
+ * should pass `{ filterCooldown: false }` — but those flows live in
+ * sessionController, not here, so the default-on behaviour is what we
+ * want for every caller in this file.
+ *
+ * @param {Array<string|number>} sessionIds
+ * @param {number|string} userId
+ * @param {{ filterCooldown?: boolean }} [opts]
  */
-async function validateSessionsOwnership(sessionIds, userId) {
+async function validateSessionsOwnership(sessionIds, userId, opts = {}) {
+  const { filterCooldown = true } = opts;
   if (!sessionIds || sessionIds.length === 0) {
     throw new AppError('At least one session ID is required', 400, 'NO_SESSIONS');
   }
 
   const placeholders = sessionIds.map((_, i) => `$${i + 2}`).join(',');
-  const result = await pool.query(
-    `SELECT id, user_id, status, is_logged_in, phone
-     FROM sessions WHERE id IN (${placeholders}) AND user_id = $1`,
-    [userId, ...sessionIds]
-  );
+  // SELECT cooldown_* alongside the legacy columns. On a deploy that
+  // hasn't run migration v24 yet the columns won't exist and the
+  // query throws — fall back to the legacy column set in that case
+  // so an upgrading deploy never breaks job submission.
+  let result;
+  try {
+    result = await pool.query(
+      `SELECT id, user_id, status, is_logged_in, phone,
+              cooldown_until, cooldown_reason, cooldown_seconds, cooldown_set_at
+         FROM sessions
+        WHERE id IN (${placeholders})
+          AND user_id = $1`,
+      [userId, ...sessionIds]
+    );
+  } catch (selErr) {
+    logger.warn(
+      `validateSessionsOwnership: cooldown columns missing, falling back: ${selErr.message}`
+    );
+    result = await pool.query(
+      `SELECT id, user_id, status, is_logged_in, phone
+         FROM sessions
+        WHERE id IN (${placeholders})
+          AND user_id = $1`,
+      [userId, ...sessionIds]
+    );
+  }
 
   if (result.rows.length === 0) {
     throw new AppError('No valid sessions found for this user', 404, 'SESSION_NOT_FOUND');
@@ -104,7 +145,52 @@ async function validateSessionsOwnership(sessionIds, userId) {
     logger.warn(`Some sessions not found for user ${userId}`, { notFound });
   }
 
-  return result.rows;
+  if (!filterCooldown) {
+    return result.rows;
+  }
+
+  // Filter rows whose cooldown_until is still in the future. Best-
+  // effort — when the column is absent (legacy deploy) every row
+  // passes through unchanged.
+  const now = Date.now();
+  const eligible = [];
+  const skipped = [];
+  for (const row of result.rows) {
+    const cdAt = row.cooldown_until ? new Date(row.cooldown_until).getTime() : 0;
+    if (cdAt > now) {
+      skipped.push({
+        id: row.id,
+        cooldown_until: row.cooldown_until,
+        remaining_seconds: Math.max(0, Math.ceil((cdAt - now) / 1000)),
+        reason: row.cooldown_reason || null,
+      });
+    } else {
+      eligible.push(row);
+    }
+  }
+
+  if (eligible.length === 0 && skipped.length > 0) {
+    const err = new AppError(
+      `All ${skipped.length} requested session(s) are on cooldown`,
+      409,
+      'ALL_SESSIONS_ON_COOLDOWN'
+    );
+    err.cooldownSkipped = skipped;
+    throw err;
+  }
+
+  if (skipped.length > 0) {
+    logger.warn(
+      `validateSessionsOwnership: ${skipped.length} session(s) skipped due to cooldown`,
+      { userId, skipped }
+    );
+    Object.defineProperty(eligible, 'cooldownSkipped', {
+      value: skipped,
+      enumerable: false,
+    });
+  }
+
+  return eligible;
 }
 
 class GroupService {
@@ -139,7 +225,6 @@ class GroupService {
       sessionIds,
       targetIds,
       targetType = 'group',
-      userList,
       delayMin = 30,
       delayMax = 60,
       batchSize = 5,
@@ -153,7 +238,18 @@ class GroupService {
       cooldownSecMax,
       itemDelayMsMin,
       itemDelayMsMax,
+      // Optional source list id — when set the audience filter
+      // persists status back into list_items and purges NOT_FOUND
+      // rows from the list.
+      listId = null,
+      // Optional pre-created group_operations row id. The async/queued
+      // controller path inserts the row before queuing so the UI can
+      // start tracking the job immediately; the worker then passes the
+      // same opId through here so progress/results land on that row
+      // instead of creating a second one.
+      opId: existingOpId = null,
     } = params;
+    let userList = params.userList;
 
     if (!userId) {
       throw new AppError('User ID is required', 400, 'MISSING_USER_ID');
@@ -165,6 +261,66 @@ class GroupService {
 
     if (!targetIds || targetIds.length === 0) {
       throw new AppError('At least one target group/channel is required', 400, 'NO_TARGETS');
+    }
+
+    // ─── Pre-job audience filter ────────────────────────────────────
+    // Dedupe + classify (cache + session-less t.me probe) the input
+    // userList BEFORE we burn any session quota. We hard-drop NOT_FOUND
+    // entries (and purge them from the list_items rows when listId is
+    // given), and skip PRIVACY_RESTRICTED entries here because they
+    // can't be added to a group anyway — those rows stay in the list
+    // tagged `dm_only` for the bulk-DM path.
+    //
+    // Failing open is non-negotiable: if Redis/HTTP/DB is degraded we
+    // still want add-members to run on the unfiltered list rather than
+    // hard-failing.
+    let audienceStats = null;
+    let audienceDmOnly = [];
+    let audienceDropped = [];
+    try {
+      const audienceResult = await audienceFilter.filterUserList({
+        userList,
+        listId,
+        userId,
+        context: 'add-members',
+        options: {
+          // Group-add jobs explicitly skip privacy-restricted users —
+          // the API will refuse to add them anyway.
+          includePrivacyRestricted: false,
+          purgeNotFound: true,
+        },
+      });
+      audienceStats = audienceResult.stats;
+      audienceDmOnly = audienceResult.dmOnly || [];
+      audienceDropped = audienceResult.dropped || [];
+      if (Array.isArray(audienceResult.eligible) && audienceResult.eligible.length > 0) {
+        userList = audienceResult.eligible.map((info) => info.raw);
+      }
+      logger.info('addMembersToGroups: audience filter applied', {
+        userId,
+        listId,
+        stats: audienceStats,
+        dmOnly: audienceDmOnly.length,
+        dropped: audienceDropped.length,
+        eligible: userList.length,
+      });
+    } catch (filterErr) {
+      logger.warn('addMembersToGroups: audience filter failed; proceeding with raw userList', {
+        error: filterErr.message,
+        userId,
+        listId,
+      });
+    }
+
+    if (!userList || userList.length === 0) {
+      // Filter dropped every entry. Don't throw — instead persist a
+      // completed-with-zero-eligible op row so the UI sees what
+      // happened.
+      throw new AppError(
+        'All audience entries were filtered out (not_found or privacy-restricted).',
+        400,
+        'NO_ELIGIBLE_USERS'
+      );
     }
 
     // Normalize each user-list entry into the full candidate chain
@@ -251,33 +407,70 @@ class GroupService {
       }
     );
 
-    // Create the operation record
-    const opResult = await pool.query(
-      `INSERT INTO group_operations (
-        user_id, session_id, target_group_id, operation, operation_type,
-        total_count, total_users, status, user_list, options, created_at
-      ) VALUES ($1, $2, $3, 'add_members', 'add_members', $4, $5, 'running', $6, $7, NOW())
-      RETURNING id`,
-      [
-        userId,
-        verifiedSessions[0].id, // primary session
-        targetIds[0], // primary target
-        userList.length,
-        userList.length,
-        JSON.stringify(userList.slice(0, 100)), // store first 100 for reference
-        JSON.stringify({
-          sessionIds: verifiedSessions.map(s => s.id),
-          targetIds,
-          targetType,
-          delayMin,
-          delayMax,
-          batchSize,
-          plan,
-        }),
-      ]
-    );
-
-    const opId = opResult.rows[0].id;
+    // Create the operation record (or reuse the row that the
+    // controller pre-created for the async/queued path).
+    let opId;
+    if (existingOpId) {
+      opId = existingOpId;
+      // Flip the row to running and refresh the stored counts/options
+      // now that we know the post-filter total. This also stores the
+      // first 100 users for the operation-detail panel.
+      await pool.query(
+        `UPDATE group_operations
+            SET status = 'running',
+                total_count = $2,
+                total_users = $2,
+                user_list   = $3,
+                options     = $4
+          WHERE id = $1`,
+        [
+          opId,
+          userList.length,
+          JSON.stringify(userList.slice(0, 100)),
+          JSON.stringify({
+            sessionIds: verifiedSessions.map((s) => s.id),
+            targetIds,
+            targetType,
+            delayMin,
+            delayMax,
+            batchSize,
+            plan,
+            audience: audienceStats,
+            dmOnly: audienceDmOnly.length,
+            dropped: audienceDropped.length,
+          }),
+        ]
+      );
+    } else {
+      const opResult = await pool.query(
+        `INSERT INTO group_operations (
+          user_id, session_id, target_group_id, operation, operation_type,
+          total_count, total_users, status, user_list, options, created_at
+        ) VALUES ($1, $2, $3, 'add_members', 'add_members', $4, $5, 'running', $6, $7, NOW())
+        RETURNING id`,
+        [
+          userId,
+          verifiedSessions[0].id, // primary session
+          targetIds[0], // primary target
+          userList.length,
+          userList.length,
+          JSON.stringify(userList.slice(0, 100)), // store first 100 for reference
+          JSON.stringify({
+            sessionIds: verifiedSessions.map(s => s.id),
+            targetIds,
+            targetType,
+            delayMin,
+            delayMax,
+            batchSize,
+            plan,
+            audience: audienceStats,
+            dmOnly: audienceDmOnly.length,
+            dropped: audienceDropped.length,
+          }),
+        ]
+      );
+      opId = opResult.rows[0].id;
+    }
 
     // Initialise Redis progress
     await updateProgress(opId, {
@@ -550,6 +743,14 @@ class GroupService {
                   userResult.error = 'Privacy settings prevent adding';
                   userResult.skipped = true;
                   skippedCount++;
+                  // Tag this entry as `dm_only` in the audience cache
+                  // so the next group-add skips it but bulk-DM picks
+                  // it up. Best-effort — never block the loop.
+                  audienceFilter
+                    .recordObservedFromEntry(prepared.entry, 'privacy_restricted', errMsg, 'observed-add')
+                    .catch((rErr) =>
+                      logger.warn(`audienceFilter.recordObserved (privacy) failed: ${rErr.message}`)
+                    );
                 }
                 // Handle user already in group
                 else if (
@@ -575,11 +776,41 @@ class GroupService {
                   userResult.error = 'User is banned or restricted';
                   failedCount++;
                 }
+                // Handle user not found / deactivated → cache as
+                // not_found so the next job skips them and the list
+                // is purged on the next filter pass.
+                else if (
+                  errMsg.includes('USER_DEACTIVATED') ||
+                  errMsg.includes('INPUT_USER_DEACTIVATED') ||
+                  errMsg.includes('USER_NOT_FOUND') ||
+                  errMsg.includes('USERNAME_NOT_OCCUPIED') ||
+                  errMsg.includes('USER_ID_INVALID')
+                ) {
+                  userResult.error = errMsg;
+                  failedCount++;
+                  audienceFilter
+                    .recordObservedFromEntry(prepared.entry, 'not_found', errMsg, 'observed-add')
+                    .catch((rErr) =>
+                      logger.warn(`audienceFilter.recordObserved (not_found) failed: ${rErr.message}`)
+                    );
+                }
                 // Generic failure
                 else {
                   userResult.error = errMsg;
                   failedCount++;
                 }
+              }
+
+              // Cache successful adds as 'live' so the next filter
+              // pass doesn't waste an HTTP probe on them. Done here
+              // (after all the error/retry handling) so the success
+              // case from a FLOOD_WAIT retry is captured too.
+              if (userResult.success) {
+                audienceFilter
+                  .recordObservedFromEntry(prepared.entry, 'live', null, 'observed-add')
+                  .catch((rErr) =>
+                    logger.warn(`audienceFilter.recordObserved (live) failed: ${rErr.message}`)
+                  );
               }
 
               results.push(userResult);
@@ -663,6 +894,12 @@ class GroupService {
         failed: failedCount,
         skipped: skippedCount,
         results,
+        audience: {
+          stats: audienceStats,
+          dmOnly: audienceDmOnly.length,
+          dropped: audienceDropped.length,
+        },
+        cooldownSkipped: verifiedSessions.cooldownSkipped || [],
       };
     } catch (outerErr) {
       logger.error(`Fatal error in add members operation ${opId}`, { error: outerErr.message });
@@ -1361,6 +1598,57 @@ class GroupService {
       status: 'queued',
     });
     return { opId, totalPairs };
+  }
+
+  /**
+   * Insert a `group_operations` row for an add-members bulk run with
+   * status 'queued'. The row is created in the controller so that the
+   * async response can return an immediate opId for the UI to poll /
+   * subscribe to. The worker (`type='add-members-bulk'`) flips the row
+   * to 'running' inside `addMembersToGroups` once it picks up the job.
+   *
+   * @param {object} args
+   * @param {number} args.userId
+   * @param {Array<{id:number}>} args.sessionRows  validated session rows
+   * @param {Array<string|number>} args.targetIds
+   * @param {string} args.targetType
+   * @param {Array<object>} args.userList
+   * @param {object} args.options                  passthrough for storage
+   * @returns {Promise<{opId: number, totalUsers: number}>}
+   */
+  async createAddMembersOperationRow({ userId, sessionRows, targetIds, targetType, userList, options }) {
+    const totalUsers = Array.isArray(userList) ? userList.length : 0;
+    const result = await pool.query(
+      `INSERT INTO group_operations (
+        user_id, session_id, target_group_id, operation, operation_type,
+        total_count, total_users, status, user_list, options, created_at
+      ) VALUES ($1, $2, $3, 'add_members', 'add_members', $4, $4, 'queued', $5, $6, NOW())
+      RETURNING id`,
+      [
+        userId,
+        sessionRows[0].id,
+        targetIds[0],
+        totalUsers,
+        JSON.stringify(Array.isArray(userList) ? userList.slice(0, 100) : []),
+        JSON.stringify({
+          sessionIds: sessionRows.map((s) => s.id),
+          targetIds,
+          targetType: targetType || 'group',
+          ...(options || {}),
+        }),
+      ]
+    );
+    const opId = result.rows[0].id;
+    await updateProgress(opId, {
+      operation_id: opId,
+      progress: 0,
+      added: 0,
+      failed: 0,
+      skipped: 0,
+      total: totalUsers,
+      status: 'queued',
+    });
+    return { opId, totalUsers };
   }
 
   /**

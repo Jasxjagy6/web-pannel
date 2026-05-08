@@ -108,12 +108,45 @@ const groupController = {
       itemDelayMsMax: itemDelayMsMax != null ? parseInt(itemDelayMsMax, 10) : undefined,
     };
 
-    // Async mode: add to BullMQ queue
-    if (async === 'true' || async === true) {
-      const queueJob = await groupQueue.addJob({
-        type: 'add-members',
-        ...options,
+    // Async mode is the default. The Groups UI used to send `async: false`
+    // which made this controller run the multi-session add inline,
+    // blocking the request for minutes and stranding the spinner. We now
+    // queue every multi-session/multi-target run via BullMQ and return a
+    // 202 with `{ opId, queueJobId, status: 'queued' }` so the UI can
+    // start tracking the operation immediately. Callers can still
+    // explicitly opt back into the synchronous code path with
+    // `async === false` (or `'false'`) — that path is retained for
+    // backward compatibility / scripts that read the full results object
+    // from the response body.
+    const wantsSync = async === false || async === 'false';
+    if (!wantsSync) {
+      // Pre-create the group_operations row so the UI gets an opId
+      // immediately. The worker (`add-members-bulk`) reuses this opId
+      // inside addMembersToGroups instead of inserting a second row.
+      const { opId, totalUsers } = await groupService.createAddMembersOperationRow({
         userId,
+        sessionRows: finalSessionIds.map((id) => ({ id })),
+        targetIds: finalTargetIds,
+        targetType,
+        userList,
+        options: {
+          delayMin: options.delayMin,
+          delayMax: options.delayMax,
+          batchSize: options.batchSize,
+          mode: options.mode,
+          perSessionBurst: options.perSessionBurst,
+          cooldownSecMin: options.cooldownSecMin,
+          cooldownSecMax: options.cooldownSecMax,
+          itemDelayMsMin: options.itemDelayMsMin,
+          itemDelayMsMax: options.itemDelayMsMax,
+        },
+      });
+
+      const queueJob = await groupQueue.addJob({
+        type: 'add-members-bulk',
+        opId,
+        userId,
+        params: options,
       });
 
       await reportService.logActivity(
@@ -123,31 +156,36 @@ const groupController = {
         null,
         {
           type: 'add_members',
+          opId,
           targetIds: finalTargetIds,
           sessionIds: finalSessionIds,
           queueJobId: queueJob.id,
-          totalUsers: userList.length,
+          totalUsers,
         }
       );
 
       logger.info(`Add members job queued by user ${userId}`, {
+        opId,
         queueJobId: queueJob.id,
         targetCount: finalTargetIds.length,
         sessionCount: finalSessionIds.length,
-        totalUsers: userList.length,
+        totalUsers,
       });
 
       return res.status(202).json({
         success: true,
         data: {
+          opId,
           queueJobId: queueJob.id,
           status: 'queued',
-          totalUsers: userList.length,
+          totalUsers,
+          totalTargets: finalTargetIds.length,
+          sessionCount: finalSessionIds.length,
         },
       });
     }
 
-    // Sync mode: run inline
+    // Legacy sync mode: run inline (kept for backward compatibility).
     const result = await groupService.addMembersToGroups(options, userId);
 
     await reportService.logActivity(
