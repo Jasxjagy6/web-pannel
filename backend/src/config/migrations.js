@@ -59,6 +59,7 @@ const MIGRATION_ORDER = [
   'migration_v22_proxy_providers.sql',
   'migration_v23_message_schedules.sql',
   'migration_v24_session_cooldown_audience_filter.sql',
+  'migration_v25_list_items_access_hash.sql',
 ];
 
 function listMigrationFiles() {

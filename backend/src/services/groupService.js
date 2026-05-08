@@ -6,6 +6,8 @@ const { redisClient } = require('../config/redis');
 const {
   normalizeTelegramTarget,
   collectTelegramTargetCandidates,
+  getAccessHash,
+  getPrimaryTelegramId,
 } = require('../utils/telegramTargetNormalizer');
 const distributionPlanner = require('./distributionPlanner');
 const audienceFilter = require('./audienceFilterService');
@@ -312,6 +314,74 @@ class GroupService {
       }
     };
 
+    // Persist current run counts to the DB so the 10s frontend poll
+    // (and the `group_operations` JOINs surfaced elsewhere) reflect
+    // live progress. We rate-limit DB writes to ~1 per second per op
+    // because `INSERT ... INTO group_operations` is heavier than the
+    // websocket fan-out and this loop fires after *every* user
+    // attempt.
+    let lastRunningPersistAt = 0;
+    const persistRunningProgress = async (counts, { force = false } = {}) => {
+      if (!existingOpId) return;
+      const now = Date.now();
+      if (!force && now - lastRunningPersistAt < 1000) return;
+      lastRunningPersistAt = now;
+      try {
+        await pool.query(
+          `UPDATE group_operations
+              SET status        = 'running',
+                  success_count = $2,
+                  failed_count  = $3,
+                  options       = COALESCE(options, '{}'::jsonb) || $4::jsonb
+            WHERE id = $1
+              AND status NOT IN ('completed', 'failed', 'cancelled')`,
+          [
+            existingOpId,
+            counts.added || 0,
+            counts.failed || 0,
+            JSON.stringify({
+              skipped_count: counts.skipped || 0,
+              processed_count: counts.processed || 0,
+              last_progress_at: new Date().toISOString(),
+            }),
+          ]
+        );
+      } catch (uErr) {
+        logger.warn(`persistRunningProgress: ${uErr.message}`);
+      }
+    };
+
+    // Emit a `group:progress` websocket event after every per-user
+    // attempt so the Operation History panel updates in real time
+    // instead of waiting for the final `_finalizeOperation` call.
+    // Best-effort — never throws and never blocks the worker on a
+    // missing socket / Redis client.
+    const emitItemProgress = async (counts) => {
+      if (!existingOpId) return;
+      try {
+        await updateProgress(existingOpId, {
+          operation_id: existingOpId,
+          status: 'running',
+          ...counts,
+        });
+      } catch (_) {
+        // redis unavailable
+      }
+      try {
+        if (global.io && userId) {
+          global.io.to(`user:${userId}`).emit('group:progress', {
+            opId: existingOpId,
+            jobId: existingOpId,
+            progress: { status: 'running', ...counts },
+          });
+        }
+      } catch (_) {
+        // ws unavailable
+      }
+      // Throttled DB write so the poll-based fallback also stays fresh.
+      await persistRunningProgress(counts);
+    };
+
     // Helper: emit an intermediate 'filtering' / 'validating' phase to
     // the op row + websocket so the Operations UI displays what the
     // worker is doing right now (instead of leaving the row stuck on
@@ -433,7 +503,19 @@ class GroupService {
       for (const entry of userList) {
         const candidates = collectTelegramTargetCandidates(entry);
         if (candidates.length > 0) {
-          preparedUsers.push({ entry, identifier: candidates[0], candidates });
+          // The frontend ships `access_hash` alongside `telegram_id`
+          // when the row was scraped. Pass it through so
+          // `addMemberToGroup` can build an `InputUser` directly for
+          // numeric-id candidates without a separate resolution step.
+          const accessHash = getAccessHash(entry);
+          const primaryNumericId = getPrimaryTelegramId(entry);
+          preparedUsers.push({
+            entry,
+            identifier: candidates[0],
+            candidates,
+            accessHash,
+            numericId: primaryNumericId,
+          });
         } else {
           unaddressable.push(entry);
         }
@@ -793,6 +875,26 @@ class GroupService {
                     : `Skipped: another session in this job determined this user is unreachable (${priorSkip.reason || 'not_found'})`;
                 skippedCount++;
                 results.push(userResult);
+
+                const liveProcessedSkip = addedCount + failedCount + skippedCount;
+                await emitItemProgress({
+                  progress: liveProcessedSkip,
+                  processed: liveProcessedSkip,
+                  added: addedCount,
+                  failed: failedCount,
+                  skipped: skippedCount,
+                  total: userList.length * targetIds.length,
+                  currentTarget: targetId,
+                  currentSession: session.id,
+                  currentRound: round + 1,
+                  totalRounds: targetRounds,
+                  lastUser: {
+                    id: userResult.userId,
+                    success: false,
+                    skipped: true,
+                    error: userResult.error,
+                  },
+                });
                 continue;
               }
 
@@ -819,8 +921,22 @@ class GroupService {
               let resolvedIdent = null;
               for (let cIdx = 0; cIdx < candidates.length; cIdx++) {
                 const userTelegramId = candidates[cIdx];
+                // Pair the cached access_hash with the numeric-id
+                // candidate only — applying it to a `@username` or
+                // `+phone` would just confuse the resolver.
+                const candidateOptions =
+                  prepared.accessHash &&
+                  prepared.numericId &&
+                  String(userTelegramId) === String(prepared.numericId)
+                    ? { accessHash: prepared.accessHash }
+                    : undefined;
                 try {
-                  await tgService.addMemberToGroup(session.id, targetId, userTelegramId);
+                  await tgService.addMemberToGroup(
+                    session.id,
+                    targetId,
+                    userTelegramId,
+                    candidateOptions
+                  );
                   userResult.success = true;
                   resolvedIdent = userTelegramId;
                   addErr = null;
@@ -891,13 +1007,21 @@ class GroupService {
 
                   // Retry once after flood wait. Use the candidate that
                   // most recently produced a non-resolution error (most
-                  // likely the original numeric id).
+                  // likely the original numeric id), and re-attach the
+                  // access_hash hint when retrying that numeric id so
+                  // we don't lose the hash across the FLOOD_WAIT pause.
                   const retryIdent = candidates[candidates.length - 1];
+                  const retryOptions =
+                    prepared.accessHash &&
+                    prepared.numericId &&
+                    String(retryIdent) === String(prepared.numericId)
+                      ? { accessHash: prepared.accessHash }
+                      : undefined;
                   let retrySuccess = false;
                   let retryAttempts = 0;
                   while (!retrySuccess && retryAttempts < MAX_FLOOD_RETRIES) {
                     try {
-                      await tgService.addMemberToGroup(session.id, targetId, retryIdent);
+                      await tgService.addMemberToGroup(session.id, targetId, retryIdent, retryOptions);
                       retrySuccess = true;
                       userResult.success = true;
                       addedCount++;
@@ -1048,6 +1172,32 @@ class GroupService {
               }
 
               results.push(userResult);
+
+              // Real-time progress: emit a `group:progress` websocket
+              // event after every per-user attempt so the Operation
+              // History panel updates live (instead of waiting for
+              // `_finalizeOperation`). Throttled DB writes inside
+              // `emitItemProgress` keep the polling fallback fresh too.
+              const liveProcessed = addedCount + failedCount + skippedCount;
+              await emitItemProgress({
+                progress: liveProcessed,
+                processed: liveProcessed,
+                added: addedCount,
+                failed: failedCount,
+                skipped: skippedCount,
+                total: userList.length * targetIds.length,
+                currentTarget: targetId,
+                currentSession: session.id,
+                currentRound: round + 1,
+                totalRounds: targetRounds,
+                lastUser: {
+                  id: userResult.userId,
+                  success: userResult.success === true,
+                  skipped: userResult.skipped === true,
+                  error: userResult.error || null,
+                },
+              });
+
               if (burstHitPeerFlood) break;
 
               // Per-item delay so we don't hammer Telegram from the
@@ -1062,7 +1212,10 @@ class GroupService {
               }
             }
 
-            // Update progress
+            // Update progress (Redis snapshot for the burst). Per-user
+            // socket fan-out + DB writes happen inside `emitItemProgress`
+            // above; this is the burst-summary that drives the Redis
+            // poll endpoint.
             const processed = addedCount + failedCount + skippedCount;
             await updateProgress(opId, {
               progress: processed,
@@ -1076,6 +1229,15 @@ class GroupService {
               currentRound: round + 1,
               totalRounds: targetRounds,
             });
+            await persistRunningProgress(
+              {
+                progress: processed,
+                added: addedCount,
+                failed: failedCount,
+                skipped: skippedCount,
+              },
+              { force: true }
+            );
           }
           } // end (round, session) block
 

@@ -1109,12 +1109,23 @@ class TelegramService {
   /**
    * Add a single member to a group.
    *
+   * The optional `userOptions.accessHash` lets the caller skip entity
+   * resolution when it already has a `(user_id, access_hash)` pair from
+   * a previous scrape. Without it, calling this with a bare numeric id
+   * for a stranger user almost always blows up with "Could not find the
+   * input entity" — Telegram requires the access_hash to construct an
+   * `InputUser`, and a stranger session has no way to look it up.
+   *
    * @param {string} sessionId - Active session identifier
    * @param {string|number} groupId - Group identifier
-   * @param {string|number} userId - User ID to add
+   * @param {string|number} userId - User ID, @username, or +phone to add
+   * @param {object} [userOptions]
+   * @param {string} [userOptions.accessHash] - Decimal-string `access_hash`
+   *   captured at scrape time. When present and `userId` is numeric, we
+   *   skip resolution and build an `InputUser` directly.
    * @returns {Promise<{ success: boolean, groupId: string, userId: string }>}
    */
-  async addMemberToGroup(sessionId, groupId, userId) {
+  async addMemberToGroup(sessionId, groupId, userId, userOptions = {}) {
     await this._ensureConnected(sessionId);
 
     try {
@@ -1123,8 +1134,14 @@ class TelegramService {
         throw new Error(`Could not resolve group: ${groupId}`);
       }
 
-      // Resolve the user to get their InputUser
-      const userEntity = await this._resolveEntity(sessionId, userId);
+      // Resolve the user to get their InputUser. When the caller has an
+      // access_hash hint and the identifier is purely numeric we can
+      // skip resolution entirely — that's the *only* path that works
+      // for an arbitrary scraped user the inviting session has never
+      // seen before.
+      const userEntity = await this._resolveEntity(sessionId, userId, {
+        accessHash: userOptions && userOptions.accessHash,
+      });
       if (!userEntity) {
         throw new Error(`Could not resolve user to add: ${userId}`);
       }
@@ -2243,9 +2260,24 @@ class TelegramService {
    * @returns {Promise<object|null>} Resolved entity or null
    * @private
    */
-  async _resolveEntity(sessionId, identifier) {
+  async _resolveEntity(sessionId, identifier, options = {}) {
     await this._ensureConnected(sessionId);
     const client = this.clients.get(String(sessionId)).client;
+
+    // Accept either `(sessionId, identifier, accessHash)` for ergonomic
+    // callers and the canonical `(sessionId, identifier, { accessHash })`
+    // shape used internally. We keep both because plumbing the hash
+    // through every call site as a string is much less invasive than
+    // converting them all to objects.
+    let accessHashHint = null;
+    if (options && typeof options === 'object') {
+      accessHashHint = options.accessHash || null;
+    } else if (typeof options === 'string' || typeof options === 'bigint') {
+      accessHashHint = options;
+    }
+    const normalizedAccessHash = accessHashHint != null
+      ? this._normalizeAccessHashHint(accessHashHint)
+      : null;
 
     try {
       // If it's already a resolved entity, return it
@@ -2254,6 +2286,41 @@ class TelegramService {
       }
 
       const idStr = String(identifier).trim();
+
+      // Fast path: numeric id + cached access_hash. This is the *only*
+      // reliable way to invite a stranger user by id — without the
+      // access_hash GramJS hits "Could not find the input entity" and
+      // every fallback below is also doomed to fail because we have
+      // never interacted with the user.
+      if (normalizedAccessHash !== null && /^\d+$/.test(idStr)) {
+        try {
+          const entity = await this._withFloodRetry(sessionId, async () => {
+            return await client.invoke(
+              new Api.users.GetUsers({
+                id: [
+                  new Api.InputUser({
+                    userId: BigInt(idStr),
+                    accessHash: normalizedAccessHash,
+                  }),
+                ],
+              })
+            );
+          });
+
+          if (entity && entity.length > 0 && entity[0].className && entity[0].className !== 'UserEmpty') {
+            return entity[0];
+          }
+        } catch (hintErr) {
+          // Fall through to the legacy resolution chain so a stale or
+          // garbled access_hash doesn't permanently block resolution
+          // — many scraped hashes are still valid even when GetUsers
+          // returns UserEmpty for the row (privacy / deactivated).
+          logger.debug(`Numeric+accessHash resolution failed for ${idStr}`, {
+            sessionId,
+            error: hintErr && hintErr.message,
+          });
+        }
+      }
 
       // Handle invite links
       if (idStr.startsWith('https://t.me/joinchat/') || idStr.startsWith('https://t.me/+')) {
@@ -2379,6 +2446,34 @@ class TelegramService {
       return null;
     } catch (error) {
       logger.error(`Failed to resolve entity: ${identifier}`, { error: error.message });
+      return null;
+    }
+  }
+
+  /**
+   * Coerce a caller-supplied access_hash into a `BigInt` suitable for
+   * use as an `InputUser.accessHash`. Accepts strings (decimal),
+   * numbers, BigInts, and the canonical-zero "no hash" sentinel. Returns
+   * null when the value is missing or unparseable so the resolver can
+   * fall back to the legacy resolution chain instead of crashing.
+   *
+   * @param {*} hint
+   * @returns {bigint|null}
+   * @private
+   */
+  _normalizeAccessHashHint(hint) {
+    try {
+      if (hint === null || hint === undefined) return null;
+      if (typeof hint === 'bigint') return hint === BigInt(0) ? null : hint;
+      if (typeof hint === 'number') {
+        if (!Number.isFinite(hint) || hint === 0) return null;
+        return BigInt(Math.trunc(hint));
+      }
+      const s = String(hint).trim();
+      if (!s || s === '0') return null;
+      if (!/^-?\d+$/.test(s)) return null;
+      return BigInt(s);
+    } catch {
       return null;
     }
   }

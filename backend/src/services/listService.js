@@ -31,13 +31,21 @@ const VALID_EXPORT_FORMATS = ['csv', 'json', 'txt'];
 
 /**
  * Valid CSV header mappings: maps common header variants to canonical field names.
+ *
+ * Header keys here are pre-normalised (lowercase, whitespace and quotes stripped),
+ * which is why entries like `userid` and `firstname` exist alongside the
+ * underscore variants — `parseCsvHeaders` strips spaces before lookup so a
+ * header literally written `"User ID"` still maps cleanly.
  */
 const HEADER_MAPPINGS = {
   // Telegram ID variants
   user_id: 'telegram_id',
+  userid: 'telegram_id',
   id: 'telegram_id',
   telegram_id: 'telegram_id',
+  telegramid: 'telegram_id',
   tg_id: 'telegram_id',
+  tgid: 'telegram_id',
   uid: 'telegram_id',
 
   // Username variants
@@ -46,12 +54,17 @@ const HEADER_MAPPINGS = {
   uname: 'username',
   handle: 'username',
   '@username': 'username',
+  '@': 'username',
 
   // First name variants
   first_name: 'first_name',
   firstname: 'first_name',
   fname: 'first_name',
   name: 'first_name',
+  full_name: 'first_name',
+  fullname: 'first_name',
+  display_name: 'first_name',
+  displayname: 'first_name',
 
   // Last name variants
   last_name: 'last_name',
@@ -62,8 +75,18 @@ const HEADER_MAPPINGS = {
   // Phone variants
   phone: 'phone',
   phone_number: 'phone',
+  phonenumber: 'phone',
   mobile: 'phone',
+  msisdn: 'phone',
   tel: 'phone',
+
+  // Access hash variants — paired with telegram_id, lets the add-members
+  // worker construct an InputUser without a separate resolution round-trip.
+  // GramJS surfaces this as a BigInt; we accept decimal, optional negative
+  // sign, and quoted strings.
+  access_hash: 'access_hash',
+  accesshash: 'access_hash',
+  hash: 'access_hash',
 };
 
 /**
@@ -133,6 +156,43 @@ function coerceUsername(raw) {
 }
 
 /**
+ * Coerce a raw access_hash value to a clean signed-integer string fitting
+ * in a Postgres BIGINT, or null. Telegram hands these out as int64; we
+ * accept decimal strings, optional leading sign, surrounding quotes, and
+ * BigInt instances.
+ *
+ * @param {*} raw - Raw access_hash value from a parsed file
+ * @returns {string|null}
+ * @private
+ */
+function coerceAccessHash(raw) {
+  if (raw === null || raw === undefined) return null;
+  // BigInt comes through some JSON pipelines as a primitive that the JSON
+  // parser does NOT touch, but if anyone passes it via `BigInt(...)` we
+  // serialize directly.
+  if (typeof raw === 'bigint') return raw.toString();
+  let str = String(raw).trim();
+  if (!str) return null;
+  // Some upstream tools wrap the hash in quotes inside JSON. Strip them so
+  // a value like `"4707693057812451327"` round-trips cleanly.
+  if ((str.startsWith('"') && str.endsWith('"')) || (str.startsWith("'") && str.endsWith("'"))) {
+    str = str.slice(1, -1).trim();
+  }
+  if (!/^-?\d+$/.test(str)) return null;
+  // Postgres BIGINT range is [-2^63, 2^63-1]. Clamp by string compare to
+  // avoid Number precision issues — anything outside the range is
+  // certainly garbage from a malformed file.
+  const isNegative = str.startsWith('-');
+  const digits = isNegative ? str.slice(1) : str;
+  const MAX_BIGINT_DIGITS = '9223372036854775807';
+  if (digits.length > MAX_BIGINT_DIGITS.length) return null;
+  if (digits.length === MAX_BIGINT_DIGITS.length && digits > MAX_BIGINT_DIGITS) {
+    return null;
+  }
+  return str;
+}
+
+/**
  * Decide whether a file's content is JSON, CSV or plain TXT.
  *
  * The extension/MIME type is treated as a strong hint, but content
@@ -156,11 +216,14 @@ function detectContentFormat(content, ext, mimeType) {
     return 'json';
   }
 
-  // CSV: a header line that contains a comma AND at least one
-  // recognisable column wins regardless of extension.
+  // CSV / TSV / semicolon-separated: a header line with any of the
+  // recognised separators AND at least one recognisable column wins
+  // regardless of extension. Operators frequently rename `.csv` exports
+  // to `.txt` or paste TSV from Excel.
   const firstLine = trimmed.split(/\r?\n/, 1)[0] || '';
-  if (firstLine.includes(',')) {
-    const probeHeaders = splitCsvLine(firstLine).map((h) =>
+  const candidateSeparators = pickCsvLikeSeparators(firstLine);
+  for (const sep of candidateSeparators) {
+    const probeHeaders = splitCsvLine(firstLine, sep).map((h) =>
       h.trim().toLowerCase().replace(/["'\s]/g, '')
     );
     const hasKnownHeader = probeHeaders.some((h) =>
@@ -169,10 +232,33 @@ function detectContentFormat(content, ext, mimeType) {
     if (hasKnownHeader) return 'csv';
   }
 
-  if (ext === '.csv' || mimeType === 'text/csv') {
+  // No headerless CSV detection — a separator alone isn't enough to
+  // commit to CSV parsing because plain TXT files often contain commas
+  // inside free-form names. Fall back to the extension hint.
+  if (ext === '.csv' || mimeType === 'text/csv' ||
+      ext === '.tsv' || mimeType === 'text/tab-separated-values') {
     return 'csv';
   }
   return 'txt';
+}
+
+/**
+ * Detect plausible field separators for the given line, in priority
+ * order. Comma always wins when present so we don't accidentally treat
+ * a name like `Doe, John` as semicolon-separated; semicolon and tab are
+ * tried only when a comma is absent or did not yield a recognised
+ * header.
+ *
+ * @param {string} firstLine - First non-empty line of the file
+ * @returns {string[]}
+ * @private
+ */
+function pickCsvLikeSeparators(firstLine) {
+  const sepCandidates = [];
+  if (firstLine.includes(',')) sepCandidates.push(',');
+  if (firstLine.includes(';')) sepCandidates.push(';');
+  if (firstLine.includes('\t')) sepCandidates.push('\t');
+  return sepCandidates;
 }
 
 /**
@@ -226,69 +312,188 @@ function parseCsvHeaders(headers) {
 function parseCsvContent(content) {
   const lines = content.split(/\r?\n/).filter((line) => line.trim().length > 0);
 
-  if (lines.length < 2) {
+  if (lines.length < 1) {
     return [];
   }
 
-  // Parse the header row
+  // Pick a separator (comma > semicolon > tab) by sniffing the first
+  // line for which one yields a recognisable header. This lets us
+  // accept TSV exports from Excel and `;`-separated CSVs from European
+  // locales without extra ceremony — `,` is still preferred when both
+  // are present so `Doe, John` doesn't get split on the wrong glyph.
   const headerLine = lines[0];
-  const rawHeaders = splitCsvLine(headerLine);
+  const separator = chooseCsvSeparator(headerLine);
+
+  // Header detection: if the first line maps to ANY known canonical
+  // field, treat it as a header. Otherwise fall through to the
+  // headerless heuristic where each row is parsed by content shape
+  // (numeric → telegram_id, `@x` → username, `+digits` → phone).
+  const rawHeaders = splitCsvLine(headerLine, separator);
   const headerMap = parseCsvHeaders(rawHeaders);
-
-  if (headerMap.size === 0) {
-    throw new AppError(
-      'Could not recognize any valid headers in CSV file. Supported headers: user_id/id/telegram_id, username, first_name/name, last_name, phone',
-      400,
-      'INVALID_CSV_HEADERS'
-    );
-  }
-
-  // Check that at least one of the identifier columns was found. We
-  // accept an id column OR a username column so scrape exports that
-  // store hidden users as `<uuid>,<handle>,...` are still importable.
-  const hasIdColumn = [...headerMap.values()].includes('telegram_id');
-  const hasUsernameColumn = [...headerMap.values()].includes('username');
-  if (!hasIdColumn && !hasUsernameColumn) {
-    throw new AppError(
-      'CSV file must contain a column for user ID (user_id, id, or telegram_id) or for username',
-      400,
-      'MISSING_ID_COLUMN'
-    );
-  }
 
   const entries = [];
 
-  for (let i = 1; i < lines.length; i++) {
-    const values = splitCsvLine(lines[i]);
-    const entry = {};
+  if (headerMap.size > 0) {
+    // Check that at least one of the identifier columns was found. We
+    // accept an id column OR a username column so scrape exports that
+    // store hidden users as `<uuid>,<handle>,...` are still importable.
+    const hasIdColumn = [...headerMap.values()].includes('telegram_id');
+    const hasUsernameColumn = [...headerMap.values()].includes('username');
+    if (!hasIdColumn && !hasUsernameColumn) {
+      throw new AppError(
+        'CSV file must contain a column for user ID (user_id, id, or telegram_id) or for username',
+        400,
+        'MISSING_ID_COLUMN'
+      );
+    }
 
-    headerMap.forEach((fieldName, colIndex) => {
-      const value = values[colIndex] ? values[colIndex].trim() : null;
-      if (value && value.length > 0) {
-        entry[fieldName] = value;
-      }
-    });
+    for (let i = 1; i < lines.length; i++) {
+      const values = splitCsvLine(lines[i], separator);
+      const entry = {};
 
-    const telegramId = coerceTelegramId(entry.telegram_id);
-    const username = coerceUsername(entry.username);
+      headerMap.forEach((fieldName, colIndex) => {
+        const value = values[colIndex] ? values[colIndex].trim() : null;
+        if (value && value.length > 0) {
+          // If the same canonical field appears twice (operators do this
+          // by accident when concatenating exports), only the first
+          // non-empty value wins.
+          if (entry[fieldName] === undefined || entry[fieldName] === null || entry[fieldName] === '') {
+            entry[fieldName] = value;
+          }
+        }
+      });
 
-    // Only keep rows that give us *some* way to address the user.
-    // Hidden-user placeholders (UUID id + UUID username) are dropped
-    // here so we don't waste a row in the BIGINT-typed list_items.
-    if (!telegramId && !username) continue;
+      const built = buildEntryFromRaw(entry);
+      if (built) entries.push(built);
+    }
 
-    const phone = entry.phone ? entry.phone.replace(/[^\d+]/g, '') : null;
+    return entries;
+  }
 
-    entries.push({
-      telegram_id: telegramId,
-      username: username,
-      first_name: entry.first_name ? String(entry.first_name).trim() : null,
-      last_name: entry.last_name ? String(entry.last_name).trim() : null,
-      phone: phone || null,
-    });
+  // No recognisable header — fall back to per-row content sniffing so
+  // bare exports (e.g. `123,@user,+15555550100` or just one identifier
+  // per line) still import. Each row's columns are matched to fields
+  // by shape, not position, so the order doesn't matter.
+  for (const line of lines) {
+    const values = splitCsvLine(line, separator).map((v) => v.trim()).filter((v) => v.length > 0);
+    if (values.length === 0) continue;
+    const entry = inferRawEntryFromCells(values);
+    const built = buildEntryFromRaw(entry);
+    if (built) entries.push(built);
   }
 
   return entries;
+}
+
+/**
+ * Choose between comma, semicolon, and tab as the active separator for
+ * the given header/row. Comma wins when it splits the line into a
+ * sensible header; otherwise we fall back to whichever separator yields
+ * the most cells.
+ *
+ * @param {string} firstLine
+ * @returns {string}
+ * @private
+ */
+function chooseCsvSeparator(firstLine) {
+  const candidates = pickCsvLikeSeparators(firstLine);
+  if (candidates.length === 0) return ',';
+  let best = candidates[0];
+  let bestScore = -1;
+  for (const sep of candidates) {
+    const cells = splitCsvLine(firstLine, sep);
+    const normalized = cells.map((h) => h.trim().toLowerCase().replace(/["'\s]/g, ''));
+    const knownHits = normalized.filter((h) =>
+      Object.prototype.hasOwnProperty.call(HEADER_MAPPINGS, h)
+    ).length;
+    // Score: matched headers count more than raw cell count so a comma
+    // line with one matched header beats a semicolon line with three
+    // unrecognised cells.
+    const score = knownHits * 100 + cells.length;
+    if (score > bestScore) {
+      best = sep;
+      bestScore = score;
+    }
+  }
+  return best;
+}
+
+/**
+ * Build the canonical `{ telegram_id, username, first_name, last_name,
+ * phone, access_hash }` shape from a raw entry whose fields are already
+ * keyed by canonical name. Returns null if the row has no usable
+ * identifier (every CSV/JSON path filters those out so callers stay
+ * uniform).
+ *
+ * @param {object} entry
+ * @returns {object|null}
+ * @private
+ */
+function buildEntryFromRaw(entry) {
+  const telegramId = coerceTelegramId(entry.telegram_id);
+  const username = coerceUsername(entry.username);
+  const accessHash = coerceAccessHash(entry.access_hash);
+  const phone = entry.phone ? entry.phone.replace(/[^\d+]/g, '') : null;
+
+  if (!telegramId && !username && !(phone && phone.length > 0)) {
+    return null;
+  }
+
+  return {
+    telegram_id: telegramId,
+    username,
+    first_name: entry.first_name ? String(entry.first_name).trim() : null,
+    last_name: entry.last_name ? String(entry.last_name).trim() : null,
+    phone: phone && phone.length > 0 ? phone : null,
+    access_hash: telegramId ? accessHash : null,
+  };
+}
+
+/**
+ * Infer canonical fields from a row of free-form cell values when no
+ * header is present. Each cell is matched by shape:
+ *   - leading `@` or non-numeric word → username
+ *   - all-digits → telegram_id
+ *   - leading `+` and digits → phone
+ * The first cell that matches a shape wins for that field; later
+ * matching cells fall through to first_name / last_name.
+ *
+ * @param {string[]} cells
+ * @returns {object}
+ * @private
+ */
+function inferRawEntryFromCells(cells) {
+  const entry = {};
+  const leftover = [];
+  for (const raw of cells) {
+    const cell = raw.trim();
+    if (!cell) continue;
+    // Leading `+` followed by digits → phone.
+    if (/^\+\d{5,15}$/.test(cell)) {
+      if (!entry.phone) entry.phone = cell;
+      else leftover.push(cell);
+      continue;
+    }
+    // Pure digits → telegram_id (when one isn't already claimed).
+    if (/^\d{4,}$/.test(cell)) {
+      if (!entry.telegram_id) entry.telegram_id = cell;
+      else leftover.push(cell);
+      continue;
+    }
+    // Leading `@` → username.
+    if (cell.startsWith('@')) {
+      if (!entry.username) entry.username = cell.slice(1);
+      else leftover.push(cell);
+      continue;
+    }
+    // Anything else is treated as a candidate display name.
+    leftover.push(cell);
+  }
+  // Fill first_name / last_name from the leftover stack so a bare
+  // row like `John,Smith` round-trips into list_items as a name only.
+  if (leftover.length > 0) entry.first_name = leftover[0];
+  if (leftover.length > 1) entry.last_name = leftover.slice(1).join(' ');
+  return entry;
 }
 
 /**
@@ -298,7 +503,8 @@ function parseCsvContent(content) {
  * @returns {string[]} Array of field values
  * @private
  */
-function splitCsvLine(line) {
+function splitCsvLine(line, separator = ',') {
+  const sep = separator || ',';
   const fields = [];
   let current = '';
   let inQuotes = false;
@@ -321,7 +527,7 @@ function splitCsvLine(line) {
     } else {
       if (char === '"') {
         inQuotes = true;
-      } else if (char === ',') {
+      } else if (char === sep) {
         fields.push(current);
         current = '';
       } else {
@@ -393,26 +599,42 @@ function parseJsonContent(content) {
 
     // Map various field names to canonical names
     const rawId =
-      item.telegram_id || item.user_id || item.id || item.tg_id || item.uid || null;
+      item.telegram_id || item.telegramId || item.user_id || item.userId ||
+      item.id || item.tg_id || item.tgId || item.uid || null;
     const rawUsername =
-      item.username || item.user_name || item.uname || item.handle || null;
+      item.username || item.user_name || item.userName ||
+      item.uname || item.handle || null;
+    const rawAccessHash =
+      item.access_hash !== undefined ? item.access_hash :
+      item.accessHash !== undefined ? item.accessHash :
+      item.hash !== undefined ? item.hash :
+      null;
 
     const telegramId = coerceTelegramId(rawId);
     const username = coerceUsername(rawUsername);
+    const accessHash = telegramId ? coerceAccessHash(rawAccessHash) : null;
 
-    // Skip rows that have neither a usable id nor a usable handle.
-    if (!telegramId && !username) continue;
+    const firstName =
+      item.first_name || item.firstName || item.firstname || item.fname ||
+      item.name || item.full_name || item.fullName || item.displayName || null;
+    const lastName =
+      item.last_name || item.lastName || item.lastname || item.lname || item.surname || null;
+    const phone =
+      item.phone || item.phone_number || item.phoneNumber ||
+      item.mobile || item.msisdn || item.tel || null;
+    const phoneClean = phone ? String(phone).replace(/[^\d+]/g, '').trim() : null;
 
-    const firstName = item.first_name || item.firstname || item.fname || item.name || null;
-    const lastName = item.last_name || item.lastname || item.lname || item.surname || null;
-    const phone = item.phone || item.phone_number || item.mobile || item.tel || null;
+    // Skip rows that have neither a usable id, handle, nor phone. Phone
+    // alone is enough because `_resolveEntity` can ImportContacts on it.
+    if (!telegramId && !username && !(phoneClean && phoneClean.length > 0)) continue;
 
     entries.push({
       telegram_id: telegramId,
       username: username,
       first_name: firstName ? String(firstName).trim() : null,
       last_name: lastName ? String(lastName).trim() : null,
-      phone: phone ? String(phone).replace(/[^\d+]/g, '').trim() : null,
+      phone: phoneClean && phoneClean.length > 0 ? phoneClean : null,
+      access_hash: accessHash,
     });
   }
 
@@ -437,41 +659,44 @@ function parseTxtContent(content) {
 
   for (const line of lines) {
     const trimmed = line.trim();
-
     if (!trimmed) continue;
 
-    if (trimmed.startsWith('@')) {
-      // Username entry
-      const username = trimmed.substring(1).trim();
-      if (username.length > 0) {
-        entries.push({
-          telegram_id: null, // No numeric ID available
-          username,
-          first_name: null,
-          last_name: null,
-          phone: null,
-        });
+    // Comment line; common in user-curated lists.
+    if (trimmed.startsWith('#') || trimmed.startsWith('//')) continue;
+
+    // Multi-token line — the operator pasted a CSV-ish row into a TXT
+    // file (e.g. `123456789,@username` or `@user, +15555550100`).
+    // Split on commas, semicolons, tabs, and whitespace runs, and let
+    // `inferRawEntryFromCells` route each token to the right field.
+    const tokens = trimmed
+      .split(/[\s,;]+/)
+      .map((tok) => tok.trim())
+      .filter((tok) => tok.length > 0);
+
+    if (tokens.length === 0) continue;
+
+    if (tokens.length === 1) {
+      // Single-token fast path so `+15555550100` doesn't accidentally
+      // get classified by the multi-cell heuristic.
+      const tok = tokens[0];
+      if (tok.startsWith('@')) {
+        const u = tok.substring(1).trim();
+        if (u.length > 0) {
+          entries.push({ telegram_id: null, username: u, first_name: null, last_name: null, phone: null, access_hash: null });
+        }
+      } else if (/^\+\d{5,15}$/.test(tok)) {
+        entries.push({ telegram_id: null, username: null, first_name: null, last_name: null, phone: tok, access_hash: null });
+      } else if (/^\d{4,}$/.test(tok)) {
+        const tid = coerceTelegramId(tok);
+        if (tid) entries.push({ telegram_id: tid, username: null, first_name: null, last_name: null, phone: null, access_hash: null });
       }
-    } else if (/^\+\d+$/.test(trimmed)) {
-      // Phone number entry
-      entries.push({
-        telegram_id: null,
-        username: null,
-        first_name: null,
-        last_name: null,
-        phone: trimmed,
-      });
-    } else if (/^\d+$/.test(trimmed)) {
-      // Numeric ID entry
-      entries.push({
-        telegram_id: trimmed,
-        username: null,
-        first_name: null,
-        last_name: null,
-        phone: null,
-      });
+      // Bare unprefixed strings are ambiguous (could be a name) — skip.
+      continue;
     }
-    // Lines that don't match any pattern are silently skipped
+
+    const inferred = inferRawEntryFromCells(tokens);
+    const built = buildEntryFromRaw(inferred);
+    if (built) entries.push(built);
   }
 
   return entries;
@@ -578,7 +803,7 @@ async function insertListItemsBatch(client, listId, items) {
 
     for (const item of batch) {
       placeholders.push(
-        `($${paramIndex}, $${paramIndex + 1}, $${paramIndex + 2}, $${paramIndex + 3}, $${paramIndex + 4}, $${paramIndex + 5}, NOW())`
+        `($${paramIndex}, $${paramIndex + 1}, $${paramIndex + 2}, $${paramIndex + 3}, $${paramIndex + 4}, $${paramIndex + 5}, $${paramIndex + 6}, NOW())`
       );
 
       // Coerce here as a final safety net even though parseCsvContent /
@@ -586,19 +811,23 @@ async function insertListItemsBatch(client, listId, items) {
       // must NEVER hand it a UUID — parseInt would silently truncate
       // `2617dd5b-...` to `2617` and corrupt the row.
       const telegramId = coerceTelegramId(item.telegram_id);
+      // access_hash is only meaningful when paired with a telegram_id —
+      // a hash without an id is unusable for InputUser construction.
+      const accessHash = telegramId ? coerceAccessHash(item.access_hash) : null;
       values.push(
         listId,
         telegramId,
         item.username || null,
         item.first_name || null,
         item.last_name || null,
-        item.phone || null
+        item.phone || null,
+        accessHash
       );
-      paramIndex += 6;
+      paramIndex += 7;
     }
 
     const insertQuery = `
-      INSERT INTO list_items (list_id, telegram_id, username, first_name, last_name, phone, added_at)
+      INSERT INTO list_items (list_id, telegram_id, username, first_name, last_name, phone, access_hash, added_at)
       VALUES ${placeholders.join(', ')}
       ON CONFLICT DO NOTHING
     `;
@@ -907,9 +1136,14 @@ class ListService {
           [listId, scrapeJobId]
         );
       } else {
+        // Carry `access_hash` from `scraped_users` into `list_items` so
+        // the add-members worker can build an InputUser directly from
+        // the row — without it, every numeric-id-only invite hits
+        // "Could not find the input entity" because GramJS has no way
+        // to look up the hash for an arbitrary id.
         await client.query(
-          `INSERT INTO list_items (list_id, telegram_id, username, first_name, last_name, phone, added_at)
-           SELECT $1, telegram_id, username, first_name, last_name, phone, NOW()
+          `INSERT INTO list_items (list_id, telegram_id, username, first_name, last_name, phone, access_hash, added_at)
+           SELECT $1, telegram_id, username, first_name, last_name, phone, access_hash, NOW()
            FROM scraped_users
            WHERE job_id = $2`,
           [listId, scrapeJobId]
@@ -994,7 +1228,7 @@ class ListService {
       for (let i = 0; i < sourceLists.length; i++) {
         const listId = sourceLists[i].id;
         const itemsResult = await client.query(
-          `SELECT telegram_id, username, first_name, last_name, phone
+          `SELECT telegram_id, username, first_name, last_name, phone, access_hash
            FROM list_items
            WHERE list_id = $1
            ORDER BY id ASC`,
@@ -1008,6 +1242,9 @@ class ListService {
             first_name: row.first_name || null,
             last_name: row.last_name || null,
             phone: row.phone || null,
+            access_hash: row.access_hash !== null && row.access_hash !== undefined
+              ? String(row.access_hash)
+              : null,
           });
         }
       }
@@ -1227,7 +1464,7 @@ class ListService {
 
     // Fetch all items
     const itemsResult = await pool.query(
-      `SELECT telegram_id, username, first_name, last_name, phone
+      `SELECT telegram_id, username, first_name, last_name, phone, access_hash
        FROM list_items
        WHERE list_id = $1
        ORDER BY id ASC`,
@@ -1244,7 +1481,11 @@ class ListService {
 
     switch (exportFormat) {
       case 'csv': {
-        const headers = ['user_id', 'username', 'first_name', 'last_name', 'phone'];
+        // Include `access_hash` in the export so a round-trip through
+        // CSV preserves enough state for the add-members worker to skip
+        // entity resolution — critical for lists scraped from large
+        // public groups.
+        const headers = ['user_id', 'username', 'first_name', 'last_name', 'phone', 'access_hash'];
         const csvRows = [headers.join(',')];
 
         for (const item of items) {
@@ -1254,6 +1495,7 @@ class ListService {
             csvEscape(item.first_name),
             csvEscape(item.last_name),
             csvEscape(item.phone),
+            csvEscape(item.access_hash !== null && item.access_hash !== undefined ? String(item.access_hash) : ''),
           ];
           csvRows.push(row.join(','));
         }
@@ -1271,6 +1513,9 @@ class ListService {
           first_name: item.first_name || null,
           last_name: item.last_name || null,
           phone: item.phone || null,
+          access_hash: item.access_hash !== null && item.access_hash !== undefined
+            ? String(item.access_hash)
+            : null,
         }));
 
         content = JSON.stringify(jsonArray, null, 2);
@@ -1524,7 +1769,7 @@ class ListService {
 
     // Get paginated items
     const itemsResult = await pool.query(
-      `SELECT id, telegram_id, username, first_name, last_name, phone, added_at
+      `SELECT id, telegram_id, username, first_name, last_name, phone, access_hash, added_at
        FROM list_items
        WHERE ${whereClause}
        ORDER BY id ASC
@@ -1539,6 +1784,9 @@ class ListService {
       firstName: row.first_name || null,
       lastName: row.last_name || null,
       phone: row.phone || null,
+      accessHash: row.access_hash !== null && row.access_hash !== undefined
+        ? String(row.access_hash)
+        : null,
       addedAt: row.added_at,
     }));
 
@@ -1691,11 +1939,20 @@ class ListService {
       }
 
       // Must have at least one identifier
-      const telegramId = item.telegram_id ? String(item.telegram_id).trim() : null;
+      const telegramId = item.telegram_id ? coerceTelegramId(item.telegram_id) : null;
       const username = item.username ? String(item.username).replace(/^@/, '').trim() : null;
       const firstName = item.first_name ? String(item.first_name).trim() : null;
       const lastName = item.last_name ? String(item.last_name).trim() : null;
       const phone = item.phone ? String(item.phone).replace(/[^\d+]/g, '').trim() : null;
+      // Operators sometimes paste rows with `access_hash` from a
+      // previous scrape; preserve it when paired with a numeric id.
+      const accessHash = telegramId
+        ? coerceAccessHash(
+            item.access_hash !== undefined
+              ? item.access_hash
+              : item.accessHash
+          )
+        : null;
 
       if (!telegramId && !username && !phone) {
         invalidCount++;
@@ -1708,6 +1965,7 @@ class ListService {
         first_name: firstName,
         last_name: lastName,
         phone,
+        access_hash: accessHash,
       });
     }
 

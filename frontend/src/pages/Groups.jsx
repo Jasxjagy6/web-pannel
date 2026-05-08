@@ -952,7 +952,12 @@ export default function Groups() {
     const startTime = Date.now();
 
     try {
-      // Fetch items from selected list
+      // Fetch items from selected list. Forward `access_hash` alongside
+      // the canonical fields so the backend can build an `InputUser`
+      // directly when the list row was scraped — without it the worker
+      // can only resolve users by @handle, which is unreliable for
+      // numeric-id-only rows (Telegram says "Could not find the input
+      // entity" for any stranger user without a cached hash).
       const listResponse = await listsAPI.getItems(data.sourceList, { limit: 10000 });
       const users = (listResponse.data.data?.items || []).map((item) => ({
         telegram_id: item.telegram_id || item.telegramId,
@@ -960,6 +965,12 @@ export default function Groups() {
         first_name: item.first_name || item.firstName,
         last_name: item.last_name || item.lastName,
         phone: item.phone,
+        access_hash:
+          item.access_hash !== undefined && item.access_hash !== null
+            ? item.access_hash
+            : item.accessHash !== undefined && item.accessHash !== null
+              ? item.accessHash
+              : null,
       }));
 
       if (users.length === 0) {
