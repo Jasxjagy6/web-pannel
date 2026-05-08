@@ -988,6 +988,12 @@ class ProxyService {
     if (!userId) throw new AppError('userId required', 400, 'PROXY_USER_ID_REQUIRED');
     const role = opts.role || null;
 
+    // Global proxy switch — when OFF return null so the caller falls
+    // through to direct VPS egress without the NO_USER_PROXY gate
+    // tripping. Existing call sites already treat null as "no proxy".
+    const settingsService = require('./systemSettingsService');
+    if (!(await settingsService.isProxyGloballyEnabled())) return null;
+
     // 1. Existing binding still good (and not an expired sticky)?
     if (sessionId) {
       const existing = await pool.query(
@@ -1307,6 +1313,51 @@ class ProxyService {
   }
 
   /**
+   * Bind the session to the `__direct__` sentinel row and release any
+   * non-direct binding it might have. Used when the global proxy
+   * toggle is OFF — buildGramJSProxy() turns the direct row into
+   * `null` so GramJS connects from the VPS IP.
+   */
+  async _bindDirectRow(sessionId) {
+    const direct = (await pool.query(
+      `SELECT * FROM proxies WHERE host='__direct__' LIMIT 1`
+    )).rows[0] || null;
+    if (!direct) {
+      logger.warn(
+        `_bindDirectRow(${sessionId}): __direct__ proxy row missing — ` +
+          `migration v2 has not run? Returning null so GramJS uses VPS IP.`
+      );
+      // Best-effort cleanup so a stale binding to a dead proxy doesn't
+      // poison the next reconnect.
+      if (sessionId) await this.releaseProxy(sessionId).catch(() => {});
+      return null;
+    }
+    if (!sessionId) return direct;
+    const existing = await this.getProxyForSession(sessionId);
+    if (existing && existing.id === direct.id) return direct;
+    if (existing) await this.releaseProxy(sessionId);
+    await pool.query(
+      `INSERT INTO session_proxy_assignments (session_id, proxy_id, assigned_at)
+       VALUES ($1, $2, NOW())
+       ON CONFLICT (session_id) DO UPDATE
+         SET proxy_id = EXCLUDED.proxy_id, assigned_at = NOW()`,
+      [sessionId, direct.id]
+    );
+    try {
+      await pool.query(
+        `UPDATE sessions
+            SET bound_proxy_id = $1,
+                proxy_url = NULL
+          WHERE id = $2 AND COALESCE(bound_proxy_id, 0) <> $1`,
+        [direct.id, sessionId]
+      );
+    } catch (_) {
+      // Column may not exist on very early migration states — ignore.
+    }
+    return direct;
+  }
+
+  /**
    * Assign a proxy for the given session, enforcing MAX_SESSIONS_PER_PROXY.
    *
    * Selection order:
@@ -1321,6 +1372,19 @@ class ProxyService {
    * @returns {Promise<object|null>} proxy row, or null if nothing usable.
    */
   async assignProxyForSession(sessionId) {
+    // Global proxy switch (system_settings.proxy.global_enabled).
+    // When OFF the panel skips every proxy path (user, admin pool,
+    // free pool, auto-rotating providers) and pins the session to the
+    // `__direct__` sentinel row so buildGramJSProxy() returns null and
+    // GramJS connects from the VPS IP. STRICT_PROXY_ISOLATION /
+    // REQUIRE_USER_PROXY do not apply when proxying is globally
+    // disabled — the operator has explicitly opted into direct egress.
+    const settingsService = require('./systemSettingsService');
+    const proxyEnabled = await settingsService.isProxyGloballyEnabled();
+    if (!proxyEnabled) {
+      return await this._bindDirectRow(sessionId);
+    }
+
     const existing = await this.getProxyForSession(sessionId);
     if (existing && existing.is_working) {
       return existing;
@@ -1464,6 +1528,21 @@ class ProxyService {
       const r = await pool.query(`SELECT * FROM proxies WHERE id = $1`, [existingId]);
       return r.rows[0] || null;
     }
+
+    // Global proxy switch: short-circuit to the `__direct__` sentinel
+    // so SendCode / SignIn paths egress directly from the VPS IP.
+    const settingsService = require('./systemSettingsService');
+    if (!(await settingsService.isProxyGloballyEnabled())) {
+      const direct = (await pool.query(
+        `SELECT * FROM proxies WHERE host='__direct__' LIMIT 1`
+      )).rows[0] || null;
+      if (direct) {
+        if (!this._adHocReservations) this._adHocReservations = new Map();
+        this._adHocReservations.set(key, direct.id);
+      }
+      return direct;
+    }
+
     const userId = opts.userId || null;
     const role = opts.role || null;
     let proxy = null;

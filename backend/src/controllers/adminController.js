@@ -630,6 +630,44 @@ const adminController = {
     );
     return res.json({ success: true, data: { rows: r.rows } });
   }),
+
+  // ----------------------------------------------------------------------
+  // Global proxy switch — `system_settings.proxy.global_enabled`.
+  //
+  // Lets the admin disable every outbound proxy path (user proxies, admin
+  // pool, free pool, auto-rotating providers) so MTProto / IG egress
+  // happens directly from the VPS IP. Used as an escape hatch when the
+  // proxy pool is unhealthy and login is blocked.
+  // ----------------------------------------------------------------------
+
+  /** GET /api/admin/proxy/settings — current global proxy config. */
+  getProxySettings: asyncHandler(async (_req, res) => {
+    const settingsService = require('../services/systemSettingsService');
+    const cfg = await settingsService.getProxyConfig();
+    res.json({ success: true, data: cfg });
+  }),
+
+  /** PUT /api/admin/proxy/settings — update global proxy config. */
+  setProxySettings: asyncHandler(async (req, res) => {
+    const settingsService = require('../services/systemSettingsService');
+    const allowedKeys = ['proxy.global_enabled'];
+    const patch = {};
+    for (const k of allowedKeys) {
+      if (Object.prototype.hasOwnProperty.call(req.body || {}, k)) {
+        patch[k] = req.body[k];
+      }
+    }
+    if (Object.keys(patch).length === 0) {
+      throw new AppError('No settings to update', 400, 'BAD_REQUEST');
+    }
+    if (patch['proxy.global_enabled'] !== undefined) {
+      patch['proxy.global_enabled'] = !!patch['proxy.global_enabled'];
+    }
+    const updated = await settingsService.setSettings(patch, req.user.id);
+    await recordAdminAction(req.user.id, req.user.id, 'proxy_settings_update', patch);
+    logger.info('admin: proxy settings updated', { admin: req.user.id, patch });
+    res.json({ success: true, data: updated });
+  }),
 };
 
 module.exports = adminController;

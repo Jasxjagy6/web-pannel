@@ -19,6 +19,11 @@ const DEFAULTS = {
     'dashboard', 'sessions', 'scrape', 'messaging', 'groups', 'lists',
     'reports', 'get_otp', 'change_2fa', 'proxies', 'anti_detect', 'privacy',
   ],
+  // Global proxy switch. When false the panel drops every proxy
+  // (user proxies, admin pool, free pool, auto-rotating providers) and
+  // egresses directly from the VPS IP. Default true keeps existing
+  // proxy-bound deployments unchanged.
+  'proxy.global_enabled': true,
 };
 
 /**
@@ -69,6 +74,25 @@ async function getBillingConfig() {
 }
 
 /**
+ * Read the global proxy switch. Returns true unless the admin has
+ * explicitly disabled outbound proxying. The result is cached via
+ * getSetting so every login / reconnect doesn't roundtrip the DB.
+ */
+async function isProxyGloballyEnabled() {
+  const v = await getSetting('proxy.global_enabled');
+  // Treat any non-strict-false as enabled to keep existing single-tenant
+  // deployments working when the row hasn't been seeded yet.
+  return v !== false;
+}
+
+/**
+ * Canonical proxy config block for admin UIs.
+ */
+async function getProxyConfig() {
+  return getSettings(['proxy.global_enabled']);
+}
+
+/**
  * Update one or more settings. The caller is expected to have already
  * authorized the request (admin only).
  */
@@ -99,6 +123,8 @@ module.exports = {
   getSetting,
   getSettings,
   getBillingConfig,
+  isProxyGloballyEnabled,
+  getProxyConfig,
   setSettings,
   invalidate,
   DEFAULTS,

@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import { useAuth } from '../hooks/useAuth';
 import {
   User,
@@ -8,10 +8,13 @@ import {
   Save,
   MessageSquare,
   Volume2,
+  Globe,
+  Loader2,
 } from 'lucide-react';
 import { useToast } from '../components/common/Toast';
 import { parseApiError } from '@/utils/formatters';
 import TelegramCredentialsCard from '../components/settings/TelegramCredentialsCard';
+import { getProxySettings, updateProxySettings } from '@/api/admin';
 
 function SectionCard({ icon: Icon, title, description, children, className = '' }) {
   return (
@@ -106,6 +109,7 @@ function ConfirmDialog({ isOpen, onClose, onConfirm, title, message, confirmLabe
 export default function Settings() {
   const { user, logout } = useAuth();
   const { error: showError, success: showSuccess } = useToast();
+  const isAdmin = user?.role === 'admin';
 
   // --- Notifications ---
   const [notifSessionLogin, setNotifSessionLogin] = useState(true);
@@ -114,6 +118,48 @@ export default function Settings() {
   const [notifErrors, setNotifErrors] = useState(true);
   const [notifWeeklyReport, setNotifWeeklyReport] = useState(false);
   const [notifSound, setNotifSound] = useState(true);
+
+  // --- Global proxy switch (admin only) ---
+  const [proxyGlobalEnabled, setProxyGlobalEnabled] = useState(true);
+  const [proxyLoading, setProxyLoading] = useState(false);
+  const [proxySaving, setProxySaving] = useState(false);
+
+  const loadProxySettings = useCallback(async () => {
+    if (!isAdmin) return;
+    setProxyLoading(true);
+    try {
+      const r = await getProxySettings();
+      const v = r?.data?.data?.['proxy.global_enabled'];
+      setProxyGlobalEnabled(v !== false);
+    } catch (e) {
+      showError(parseApiError(e), 'Failed to load proxy settings');
+    } finally {
+      setProxyLoading(false);
+    }
+  }, [isAdmin, showError]);
+
+  useEffect(() => { loadProxySettings(); }, [loadProxySettings]);
+
+  const handleProxyToggle = async (next) => {
+    if (proxySaving) return;
+    setProxySaving(true);
+    const previous = proxyGlobalEnabled;
+    setProxyGlobalEnabled(next);
+    try {
+      await updateProxySettings({ 'proxy.global_enabled': next });
+      showSuccess(
+        next
+          ? 'Proxies enabled. Sessions will route through the proxy pool.'
+          : 'Proxies disabled. Sessions will egress directly from the server IP. Existing connections reconnect on next heartbeat.',
+        'Proxy settings saved'
+      );
+    } catch (e) {
+      setProxyGlobalEnabled(previous);
+      showError(parseApiError(e), 'Failed to update proxy settings');
+    } finally {
+      setProxySaving(false);
+    }
+  };
 
   // --- Danger Zone ---
   const [showDeleteModal, setShowDeleteModal] = useState(false);
@@ -203,6 +249,48 @@ export default function Settings() {
           </button>
         </div>
       </SectionCard>
+
+      {/* GLOBAL PROXY SWITCH (admin only).
+          When OFF the panel drops every outbound proxy and egresses
+          directly from the VPS IP — the operator's escape hatch when
+          the proxy pool is unhealthy and login is blocked. */}
+      {isAdmin && (
+        <SectionCard
+          icon={Globe}
+          title="Outbound Proxy"
+          description="Global switch for every Telegram / Instagram outbound connection."
+        >
+          {proxyLoading ? (
+            <div className="flex items-center gap-2 text-sm text-gray-400">
+              <Loader2 className="h-4 w-4 animate-spin" /> Loading proxy settings…
+            </div>
+          ) : (
+            <>
+              <Toggle
+                checked={proxyGlobalEnabled}
+                onChange={handleProxyToggle}
+                label={proxySaving ? 'Saving…' : 'Use proxies for outbound connections'}
+                description={
+                  proxyGlobalEnabled
+                    ? 'ON — sessions route through user proxies, the admin pool, and any auto-rotating providers configured.'
+                    : 'OFF — every session connects directly from the server IP. User proxies, admin pool and free pool are bypassed.'
+                }
+              />
+              <div
+                className={`mt-3 rounded-lg border p-3 text-xs ${
+                  proxyGlobalEnabled
+                    ? 'border-primary-500/20 bg-primary-500/5 text-primary-200/80'
+                    : 'border-amber-500/20 bg-amber-500/5 text-amber-200/90'
+                }`}
+              >
+                {proxyGlobalEnabled
+                  ? 'Tip: turn this OFF to bypass the proxy pool entirely if your proxies are dead and login is timing out. Existing sessions reconnect on next heartbeat.'
+                  : 'All proxy paths (BYO, admin pool, free, auto-rotating) are bypassed. STRICT_PROXY_ISOLATION and REQUIRE_USER_PROXY do not apply while this is OFF.'}
+              </div>
+            </>
+          )}
+        </SectionCard>
+      )}
 
       {/* DANGER ZONE */}
       <div className="rounded-xl border border-red-500/20 bg-dark-800 shadow-sm">
