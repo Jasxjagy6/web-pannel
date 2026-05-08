@@ -1,9 +1,19 @@
 const { Queue, Worker, QueueEvents } = require('bullmq');
-const { redisClient } = require('../config/redis');
 const messageService = require('../services/messageService');
 const logger = require('../utils/logger');
 
 const MESSAGE_QUEUE_NAME = 'message-jobs';
+
+// BullMQ requires its own ioredis-style connection — it cannot reuse a
+// node-redis (v4) instance. Passing one used to silently hang every
+// `queue.add(...)` call. We pass plain options so BullMQ creates its
+// own ioredis client, matching `scrapeQueue.js` / `groupQueue.js`.
+const redisConnection = {
+  host: process.env.REDIS_HOST || 'localhost',
+  port: parseInt(process.env.REDIS_PORT || '6382'),
+  password: process.env.REDIS_PASSWORD || undefined,
+  maxRetriesPerRequest: null,
+};
 
 class MessageQueueManager {
   constructor() {
@@ -17,7 +27,7 @@ class MessageQueueManager {
     if (this.initialized) return;
 
     this.queue = new Queue(MESSAGE_QUEUE_NAME, {
-      connection: redisClient,
+      connection: redisConnection,
       defaultJobOptions: {
         attempts: 3,
         backoff: { type: 'exponential', delay: 5000 },
@@ -41,10 +51,10 @@ class MessageQueueManager {
           return await messageService.forwardMessage(sessionId, targetId, messageId, sourceId, userId);
         }
       },
-      { connection: redisClient, concurrency: 5 }
+      { connection: redisConnection, concurrency: 5 }
     );
 
-    this.queueEvents = new QueueEvents(MESSAGE_QUEUE_NAME, { connection: redisClient });
+    this.queueEvents = new QueueEvents(MESSAGE_QUEUE_NAME, { connection: redisConnection });
 
     this.worker.on('completed', (job) => {
       logger.info(`Message job ${job.id} completed`, { jobId: job.id });
