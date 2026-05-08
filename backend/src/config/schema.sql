@@ -106,7 +106,8 @@ CREATE TABLE IF NOT EXISTS group_operations (
   failed_count INTEGER DEFAULT 0,
   options JSONB,
   created_at TIMESTAMP DEFAULT NOW(),
-  completed_at TIMESTAMP
+  completed_at TIMESTAMP,
+  last_progress_at TIMESTAMP
 );
 
 -- Lists table
@@ -129,6 +130,7 @@ CREATE TABLE IF NOT EXISTS list_items (
   first_name VARCHAR(100),
   last_name VARCHAR(100),
   phone VARCHAR(20),
+  access_hash BIGINT,
   added_at TIMESTAMP DEFAULT NOW()
 );
 

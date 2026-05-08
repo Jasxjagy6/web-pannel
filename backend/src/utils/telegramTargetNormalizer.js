@@ -53,6 +53,31 @@ function _toPhone(raw) {
 }
 
 /**
+ * Pull the access_hash for a list-item-shaped target. Accepts the
+ * canonical snake_case form persisted on `list_items` rows, the
+ * camelCase variant the frontend ships in WebSocket payloads, and the
+ * shorter `hash` alias some operator-built JSON exports use.
+ *
+ * @param {*} target
+ * @returns {string|null} Decimal-string representation of the int64
+ *                        access_hash, or null when absent / malformed.
+ */
+function _accessHashOf(target) {
+  if (!target || typeof target !== 'object') return null;
+  const raw =
+    target.access_hash !== undefined && target.access_hash !== null ? target.access_hash :
+    target.accessHash !== undefined && target.accessHash !== null ? target.accessHash :
+    target.hash !== undefined && target.hash !== null ? target.hash :
+    null;
+  if (raw === null || raw === undefined) return null;
+  if (typeof raw === 'bigint') return raw.toString();
+  const s = String(raw).trim();
+  if (!s) return null;
+  if (!/^-?\d+$/.test(s)) return null;
+  return s;
+}
+
+/**
  * Like `normalizeTelegramTarget` but returns *every* usable identifier
  * for a list entry, in resolution-priority order. Use this when you
  * want to fall back through (id → @username → +phone) — e.g. when a
@@ -111,9 +136,32 @@ function normalizeTelegramTarget(target) {
   return candidates.length > 0 ? candidates[0] : null;
 }
 
+/**
+ * Pick the primary numeric `telegram_id` carried on a target object,
+ * if any. Used by the add-members worker to pair an access_hash with
+ * the right candidate (the numeric-id one) and skip the entity-
+ * resolution round-trip when the hash is known.
+ *
+ * @param {*} target
+ * @returns {string|null}
+ */
+function getPrimaryTelegramId(target) {
+  if (!target || typeof target !== 'object') return null;
+  return (
+    _toIdString(target.telegram_id) ||
+    _toIdString(target.telegramId) ||
+    _toIdString(target.id) ||
+    _toIdString(target.user_id) ||
+    _toIdString(target.userId) ||
+    null
+  );
+}
+
 module.exports = {
   normalizeTelegramTarget,
   collectTelegramTargetCandidates,
+  getAccessHash: _accessHashOf,
+  getPrimaryTelegramId,
   // Exposed for unit testing:
   _UUID_LIKE_RE: UUID_LIKE_RE,
 };
