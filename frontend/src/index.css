@@ -215,6 +215,68 @@ html[data-platform="telegram"][data-tg-theme="light"] .border-white\/5  { border
 html[data-platform="telegram"][data-tg-theme="light"] .border-white\/10 { border-color: rgba(15,23,42,0.10) !important; }
 html[data-platform="telegram"][data-tg-theme="light"] .border-white\/20 { border-color: rgba(15,23,42,0.16) !important; }
 
+/* Solid `border-dark-*` utilities (used by stat cards, admin tables, etc.).
+   Map them onto a faint slate scale so cards stay visible in light mode. */
+html[data-platform="telegram"][data-tg-theme="light"] .border-dark-900 { border-color: rgba(15,23,42,0.08) !important; }
+html[data-platform="telegram"][data-tg-theme="light"] .border-dark-800 { border-color: rgba(15,23,42,0.10) !important; }
+html[data-platform="telegram"][data-tg-theme="light"] .border-dark-700 { border-color: rgba(15,23,42,0.12) !important; }
+html[data-platform="telegram"][data-tg-theme="light"] .border-dark-600 { border-color: rgba(15,23,42,0.16) !important; }
+
+/* `text-dark-*` utility ramp. In dark mode these are very-dark slate —
+   in light mode flip them to mid/low slate so labels stay readable. */
+html[data-platform="telegram"][data-tg-theme="light"] .text-dark-100 { color: #0f172a !important; }
+html[data-platform="telegram"][data-tg-theme="light"] .text-dark-200 { color: #1e293b !important; }
+html[data-platform="telegram"][data-tg-theme="light"] .text-dark-300 { color: #334155 !important; }
+html[data-platform="telegram"][data-tg-theme="light"] .text-dark-400 { color: #475569 !important; }
+html[data-platform="telegram"][data-tg-theme="light"] .text-dark-500 { color: #64748b !important; }
+html[data-platform="telegram"][data-tg-theme="light"] .text-dark-600 { color: #475569 !important; }
+
+/* Translucent dark surfaces (`bg-dark-*\/40` … `\/80`) used for cards
+   that intentionally sit "above" the page background. Flip every
+   variant onto a near-white tint so the card still pops on white. */
+html[data-platform="telegram"][data-tg-theme="light"] .bg-dark-950\/60 { background-color: rgba(255,255,255,0.85) !important; }
+html[data-platform="telegram"][data-tg-theme="light"] .bg-dark-900\/40 { background-color: rgba(255,255,255,0.6)  !important; }
+html[data-platform="telegram"][data-tg-theme="light"] .bg-dark-900\/50 { background-color: rgba(255,255,255,0.7)  !important; }
+html[data-platform="telegram"][data-tg-theme="light"] .bg-dark-900\/60 { background-color: rgba(255,255,255,0.85) !important; }
+html[data-platform="telegram"][data-tg-theme="light"] .bg-dark-900\/80 { background-color: rgba(255,255,255,0.95) !important; }
+html[data-platform="telegram"][data-tg-theme="light"] .bg-dark-800\/40 { background-color: rgba(248,250,252,0.6)  !important; }
+html[data-platform="telegram"][data-tg-theme="light"] .bg-dark-800\/60 { background-color: rgba(248,250,252,0.85) !important; }
+html[data-platform="telegram"][data-tg-theme="light"] .bg-dark-800\/70 { background-color: rgba(248,250,252,0.9)  !important; }
+html[data-platform="telegram"][data-tg-theme="light"] .bg-dark-800\/80 { background-color: rgba(248,250,252,0.95) !important; }
+html[data-platform="telegram"][data-tg-theme="light"] .bg-dark-700\/40 { background-color: rgba(241,245,249,0.6)  !important; }
+html[data-platform="telegram"][data-tg-theme="light"] .bg-dark-700\/50 { background-color: rgba(241,245,249,0.7)  !important; }
+html[data-platform="telegram"][data-tg-theme="light"] .bg-dark-600\/60 { background-color: rgba(226,232,240,0.7)  !important; }
+
+/* Hover variants (`hover:bg-dark-*`, `hover:text-dark-*`,
+   `hover:border-dark-*`) — keep them subtle on white. */
+html[data-platform="telegram"][data-tg-theme="light"] .hover\:bg-dark-500:hover { background-color: rgba(15,23,42,0.10) !important; }
+html[data-platform="telegram"][data-tg-theme="light"] .hover\:bg-dark-600:hover { background-color: rgba(15,23,42,0.08) !important; }
+html[data-platform="telegram"][data-tg-theme="light"] .hover\:bg-dark-700:hover { background-color: rgba(15,23,42,0.06) !important; }
+html[data-platform="telegram"][data-tg-theme="light"] .hover\:bg-dark-800:hover { background-color: rgba(15,23,42,0.04) !important; }
+html[data-platform="telegram"][data-tg-theme="light"] .hover\:bg-dark-900:hover { background-color: rgba(15,23,42,0.03) !important; }
+html[data-platform="telegram"][data-tg-theme="light"] .hover\:text-dark-300:hover { color: #1e293b !important; }
+html[data-platform="telegram"][data-tg-theme="light"] .hover\:border-dark-600:hover { border-color: rgba(15,23,42,0.20) !important; }
+
+/* `bg-gray-*` utilities used by some pages directly (Reports, Proxies)
+   for stat tiles. Keep them on a near-white slate ramp. */
+html[data-platform="telegram"][data-tg-theme="light"] .bg-gray-50  { background-color: #f8fafc !important; }
+html[data-platform="telegram"][data-tg-theme="light"] .bg-gray-100 { background-color: #f1f5f9 !important; }
+html[data-platform="telegram"][data-tg-theme="light"] .bg-gray-300 { background-color: #cbd5e1 !important; }
+html[data-platform="telegram"][data-tg-theme="light"] .bg-gray-400 { background-color: #94a3b8 !important; }
+html[data-platform="telegram"][data-tg-theme="light"] .bg-gray-500 { background-color: #64748b !important; }
+html[data-platform="telegram"][data-tg-theme="light"] .bg-gray-600 { background-color: #475569 !important; }
+html[data-platform="telegram"][data-tg-theme="light"] .bg-gray-700 { background-color: #334155 !important; }
+html[data-platform="telegram"][data-tg-theme="light"] .bg-gray-800 { background-color: #1e293b !important; }
+html[data-platform="telegram"][data-tg-theme="light"] .bg-gray-900 { background-color: #0f172a !important; }
+html[data-platform="telegram"][data-tg-theme="light"] .text-gray-800 { color: #1e293b !important; }
+html[data-platform="telegram"][data-tg-theme="light"] .text-gray-900 { color: #0f172a !important; }
+html[data-platform="telegram"][data-tg-theme="light"] .border-gray-100 { border-color: rgba(15,23,42,0.06) !important; }
+html[data-platform="telegram"][data-tg-theme="light"] .border-gray-200 { border-color: rgba(15,23,42,0.08) !important; }
+html[data-platform="telegram"][data-tg-theme="light"] .border-gray-300 { border-color: rgba(15,23,42,0.10) !important; }
+html[data-platform="telegram"][data-tg-theme="light"] .border-gray-500 { border-color: rgba(15,23,42,0.18) !important; }
+html[data-platform="telegram"][data-tg-theme="light"] .border-gray-600 { border-color: rgba(15,23,42,0.24) !important; }
+html[data-platform="telegram"][data-tg-theme="light"] .border-gray-700 { border-color: rgba(15,23,42,0.32) !important; }
+
 /* Background tints (`bg-white/5`, `bg-white/10`) used for hover /
    pressed states need the same inversion. */
 html[data-platform="telegram"][data-tg-theme="light"] .bg-white\/5  { background-color: rgba(15,23,42,0.04) !important; }
