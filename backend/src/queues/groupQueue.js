@@ -1,9 +1,23 @@
 const { Queue, Worker, QueueEvents } = require('bullmq');
-const { redisClient } = require('../config/redis');
 const groupService = require('../services/groupService');
 const logger = require('../utils/logger');
 
 const GROUP_QUEUE_NAME = 'group-jobs';
+
+// BullMQ talks to Redis via its own internal ioredis client. It does NOT
+// accept a node-redis (v4) instance. Passing the shared `redisClient`
+// here used to look like it worked at boot — `new Queue(...)` doesn't
+// touch Redis — but every later `queue.add(...)` would silently hang
+// because the client doesn't expose the ioredis surface BullMQ uses
+// (Lua scripts via `defineCommand`, the `xadd`/`xread` semantics, etc.).
+// We pass plain options so BullMQ creates its own ioredis connection,
+// matching `scrapeQueue.js` / `instagramScrapeQueue.js`.
+const redisConnection = {
+  host: process.env.REDIS_HOST || 'localhost',
+  port: parseInt(process.env.REDIS_PORT || '6382'),
+  password: process.env.REDIS_PASSWORD || undefined,
+  maxRetriesPerRequest: null,
+};
 
 class GroupQueueManager {
   constructor() {
@@ -17,7 +31,7 @@ class GroupQueueManager {
     if (this.initialized) return;
 
     this.queue = new Queue(GROUP_QUEUE_NAME, {
-      connection: redisClient,
+      connection: redisConnection,
       defaultJobOptions: {
         attempts: 3,
         backoff: { type: 'exponential', delay: 5000 },
@@ -54,10 +68,10 @@ class GroupQueueManager {
           return await groupService.runJoinLeaveJob({ opId, operation, userId, sessionIds, targetIds });
         }
       },
-      { connection: redisClient, concurrency: 5 }
+      { connection: redisConnection, concurrency: 5 }
     );
 
-    this.queueEvents = new QueueEvents(GROUP_QUEUE_NAME, { connection: redisClient });
+    this.queueEvents = new QueueEvents(GROUP_QUEUE_NAME, { connection: redisConnection });
 
     this.worker.on('completed', (job) => {
       logger.info(`Group job ${job.id} completed`, { jobId: job.id });
