@@ -521,6 +521,61 @@ class GroupService {
         }
       }
 
+      // Opportunistic access_hash backfill: when the row arrived via a
+      // CSV import (or any path that didn't preserve `access_hash`),
+      // there's still a good chance THIS account has seen the user
+      // before via a previous scrape on the panel. Look those up from
+      // `scraped_users` in a single batched query so numeric-id-only
+      // rows can still build a valid `InputUser`. Without this, every
+      // import of a fresh CSV with bare numeric IDs would silently
+      // fail with "Could not find the input entity".
+      const missingHashIds = [];
+      const preparedByNumericId = new Map();
+      for (const p of preparedUsers) {
+        if (!p.accessHash && p.numericId) {
+          missingHashIds.push(String(p.numericId));
+          if (!preparedByNumericId.has(String(p.numericId))) {
+            preparedByNumericId.set(String(p.numericId), []);
+          }
+          preparedByNumericId.get(String(p.numericId)).push(p);
+        }
+      }
+      if (missingHashIds.length > 0) {
+        try {
+          // pick the most recent non-null hash per telegram_id
+          const lookup = await pool.query(
+            `SELECT DISTINCT ON (telegram_id) telegram_id, access_hash
+               FROM scraped_users
+              WHERE access_hash IS NOT NULL
+                AND telegram_id::text = ANY($1::text[])
+              ORDER BY telegram_id, scraped_at DESC NULLS LAST`,
+            [missingHashIds]
+          );
+          let backfilled = 0;
+          for (const row of lookup.rows) {
+            const tgId = String(row.telegram_id);
+            const hash = row.access_hash != null ? String(row.access_hash) : null;
+            if (!hash) continue;
+            const targets = preparedByNumericId.get(tgId);
+            if (!targets) continue;
+            for (const t of targets) {
+              t.accessHash = hash;
+              backfilled++;
+            }
+          }
+          if (backfilled > 0) {
+            logger.info(
+              `addMembersToGroups: backfilled ${backfilled} access_hash values from scraped_users for imported list rows`,
+              { userId, missingBefore: missingHashIds.length }
+            );
+          }
+        } catch (lookupErr) {
+          logger.warn('access_hash backfill from scraped_users failed; continuing without it', {
+            error: lookupErr && lookupErr.message,
+          });
+        }
+      }
+
       if (preparedUsers.length === 0) {
         throw new AppError(
           'No usable identifiers found in userList (every row was empty, a UUID placeholder, or otherwise unaddressable).',
