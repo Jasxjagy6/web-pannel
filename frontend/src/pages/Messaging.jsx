@@ -332,18 +332,19 @@ function DistributionSettings({
           <div>
             <label className="mb-1.5 block text-sm font-medium text-gray-300 flex items-center gap-1.5">
               <Users className="w-3.5 h-3.5 text-gray-500" />
-              User IDs (comma-separated)
+              Recipients (IDs, @usernames, or +phones)
             </label>
             <textarea
               value={targetIds}
               onChange={(e) => setTargetIds(e.target.value)}
-              placeholder="12345678, 87654321, 11223344..."
-              rows={3}
+              placeholder={"@alice\n@bob\n12345678\n+447900123456"}
+              rows={4}
               className="w-full rounded-lg border border-white/10 bg-dark-900 py-2.5 px-3 text-sm text-white placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-primary-500/50 focus:border-primary-500 transition resize-y font-mono"
             />
             {targetIds.trim() && (
               <p className="mt-1 text-xs text-gray-500">
-                {targetIds.split(',').filter((id) => id.trim()).length} user ID(s) entered
+                {targetIds.split(/[\n,\s]+/).filter((id) => id.trim()).length} recipient(s) entered
+                <span className="ml-1 text-gray-600">— separated by commas, spaces, or new lines</span>
               </p>
             )}
           </div>
@@ -993,14 +994,16 @@ export default function Messaging() {
     };
   }, [on, off, showSuccess, showError, fetchHistory]);
 
-  // Compute target count for distribution visualization
+  // Compute target count for distribution visualization. Manual entry
+  // accepts IDs / @usernames / +phones separated by commas, spaces or
+  // newlines so the user can paste any of those formats.
   const getTargetCount = () => {
     if (targetMode === 'list' && selectedList) {
       const list = targetLists.find((l) => String(l.id) === String(selectedList));
       return list?.itemsCount || list?.count || 0;
     }
     if (targetMode === 'manual' && targetIds.trim()) {
-      return targetIds.split(',').filter((id) => id.trim()).length;
+      return targetIds.split(/[\n,\s]+/).filter((id) => id.trim()).length;
     }
     return 0;
   };
@@ -1013,7 +1016,7 @@ export default function Messaging() {
       return Number(list?.itemsCount || list?.count || 0);
     }
     if (targetMode === 'manual' && targetIds.trim()) {
-      return targetIds.split(',').filter((id) => id.trim()).length;
+      return targetIds.split(/[\n,\s]+/).filter((id) => id.trim()).length;
     }
     return 0;
   }, [targetMode, selectedList, targetIds, targetLists]);
@@ -1129,9 +1132,14 @@ export default function Messaging() {
         payload.sourceType = 'list';
         payload.sourceId = parseInt(selectedList, 10);
       } else {
-        // Manual user IDs - create simple target objects
+        // Manual recipient entry. Accept any of:
+        //   - numeric Telegram IDs (12345678)
+        //   - @usernames (resolved server-side via getEntity)
+        //   - +phone numbers
+        // Allow commas, spaces, or new lines as separators so the
+        // operator can paste any of the formats they have.
         const userIds = targetIds
-          .split(',')
+          .split(/[\n,\s]+/)
           .map((id) => id.trim())
           .filter(Boolean);
         payload.targetList = userIds;
