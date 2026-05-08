@@ -969,6 +969,29 @@ class GroupService {
                   userResult.error = 'User is banned or restricted';
                   failedCount++;
                 }
+                // CHAT_MEMBER_ADD_FAILED is Telegram's catch-all "I won't
+                // tell you why" refusal. Two common causes:
+                //   * Target's privacy is "Premium users only" — looks
+                //     like privacy-restrict from the outside.
+                //   * The inviting session has been silently flagged
+                //     after recent invites — same user might succeed
+                //     from a warmer session next time.
+                // Don't poison the audience cache with this (we can't
+                // tell which cause), but skip the user for the rest of
+                // *this* job so other sessions don't burn invites on
+                // the same target with the same outcome. Counts as
+                // skipped, not failed, since it's not the user's fault.
+                else if (
+                  errMsg.includes('CHAT_MEMBER_ADD_FAILED') ||
+                  // The friendly message we mapped CHAT_MEMBER_ADD_FAILED to.
+                  errMsg.includes('Telegram refused to add this user')
+                ) {
+                  userResult.error =
+                    'Telegram refused (CHAT_MEMBER_ADD_FAILED) — likely Premium-only privacy or a quietly-flagged session';
+                  userResult.skipped = true;
+                  skippedCount++;
+                  markSkip(prepared, 'privacy_restricted', 'CHAT_MEMBER_ADD_FAILED');
+                }
                 // Handle user not found / deactivated / unresolvable
                 // username → cache as `not_found` so the next job skips
                 // them entirely. The audience filter's HTTP probe can't

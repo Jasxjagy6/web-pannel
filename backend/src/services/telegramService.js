@@ -1134,8 +1134,36 @@ class TelegramService {
         accessHash: userEntity.accessHash,
       });
 
+      // Telegram has two completely different "add member" RPCs:
+      //
+      //   * `messages.AddChatUser`     → for **basic groups** (legacy
+      //     "Chat" peer, no access_hash, capped at ~200 members).
+      //   * `channels.InviteToChannel` → for **supergroups & channels**
+      //     ("Channel" peer with access_hash). Calling this on a basic
+      //     group fails with `400: CHAT_MEMBER_ADD_FAILED` because the
+      //     RPC namespace is wrong — the group isn't a channel.
+      //
+      // GramJS exposes the entity's MTProto class as `className`, which
+      // is `'Chat'` for basic groups and `'Channel'` for supergroups /
+      // broadcast channels. Branch on that to pick the right RPC.
+      const isBasicGroup = groupEntity.className === 'Chat';
+
       const inviteResult = await this._withFloodRetry(sessionId, async () => {
-        return await this.clients.get(String(sessionId)).client.invoke(
+        const client = this.clients.get(String(sessionId)).client;
+        if (isBasicGroup) {
+          // `messages.AddChatUser` takes the legacy chat id directly
+          // (no access_hash) and a `fwdLimit` for how many of the
+          // recent messages the new user should see. Pick a small,
+          // reasonable backfill — large values can be flagged as spam.
+          return await client.invoke(
+            new Api.messages.AddChatUser({
+              chatId: groupEntity.id,
+              userId: inputUser,
+              fwdLimit: 50,
+            })
+          );
+        }
+        return await client.invoke(
           new Api.channels.InviteToChannel({
             channel: getInputPeer(groupEntity),
             users: [inputUser],
@@ -1143,56 +1171,56 @@ class TelegramService {
         );
       });
 
-      // Telegram's InviteToChannel does not throw when a user can't be
-      // added because of privacy settings — it returns the user inside
-      // `missingInvitees` (Layer 198: messages.InvitedUsers wrapper)
-      // and the call "succeeds". Since we only invite one user per
-      // call, any non-empty missingInvitees means our user was the
-      // dropped one. Surface that as USER_PRIVACY_RESTRICT so the
-      // controller marks it skipped instead of falsely added.
-      // Telegram returns `messages.InvitedUsers` wrapper from Layer
-      // 198 (older replies are bare `Updates`). Privacy-restricted
-      // users are silently demoted into `missingInvitees` on the
-      // wrapper. Older API path will not have this field — that case
-      // is already handled by the empty-updates case below.
-      const missing =
-        (inviteResult && (inviteResult.missingInvitees || inviteResult.missing_invitees)) || [];
+      // Privacy-restricted detection differs between the two RPCs:
+      //
+      //   * `channels.InviteToChannel` — does NOT throw on privacy.
+      //     It returns the user inside `missingInvitees` (Layer 198
+      //     `messages.InvitedUsers` wrapper) and the call "succeeds".
+      //     Since we only invite one user per call, any non-empty
+      //     `missingInvitees` means our user was the one dropped.
+      //
+      //   * `messages.AddChatUser` — throws `USER_PRIVACY_RESTRICTED`
+      //     directly, so it's already in the catch-block path.
+      //
+      // We also catch the legacy "empty updates && empty users" reply
+      // (older deployments without the Layer 198 wrapper) as a silent
+      // drop — same outcome as a privacy reject.
+      if (!isBasicGroup) {
+        const missing =
+          (inviteResult && (inviteResult.missingInvitees || inviteResult.missing_invitees)) || [];
+        const inviteUpdates = (inviteResult && inviteResult.updates) || null;
+        const innerUpdates =
+          inviteUpdates && Array.isArray(inviteUpdates.updates)
+            ? inviteUpdates.updates
+            : Array.isArray(inviteResult && inviteResult.updates)
+              ? inviteResult.updates
+              : [];
+        const innerUsers =
+          (inviteUpdates && Array.isArray(inviteUpdates.users) && inviteUpdates.users) ||
+          (Array.isArray(inviteResult && inviteResult.users) && inviteResult.users) ||
+          [];
 
-      // The successful add produces a non-empty `users` and a
-      // ChatAddUser update inside the wrapper's `updates` field. If
-      // we instead got back an empty users[] AND empty updates[],
-      // treat it as a silent drop. (This catches the case where the
-      // Layer 198 wrapper is missing the missingInvitees array on
-      // older bridges.)
-      const inviteUpdates = (inviteResult && inviteResult.updates) || null;
-      const innerUpdates =
-        inviteUpdates && Array.isArray(inviteUpdates.updates)
-          ? inviteUpdates.updates
-          : Array.isArray(inviteResult && inviteResult.updates)
-            ? inviteResult.updates
-            : [];
-      const innerUsers =
-        (inviteUpdates && Array.isArray(inviteUpdates.users) && inviteUpdates.users) ||
-        (Array.isArray(inviteResult && inviteResult.users) && inviteResult.users) ||
-        [];
+        const silentlyDropped =
+          (Array.isArray(missing) && missing.length > 0) ||
+          (innerUpdates.length === 0 && innerUsers.length === 0);
 
-      const silentlyDropped =
-        (Array.isArray(missing) && missing.length > 0) ||
-        (innerUpdates.length === 0 && innerUsers.length === 0);
-
-      if (silentlyDropped) {
-        const detail = (Array.isArray(missing) && missing[0]) || {};
-        const wouldAllow = detail.premiumWouldAllowInvite || detail.premium_would_allow_invite;
-        logger.warn(
-          `Telegram dropped invite (privacy/restricted) for ${userId}` +
-            (wouldAllow ? ' [premiumWouldAllowInvite=true]' : '') +
-            ` (missing=${Array.isArray(missing) ? missing.length : 0}, updates=${innerUpdates.length}, users=${innerUsers.length})`,
-          { sessionId, groupId }
-        );
-        throw new Error('USER_PRIVACY_RESTRICT');
+        if (silentlyDropped) {
+          const detail = (Array.isArray(missing) && missing[0]) || {};
+          const wouldAllow = detail.premiumWouldAllowInvite || detail.premium_would_allow_invite;
+          logger.warn(
+            `Telegram dropped invite (privacy/restricted) for ${userId}` +
+              (wouldAllow ? ' [premiumWouldAllowInvite=true]' : '') +
+              ` (missing=${Array.isArray(missing) ? missing.length : 0}, updates=${innerUpdates.length}, users=${innerUsers.length})`,
+            { sessionId, groupId }
+          );
+          throw new Error('USER_PRIVACY_RESTRICT');
+        }
       }
 
-      logger.info(`Added user ${userId} to group ${groupId}`, { sessionId });
+      logger.info(
+        `Added user ${userId} to ${isBasicGroup ? 'basic group' : 'channel/supergroup'} ${groupId}`,
+        { sessionId }
+      );
 
       return {
         success: true,
@@ -2583,6 +2611,28 @@ class TelegramService {
         code: 'CONNECTION_NOT_INITED',
         retryable: true,
         statusCode: 503,
+      },
+      // Telegram returns CHAT_MEMBER_ADD_FAILED in two situations:
+      //   1. Wrong RPC namespace — calling channels.InviteToChannel on a
+      //      basic group (Chat) instead of messages.AddChatUser. With the
+      //      basic-group dispatch fixed in `addMemberToGroup` this branch
+      //      should be rare, but keep the mapping so the operator sees
+      //      a clear message instead of a raw "400: CHAT_MEMBER_ADD_FAILED".
+      //   2. Telegram refused the add for opaque "trust" reasons (the
+      //      session has been quietly flagged after recent invites, or
+      //      the target's privacy setting is "Allow Premium users only").
+      //      Either way it's user-input adjacent — surface it clearly.
+      CHAT_MEMBER_ADD_FAILED: {
+        pattern: /CHAT_MEMBER_ADD_FAILED/i,
+        message:
+          "Telegram refused to add this user (CHAT_MEMBER_ADD_FAILED). " +
+          "Most common causes: target's privacy is 'Premium users only', " +
+          "the inviting account has been silently flagged after recent " +
+          "adds, or the group is full / archived. Try a warmer session " +
+          "or skip the user.",
+        code: 'CHAT_MEMBER_ADD_FAILED',
+        retryable: false,
+        statusCode: 403,
       },
     };
 
