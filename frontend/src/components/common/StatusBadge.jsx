@@ -12,13 +12,14 @@ import React from 'react';
  * Status-to-color mapping:
  *   active, online, completed, success -> green
  *   inactive, offline, pending, uploaded -> gray
- *   running, processing -> blue (with pulse)
+ *   running, processing, filtering, validating -> blue (with pulse)
+ *   queued, cooldown -> yellow (with pulse)
  *   error, failed, banned, revoked, expired -> red
  *   warning, paused -> yellow
  *   default -> gray
  */
 export default function StatusBadge({ status, size = 'md' }) {
-  const normalizedStatus = status.toLowerCase().trim();
+  const normalizedStatus = String(status || '').toLowerCase().trim();
 
   /** Map status keyword to a color group */
   const getColorGroup = () => {
@@ -35,7 +36,12 @@ export default function StatusBadge({ status, size = 'md' }) {
         return 'gray';
       case 'running':
       case 'processing':
+      case 'filtering':
+      case 'validating':
         return 'blue';
+      case 'queued':
+      case 'cooldown':
+        return 'yellow';
       case 'error':
       case 'failed':
       case 'banned':
@@ -51,6 +57,17 @@ export default function StatusBadge({ status, size = 'md' }) {
   };
 
   const colorGroup = getColorGroup();
+  // Pulse for any status that represents in-flight work, including
+  // intermediate phases like 'filtering' / 'validating' / 'queued' so
+  // the operator can tell at a glance that the row is still moving.
+  const ANIMATED_STATUSES = new Set([
+    'running',
+    'processing',
+    'filtering',
+    'validating',
+    'queued',
+    'cooldown',
+  ]);
 
   /** Background color for the badge pill */
   const bgStyles = {
@@ -78,7 +95,7 @@ export default function StatusBadge({ status, size = 'md' }) {
   };
 
   const sizes = sizeStyles[size] || sizeStyles.md;
-  const isAnimated = colorGroup === 'blue';
+  const isAnimated = ANIMATED_STATUSES.has(normalizedStatus);
 
   const label = normalizedStatus.charAt(0).toUpperCase() + normalizedStatus.slice(1);
 
