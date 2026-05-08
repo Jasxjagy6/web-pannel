@@ -531,50 +531,105 @@ class SessionService {
    */
   async _processJsonUpload(client, file, userId, apiId, apiHash, autoLogin, userApiCredentialId = null) {
     const content = await fs.readFile(file.path, 'utf8');
-    let sessionStrings = [];
+
+    // Per-item session records. Each entry carries the session string
+    // and any per-item credential overrides we extracted from the JSON.
+    // Falling back to the batch-level apiId/apiHash only when the
+    // per-item object doesn't supply its own (root cause for
+    // AUTH_KEY_UNREGISTERED on uploaded sessions: when a session was
+    // generated against api_id A but is then logged in with api_id B
+    // Telegram revokes the auth key on first contact).
+    /** @type {{session:string, apiId:?number, apiHash:?string, phone:?string}[]} */
+    let sessionRecords = [];
+
+    const pickSession = (obj) => {
+      if (!obj || typeof obj !== 'object') return null;
+      const raw =
+        obj.session_string ||
+        obj.sessionString ||
+        obj.string_session ||
+        obj.stringSession ||
+        obj.session ||
+        obj.data ||
+        null;
+      return raw && typeof raw === 'string' ? raw.trim() : null;
+    };
+    const pickApiId = (obj) => {
+      if (!obj || typeof obj !== 'object') return null;
+      const v = obj.api_id ?? obj.apiId ?? obj.app_id ?? obj.appId ?? obj.API_ID;
+      const n = Number(v);
+      return Number.isFinite(n) && n > 0 ? n : null;
+    };
+    const pickApiHash = (obj) => {
+      if (!obj || typeof obj !== 'object') return null;
+      const v = obj.api_hash || obj.apiHash || obj.app_hash || obj.appHash || obj.API_HASH;
+      return v && typeof v === 'string' ? v.trim() : null;
+    };
+    const pickPhone = (obj) => {
+      if (!obj || typeof obj !== 'object') return null;
+      const v = obj.phone || obj.phone_number || obj.phoneNumber || obj.number;
+      return v && typeof v === 'string' ? v.trim() : null;
+    };
+    const recordFromObject = (obj) => {
+      const session = pickSession(obj);
+      if (!session) return null;
+      return {
+        session,
+        apiId: pickApiId(obj),
+        apiHash: pickApiHash(obj),
+        phone: pickPhone(obj),
+      };
+    };
 
     try {
       const parsed = JSON.parse(content);
 
       if (Array.isArray(parsed)) {
-        // Array of session strings or objects
         for (const item of parsed) {
           if (typeof item === 'string') {
-            sessionStrings.push(item.trim());
-          } else if (item && typeof item === 'object') {
-            if (item.session_string || item.sessionString || item.session) {
-              sessionStrings.push(
-                (item.session_string || item.sessionString || item.session).trim()
-              );
-            } else if (item.phone && item.data) {
-              sessionStrings.push(item.data.trim());
-            }
+            sessionRecords.push({ session: item.trim(), apiId: null, apiHash: null, phone: null });
+          } else {
+            const rec = recordFromObject(item);
+            if (rec) sessionRecords.push(rec);
           }
         }
       } else if (typeof parsed === 'string') {
-        sessionStrings.push(parsed.trim());
+        sessionRecords.push({ session: parsed.trim(), apiId: null, apiHash: null, phone: null });
       } else if (parsed && typeof parsed === 'object') {
         if (parsed.sessions && Array.isArray(parsed.sessions)) {
+          // Wrapper object — top-level may carry default api_id/api_hash
+          // that applies to every nested session unless overridden.
+          const defaultApiId = pickApiId(parsed);
+          const defaultApiHash = pickApiHash(parsed);
           for (const s of parsed.sessions) {
             if (typeof s === 'string') {
-              sessionStrings.push(s.trim());
-            } else if (s && typeof s === 'object' && s.session_string) {
-              sessionStrings.push(s.session_string.trim());
+              sessionRecords.push({
+                session: s.trim(),
+                apiId: defaultApiId,
+                apiHash: defaultApiHash,
+                phone: null,
+              });
+            } else {
+              const rec = recordFromObject(s);
+              if (rec) {
+                sessionRecords.push({
+                  ...rec,
+                  apiId: rec.apiId ?? defaultApiId,
+                  apiHash: rec.apiHash ?? defaultApiHash,
+                });
+              }
             }
           }
-        } else if (parsed.session_string || parsed.sessionString || parsed.session) {
-          sessionStrings.push(
-            (parsed.session_string || parsed.sessionString || parsed.session).trim()
-          );
-        } else if (parsed.data) {
-          sessionStrings.push(parsed.data.trim());
+        } else {
+          const rec = recordFromObject(parsed);
+          if (rec) sessionRecords.push(rec);
         }
       }
     } catch (parseError) {
       // If JSON parsing fails, treat the entire content as a raw session string
       const trimmed = content.trim();
       if (trimmed.length > 10) {
-        sessionStrings.push(trimmed);
+        sessionRecords.push({ session: trimmed, apiId: null, apiHash: null, phone: null });
       } else {
         throw new AppError(
           `Invalid JSON file: ${file.originalname}. Could not extract session strings.`,
@@ -584,10 +639,17 @@ class SessionService {
       }
     }
 
-    // Remove empty strings and duplicates
-    sessionStrings = [...new Set(sessionStrings.filter((s) => s && s.length > 10))];
+    // Drop empties and de-duplicate by session string while keeping the
+    // first occurrence's per-item credentials.
+    const seen = new Set();
+    sessionRecords = sessionRecords.filter((r) => {
+      if (!r || !r.session || r.session.length <= 10) return false;
+      if (seen.has(r.session)) return false;
+      seen.add(r.session);
+      return true;
+    });
 
-    if (sessionStrings.length === 0) {
+    if (sessionRecords.length === 0) {
       throw new AppError(
         `No valid session strings found in JSON file: ${file.originalname}`,
         400,
@@ -599,7 +661,8 @@ class SessionService {
     const sessionDir = this._getUserSessionDir(userId);
     await fs.ensureDir(sessionDir);
 
-    for (const sessionStr of sessionStrings) {
+    for (const rec of sessionRecords) {
+      const sessionStr = rec.session;
       // Validate session string format (GramJS strings start with "1" or "2" and are base64-encoded)
       if (!this._isValidSessionString(sessionStr)) {
         logger.warn(`Skipping invalid session string in ${file.originalname}`, {
@@ -626,6 +689,19 @@ class SessionService {
 
       const status = autoLogin ? 'active' : 'uploaded';
 
+      // Per-item credentials win over the batch defaults so each session
+      // is logged in with the api_id/api_hash it was originally created
+      // with. Mismatched credentials make Telegram return
+      // AUTH_KEY_UNREGISTERED on the very first call.
+      const effectiveApiId = rec.apiId ?? (apiId || null);
+      const effectiveApiHash = rec.apiHash ?? (apiHash || null);
+      // If the JSON brought its own credentials, the row's
+      // user_api_credential_id no longer represents the truth — null it
+      // out so heartbeat/login code treats `sessions.api_id/api_hash`
+      // as authoritative.
+      const effectiveCredentialId =
+        rec.apiId || rec.apiHash ? null : userApiCredentialId || null;
+
       const result = await client.query(
         `INSERT INTO sessions (
           user_id, phone, session_file_path, api_id, api_hash,
@@ -635,11 +711,11 @@ class SessionService {
         RETURNING id`,
         [
           userId,
-          null, // phone - unknown until login
+          rec.phone || null, // phone may be supplied per-item; otherwise unknown until login
           relativePath,
-          apiId || null,
-          apiHash || null,
-          userApiCredentialId || null,
+          effectiveApiId,
+          effectiveApiHash,
+          effectiveCredentialId,
           status,
           false,
           autoLogin,
@@ -647,6 +723,7 @@ class SessionService {
             uploadedFrom: file.originalname,
             sessionType: 'string',
             uploadedAt: new Date().toISOString(),
+            credentialsFromJson: !!(rec.apiId || rec.apiHash),
           }),
         ]
       );
@@ -658,6 +735,7 @@ class SessionService {
         sessionId: dbId,
         file: file.originalname,
         status,
+        credentialsFromJson: !!(rec.apiId || rec.apiHash),
       });
     }
 
@@ -1939,12 +2017,45 @@ class SessionService {
               [sessionId, JSON.stringify(failedInfo)]
             )
             .catch(() => {});
-          throw new AppError(
-            meError.message ||
+          // Spell out the most common operator-actionable causes for
+          // each symbolic Telegram error so the panel UI shows a hint
+          // the user can act on, instead of a flat "auth revoked".
+          const haystack = [meError.errorMessage, meError.message, errorCode]
+            .filter(Boolean)
+            .join(' ')
+            .toUpperCase();
+          let hint;
+          if (haystack.includes('AUTH_KEY_UNREGISTERED')) {
+            hint =
+              'Telegram returned AUTH_KEY_UNREGISTERED for this session. ' +
+              'Most common causes: (1) the session was created with a different ' +
+              'api_id / api_hash than the one configured here — make sure each ' +
+              'uploaded session is logged in with the credentials it was generated ' +
+              'against; (2) the user terminated this session from Settings → Active ' +
+              'Sessions in their Telegram client; (3) the session has been idle long ' +
+              'enough that Telegram pruned it. Re-create or re-upload the session.';
+          } else if (haystack.includes('AUTH_KEY_DUPLICATED')) {
+            hint =
+              'Telegram returned AUTH_KEY_DUPLICATED — the same session string is ' +
+              'being used by another connection (another panel / bot / client). ' +
+              'Generate a fresh session or stop the other consumer before retrying.';
+          } else if (haystack.includes('USER_DEACTIVATED')) {
+            hint =
+              'Telegram returned USER_DEACTIVATED — the underlying account has been ' +
+              'banned or self-deleted. The session cannot be recovered.';
+          } else if (haystack.includes('SESSION_REVOKED') || haystack.includes('SESSION_EXPIRED')) {
+            hint =
+              'Telegram returned ' + errorCode + ' — this session was explicitly ' +
+              'revoked / expired. Re-create or re-upload it.';
+          } else {
+            hint =
               'Telegram revoked this session (auth key invalid). ' +
-                'Please re-upload or re-login the session.',
+              'Please re-upload or re-login the session.';
+          }
+          throw new AppError(
+            hint,
             401,
-            meError.code || 'AUTH_KEY_REVOKED'
+            errorCode || 'AUTH_KEY_REVOKED'
           );
         }
         // Non-permanent failures: set status='error' and record the same

@@ -407,6 +407,17 @@ class ProxyService {
   }
 
   async _tick() {
+    // Skip the entire health-check pass when the global proxy switch
+    // is OFF. With proxying disabled the panel egresses directly from
+    // the VPS IP, so probing/refreshing the SOCKS pool is wasted work
+    // (and pollutes logs with "evicted N dead free proxies" lines that
+    // confuse operators trying to diagnose login failures).
+    try {
+      const settingsService = require('./systemSettingsService');
+      if (!(await settingsService.isProxyGloballyEnabled())) return;
+    } catch (err) {
+      logger.debug(`proxy _tick gate failed, falling through: ${err.message}`);
+    }
     await this.revalidateAll();
     await this.refreshFreeProxies();
   }
@@ -1318,6 +1329,70 @@ class ProxyService {
    * toggle is OFF — buildGramJSProxy() turns the direct row into
    * `null` so GramJS connects from the VPS IP.
    */
+  /**
+   * Force every session currently bound to a non-direct proxy onto the
+   * `__direct__` sentinel row, and tear down any in-memory GramJS /
+   * Instagram client that was holding a now-stale proxy.
+   *
+   * Triggered by the admin toggle when `proxy.global_enabled` flips
+   * ON → OFF. Without this step, TelegramClient instances that were
+   * created while proxying was on keep their old proxy options baked
+   * in: their `_updateLoop` retries forever against an unreachable
+   * SOCKS5 endpoint (the "Reconnecting session N (timeout=10000ms) /
+   * SocksClientError ECONNREFUSED" loop in the logs). Disconnecting
+   * forces the next reconnect to go through the heartbeat / restore
+   * path, which calls `assignProxyForSession()` again and now picks up
+   * the direct row.
+   */
+  async releaseAllProxiedSessions() {
+    const direct = (await pool.query(
+      `SELECT id FROM proxies WHERE host='__direct__' LIMIT 1`
+    )).rows[0] || null;
+
+    // Sessions whose binding is to a non-direct proxy. We deliberately
+    // walk session_proxy_assignments rather than sessions.bound_proxy_id
+    // because the assignments table is the source of truth for the
+    // GramJS proxy actually in use.
+    const directId = direct ? direct.id : -1;
+    const r = await pool.query(
+      `SELECT spa.session_id
+         FROM session_proxy_assignments spa
+         JOIN proxies p ON p.id = spa.proxy_id
+        WHERE p.host <> '__direct__' AND spa.proxy_id <> $1`,
+      [directId]
+    );
+
+    let rebound = 0;
+    let disconnected = 0;
+    for (const row of r.rows) {
+      const sid = row.session_id;
+      try {
+        await this._bindDirectRow(sid);
+        rebound++;
+      } catch (err) {
+        logger.warn(`releaseAllProxiedSessions: rebind failed for ${sid}: ${err.message}`);
+      }
+      // Best-effort tear-down of the in-memory client. We resolve
+      // telegramService lazily to avoid a require cycle (proxyService
+      // is loaded during sessionService construction).
+      try {
+        const tg = require('./telegramService');
+        if (tg && typeof tg.disconnectSession === 'function') {
+          const res = await tg.disconnectSession(String(sid)).catch(() => null);
+          if (res && res.disconnected) disconnected++;
+        }
+      } catch (err) {
+        logger.debug(`releaseAllProxiedSessions: telegram disconnect skipped for ${sid}: ${err.message}`);
+      }
+    }
+
+    logger.info(
+      `releaseAllProxiedSessions: rebound=${rebound} disconnected=${disconnected} ` +
+        `total=${r.rows.length}`
+    );
+    return { rebound, disconnected, total: r.rows.length };
+  }
+
   async _bindDirectRow(sessionId) {
     const direct = (await pool.query(
       `SELECT * FROM proxies WHERE host='__direct__' LIMIT 1`
