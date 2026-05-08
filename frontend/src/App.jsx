@@ -2,6 +2,7 @@ import { lazy, Suspense } from 'react';
 import { BrowserRouter, Routes, Route, Navigate, useParams, useLocation } from 'react-router-dom';
 import { AuthProvider } from './context/AuthContext';
 import { PlatformProvider, PLATFORMS, DEFAULT_PLATFORM, PLATFORM_FEATURE_FLAG_KEY } from './context/PlatformContext';
+import { ThemeProvider } from './context/ThemeContext';
 import { ToastContainer } from './components/common/Toast';
 import MissingApiCredsModal from './components/common/MissingApiCredsModal';
 import PlatformRouteFallback from './components/common/PlatformRouteFallback';
@@ -299,6 +300,7 @@ export default function App() {
     <BrowserRouter>
       <AuthProvider>
         <PlatformProvider>
+          <ThemeProvider>
           <ToastContainer />
           <MissingApiCredsModal />
           <PanelSwitchOverlay />
@@ -358,6 +360,7 @@ export default function App() {
               <Route path="*" element={<HomeRedirect />} />
             </Routes>
           </Suspense>
+          </ThemeProvider>
         </PlatformProvider>
       </AuthProvider>
     </BrowserRouter>

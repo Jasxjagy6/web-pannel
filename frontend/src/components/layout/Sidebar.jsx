@@ -78,7 +78,7 @@ export default function Sidebar({ collapsed, mobileOpen, onToggle, onCloseMobile
 
   const aside = (
     <aside
-      className={`flex h-full flex-col bg-dark-900 border-r border-white/5 transition-[width] duration-300 ease-in-out
+      className={`tg-chrome flex h-full flex-col bg-dark-900 border-r border-white/5 transition-[width] duration-300 ease-in-out
         ${collapsed ? 'md:w-20' : 'md:w-64'} w-72 md:w-64`}
     >
       {/* Logo / Header area */}

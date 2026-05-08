@@ -3,6 +3,7 @@ import { useToast } from '../components/common/Toast';
 import { listSessions } from '../api/sessions';
 import { sendBulkToGroups, getJobs } from '../api/messages';
 import { parseApiError, formatRelativeTime } from '../utils/formatters';
+import SessionListSwitcher from '../components/common/SessionListSwitcher';
 import {
   Loader2,
   Users,
@@ -27,6 +28,11 @@ export default function MessageGroupsTab() {
   const [delayBetweenRounds, setDelayBetweenRounds] = useState(20);
   const [submitting, setSubmitting] = useState(false);
   const [showAllSessions, setShowAllSessions] = useState(false);
+  // "Pick sessions" vs. "Use saved session list" — same toggle the
+  // Users tab uses, mirrored here so the two flows feel symmetric.
+  // Backend already accepts `sessionListId` on /messages/bulk-groups.
+  const [sessionPickMode, setSessionPickMode] = useState('sessions');
+  const [selectedSessionListId, setSelectedSessionListId] = useState('');
 
   // Job history
   const [jobHistory, setJobHistory] = useState([]);
@@ -98,8 +104,9 @@ export default function MessageGroupsTab() {
       showError('Message exceeds maximum length.', 'Validation Error');
       return;
     }
-    if (selectedSessionIds.length === 0) {
-      showError('Please select at least one session.', 'Validation Error');
+    const usingSessionList = sessionPickMode === 'list' && selectedSessionListId;
+    if (!usingSessionList && selectedSessionIds.length === 0) {
+      showError('Please select at least one session (or pick a session list).', 'Validation Error');
       return;
     }
     if (!groupIds.trim()) {
@@ -115,13 +122,18 @@ export default function MessageGroupsTab() {
         .map(g => g.trim())
         .filter(g => g.length > 0);
 
-      const response = await sendBulkToGroups({
-        sessionIds: selectedSessionIds,
+      const payload = {
         groupIds: groups,
         message: message.trim(),
         messageType: 'text',
         delayBetweenRounds: parseInt(delayBetweenRounds, 10),
-      });
+      };
+      if (usingSessionList) {
+        payload.sessionListId = Number(selectedSessionListId);
+      } else {
+        payload.sessionIds = selectedSessionIds;
+      }
+      const response = await sendBulkToGroups(payload);
 
       const result = response.data.data;
       showSuccess(
@@ -133,6 +145,8 @@ export default function MessageGroupsTab() {
       setMessage('');
       setGroupIds('');
       setSelectedSessionIds([]);
+      setSelectedSessionListId('');
+      setSessionPickMode('sessions');
 
       // Refresh job history after a short delay
       setTimeout(() => fetchJobHistory(), 1000);
@@ -215,48 +229,62 @@ https://t.me/example_group
         <div className="rounded-xl border border-white/5 bg-dark-800 p-5">
           <h3 className="mb-4 text-sm font-semibold text-white flex items-center gap-2">
             <Users className="w-4 h-4 text-primary-500" />
-            Sessions ({selectedSessionIds.length} selected)
+            {sessionPickMode === 'list'
+              ? 'Sessions (from session list)'
+              : `Sessions (${selectedSessionIds.length} selected)`}
           </h3>
 
-          <div className="flex gap-2 mb-2">
-            <button type="button" onClick={selectAllSessions} className="text-xs text-primary-400 hover:text-primary-300">
-              Select All Active
-            </button>
-            <span className="text-xs text-gray-600">|</span>
-            <button type="button" onClick={deselectAllSessions} className="text-xs text-gray-400 hover:text-gray-300">
-              Deselect All
-            </button>
-          </div>
+          <SessionListSwitcher
+            mode={sessionPickMode}
+            onModeChange={setSessionPickMode}
+            selectedSessionListId={selectedSessionListId}
+            onSelectedSessionListIdChange={setSelectedSessionListId}
+            className="mb-3"
+          />
 
-          <div className="max-h-48 overflow-y-auto rounded-lg border border-white/10 bg-dark-900 p-2 space-y-1">
-            {displayedSessions.map((s) => {
-              const isSelected = selectedSessionIds.includes(s.id);
-              const isActive = s.status?.toLowerCase() === 'active' || s.is_logged_in;
-              return (
-                <button
-                  key={s.id}
-                  type="button"
-                  onClick={() => toggleSession(s.id)}
-                  className={`w-full flex items-center gap-2 px-3 py-2 rounded-md text-sm transition ${
-                    isSelected
-                      ? 'bg-primary-500/20 text-primary-300 border border-primary-500/30'
-                      : 'hover:bg-white/5 text-gray-300 border border-transparent'
-                  } ${!isActive ? 'opacity-50' : ''}`}
-                  disabled={!isActive}
-                >
-                  <div className={`w-4 h-4 rounded border flex items-center justify-center flex-shrink-0 ${
-                    isSelected ? 'border-primary-500 bg-primary-500/30' : 'border-gray-600'
-                  }`}>
-                    {isSelected && <Check className="w-3 h-3 text-primary-400" />}
-                  </div>
-                  <span className="truncate">{s.phone || s.id}</span>
-                  {s.username && <span className="text-gray-500 text-xs">@{s.username}</span>}
+          {sessionPickMode === 'sessions' && (
+            <>
+              <div className="flex gap-2 mb-2">
+                <button type="button" onClick={selectAllSessions} className="text-xs text-primary-400 hover:text-primary-300">
+                  Select All Active
                 </button>
-              );
-            })}
-          </div>
-          {activeSessions.length === 0 && (
-            <p className="mt-2 text-xs text-amber-400">No active sessions. Please login first.</p>
+                <span className="text-xs text-gray-600">|</span>
+                <button type="button" onClick={deselectAllSessions} className="text-xs text-gray-400 hover:text-gray-300">
+                  Deselect All
+                </button>
+              </div>
+
+              <div className="max-h-48 overflow-y-auto rounded-lg border border-white/10 bg-dark-900 p-2 space-y-1">
+                {displayedSessions.map((s) => {
+                  const isSelected = selectedSessionIds.includes(s.id);
+                  const isActive = s.status?.toLowerCase() === 'active' || s.is_logged_in;
+                  return (
+                    <button
+                      key={s.id}
+                      type="button"
+                      onClick={() => toggleSession(s.id)}
+                      className={`w-full flex items-center gap-2 px-3 py-2 rounded-md text-sm transition ${
+                        isSelected
+                          ? 'bg-primary-500/20 text-primary-300 border border-primary-500/30'
+                          : 'hover:bg-white/5 text-gray-300 border border-transparent'
+                      } ${!isActive ? 'opacity-50' : ''}`}
+                      disabled={!isActive}
+                    >
+                      <div className={`w-4 h-4 rounded border flex items-center justify-center flex-shrink-0 ${
+                        isSelected ? 'border-primary-500 bg-primary-500/30' : 'border-gray-600'
+                      }`}>
+                        {isSelected && <Check className="w-3 h-3 text-primary-400" />}
+                      </div>
+                      <span className="truncate">{s.phone || s.id}</span>
+                      {s.username && <span className="text-gray-500 text-xs">@{s.username}</span>}
+                    </button>
+                  );
+                })}
+              </div>
+              {activeSessions.length === 0 && (
+                <p className="mt-2 text-xs text-amber-400">No active sessions. Please login first.</p>
+              )}
+            </>
           )}
         </div>
       </div>
@@ -294,7 +322,11 @@ https://t.me/example_group
           <div>
             <p className="text-sm font-medium text-white">Ready to Send</p>
             <p className="text-xs text-gray-500 mt-1">
-              {selectedSessionIds.length} session(s) &middot; {groupIds.split('\n').filter(g => g.trim()).length} group(s)
+              {sessionPickMode === 'list' && selectedSessionListId
+                ? 'Using saved session list'
+                : `${selectedSessionIds.length} session(s)`}
+              {' '}&middot;{' '}
+              {groupIds.split('\n').filter(g => g.trim()).length} group(s)
             </p>
           </div>
           <button

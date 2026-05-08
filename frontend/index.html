@@ -8,6 +8,20 @@
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <script>
+      // Apply the persisted Telegram-panel theme synchronously so the
+      // very first paint already matches the user's chosen palette
+      // (no flash of opposite theme during route hydration).
+      (function () {
+        try {
+          var stored = localStorage.getItem('tg_panel_theme');
+          var theme = (stored === 'light' || stored === 'dark') ? stored : 'dark';
+          document.documentElement.setAttribute('data-tg-theme', theme);
+        } catch (_) {
+          document.documentElement.setAttribute('data-tg-theme', 'dark');
+        }
+      })();
+    </script>
   </head>
   <body>
     <div id="root"></div>
