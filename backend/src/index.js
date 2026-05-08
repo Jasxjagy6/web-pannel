@@ -552,6 +552,20 @@ async function start() {
       logger.warn(`monitor sweep init failed: ${err.message}`);
     }
 
+    // 7b. Boot the message-schedule tick loop. Polls
+    //     `message_schedules` for rows that are due for another run
+    //     (last dispatched job is in a terminal state AND
+    //     completed_at + interval_minutes is in the past) and kicks
+    //     off a new bulk-groups job for each. Multiple schedules run
+    //     concurrently; a thrown error inside one never stops the
+    //     others.
+    try {
+      const messageScheduleService = require('./services/messageScheduleService');
+      messageScheduleService.start();
+    } catch (err) {
+      logger.warn(`messageScheduleService.start failed: ${err.message}`);
+    }
+
     // 8. Subscription / trial expiry sweep. Runs every minute so a paid
     //    user whose monthly window just elapsed gets gated out of the app
     //    on their very next request. Trial expiry happens implicitly via

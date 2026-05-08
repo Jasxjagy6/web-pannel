@@ -19,6 +19,7 @@ import { useToast } from '../components/common/Toast';
 import { Modal } from '../components/common/Modal';
 import StatusBadge from '../components/common/StatusBadge';
 import MessageGroupsTab from './MessageGroupsTab';
+import MessageSchedulesTab from './MessageSchedulesTab';
 import {
   Send,
   Loader2,
@@ -808,7 +809,10 @@ export default function Messaging() {
   const { connect, on, off, connected } = useWebSocket();
   const [searchParams, setSearchParams] = useSearchParams();
 
-  const [activeTab, setActiveTab] = useState('users'); // 'users' or 'groups'
+  // 'users' → one-shot DM bulk send
+  // 'groups' → one-shot bulk-groups send
+  // 'schedule' → recurring bulk-groups schedule
+  const [activeTab, setActiveTab] = useState('users');
 
   // Composer state
   const [message, setMessage] = useState('');
@@ -1291,9 +1295,11 @@ export default function Messaging() {
         <div>
           <h1 className="text-2xl font-bold tracking-tight text-white">Messaging</h1>
           <p className="mt-1 text-sm text-gray-400">
-            {activeTab === 'users' 
+            {activeTab === 'users'
               ? 'Compose and send messages to target users across multiple sessions'
-              : 'Send messages to multiple groups/channels with rate limiting'}
+              : activeTab === 'groups'
+              ? 'Send messages to multiple groups/channels with rate limiting'
+              : 'Schedule a recurring send: same message + groups + sessions, re-runs after each completion until cancelled'}
           </p>
         </div>
         {connected && (
@@ -1328,6 +1334,17 @@ export default function Messaging() {
           >
             <Group className="w-4 h-4" />
             Groups
+          </button>
+          <button
+            onClick={() => setActiveTab('schedule')}
+            className={`flex-1 px-5 py-3 text-sm font-medium transition flex items-center justify-center gap-2 ${
+              activeTab === 'schedule'
+                ? 'border-b-2 border-primary-500 text-primary-400 bg-primary-500/5'
+                : 'text-gray-400 hover:text-white hover:bg-white/5'
+            }`}
+          >
+            <Clock className="w-4 h-4" />
+            Schedule
           </button>
         </div>
       </div>
@@ -1718,8 +1735,10 @@ export default function Messaging() {
         onSendTest={handleSendTest}
       />
         </>
-      ) : (
+      ) : activeTab === 'groups' ? (
         <MessageGroupsTab />
+      ) : (
+        <MessageSchedulesTab />
       )}
     </div>
   );

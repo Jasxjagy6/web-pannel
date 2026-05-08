@@ -43,6 +43,27 @@ router.post('/bulk-groups', messageController.sendBulkToGroups);
 // POST /api/messages/bulk-users - Send to multiple users with rate limiting
 router.post('/bulk-users', messageController.sendBulkToUsers);
 
+// ---------------------------------------------------------------------
+// Recurring group-message schedules (Messaging > Schedule tab).
+// IMPORTANT: must be declared BEFORE the catch-all `/:id` routes
+// below, otherwise `/schedules` would be parsed as `/:id`.
+// ---------------------------------------------------------------------
+
+// POST /api/messages/schedules - Create a recurring group-message schedule
+router.post('/schedules', messageController.createSchedule);
+
+// GET /api/messages/schedules - List the caller's schedules
+router.get('/schedules', messageController.listSchedules);
+
+// POST /api/messages/schedules/cancel-all - Cancel every running schedule
+router.post('/schedules/cancel-all', messageController.cancelAllSchedules);
+
+// GET /api/messages/schedules/:id - Get one schedule
+router.get('/schedules/:id', messageController.getSchedule);
+
+// POST /api/messages/schedules/:id/cancel - Cancel one schedule
+router.post('/schedules/:id/cancel', messageController.cancelSchedule);
+
 // GET /api/messages/jobs/:id - Get job
 router.get('/:id', messageController.getJob);
 

@@ -1,4 +1,5 @@
 const messageService = require('../services/messageService');
+const messageScheduleService = require('../services/messageScheduleService');
 const reportService = require('../services/reportService');
 const messageQueue = require('../queues/messageQueue');
 const { AppError, asyncHandler } = require('../utils/errorHandler');
@@ -772,6 +773,140 @@ const messageController = {
     });
 
     return res.status(200).json({ success: true, data: { plan } });
+  }),
+
+  // -----------------------------------------------------------------
+  // Recurring group-message schedules (Messaging > Schedule tab).
+  //
+  // The actual sending is delegated to messageService.sendBulkToGroups
+  // every `intervalMinutes`; these endpoints just CRUD the schedule
+  // row and let the in-process tick loop do the dispatching.
+  // -----------------------------------------------------------------
+
+  /**
+   * Create a new recurring group-message schedule.
+   *
+   * Body: {
+   *   sessionIds: number[] (or sessionListId via resolveSessionIdsFromRequest),
+   *   groupIds:   string[] (numeric ids, @usernames, or invite links),
+   *   message:    string,
+   *   messageType?: 'text'|'html'|'markdown',
+   *   delayBetweenRounds?: number  (seconds, intra-job rate limit),
+   *   intervalMinutes:    number  (between-runs cool-down, 1..10080),
+   *   name?: string,
+   * }
+   */
+  createSchedule: asyncHandler(async (req, res) => {
+    const userId = req.user.id;
+    const {
+      sessionIds: rawSessionIds,
+      groupIds,
+      message,
+      messageType = 'text',
+      delayBetweenRounds = 20,
+      intervalMinutes,
+      name,
+    } = req.body || {};
+
+    const sessionIds = await resolveSessionIdsFromRequest(req, rawSessionIds || []);
+    if (!Array.isArray(sessionIds) || sessionIds.length === 0) {
+      throw new AppError(
+        'sessionIds array (or a non-empty sessionListId) is required',
+        400,
+        'NO_SESSIONS'
+      );
+    }
+    if (!Array.isArray(groupIds) || groupIds.length === 0) {
+      throw new AppError('groupIds array is required', 400, 'NO_GROUPS');
+    }
+    if (!message || String(message).trim().length === 0) {
+      throw new AppError('message content is required', 400, 'EMPTY_MESSAGE');
+    }
+    if (intervalMinutes === undefined || intervalMinutes === null) {
+      throw new AppError(
+        'intervalMinutes is required',
+        400,
+        'MISSING_INTERVAL'
+      );
+    }
+
+    const schedule = await messageScheduleService.createSchedule({
+      sessionIds,
+      groupIds,
+      message: String(message).trim(),
+      messageType,
+      delayBetweenRounds,
+      intervalMinutes,
+      name,
+    }, userId);
+
+    await reportService.logActivity(
+      userId,
+      'message_schedule_create',
+      'message_schedule',
+      schedule.id,
+      {
+        sessionCount: sessionIds.length,
+        groupCount: groupIds.length,
+        intervalMinutes: schedule.intervalMinutes,
+      }
+    );
+
+    logger.info(
+      `Schedule ${schedule.id} created by user ${userId} ` +
+      `(every ${schedule.intervalMinutes} min)`
+    );
+
+    return res.status(201).json({ success: true, data: schedule });
+  }),
+
+  /** GET /messages/schedules?status=running */
+  listSchedules: asyncHandler(async (req, res) => {
+    const userId = req.user.id;
+    const schedules = await messageScheduleService.listSchedules(userId, {
+      status: req.query.status,
+      limit: req.query.limit,
+    });
+    return res.status(200).json({ success: true, data: { schedules } });
+  }),
+
+  /** GET /messages/schedules/:id */
+  getSchedule: asyncHandler(async (req, res) => {
+    const userId = req.user.id;
+    const schedule = await messageScheduleService.getSchedule(req.params.id, userId);
+    return res.status(200).json({ success: true, data: schedule });
+  }),
+
+  /** POST /messages/schedules/:id/cancel */
+  cancelSchedule: asyncHandler(async (req, res) => {
+    const userId = req.user.id;
+    const result = await messageScheduleService.cancelSchedule(req.params.id, userId);
+
+    await reportService.logActivity(
+      userId,
+      'message_schedule_cancel',
+      'message_schedule',
+      req.params.id,
+      {}
+    );
+
+    return res.status(200).json({ success: true, data: result });
+  }),
+
+  /** POST /messages/schedules/cancel-all */
+  cancelAllSchedules: asyncHandler(async (req, res) => {
+    const userId = req.user.id;
+    const result = await messageScheduleService.cancelAllSchedules(userId);
+
+    await reportService.logActivity(
+      userId,
+      'message_schedule_cancel_all',
+      'message_schedule',
+      null,
+      { cancelled: result.cancelled }
+    );
+
+    return res.status(200).json({ success: true, data: result });
   }),
 };
 
