@@ -14,6 +14,7 @@ const { AppError } = require('../utils/errorHandler');
 const { buildPagination, applyPagination, applySorting } = require('../utils/pagination');
 const { redisClient } = require('../config/redis');
 const distributionPlanner = require('./distributionPlanner');
+const audienceFilter = require('./audienceFilterService');
 
 // =========================================================================
 // Constants
@@ -519,6 +520,43 @@ class DistributionEngine {
             deadSessions.add(usedSessionId);
           }
 
+          // Cache observed target outcomes so the next job's pre-job
+          // filter doesn't waste a probe / quota on this row. Done
+          // best-effort and never blocks the send loop.
+          if (
+            lastError.includes('USER_PRIVACY_RESTRICT') ||
+            lastError.includes('PRIVACY_RESTRICTED')
+          ) {
+            audienceFilter
+              .recordObservedFromEntry(
+                { telegram_id: String(targetId), username: String(targetId) },
+                'privacy_restricted',
+                lastError,
+                'observed-dm'
+              )
+              .catch((rErr) =>
+                logger.warn(`audienceFilter.recordObserved (dm-privacy) failed: ${rErr.message}`)
+              );
+          } else if (
+            lastError.includes('USER_DEACTIVATED') ||
+            lastError.includes('INPUT_USER_DEACTIVATED') ||
+            lastError.includes('USER_NOT_FOUND') ||
+            lastError.includes('USERNAME_NOT_OCCUPIED') ||
+            lastError.includes('USER_ID_INVALID') ||
+            lastError.includes('PEER_ID_INVALID')
+          ) {
+            audienceFilter
+              .recordObservedFromEntry(
+                { telegram_id: String(targetId), username: String(targetId) },
+                'not_found',
+                lastError,
+                'observed-dm'
+              )
+              .catch((rErr) =>
+                logger.warn(`audienceFilter.recordObserved (dm-not_found) failed: ${rErr.message}`)
+              );
+          }
+
           if (!isRetryableError(lastError)) {
             break;
           }
@@ -883,7 +921,6 @@ class MessageService {
   async sendBulkMessage(params, userId) {
     const {
       sessionIds,
-      targetList,
       message,
       messageType = 'text',
       mediaPath = null,
@@ -904,6 +941,9 @@ class MessageService {
       itemDelayMsMin,
       itemDelayMsMax,
     } = params;
+    // `targetList` is reassigned by the audience filter below, so it
+    // can't be a const-binding from the destructure.
+    let targetList = params.targetList;
 
     logger.info(`Starting bulk message job for user ${userId}`, {
       sessionCount: sessionIds ? sessionIds.length : 0,
@@ -922,6 +962,55 @@ class MessageService {
 
     if (!message || message.trim().length === 0) {
       throw new AppError('Message content is required', 400, 'EMPTY_MESSAGE');
+    }
+
+    // ─── Pre-job audience filter ─────────────────────────────────
+    // For list-sourced jobs we run the dedupe + classify + cache
+    // pipeline so we don't burn session quota on already-known
+    // not_found / privacy_restricted users. DM jobs keep
+    // privacy-restricted entries (`includePrivacyRestricted: true`)
+    // — the user explicitly said dm_only entries should still
+    // receive DMs. Fail open: if the filter throws we fall back to
+    // the raw target list.
+    let audienceStats = null;
+    let audienceDmOnly = 0;
+    let audienceDropped = 0;
+    if (sourceType === 'list' && Array.isArray(targetList) && targetList.length > 0) {
+      try {
+        const audienceResult = await audienceFilter.filterUserList({
+          userList: targetList,
+          listId: sourceId || null,
+          userId,
+          context: 'send-bulk',
+          options: {
+            includePrivacyRestricted: true,
+            purgeNotFound: true,
+          },
+        });
+        audienceStats = audienceResult.stats;
+        audienceDmOnly = (audienceResult.dmOnly || []).length;
+        audienceDropped = (audienceResult.dropped || []).length;
+        if (Array.isArray(audienceResult.eligible) && audienceResult.eligible.length > 0) {
+          // Replace targetList with the post-filter raw entries.
+          // Keeping `.raw` preserves the existing normalizeTargetId
+          // call site downstream.
+          targetList = audienceResult.eligible.map((info) => info.raw);
+          params.targetList = targetList;
+        }
+        logger.info('sendBulkMessage: audience filter applied', {
+          userId,
+          sourceId,
+          stats: audienceStats,
+          dmOnly: audienceDmOnly,
+          dropped: audienceDropped,
+        });
+      } catch (filterErr) {
+        logger.warn('sendBulkMessage: audience filter failed; using raw list', {
+          error: filterErr.message,
+          userId,
+          sourceId,
+        });
+      }
     }
 
     // Verify all sessions belong to the user
@@ -2258,12 +2347,15 @@ class MessageService {
   async sendBulkToUsers(params, userId) {
     const {
       sessionIds,
-      users,
       message,
       messageType = 'text',
       usersPerRound = 5,
       delayBetweenRounds = 60,
+      // Optional source list id — when set the audience filter
+      // persists status back into list_items.
+      listId = null,
     } = params;
+    let users = params.users;
 
     if (!userId) {
       throw new AppError('User ID is required', 400, 'MISSING_USER_ID');
@@ -2279,6 +2371,47 @@ class MessageService {
 
     if (!message || message.trim().length === 0) {
       throw new AppError('Message is required', 400, 'EMPTY_MESSAGE');
+    }
+
+    // ─── Pre-job audience filter ─────────────────────────────────
+    // Bulk-DM keeps privacy-restricted users (they can still receive
+    // DMs); we only drop NOT_FOUND / deactivated rows.
+    try {
+      const audienceResult = await audienceFilter.filterUserList({
+        userList: users,
+        listId,
+        userId,
+        context: 'send-bulk-users',
+        options: {
+          includePrivacyRestricted: true,
+          purgeNotFound: true,
+        },
+      });
+      if (Array.isArray(audienceResult.eligible) && audienceResult.eligible.length > 0) {
+        users = audienceResult.eligible.map((info) => info.raw);
+        params.users = users;
+      }
+      logger.info('sendBulkToUsers: audience filter applied', {
+        userId,
+        listId,
+        stats: audienceResult.stats,
+        dmOnly: (audienceResult.dmOnly || []).length,
+        dropped: (audienceResult.dropped || []).length,
+      });
+    } catch (filterErr) {
+      logger.warn('sendBulkToUsers: audience filter failed; using raw list', {
+        error: filterErr.message,
+        userId,
+        listId,
+      });
+    }
+
+    if (!users || users.length === 0) {
+      throw new AppError(
+        'All audience entries were filtered out (not_found).',
+        400,
+        'NO_ELIGIBLE_USERS'
+      );
     }
 
     // Verify session ownership
@@ -2501,20 +2634,91 @@ class MessageService {
   /**
    * Verify that multiple sessions belong to the specified user.
    *
+   * Sessions that are on cooldown (`cooldown_until` in the future)
+   * are filtered out of the returned set unless the caller passes
+   * `{ filterCooldown: false }`. This mirrors
+   * `groupService.validateSessionsOwnership` so PEER_FLOOD /
+   * FLOOD_WAIT cooldowns observed by the worker propagate to bulk
+   * messaging too.
+   *
+   * The dropped sessions are attached to the returned array as a
+   * non-enumerable `cooldownSkipped` property — callers that want to
+   * surface the skipped count can read it without a signature change.
+   * If every requested session is on cooldown, throws
+   * `ALL_SESSIONS_ON_COOLDOWN` (409).
+   *
    * @param {Array<string|number>} sessionIds - Array of session IDs
    * @param {number|string} userId - User ID
+   * @param {{ filterCooldown?: boolean }} [opts]
    * @returns {Promise<Array<{ id: number, user_id: number, status: string }>>}
    * @private
    */
-  async _verifyMultipleSessionsOwnership(sessionIds, userId) {
+  async _verifyMultipleSessionsOwnership(sessionIds, userId, opts = {}) {
     if (!sessionIds || sessionIds.length === 0) return [];
+    const { filterCooldown = true } = opts;
 
-    const result = await pool.query(
-      'SELECT id, user_id, status FROM sessions WHERE id = ANY($1::int[]) AND user_id = $2',
-      [sessionIds.map((s) => parseInt(s, 10)), userId]
-    );
+    let result;
+    try {
+      result = await pool.query(
+        `SELECT id, user_id, status,
+                cooldown_until, cooldown_reason, cooldown_seconds, cooldown_set_at
+           FROM sessions
+          WHERE id = ANY($1::int[]) AND user_id = $2`,
+        [sessionIds.map((s) => parseInt(s, 10)), userId]
+      );
+    } catch (selErr) {
+      // Columns absent on an upgrading deploy → fall back so the
+      // bulk-message API doesn't 500 before the migration runs.
+      logger.warn(
+        `_verifyMultipleSessionsOwnership: cooldown columns missing, falling back: ${selErr.message}`
+      );
+      result = await pool.query(
+        'SELECT id, user_id, status FROM sessions WHERE id = ANY($1::int[]) AND user_id = $2',
+        [sessionIds.map((s) => parseInt(s, 10)), userId]
+      );
+    }
 
-    return result.rows;
+    if (!filterCooldown) return result.rows;
+
+    const now = Date.now();
+    const eligible = [];
+    const skipped = [];
+    for (const row of result.rows) {
+      const cdAt = row.cooldown_until ? new Date(row.cooldown_until).getTime() : 0;
+      if (cdAt > now) {
+        skipped.push({
+          id: row.id,
+          cooldown_until: row.cooldown_until,
+          remaining_seconds: Math.max(0, Math.ceil((cdAt - now) / 1000)),
+          reason: row.cooldown_reason || null,
+        });
+      } else {
+        eligible.push(row);
+      }
+    }
+
+    if (eligible.length === 0 && skipped.length > 0) {
+      const err = new AppError(
+        `All ${skipped.length} requested session(s) are on cooldown`,
+        409,
+        'ALL_SESSIONS_ON_COOLDOWN'
+      );
+      err.cooldownSkipped = skipped;
+      throw err;
+    }
+
+    if (skipped.length > 0) {
+      logger.warn(
+        `_verifyMultipleSessionsOwnership: ${skipped.length} session(s) skipped due to cooldown`,
+        { userId, skipped }
+      );
+      Object.defineProperty(eligible, 'cooldownSkipped', {
+        value: skipped,
+        enumerable: false,
+      });
+    }
+
+    return eligible;
   }
 
   /**

@@ -1504,40 +1504,83 @@ class SessionService {
     // for the per-row anti-revoke posture (risk score, ping age, etc.)
     // so the Sessions UI can render device + DC + risk without an
     // extra round-trip per session.
-    const sessionsResult = await pool.query(
-      `SELECT s.id, s.user_id, s.phone, s.session_file_path, s.api_id, s.api_hash,
-              s.status, s.is_2fa_enabled, s.is_logged_in, s.account_info,
-              s.created_at, s.last_active,
-              s.device_identity, s.dc_id, s.dc_ip, s.dc_port,
-              s.last_online_status_at, s.last_ping_at, s.auth_key_first_seen_at,
-              s.bound_proxy_id,
-              tsh.risk_score, tsh.consecutive_failed_pings,
-              tsh.consecutive_flood_waits, tsh.last_flood_at,
-              tsh.last_authorizations_check_at, tsh.last_reauth_required_at,
-              tsh.dc_migrate_count_24h, tsh.ip_country_jumps_24h,
-              tsh.bootstrapped_at, tsh.active_authorizations,
-              tsh.risk_score_updated_at,
-              -- BYO Proxy (Phase 3 §5.4): mirror the bound proxy's
-              -- per-session metadata so the table can render the
-              -- country-flag + label + egress + health-dot column
-              -- without an N+1 lookup.
-              p.host           AS proxy_host,
-              p.port           AS proxy_port,
-              p.protocol       AS proxy_protocol,
-              p.country_code   AS proxy_country_code,
-              p.label          AS proxy_label,
-              p.is_working     AS proxy_is_working,
-              p.last_health_check AS proxy_last_health_check,
-              p.last_health_ok    AS proxy_last_health_ok,
-              p.metadata          AS proxy_metadata
-       FROM sessions s
-       LEFT JOIN tg_session_health tsh ON tsh.session_id = s.id
-       LEFT JOIN proxies p              ON p.id          = s.bound_proxy_id
-       WHERE ${whereClause}
-       ORDER BY s.${sortField} ${sortOrder}
-       LIMIT $${paramIndex} OFFSET $${paramIndex + 1}`,
-      [...queryParams, pageSize, offset]
-    );
+    // Cooldown columns (`cooldown_*`) are owned by migration v24
+    // (sessionCooldown). On a deploy that hasn't run that migration
+    // yet the SELECT throws — we fall back to a query that omits
+    // them so /api/sessions never 500s during an upgrade window.
+    let sessionsResult;
+    try {
+      sessionsResult = await pool.query(
+        `SELECT s.id, s.user_id, s.phone, s.session_file_path, s.api_id, s.api_hash,
+                s.status, s.is_2fa_enabled, s.is_logged_in, s.account_info,
+                s.created_at, s.last_active,
+                s.device_identity, s.dc_id, s.dc_ip, s.dc_port,
+                s.last_online_status_at, s.last_ping_at, s.auth_key_first_seen_at,
+                s.bound_proxy_id,
+                s.cooldown_until, s.cooldown_reason,
+                s.cooldown_seconds, s.cooldown_set_at,
+                tsh.risk_score, tsh.consecutive_failed_pings,
+                tsh.consecutive_flood_waits, tsh.last_flood_at,
+                tsh.last_authorizations_check_at, tsh.last_reauth_required_at,
+                tsh.dc_migrate_count_24h, tsh.ip_country_jumps_24h,
+                tsh.bootstrapped_at, tsh.active_authorizations,
+                tsh.risk_score_updated_at,
+                -- BYO Proxy (Phase 3 §5.4): mirror the bound proxy's
+                -- per-session metadata so the table can render the
+                -- country-flag + label + egress + health-dot column
+                -- without an N+1 lookup.
+                p.host           AS proxy_host,
+                p.port           AS proxy_port,
+                p.protocol       AS proxy_protocol,
+                p.country_code   AS proxy_country_code,
+                p.label          AS proxy_label,
+                p.is_working     AS proxy_is_working,
+                p.last_health_check AS proxy_last_health_check,
+                p.last_health_ok    AS proxy_last_health_ok,
+                p.metadata          AS proxy_metadata
+         FROM sessions s
+         LEFT JOIN tg_session_health tsh ON tsh.session_id = s.id
+         LEFT JOIN proxies p              ON p.id          = s.bound_proxy_id
+         WHERE ${whereClause}
+         ORDER BY s.${sortField} ${sortOrder}
+         LIMIT $${paramIndex} OFFSET $${paramIndex + 1}`,
+        [...queryParams, pageSize, offset]
+      );
+    } catch (selErr) {
+      logger.warn(
+        `listSessions: cooldown columns missing, falling back: ${selErr.message}`
+      );
+      sessionsResult = await pool.query(
+        `SELECT s.id, s.user_id, s.phone, s.session_file_path, s.api_id, s.api_hash,
+                s.status, s.is_2fa_enabled, s.is_logged_in, s.account_info,
+                s.created_at, s.last_active,
+                s.device_identity, s.dc_id, s.dc_ip, s.dc_port,
+                s.last_online_status_at, s.last_ping_at, s.auth_key_first_seen_at,
+                s.bound_proxy_id,
+                tsh.risk_score, tsh.consecutive_failed_pings,
+                tsh.consecutive_flood_waits, tsh.last_flood_at,
+                tsh.last_authorizations_check_at, tsh.last_reauth_required_at,
+                tsh.dc_migrate_count_24h, tsh.ip_country_jumps_24h,
+                tsh.bootstrapped_at, tsh.active_authorizations,
+                tsh.risk_score_updated_at,
+                p.host           AS proxy_host,
+                p.port           AS proxy_port,
+                p.protocol       AS proxy_protocol,
+                p.country_code   AS proxy_country_code,
+                p.label          AS proxy_label,
+                p.is_working     AS proxy_is_working,
+                p.last_health_check AS proxy_last_health_check,
+                p.last_health_ok    AS proxy_last_health_ok,
+                p.metadata          AS proxy_metadata
+         FROM sessions s
+         LEFT JOIN tg_session_health tsh ON tsh.session_id = s.id
+         LEFT JOIN proxies p              ON p.id          = s.bound_proxy_id
+         WHERE ${whereClause}
+         ORDER BY s.${sortField} ${sortOrder}
+         LIMIT $${paramIndex} OFFSET $${paramIndex + 1}`,
+        [...queryParams, pageSize, offset]
+      );
+    }
 
     const sessions = sessionsResult.rows.map((row) => {
       const accountInfo = this._parseJsonField(row.account_info);
@@ -1592,6 +1635,28 @@ class SessionService {
           last_health_ok: row.proxy_last_health_ok,
           egress_ip: row.proxy_metadata?.egress_ip || null,
         } : null,
+        // Per-session cooldown (PEER_FLOOD / FLOOD_WAIT lockout) —
+        // populated by `sessionCooldown.markFloodCooldown(...)` from
+        // inside `telegramService._withFloodRetry`. The Sessions UI
+        // uses `cooldown_until` + `cooldown_remaining_seconds` to
+        // render a "Cooldown 12m" badge and disable job-launch
+        // actions. Login / 2FA / privacy / delete actions stay
+        // enabled even while the row is on cooldown.
+        cooldown_until: row.cooldown_until || null,
+        cooldown_reason: row.cooldown_reason || null,
+        cooldown_seconds: row.cooldown_seconds != null
+          ? Number(row.cooldown_seconds)
+          : null,
+        cooldown_set_at: row.cooldown_set_at || null,
+        cooldown_remaining_seconds: (() => {
+          if (!row.cooldown_until) return 0;
+          const ms = new Date(row.cooldown_until).getTime() - Date.now();
+          return Math.max(0, Math.ceil(ms / 1000));
+        })(),
+        is_on_cooldown: !!(
+          row.cooldown_until &&
+          new Date(row.cooldown_until).getTime() > Date.now()
+        ),
       };
     });
 

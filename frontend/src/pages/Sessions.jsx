@@ -50,6 +50,7 @@ import {
   Download,
   LifeBuoy,
   ShieldAlert,
+  Clock,
 } from 'lucide-react';
 
 // --- Helper: format file size ---
@@ -867,6 +868,82 @@ function RiskPill({ session }) {
   );
 }
 
+/**
+ * Format a remaining-seconds value into a short, human-friendly
+ * cooldown label ("12m 03s" / "1h 12m" / "2d 03h"). Used by both the
+ * Sessions row badge and the bulk-action banner.
+ */
+function formatCooldownLabel(seconds) {
+  const s = Math.max(0, Math.floor(Number(seconds) || 0));
+  if (s < 60) return `${s}s`;
+  if (s < 3600) {
+    const m = Math.floor(s / 60);
+    const rs = s % 60;
+    return `${m}m ${rs.toString().padStart(2, '0')}s`;
+  }
+  if (s < 86400) {
+    const h = Math.floor(s / 3600);
+    const m = Math.floor((s % 3600) / 60);
+    return `${h}h ${m.toString().padStart(2, '0')}m`;
+  }
+  const d = Math.floor(s / 86400);
+  const h = Math.floor((s % 86400) / 3600);
+  return `${d}d ${h.toString().padStart(2, '0')}h`;
+}
+
+/**
+ * Render an inline "Cooldown 12m" pill if the session row is currently
+ * locked out by `sessionCooldown.markFloodCooldown(...)` (PEER_FLOOD /
+ * FLOOD_WAIT). The pill is intentionally distinct from RiskPill /
+ * StatusBadge so operators can see at a glance which sessions will be
+ * skipped by group-add / bulk-message jobs.
+ *
+ * Backend-side, `groupService.validateSessionsOwnership` and
+ * `messageService._verifyMultipleSessionsOwnership` already filter
+ * cooldown rows out of every job — this badge is the user-facing
+ * counterpart so the operator knows why a particular session was
+ * dropped from the eligible set.
+ *
+ * Returns null when the session is not on cooldown.
+ */
+function CooldownBadge({ session }) {
+  // Prefer the precomputed remaining-seconds the backend ships in the
+  // list payload; fall back to the raw `cooldown_until` timestamp so
+  // older snapshots still render correctly (e.g. cached responses).
+  const onCooldown =
+    session?.is_on_cooldown ||
+    (session?.cooldown_until && new Date(session.cooldown_until).getTime() > Date.now());
+  if (!onCooldown) return null;
+
+  const remaining = (() => {
+    if (typeof session?.cooldown_remaining_seconds === 'number') {
+      return session.cooldown_remaining_seconds;
+    }
+    if (session?.cooldown_until) {
+      const ms = new Date(session.cooldown_until).getTime() - Date.now();
+      return Math.max(0, Math.ceil(ms / 1000));
+    }
+    return 0;
+  })();
+  if (remaining <= 0) return null;
+
+  const reason = session?.cooldown_reason || 'flood';
+  const tooltip =
+    `Telegram rate-limited this session (${reason}). ` +
+    `It will be skipped by group-add / bulk-message jobs for ` +
+    `${formatCooldownLabel(remaining)}. Login / 2FA / privacy / delete actions still work.`;
+
+  return (
+    <span
+      className="inline-flex items-center rounded-full px-2 py-0.5 text-[11px] font-semibold bg-amber-500/15 text-amber-300 border border-amber-400/30"
+      title={tooltip}
+    >
+      <Clock className="w-3 h-3 mr-1" />
+      Cooldown {formatCooldownLabel(remaining)}
+    </span>
+  );
+}
+
 // --- Main Sessions Page ---
 export default function Sessions() {
   const { success: showSuccess, error: showError, info: showInfo } = useToast();
@@ -1457,10 +1534,22 @@ export default function Sessions() {
                         </div>
                       </td>
                       <td className="px-4 py-3">
-                        <StatusBadge
-                          status={session.status || 'inactive'}
-                          size="sm"
-                        />
+                        <div className="flex flex-col items-start gap-1">
+                          <StatusBadge
+                            status={session.status || 'inactive'}
+                            size="sm"
+                          />
+                          {/*
+                            Cooldown badge — surfaces PEER_FLOOD /
+                            FLOOD_WAIT lockouts marked by
+                            sessionCooldown.markFloodCooldown(...). The
+                            backend already filters cooldown rows out
+                            of every job; this is the visual marker so
+                            operators understand why a session was
+                            skipped without opening the detail modal.
+                          */}
+                          <CooldownBadge session={session} />
+                        </div>
                       </td>
                       <td className="px-4 py-3 hidden lg:table-cell">
                         <DeviceDcCell session={session} />
