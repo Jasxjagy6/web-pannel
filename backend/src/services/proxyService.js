@@ -407,6 +407,17 @@ class ProxyService {
   }
 
   async _tick() {
+    // Skip the entire health-check pass when the global proxy switch
+    // is OFF. With proxying disabled the panel egresses directly from
+    // the VPS IP, so probing/refreshing the SOCKS pool is wasted work
+    // (and pollutes logs with "evicted N dead free proxies" lines that
+    // confuse operators trying to diagnose login failures).
+    try {
+      const settingsService = require('./systemSettingsService');
+      if (!(await settingsService.isProxyGloballyEnabled())) return;
+    } catch (err) {
+      logger.debug(`proxy _tick gate failed, falling through: ${err.message}`);
+    }
     await this.revalidateAll();
     await this.refreshFreeProxies();
   }
@@ -1318,6 +1329,108 @@ class ProxyService {
    * toggle is OFF — buildGramJSProxy() turns the direct row into
    * `null` so GramJS connects from the VPS IP.
    */
+  /**
+   * Move every session currently bound to a non-direct proxy onto the
+   * `__direct__` sentinel row so that future reconnects egress
+   * directly from the VPS, AND tear down any in-memory GramJS client
+   * that is *stuck* (zombie reconnect loop through a now-dead proxy).
+   *
+   * Triggered by the admin toggle when `proxy.global_enabled` flips
+   * ON → OFF. Without this step, TelegramClient instances that were
+   * created while proxying was on keep their old proxy options baked
+   * in: their `_updateLoop` retries forever against an unreachable
+   * SOCKS5 endpoint (the "Reconnecting session N (timeout=10000ms) /
+   * SocksClientError ECONNREFUSED" loop in the logs).
+   *
+   * Behavior intentionally avoids interrupting healthy proxied
+   * sessions: clients that are *actually connected* right now keep
+   * running on their current proxy until the connection naturally
+   * drops, at which point the heartbeat / restore loop will
+   * reconnect via `assignProxyForSession()` and pick up the
+   * `__direct__` row we just bound. Only stuck/disconnected clients
+   * are torn down, because those are the ones flooding logs with
+   * SOCKS5 errors and never making forward progress.
+   *
+   * @param {{mode?:'soft'|'hard'}} [opts] - 'soft' (default) leaves
+   *   currently-connected clients alone; 'hard' disconnects every
+   *   proxied client unconditionally.
+   */
+  async releaseAllProxiedSessions(opts = {}) {
+    const mode = opts.mode === 'hard' ? 'hard' : 'soft';
+    const direct = (await pool.query(
+      `SELECT id FROM proxies WHERE host='__direct__' LIMIT 1`
+    )).rows[0] || null;
+
+    // Sessions whose binding is to a non-direct proxy. We deliberately
+    // walk session_proxy_assignments rather than sessions.bound_proxy_id
+    // because the assignments table is the source of truth for the
+    // GramJS proxy actually in use.
+    const directId = direct ? direct.id : -1;
+    const r = await pool.query(
+      `SELECT spa.session_id
+         FROM session_proxy_assignments spa
+         JOIN proxies p ON p.id = spa.proxy_id
+        WHERE p.host <> '__direct__' AND spa.proxy_id <> $1`,
+      [directId]
+    );
+
+    // Resolve telegramService lazily (proxyService is loaded during
+    // sessionService construction; telegramService depends on
+    // sessionService).
+    let tg = null;
+    try { tg = require('./telegramService'); } catch { /* optional */ }
+
+    let rebound = 0;
+    let disconnected = 0;
+    let kept = 0;
+    for (const row of r.rows) {
+      const sid = row.session_id;
+      try {
+        await this._bindDirectRow(sid);
+        rebound++;
+      } catch (err) {
+        logger.warn(`releaseAllProxiedSessions: rebind failed for ${sid}: ${err.message}`);
+      }
+      if (!tg || typeof tg.disconnectSession !== 'function') continue;
+
+      // Decide whether to disconnect the in-memory client.
+      let shouldDisconnect = mode === 'hard';
+      if (mode === 'soft') {
+        // Only kill the client when it's NOT actively connected — i.e.
+        // it's the zombie path: GramJS dropped the connection, the
+        // _updateLoop is now retrying through the dead proxy, and
+        // `isSessionActive` returns false because `entry.connected` is
+        // false. Healthy proxied sessions (entry.connected === true)
+        // keep running on their existing proxy until they naturally
+        // drop, then reconnect direct via the bound `__direct__` row.
+        try {
+          const active =
+            typeof tg.isSessionActive === 'function'
+              ? tg.isSessionActive(String(sid))
+              : false;
+          if (!active) shouldDisconnect = true;
+          else kept++;
+        } catch (err) {
+          logger.debug(`releaseAllProxiedSessions: isSessionActive failed for ${sid}: ${err.message}`);
+          shouldDisconnect = true;
+        }
+      }
+      if (!shouldDisconnect) continue;
+      try {
+        const res = await tg.disconnectSession(String(sid)).catch(() => null);
+        if (res && res.disconnected) disconnected++;
+      } catch (err) {
+        logger.debug(`releaseAllProxiedSessions: disconnect failed for ${sid}: ${err.message}`);
+      }
+    }
+
+    logger.info(
+      `releaseAllProxiedSessions(${mode}): rebound=${rebound} ` +
+        `disconnected=${disconnected} kept=${kept} total=${r.rows.length}`
+    );
+    return { mode, rebound, disconnected, kept, total: r.rows.length };
+  }
+
   async _bindDirectRow(sessionId) {
     const direct = (await pool.query(
       `SELECT * FROM proxies WHERE host='__direct__' LIMIT 1`

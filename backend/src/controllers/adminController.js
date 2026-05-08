@@ -650,6 +650,7 @@ const adminController = {
   /** PUT /api/admin/proxy/settings — update global proxy config. */
   setProxySettings: asyncHandler(async (req, res) => {
     const settingsService = require('../services/systemSettingsService');
+    const proxyService = require('../services/proxyService');
     const allowedKeys = ['proxy.global_enabled'];
     const patch = {};
     for (const k of allowedKeys) {
@@ -663,10 +664,33 @@ const adminController = {
     if (patch['proxy.global_enabled'] !== undefined) {
       patch['proxy.global_enabled'] = !!patch['proxy.global_enabled'];
     }
+
+    const wasEnabled = await settingsService.isProxyGloballyEnabled();
     const updated = await settingsService.setSettings(patch, req.user.id);
-    await recordAdminAction(req.user.id, req.user.id, 'proxy_settings_update', patch);
-    logger.info('admin: proxy settings updated', { admin: req.user.id, patch });
-    res.json({ success: true, data: updated });
+
+    // Going ON -> OFF: rebind every session bound to a non-direct proxy
+    // onto the `__direct__` row and tear down its in-memory GramJS
+    // client. Without this, TelegramClients created while proxying was
+    // ON keep retrying their old SOCKS endpoint via _updateLoop and
+    // never pick up the new direct-egress assignment.
+    let cleanup = null;
+    if (
+      patch['proxy.global_enabled'] === false &&
+      wasEnabled === true
+    ) {
+      try {
+        cleanup = await proxyService.releaseAllProxiedSessions();
+      } catch (err) {
+        logger.warn(`releaseAllProxiedSessions failed: ${err.message}`);
+      }
+    }
+
+    await recordAdminAction(req.user.id, req.user.id, 'proxy_settings_update', {
+      ...patch,
+      ...(cleanup ? { cleanup } : {}),
+    });
+    logger.info('admin: proxy settings updated', { admin: req.user.id, patch, cleanup });
+    res.json({ success: true, data: updated, cleanup });
   }),
 };
 
