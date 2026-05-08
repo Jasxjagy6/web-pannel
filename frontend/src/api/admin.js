@@ -70,3 +70,9 @@ export const adminRefreshProxies = () =>
   api.post('/admin/proxies/refresh');
 export const adminProxyUsage = () =>
   api.get('/admin/proxies/usage');
+
+// Global proxy switch (system_settings.proxy.global_enabled).
+// When false the panel drops every proxy and egresses from the VPS IP.
+export const getProxySettings = () => api.get('/admin/proxy/settings');
+export const updateProxySettings = (data) =>
+  api.put('/admin/proxy/settings', data);

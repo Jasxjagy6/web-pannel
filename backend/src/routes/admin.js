@@ -63,4 +63,11 @@ router.post('/proxies/refresh', ctrl.refreshAdminProxies);
 router.get('/proxies/usage',   ctrl.adminProxyUsage);
 router.delete('/proxies/:id',  ctrl.deleteAdminProxy);
 
+// ---------------------------------------------------------------------
+// Global proxy switch (system_settings.proxy.global_enabled). When OFF
+// the panel drops every proxy and egresses directly from the VPS IP.
+// ---------------------------------------------------------------------
+router.get('/proxy/settings', ctrl.getProxySettings);
+router.put('/proxy/settings', ctrl.setProxySettings);
+
 module.exports = router;
