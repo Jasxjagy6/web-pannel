@@ -2067,20 +2067,28 @@ class MessageService {
       userId, numSessions, numGroups,
     });
 
-    // Create job record
+    // Create job record. The schema only has a single `session_id`
+    // column, so we record the primary session here and stash the
+    // full session list (plus targets and rate-limit knobs) in
+    // `options` so `_processBulkGroups` can reconstruct the fan-out.
     const jobResult = await pool.query(
       `INSERT INTO messaging_jobs (
-        user_id, session_ids, job_type, status, total_count, message, message_type,
-        options, created_at
-      ) VALUES ($1, $2, 'bulk_groups', 'pending', $3, $4, $5, $6, NOW())
+        user_id, session_id, job_type, target_list, message_content, message_type,
+        status, total_count, sent_count, failed_count, skipped_count, options, created_at
+      ) VALUES ($1, $2, 'bulk_groups', $3, $4, $5, 'pending', $6, 0, 0, 0, $7, NOW())
       RETURNING id`,
       [
         userId,
-        JSON.stringify(sessionIds),
-        groupIds.length,
+        verifiedSessions[0].id,
+        JSON.stringify(groupIds),
         message,
         messageType,
-        JSON.stringify({ delayBetweenRounds, groupIds }),
+        groupIds.length * verifiedSessions.length,
+        JSON.stringify({
+          delayBetweenRounds,
+          groupIds,
+          sessionIds: verifiedSessions.map((s) => s.id),
+        }),
       ]
     );
 
@@ -2110,9 +2118,12 @@ class MessageService {
     const skippedCount = { value: 0 };
     const results = [];
 
-    // Update job to running
+    // Update job to running. NOTE: `messaging_jobs` does not have a
+    // `started_at` column (only `created_at` and `completed_at`); the
+    // earlier code referenced it and bombed out the bulk-groups path
+    // with a 500. Keep this UPDATE minimal.
     await pool.query(
-      `UPDATE messaging_jobs SET status = 'running', started_at = NOW() WHERE id = $1`,
+      `UPDATE messaging_jobs SET status = 'running' WHERE id = $1`,
       [jobId]
     );
 
@@ -2283,20 +2294,29 @@ class MessageService {
       userId, numSessions, numUsers,
     });
 
-    // Create job record
+    // Create job record. The schema only has a single `session_id`
+    // column, so we record the primary session here and stash the
+    // full session list (plus targets and rate-limit knobs) in
+    // `options` so `_processBulkUsers` can reconstruct the fan-out.
     const jobResult = await pool.query(
       `INSERT INTO messaging_jobs (
-        user_id, session_ids, job_type, status, total_count, message, message_type,
-        options, created_at
-      ) VALUES ($1, $2, 'bulk_users', 'pending', $3, $4, $5, $6, NOW())
+        user_id, session_id, job_type, target_list, message_content, message_type,
+        status, total_count, sent_count, failed_count, skipped_count, options, created_at
+      ) VALUES ($1, $2, 'bulk_users', $3, $4, $5, 'pending', $6, 0, 0, 0, $7, NOW())
       RETURNING id`,
       [
         userId,
-        JSON.stringify(sessionIds),
-        users.length,
+        verifiedSessions[0].id,
+        JSON.stringify(users),
         message,
         messageType,
-        JSON.stringify({ delayBetweenRounds, usersPerRound, userCount: users.length }),
+        users.length,
+        JSON.stringify({
+          delayBetweenRounds,
+          usersPerRound,
+          userCount: users.length,
+          sessionIds: verifiedSessions.map((s) => s.id),
+        }),
       ]
     );
 
@@ -2326,9 +2346,12 @@ class MessageService {
     const skippedCount = { value: 0 };
     const results = [];
 
-    // Update job to running
+    // Update job to running. NOTE: `messaging_jobs` does not have a
+    // `started_at` column (only `created_at` and `completed_at`); the
+    // earlier code referenced it and bombed out the bulk-users path
+    // with a 500. Keep this UPDATE minimal.
     await pool.query(
-      `UPDATE messaging_jobs SET status = 'running', started_at = NOW() WHERE id = $1`,
+      `UPDATE messaging_jobs SET status = 'running' WHERE id = $1`,
       [jobId]
     );
 
@@ -2510,15 +2533,21 @@ class MessageService {
 
   /**
    * Finalize a messaging job with final status and counts.
+   *
+   * NOTE: `messaging_jobs` does not have a `results` column. Per-target
+   * outcomes are persisted to `message_logs` as the job runs, so we
+   * deliberately do not try to write the in-memory `results` array
+   * here — doing so previously made the bulk-groups / bulk-users jobs
+   * silently fail at the end with `column "results" does not exist`.
    */
-  async _finalizeJob(jobId, status, sentCount, failedCount, skippedCount, results) {
+  async _finalizeJob(jobId, status, sentCount, failedCount, skippedCount, results) { // eslint-disable-line no-unused-vars
     try {
       await pool.query(
-        `UPDATE messaging_jobs 
+        `UPDATE messaging_jobs
          SET status = $1, sent_count = $2, failed_count = $3, skipped_count = $4,
-             completed_at = NOW(), results = $5
-         WHERE id = $6`,
-        [status, sentCount, failedCount, skippedCount, JSON.stringify(results.slice(-500)), jobId]
+             completed_at = NOW()
+         WHERE id = $5`,
+        [status, sentCount, failedCount, skippedCount, jobId]
       );
 
       // Notify completion via Redis

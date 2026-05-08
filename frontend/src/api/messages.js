@@ -8,7 +8,11 @@ export const sendBulk = (data) => api.post('/messages/bulk', data);
 // the runner would use without sending anything.
 export const previewBulk = (data) => api.post('/messages/bulk/preview', data);
 
-export const sendMessageToGroup = (data) => api.post('/messages/send-group', data);
+// Single-shot send to a group/channel. The backend route is
+// `POST /messages/group` (see backend/src/routes/messages.js); the
+// older `/messages/send-group` path 404'd through the catch-all and
+// surfaced as a 500 in the UI.
+export const sendMessageToGroup = (data) => api.post('/messages/group', data);
 
 export const forwardMessage = (data) => api.post('/messages/forward', data);
 
