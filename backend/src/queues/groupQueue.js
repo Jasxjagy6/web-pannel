@@ -1,7 +1,8 @@
-const { Queue, Worker, QueueEvents } = require('bullmq');
+const { Queue, Worker, QueueEvents, UnrecoverableError } = require('bullmq');
 const groupService = require('../services/groupService');
 const logger = require('../utils/logger');
 const { withJobLock, QUEUED_BEHIND_LOCK } = require('../utils/jobLock');
+const { pool } = require('../config/database');
 
 const GROUP_QUEUE_NAME = 'group-jobs';
 
@@ -40,6 +41,24 @@ class GroupQueueManager {
         removeOnFail: { age: 86400 },
       },
     });
+
+    // Errors caused by user input or pre-flight validation should NOT
+    // be retried — re-running an audience filter on the same UUID-only
+    // list will throw the same way three times in a row, polluting the
+    // logs and (more importantly) leaving the op row stuck on
+    // `queued`/`running` for the entire backoff window. We map those
+    // codes to BullMQ's `UnrecoverableError` so the job moves to
+    // `failed` immediately on the first attempt.
+    const NON_RETRYABLE_ERROR_CODES = new Set([
+      'NO_VALID_USERS',
+      'NO_ELIGIBLE_USERS',
+      'NO_VALID_SESSIONS',
+      'EMPTY_USER_LIST',
+      'NO_TARGETS',
+      'MISSING_USER_ID',
+      'ALL_SESSIONS_ON_COOLDOWN',
+      'SESSION_NOT_FOUND',
+    ]);
 
     this.worker = new Worker(
       GROUP_QUEUE_NAME,
@@ -92,12 +111,28 @@ class GroupQueueManager {
           }
         };
 
-        if (!heavyCategory) return run();
+        // Wrap the actual job runner so we can intercept user-input
+        // errors and convert them into UnrecoverableError. Without this
+        // BullMQ retries 3× and the op row stays in a non-terminal
+        // state for the entire backoff window.
+        const runWithErrorMapping = async () => {
+          try {
+            return await run();
+          } catch (err) {
+            const code = err && err.code;
+            if (code && NON_RETRYABLE_ERROR_CODES.has(code)) {
+              throw new UnrecoverableError(`${code}: ${err.message}`);
+            }
+            throw err;
+          }
+        };
+
+        if (!heavyCategory) return runWithErrorMapping();
 
         const result = await withJobLock(
           job,
           { userId: String(userId), category: heavyCategory },
-          run
+          runWithErrorMapping
         );
         if (result === QUEUED_BEHIND_LOCK) {
           // BullMQ has already moved this job to the delayed set; signal
@@ -121,11 +156,39 @@ class GroupQueueManager {
       }
     });
 
-    this.worker.on('failed', (job, err) => {
+    this.worker.on('failed', async (job, err) => {
       logger.error(`Group job ${job.id} failed: ${err.message}`, { jobId: job.id });
+
+      // Backstop: if the job was an add-members-bulk run with a
+      // pre-created op row and we somehow exited without finalising
+      // (e.g. the runner threw before the existing in-service
+      // try/catch ran), flip the row to `failed` here so the
+      // Operation History panel doesn't show a stale spinner.
+      try {
+        const data = job?.data || {};
+        const opId = data.opId;
+        if (opId && (data.type === 'add-members-bulk' || data.type === 'join-channels' || data.type === 'leave-channels')) {
+          const trimmed = (err && err.message ? String(err.message) : 'job failed').slice(0, 500);
+          await pool.query(
+            `UPDATE group_operations
+                SET status       = CASE
+                    WHEN status IN ('completed', 'cancelled', 'failed') THEN status
+                    ELSE 'failed'
+                  END,
+                  options      = COALESCE(options, '{}'::jsonb) || $2::jsonb,
+                  completed_at = COALESCE(completed_at, NOW())
+              WHERE id = $1`,
+            [opId, JSON.stringify({ error: trimmed, error_status: 'failed' })]
+          );
+        }
+      } catch (uErr) {
+        logger.warn(`group worker: failed to mark op as failed for job ${job?.id}: ${uErr.message}`);
+      }
+
       if (global.io) {
         global.io.to(`user:${job.data.userId}`).emit('group:failed', {
           jobId: job.id,
+          opId: job?.data?.opId,
           error: err.message,
         });
       }

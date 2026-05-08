@@ -991,10 +991,12 @@ class MessageService {
         audienceDmOnly = (audienceResult.dmOnly || []).length;
         audienceDropped = (audienceResult.dropped || []).length;
         if (Array.isArray(audienceResult.eligible) && audienceResult.eligible.length > 0) {
-          // Replace targetList with the post-filter raw entries.
-          // Keeping `.raw` preserves the existing normalizeTargetId
-          // call site downstream.
-          targetList = audienceResult.eligible.map((info) => info.raw);
+          // `audienceResult.eligible` is already projected into the
+          // worker-friendly shape (`{ ...raw, _filter_kind, _filter_status }`).
+          // Mapping `.raw` here would replace every entry with
+          // `undefined` and downstream normalizeTargetId would reject
+          // them all.
+          targetList = audienceResult.eligible;
           params.targetList = targetList;
         }
         logger.info('sendBulkMessage: audience filter applied', {
@@ -2388,7 +2390,10 @@ class MessageService {
         },
       });
       if (Array.isArray(audienceResult.eligible) && audienceResult.eligible.length > 0) {
-        users = audienceResult.eligible.map((info) => info.raw);
+        // `audienceResult.eligible` is already projected into the
+        // worker-friendly shape; mapping `.raw` would yield undefined
+        // entries.
+        users = audienceResult.eligible;
         params.users = users;
       }
       logger.info('sendBulkToUsers: audience filter applied', {

@@ -263,6 +263,91 @@ class GroupService {
       throw new AppError('At least one target group/channel is required', 400, 'NO_TARGETS');
     }
 
+    // Helper: flip the op row to a terminal state and emit a
+    // websocket event so the Operation History panel doesn't show a
+    // stale `queued`/`running` row. Best-effort; never throws.
+    const markPreflightFailure = async (status, message) => {
+      if (!existingOpId) return;
+      const trimmed = message ? String(message).slice(0, 500) : null;
+      try {
+        // The `group_operations` table has no dedicated error column,
+        // so we stash the message into `options.error` (JSONB merge)
+        // alongside the status flip + completed_at. JSONB `||`
+        // shallow-merges keys.
+        await pool.query(
+          `UPDATE group_operations
+              SET status       = $2,
+                  options      = COALESCE(options, '{}'::jsonb) || $3::jsonb,
+                  completed_at = NOW()
+            WHERE id = $1`,
+          [
+            existingOpId,
+            status,
+            JSON.stringify({ error: trimmed, error_status: status }),
+          ]
+        );
+      } catch (uErr) {
+        logger.warn(`addMembersToGroups: could not mark op ${existingOpId} as ${status}: ${uErr.message}`);
+      }
+      try {
+        await updateProgress(existingOpId, {
+          operation_id: existingOpId,
+          status,
+          error: message ? String(message).slice(0, 500) : null,
+        });
+      } catch (_) {
+        // redis unavailable
+      }
+      try {
+        if (global.io && userId) {
+          global.io.to(`user:${userId}`).emit('group:failed', {
+            opId: existingOpId,
+            jobId: existingOpId,
+            error: message,
+            status,
+          });
+        }
+      } catch (_) {
+        // ws unavailable
+      }
+    };
+
+    // Helper: emit an intermediate 'filtering' / 'validating' phase to
+    // the op row + websocket so the Operations UI displays what the
+    // worker is doing right now (instead of leaving the row stuck on
+    // `queued` for the entire pre-flight).
+    const markPhase = async (phase, extra = {}) => {
+      if (!existingOpId) return;
+      try {
+        await pool.query(
+          `UPDATE group_operations SET status = $2 WHERE id = $1`,
+          [existingOpId, phase]
+        );
+      } catch (uErr) {
+        logger.warn(`addMembersToGroups: could not mark op ${existingOpId} as ${phase}: ${uErr.message}`);
+      }
+      try {
+        await updateProgress(existingOpId, {
+          operation_id: existingOpId,
+          status: phase,
+          ...extra,
+        });
+      } catch (_) {
+        // redis unavailable
+      }
+      try {
+        if (global.io && userId) {
+          global.io.to(`user:${userId}`).emit('group:progress', {
+            opId: existingOpId,
+            jobId: existingOpId,
+            progress: { status: phase, ...extra },
+          });
+        }
+      } catch (_) {
+        // ws unavailable
+      }
+    };
+
     // ─── Pre-job audience filter ────────────────────────────────────
     // Dedupe + classify (cache + session-less t.me probe) the input
     // userList BEFORE we burn any session quota. We hard-drop NOT_FOUND
@@ -277,87 +362,117 @@ class GroupService {
     let audienceStats = null;
     let audienceDmOnly = [];
     let audienceDropped = [];
+    let preparedUsers = [];
+    let unaddressable = [];
+    let verifiedSessions;
     try {
-      const audienceResult = await audienceFilter.filterUserList({
-        userList,
-        listId,
-        userId,
-        context: 'add-members',
-        options: {
-          // Group-add jobs explicitly skip privacy-restricted users —
-          // the API will refuse to add them anyway.
-          includePrivacyRestricted: false,
-          purgeNotFound: true,
-        },
-      });
-      audienceStats = audienceResult.stats;
-      audienceDmOnly = audienceResult.dmOnly || [];
-      audienceDropped = audienceResult.dropped || [];
-      if (Array.isArray(audienceResult.eligible) && audienceResult.eligible.length > 0) {
-        userList = audienceResult.eligible.map((info) => info.raw);
+      // Surface the 'filtering' phase to the UI as soon as we start
+      // the audience pass.
+      await markPhase('filtering', { total: userList.length });
+
+      try {
+        const audienceResult = await audienceFilter.filterUserList({
+          userList,
+          listId,
+          userId,
+          context: 'add-members',
+          options: {
+            // Group-add jobs explicitly skip privacy-restricted users —
+            // the API will refuse to add them anyway.
+            includePrivacyRestricted: false,
+            purgeNotFound: true,
+          },
+        });
+        audienceStats = audienceResult.stats;
+        audienceDmOnly = audienceResult.dmOnly || [];
+        audienceDropped = audienceResult.dropped || [];
+        // `audienceResult.eligible` is already projected into the
+        // worker-friendly shape (`{ ...raw, _filter_kind, _filter_status }`).
+        // Mapping `.raw` here was a bug — there is no `.raw` on the
+        // already-projected entries, so every userList item became
+        // `undefined` and `collectTelegramTargetCandidates` threw
+        // "No usable identifiers found in userList". Use the projected
+        // entries directly.
+        if (Array.isArray(audienceResult.eligible) && audienceResult.eligible.length > 0) {
+          userList = audienceResult.eligible;
+        } else if (Array.isArray(audienceResult.eligible)) {
+          // Filter ran cleanly but yielded zero eligible rows. Reflect
+          // that in `userList` so the empty-check below catches it.
+          userList = [];
+        }
+        logger.info('addMembersToGroups: audience filter applied', {
+          userId,
+          listId,
+          stats: audienceStats,
+          dmOnly: audienceDmOnly.length,
+          dropped: audienceDropped.length,
+          eligible: userList.length,
+        });
+      } catch (filterErr) {
+        logger.warn('addMembersToGroups: audience filter failed; proceeding with raw userList', {
+          error: filterErr.message,
+          userId,
+          listId,
+        });
       }
-      logger.info('addMembersToGroups: audience filter applied', {
-        userId,
-        listId,
-        stats: audienceStats,
-        dmOnly: audienceDmOnly.length,
-        dropped: audienceDropped.length,
-        eligible: userList.length,
-      });
-    } catch (filterErr) {
-      logger.warn('addMembersToGroups: audience filter failed; proceeding with raw userList', {
-        error: filterErr.message,
-        userId,
-        listId,
-      });
-    }
 
-    if (!userList || userList.length === 0) {
-      // Filter dropped every entry. Don't throw — instead persist a
-      // completed-with-zero-eligible op row so the UI sees what
-      // happened.
-      throw new AppError(
-        'All audience entries were filtered out (not_found or privacy-restricted).',
-        400,
-        'NO_ELIGIBLE_USERS'
-      );
-    }
-
-    // Normalize each user-list entry into the full candidate chain
-    // (numeric id → @username → +phone) and skip unaddressable rows
-    // up-front. We keep ALL candidates because scraped numeric ids
-    // typically can't be resolved without a cached access_hash, while
-    // a sibling @username on the same row often resolves cleanly via
-    // contacts.ResolveUsername — so falling through is a real win.
-    const preparedUsers = [];
-    const unaddressable = [];
-    for (const entry of userList) {
-      const candidates = collectTelegramTargetCandidates(entry);
-      if (candidates.length > 0) {
-        preparedUsers.push({ entry, identifier: candidates[0], candidates });
-      } else {
-        unaddressable.push(entry);
+      if (!userList || userList.length === 0) {
+        throw new AppError(
+          'All audience entries were filtered out (not_found or privacy-restricted).',
+          400,
+          'NO_ELIGIBLE_USERS'
+        );
       }
-    }
 
-    if (preparedUsers.length === 0) {
-      throw new AppError(
-        'No usable identifiers found in userList (every row was empty, a UUID placeholder, or otherwise unaddressable).',
-        400,
-        'NO_VALID_USERS'
-      );
-    }
+      // Normalize each user-list entry into the full candidate chain
+      // (numeric id → @username → +phone) and skip unaddressable rows
+      // up-front. We keep ALL candidates because scraped numeric ids
+      // typically can't be resolved without a cached access_hash, while
+      // a sibling @username on the same row often resolves cleanly via
+      // contacts.ResolveUsername — so falling through is a real win.
+      for (const entry of userList) {
+        const candidates = collectTelegramTargetCandidates(entry);
+        if (candidates.length > 0) {
+          preparedUsers.push({ entry, identifier: candidates[0], candidates });
+        } else {
+          unaddressable.push(entry);
+        }
+      }
 
-    if (unaddressable.length > 0) {
-      logger.warn(
-        `addMembersToGroups: dropping ${unaddressable.length} unaddressable userList entries`,
-        { sample: unaddressable.slice(0, 3) }
-      );
-    }
+      if (preparedUsers.length === 0) {
+        throw new AppError(
+          'No usable identifiers found in userList (every row was empty, a UUID placeholder, or otherwise unaddressable).',
+          400,
+          'NO_VALID_USERS'
+        );
+      }
 
-    // Verify session ownership
-    const verifiedSessions = await validateSessionsOwnership(sessionIds, userId);
-    if (verifiedSessions.length === 0) {
+      if (unaddressable.length > 0) {
+        logger.warn(
+          `addMembersToGroups: dropping ${unaddressable.length} unaddressable userList entries`,
+          { sample: unaddressable.slice(0, 3) }
+        );
+      }
+
+      // Move into the 'validating sessions' phase before we touch the DB
+      // for ownership/cooldown — gives the UI a clear state-change.
+      await markPhase('validating', {
+        total: preparedUsers.length,
+        eligible: preparedUsers.length,
+      });
+
+      // Verify session ownership (also drops cooldown sessions; throws
+      // ALL_SESSIONS_ON_COOLDOWN when nothing usable is left).
+      verifiedSessions = await validateSessionsOwnership(sessionIds, userId);
+    } catch (preflightErr) {
+      // Persist a terminal status on the queued op row so the
+      // Operation History panel doesn't show a stale spinner. Then
+      // re-throw so BullMQ marks the job failed.
+      await markPreflightFailure('failed', preflightErr.message);
+      throw preflightErr;
+    }
+    if (!verifiedSessions || verifiedSessions.length === 0) {
+      await markPreflightFailure('failed', 'No valid sessions found');
       throw new AppError('No valid sessions found', 404, 'NO_VALID_SESSIONS');
     }
 
@@ -1392,7 +1507,7 @@ class GroupService {
     }
 
     const opResult = await pool.query(
-      'SELECT id FROM group_operations WHERE id = $1 AND user_id = $2',
+      'SELECT id, status FROM group_operations WHERE id = $1 AND user_id = $2',
       [opId, userId]
     );
 
@@ -1406,6 +1521,41 @@ class GroupService {
       }
     } catch (err) {
       logger.error(`Failed to set cancel token for op ${opId}`, { error: err.message });
+    }
+
+    // If the runner hasn't entered the loop yet (e.g. still 'queued',
+    // 'filtering', or 'validating'), the next `isCancelled(opId)` check
+    // won't fire until it gets there — by which point the audience
+    // filter / session validation already wasted work. Flip the row
+    // synchronously so the UI shows the cancel as soon as it's
+    // requested. The runner's own terminal handlers are idempotent
+    // (status guard in the worker.failed backstop too) so this is safe.
+    const currentStatus = opResult.rows[0].status;
+    if (['queued', 'pending', 'filtering', 'validating'].includes(currentStatus)) {
+      try {
+        await pool.query(
+          `UPDATE group_operations
+              SET status       = 'cancelled',
+                  completed_at = NOW()
+            WHERE id = $1
+              AND status NOT IN ('completed', 'failed', 'cancelled')`,
+          [opId]
+        );
+      } catch (uErr) {
+        logger.warn(`cancelOperation: could not eagerly mark op ${opId} cancelled: ${uErr.message}`);
+      }
+      try {
+        if (global.io) {
+          global.io.to(`user:${userId}`).emit('group:failed', {
+            opId,
+            jobId: opId,
+            error: 'cancelled',
+            status: 'cancelled',
+          });
+        }
+      } catch (_) {
+        // ws unavailable
+      }
     }
 
     logger.info(`Cancel requested for operation ${opId} by user ${userId}`);

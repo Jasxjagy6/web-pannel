@@ -713,6 +713,22 @@ function ActiveOperationsPanel({ operations, onCancel }) {
           const failed = op.failedCount || 0;
           const progress = total > 0 ? ((added + failed) / total) * 100 : 0;
 
+          // Status that the worker emits while the pre-flight is
+          // running. Treat them like 'running' for cancel UI purposes
+          // and surface a human description so the operator knows
+          // exactly what the worker is doing right now.
+          const PHASE_LABELS = {
+            queued: 'Queued — waiting for a worker',
+            filtering: 'Filtering audience (deduping + classifying)',
+            validating: 'Validating sessions (skipping cooldown rows)',
+            running: 'Running',
+            cooldown: 'Cooldown — pausing between rotations',
+            pending: 'Pending',
+          };
+          const isInFlight = ['running', 'queued', 'pending', 'filtering', 'validating', 'cooldown'].includes(op.status);
+          const phaseLabel = PHASE_LABELS[op.status];
+          const opError = op?.options?.error || op?.error || null;
+
           return (
             <div key={op.id} className="rounded-lg border border-white/5 bg-dark-900 p-4 space-y-3">
               <div className="flex items-center justify-between">
@@ -720,7 +736,7 @@ function ActiveOperationsPanel({ operations, onCancel }) {
                   <StatusBadge status={op.status || 'running'} size="sm" />
                   <span className="text-sm text-white font-mono">#{op.id}</span>
                 </div>
-                {(op.status === 'running' || op.status === 'queued' || op.status === 'pending') && (
+                {isInFlight && (
                   <button
                     onClick={() => onCancel(op.id)}
                     className="flex items-center gap-1 rounded-lg bg-red-500/10 border border-red-500/20 px-2.5 py-1 text-xs font-medium text-red-400 hover:bg-red-500/20 transition"
@@ -730,6 +746,16 @@ function ActiveOperationsPanel({ operations, onCancel }) {
                   </button>
                 )}
               </div>
+
+              {phaseLabel && isInFlight && (
+                <p className="text-xs text-gray-400">{phaseLabel}</p>
+              )}
+
+              {op.status === 'failed' && opError && (
+                <div className="rounded-md border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs text-red-300">
+                  <span className="font-medium">Error:</span> {opError}
+                </div>
+              )}
 
               <div>
                 <div className="flex items-center justify-between mb-1.5">
@@ -837,41 +863,83 @@ export default function Groups() {
     if (token) connect(token);
   }, [connect]);
 
-  // WebSocket event handlers
+  // WebSocket event handlers.
+  //
+  // The backend emits three event names from `groupQueue.js` and
+  // `groupService.js` for every queued add-members run:
+  //   - `group:progress` { jobId, opId, progress: { status, total, ... } }
+  //   - `group:completed` { jobId, opId, result }
+  //   - `group:failed` { jobId, opId, error }
+  //
+  // Older builds were listening for `add_progress` / `add_completed` /
+  // `add_error`, which the backend never emitted — so the Operations
+  // panel only updated via the 10s poll. Pull the operation id from
+  // both `opId` and the legacy `operation_id` shape so this stays
+  // compatible with anything still emitting the old payload.
   useEffect(() => {
+    const opIdOf = (data) => {
+      if (!data) return null;
+      return data.opId ?? data.operation_id ?? data.jobId ?? null;
+    };
+
     const handleProgress = (data) => {
+      const id = opIdOf(data);
+      if (id == null) return;
+      const progress = data.progress || data;
       setOperations((prev) =>
         prev.map((op) =>
-          op.id === data.operation_id ? { ...op, ...data, status: data.status || op.status } : op
+          op.id === id
+            ? {
+                ...op,
+                ...progress,
+                status: progress.status || op.status,
+              }
+            : op
         )
       );
     };
 
     const handleCompleted = (data) => {
+      const id = opIdOf(data);
+      if (id == null) return;
+      const result = data.result || data;
       setOperations((prev) =>
         prev.map((op) =>
-          op.id === data.operation_id ? { ...op, ...data, status: 'completed' } : op
+          op.id === id ? { ...op, ...result, status: 'completed' } : op
         )
       );
       showSuccess(
-        `Add operation ${data.operation_id} completed. ${data.added || data.addedCount || 0} added, ${data.failed || 0} failed, ${data.skipped || 0} skipped.`,
+        `Add operation ${id} completed. ${result.added || result.addedCount || 0} added, ${result.failed || 0} failed, ${result.skipped || 0} skipped.`,
         'Operation Complete'
       );
       fetchOperations();
     };
 
     const handleError = (data) => {
+      const id = opIdOf(data);
+      if (id == null) return;
       setOperations((prev) =>
-        prev.map((op) => (op.id === data.operation_id ? { ...op, status: 'failed' } : op))
+        prev.map((op) => (op.id === id ? { ...op, status: 'failed' } : op))
       );
-      showError(`Add operation ${data.operation_id} failed: ${data.error || 'Unknown error'}`, 'Operation Error');
+      showError(
+        `Add operation ${id} failed: ${data.error || 'Unknown error'}`,
+        'Operation Error'
+      );
+      fetchOperations();
     };
 
+    on('group:progress', handleProgress);
+    on('group:completed', handleCompleted);
+    on('group:failed', handleError);
+    // Legacy aliases — keep listening so older deployments don't break.
     on('add_progress', handleProgress);
     on('add_completed', handleCompleted);
     on('add_error', handleError);
 
     return () => {
+      off('group:progress', handleProgress);
+      off('group:completed', handleCompleted);
+      off('group:failed', handleError);
       off('add_progress', handleProgress);
       off('add_completed', handleCompleted);
       off('add_error', handleError);
@@ -1120,8 +1188,12 @@ export default function Groups() {
     }
   };
 
+  // Treat the worker's intermediate phases ('filtering', 'validating',
+  // 'cooldown') as active so the operator sees the row in the
+  // top-of-page Active Operations panel for the entire pre-flight,
+  // not just once the runner reaches 'running'.
   const activeOperations = operations.filter((op) =>
-    ['running', 'queued', 'pending'].includes(op.status)
+    ['running', 'queued', 'pending', 'filtering', 'validating', 'cooldown'].includes(op.status)
   );
 
   const totalPages = Math.ceil(operations.length / pageSize);
@@ -1263,7 +1335,7 @@ export default function Groups() {
                             <AlertTriangle className="w-3.5 h-3.5" />
                           </button>
                         )}
-                        {(op.status === 'running' || op.status === 'queued') && (
+                        {['running', 'queued', 'pending', 'filtering', 'validating', 'cooldown'].includes(op.status) && (
                           <button
                             onClick={() => handleCancelOperation(op.id)}
                             className="p-1.5 rounded hover:bg-red-500/20 text-red-400"
