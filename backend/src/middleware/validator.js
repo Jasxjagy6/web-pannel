@@ -153,11 +153,18 @@ const schemas = {
     .or('sessionIds', 'sessionId', 'sessionListId')
     .or('targetIds', 'targetGroupId'),
 
+  // Either sessionIds (explicit) OR sessionListId (resolved server-side
+  // by `resolveSessionIdsFromRequest`) must be provided. Without the
+  // `.or()` clause the panel's "Use Sessions List" picker silently
+  // failed validation when no sessionIds were sent, surfacing as a
+  // generic 400 in the join/leave UI.
   joinLeaveChannels: Joi.object({
-    sessionIds: Joi.array().items(Joi.number().integer().positive()).min(1).required(),
+    sessionIds: Joi.array().items(Joi.number().integer().positive()).min(1).optional(),
+    sessionListId: Joi.alternatives(Joi.number().integer().positive(), Joi.string()).optional(),
+    session_list_id: Joi.alternatives(Joi.number().integer().positive(), Joi.string()).optional(),
     targetIds: Joi.array().items(Joi.string()).min(1).required(),
     targetType: Joi.string().valid('group', 'channel').default('group'),
-  }),
+  }).or('sessionIds', 'sessionListId', 'session_list_id'),
 
   twoFACheck: Joi.object({
     sessionId: Joi.number().integer().positive().required(),

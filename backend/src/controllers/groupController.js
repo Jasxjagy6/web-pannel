@@ -462,10 +462,24 @@ const groupController = {
 
   /**
    * Join multiple sessions to multiple groups/channels.
+   *
+   * The controller validates the request, persists a `group_operations`
+   * row, hands the work off to the BullMQ `groupQueue` worker, and
+   * responds 202 immediately. Doing the join inline used to block on
+   * each session's reconnect (`_ensureConnected` waits up to
+   * TG_CONNECT_TIMEOUT_MS) so the 30s axios timeout hit before any
+   * Telegram API call landed when many sessions were selected. Pushing
+   * the work off the request thread also lets us run sessions in
+   * parallel (different sessions share no rate limit) so the total
+   * wall-clock drops from O(N×1s) to O(N/concurrency × per-session
+   * latency).
+   *
+   * The frontend polls `/api/groups/operations/:id` (already exposed)
+   * for progress and renders the result on completion.
    */
   joinChannels: asyncHandler(async (req, res) => {
     const userId = req.user.id;
-    const { sessionIds: rawSessionIds, targetIds, targetType = 'group' } = req.body;
+    const { sessionIds: rawSessionIds, targetIds } = req.body;
 
     const sessionIds = await resolveSessionIdsFromRequest(req, rawSessionIds || []);
     if (!Array.isArray(sessionIds) || sessionIds.length === 0) {
@@ -480,7 +494,9 @@ const groupController = {
       throw new AppError('targetIds array is required', 400, 'MISSING_TARGETS');
     }
 
-    // Verify session ownership
+    // Verify session ownership up-front so we fail fast (and so the
+    // caller never gets a 202 for a request that was always going to
+    // be rejected later in the worker).
     const { pool } = require('../config/database');
     const placeholders = sessionIds.map((_, i) => `$${i + 2}`).join(',');
     const sessionResult = await pool.query(
@@ -493,85 +509,66 @@ const groupController = {
     }
 
     const verifiedSessions = sessionResult.rows;
-    const tgService = telegramService;
 
-    const results = [];
-    let joinedCount = 0;
-    let failedCount = 0;
-    let skippedCount = 0;
+    const { opId, totalPairs } = await groupService.createJoinLeaveOperationRow({
+      userId,
+      operation: 'join_channels',
+      sessionRows: verifiedSessions,
+      targetIds,
+    });
 
-    // Process each session for each target
-    for (const session of verifiedSessions) {
-      for (const targetId of targetIds) {
-        const result = {
-          sessionId: session.id,
-          targetId,
-          success: false,
-        };
+    const queueJob = await groupQueue.addJob({
+      type: 'join-channels',
+      opId,
+      userId,
+      sessionIds: verifiedSessions.map((s) => s.id),
+      targetIds,
+    });
 
-        try {
-          const joinResult = await tgService.joinChannel(session.id, targetId);
-          result.success = joinResult.success;
-          result.targetName = joinResult.targetName;
-          if (joinResult.skipped) {
-            result.skipped = true;
-            result.reason = joinResult.reason;
-            skippedCount++;
-          } else {
-            joinedCount++;
-          }
-        } catch (err) {
-          result.error = err.message;
-          failedCount++;
-        }
-
-        results.push(result);
-
-        // Small delay between joins to avoid flood
-        await new Promise(resolve => setTimeout(resolve, 1000));
-      }
-    }
-
-    // Log operation
     await reportService.logActivity(
       userId,
-      'group_join',
+      'group_join_start',
       'group_operation',
-      null,
+      String(opId),
       {
         type: 'join',
+        opId,
+        queueJobId: queueJob.id,
         targetIds,
-        sessionIds: verifiedSessions.map(s => s.id),
-        joinedCount,
-        failedCount,
-        skippedCount,
+        sessionIds: verifiedSessions.map((s) => s.id),
+        totalPairs,
       }
     );
 
-    logger.info(`Join operation complete for user ${userId}`, {
-      joined: joinedCount,
-      failed: failedCount,
-      skipped: skippedCount,
+    logger.info(`Join job queued for user ${userId}`, {
+      opId,
+      queueJobId: queueJob.id,
+      sessionCount: verifiedSessions.length,
+      targetCount: targetIds.length,
     });
 
-    return res.status(200).json({
+    return res.status(202).json({
       success: true,
       data: {
-        total: results.length,
-        joined: joinedCount,
-        failed: failedCount,
-        skipped: skippedCount,
-        results,
+        opId,
+        queueJobId: queueJob.id,
+        status: 'queued',
+        total: totalPairs,
+        sessionCount: verifiedSessions.length,
+        targetCount: targetIds.length,
       },
     });
   }),
 
   /**
    * Remove multiple sessions from multiple groups/channels.
+   *
+   * Same async-via-queue contract as `joinChannels`. See that handler
+   * for the rationale.
    */
   leaveChannels: asyncHandler(async (req, res) => {
     const userId = req.user.id;
-    const { sessionIds: rawSessionIds, targetIds, targetType = 'group' } = req.body;
+    const { sessionIds: rawSessionIds, targetIds } = req.body;
 
     const sessionIds = await resolveSessionIdsFromRequest(req, rawSessionIds || []);
     if (!Array.isArray(sessionIds) || sessionIds.length === 0) {
@@ -586,7 +583,6 @@ const groupController = {
       throw new AppError('targetIds array is required', 400, 'MISSING_TARGETS');
     }
 
-    // Verify session ownership
     const { pool } = require('../config/database');
     const placeholders = sessionIds.map((_, i) => `$${i + 2}`).join(',');
     const sessionResult = await pool.query(
@@ -599,74 +595,53 @@ const groupController = {
     }
 
     const verifiedSessions = sessionResult.rows;
-    const tgService = telegramService;
 
-    const results = [];
-    let leftCount = 0;
-    let failedCount = 0;
-    let skippedCount = 0;
+    const { opId, totalPairs } = await groupService.createJoinLeaveOperationRow({
+      userId,
+      operation: 'leave_channels',
+      sessionRows: verifiedSessions,
+      targetIds,
+    });
 
-    // Process each session for each target
-    for (const session of verifiedSessions) {
-      for (const targetId of targetIds) {
-        const result = {
-          sessionId: session.id,
-          targetId,
-          success: false,
-        };
+    const queueJob = await groupQueue.addJob({
+      type: 'leave-channels',
+      opId,
+      userId,
+      sessionIds: verifiedSessions.map((s) => s.id),
+      targetIds,
+    });
 
-        try {
-          const leaveResult = await tgService.leaveChannel(session.id, targetId);
-          result.success = leaveResult.success;
-          if (leaveResult.skipped) {
-            result.skipped = true;
-            result.reason = leaveResult.reason;
-            skippedCount++;
-          } else {
-            leftCount++;
-          }
-        } catch (err) {
-          result.error = err.message;
-          failedCount++;
-        }
-
-        results.push(result);
-
-        // Small delay between leaves to avoid flood
-        await new Promise(resolve => setTimeout(resolve, 1000));
-      }
-    }
-
-    // Log operation
     await reportService.logActivity(
       userId,
-      'group_leave',
+      'group_leave_start',
       'group_operation',
-      null,
+      String(opId),
       {
         type: 'leave',
+        opId,
+        queueJobId: queueJob.id,
         targetIds,
-        sessionIds: verifiedSessions.map(s => s.id),
-        leftCount,
-        failedCount,
-        skippedCount,
+        sessionIds: verifiedSessions.map((s) => s.id),
+        totalPairs,
       }
     );
 
-    logger.info(`Leave operation complete for user ${userId}`, {
-      left: leftCount,
-      failed: failedCount,
-      skipped: skippedCount,
+    logger.info(`Leave job queued for user ${userId}`, {
+      opId,
+      queueJobId: queueJob.id,
+      sessionCount: verifiedSessions.length,
+      targetCount: targetIds.length,
     });
 
-    return res.status(200).json({
+    return res.status(202).json({
       success: true,
       data: {
-        total: results.length,
-        left: leftCount,
-        failed: failedCount,
-        skipped: skippedCount,
-        results,
+        opId,
+        queueJobId: queueJob.id,
+        status: 'queued',
+        total: totalPairs,
+        sessionCount: verifiedSessions.length,
+        targetCount: targetIds.length,
       },
     });
   }),
