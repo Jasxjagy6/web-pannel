@@ -1177,6 +1177,238 @@ class GroupService {
   }
 
   // =========================================================================
+  // Bulk Join / Leave Channels (Multi-Session, Multi-Target)
+  // =========================================================================
+  //
+  // Both helpers run sessions in parallel with a small concurrency cap.
+  // Each session contacts Telegram independently, so we don't need the
+  // original 1s-per-pair sleep; the only throttle that matters is
+  // *within* a single session when it touches multiple targets in
+  // sequence. That's why we sleep between targets of the same session
+  // (and only there).
+  //
+  // The caller (controller / queue worker) is responsible for creating
+  // the `group_operations` row and passing `opId`. Progress updates and
+  // final completion are written back via `updateProgress` +
+  // `_finalizeOperation`, exactly like add-members. This means the
+  // existing `getOperationDetails` endpoint and websocket events the
+  // frontend already polls/listens to keep working with no schema
+  // changes.
+
+  async _runJoinLeaveBulk({
+    opId,
+    operationType, // 'join_channels' | 'leave_channels'
+    sessionRows,   // [{ id, user_id, ... }]
+    targetIds,
+    userId,
+    concurrency = 8,
+    perTargetJitterMs = 750,
+  }) {
+    const tgService = telegramService;
+    const isLeave = operationType === 'leave_channels';
+    const totalPairs = sessionRows.length * targetIds.length;
+
+    let successCount = 0;
+    let failedCount = 0;
+    let skippedCount = 0;
+    const results = [];
+
+    const emitProgress = async () => {
+      const processed = successCount + failedCount + skippedCount;
+      await updateProgress(opId, {
+        operation_id: opId,
+        progress: processed,
+        success: successCount,
+        failed: failedCount,
+        skipped: skippedCount,
+        total: totalPairs,
+        status: 'running',
+      });
+      try {
+        if (global.io && userId) {
+          global.io.to(`user:${userId}`).emit('group:progress', {
+            opId,
+            jobId: opId,
+            progress: {
+              processed,
+              total: totalPairs,
+              success: successCount,
+              failed: failedCount,
+              skipped: skippedCount,
+            },
+          });
+        }
+      } catch (_) {
+        // ws unavailable
+      }
+    };
+
+    // One async worker per parallel slot. Workers pull sessions off a
+    // shared cursor so we never run more than `concurrency` sessions
+    // at the same time, regardless of how many sessions were chosen.
+    let cursor = 0;
+    const runWorker = async () => {
+      while (true) {
+        if (await isCancelled(opId)) return;
+        const i = cursor++;
+        if (i >= sessionRows.length) return;
+        const session = sessionRows[i];
+
+        for (let t = 0; t < targetIds.length; t++) {
+          if (await isCancelled(opId)) return;
+          const targetId = targetIds[t];
+          const result = {
+            sessionId: session.id,
+            targetId,
+            success: false,
+          };
+          try {
+            const opResult = isLeave
+              ? await tgService.leaveChannel(session.id, targetId)
+              : await tgService.joinChannel(session.id, targetId);
+            result.success = opResult.success;
+            if (opResult.targetName) result.targetName = opResult.targetName;
+            if (opResult.skipped) {
+              result.skipped = true;
+              result.reason = opResult.reason;
+              skippedCount++;
+            } else {
+              successCount++;
+            }
+          } catch (err) {
+            result.error = err.message || String(err);
+            failedCount++;
+          }
+          results.push(result);
+          await emitProgress();
+
+          // Only stagger between *targets within the same session* —
+          // different sessions are already running in parallel.
+          if (t < targetIds.length - 1) {
+            await sleep(perTargetJitterMs);
+          }
+        }
+      }
+    };
+
+    const workerCount = Math.max(1, Math.min(concurrency, sessionRows.length));
+    const workers = Array.from({ length: workerCount }, () => runWorker());
+
+    try {
+      await Promise.all(workers);
+    } catch (err) {
+      logger.error(`Bulk ${operationType} fatal error op=${opId}: ${err.message}`);
+    }
+
+    const cancelled = await isCancelled(opId);
+    const finalStatus = cancelled ? 'cancelled' : 'completed';
+
+    await updateProgress(opId, {
+      operation_id: opId,
+      progress: successCount + failedCount + skippedCount,
+      success: successCount,
+      failed: failedCount,
+      skipped: skippedCount,
+      total: totalPairs,
+      status: finalStatus,
+    });
+    await this._finalizeOperation(opId, finalStatus, successCount, failedCount, skippedCount, results);
+
+    return {
+      opId,
+      total: totalPairs,
+      success: successCount,
+      failed: failedCount,
+      skipped: skippedCount,
+      results,
+    };
+  }
+
+  /**
+   * Insert a `group_operations` row for a join/leave bulk run and return
+   * `{ opId, totalPairs }`. Done in the controller (synchronously,
+   * before responding) so the client gets an immediate handle for
+   * polling, even though the actual joins are still pending.
+   */
+  async createJoinLeaveOperationRow({ userId, operation, sessionRows, targetIds }) {
+    const totalPairs = sessionRows.length * targetIds.length;
+    const result = await pool.query(
+      `INSERT INTO group_operations (
+        user_id, session_id, target_group_id, operation, operation_type,
+        total_count, total_users, status, options, created_at
+      ) VALUES ($1, $2, $3, $4, $4, $5, $5, 'queued', $6, NOW())
+      RETURNING id`,
+      [
+        userId,
+        sessionRows[0].id,
+        targetIds[0],
+        operation, // 'join_channels' | 'leave_channels'
+        totalPairs,
+        JSON.stringify({
+          sessionIds: sessionRows.map((s) => s.id),
+          targetIds,
+        }),
+      ]
+    );
+    const opId = result.rows[0].id;
+    await updateProgress(opId, {
+      operation_id: opId,
+      progress: 0,
+      success: 0,
+      failed: 0,
+      skipped: 0,
+      total: totalPairs,
+      status: 'queued',
+    });
+    return { opId, totalPairs };
+  }
+
+  /**
+   * Public entry the BullMQ worker calls. Looks up sessions, then runs
+   * the parallel join/leave loop. Caller passes the pre-existing opId
+   * (created in the controller before responding) so progress/results
+   * land on the right row.
+   */
+  async runJoinLeaveJob({ opId, operation, userId, sessionIds, targetIds }) {
+    if (!opId) throw new AppError('opId is required', 400, 'MISSING_OP_ID');
+    if (!Array.isArray(sessionIds) || sessionIds.length === 0) {
+      throw new AppError('sessionIds is required', 400, 'MISSING_SESSIONS');
+    }
+    if (!Array.isArray(targetIds) || targetIds.length === 0) {
+      throw new AppError('targetIds is required', 400, 'MISSING_TARGETS');
+    }
+
+    const sessionRows = await validateSessionsOwnership(sessionIds, userId);
+    if (sessionRows.length === 0) {
+      await this._finalizeOperation(opId, 'failed', 0, 0, 0, []);
+      throw new AppError('No valid sessions found for this user', 404, 'SESSION_NOT_FOUND');
+    }
+
+    // Mark running before the heavy loop so the UI flips off "queued".
+    await pool.query(
+      `UPDATE group_operations SET status = 'running' WHERE id = $1`,
+      [opId]
+    );
+    await updateProgress(opId, {
+      operation_id: opId,
+      progress: 0,
+      success: 0,
+      failed: 0,
+      skipped: 0,
+      total: sessionRows.length * targetIds.length,
+      status: 'running',
+    });
+
+    return this._runJoinLeaveBulk({
+      opId,
+      operationType: operation,
+      sessionRows,
+      targetIds,
+      userId,
+    });
+  }
+
+  // =========================================================================
   // Internal Helpers
   // =========================================================================
 

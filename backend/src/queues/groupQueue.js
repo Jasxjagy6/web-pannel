@@ -29,7 +29,7 @@ class GroupQueueManager {
     this.worker = new Worker(
       GROUP_QUEUE_NAME,
       async (job) => {
-        const { type, sessionId, targetGroupId, userList, options, userId, groupId, settings, rules, title, members, userIdTarget } = job.data;
+        const { type, sessionId, targetGroupId, userList, options, userId, groupId, settings, rules, title, members, userIdTarget, opId, sessionIds, targetIds } = job.data;
 
         if (type === 'add-members') {
           return await groupService.addMembersToGroup(sessionId, targetGroupId, userList, options, userId);
@@ -45,6 +45,13 @@ class GroupQueueManager {
           return await groupService.createGroup(sessionId, title, members, userId);
         } else if (type === 'remove-member') {
           return await groupService.removeMember(sessionId, groupId, userIdTarget, userId);
+        } else if (type === 'join-channels' || type === 'leave-channels') {
+          // Bulk join/leave: sessions are processed in parallel (with a
+          // concurrency cap) inside the service, against every target.
+          // The opId / sessionIds / targetIds are pre-validated by the
+          // controller so the worker just runs the loop.
+          const operation = type === 'join-channels' ? 'join_channels' : 'leave_channels';
+          return await groupService.runJoinLeaveJob({ opId, operation, userId, sessionIds, targetIds });
         }
       },
       { connection: redisClient, concurrency: 5 }

@@ -947,12 +947,20 @@ export default function Groups() {
   };
 
   const handleJoinLeave = async (data) => {
+    // Join/Leave runs server-side as a BullMQ job: the controller
+    // accepts the request and returns 202 with an opId immediately,
+    // then we poll the operation row until it finishes. This keeps the
+    // request well below the 30s axios cap even when many sessions are
+    // selected (the inline implementation used to time out long before
+    // the loop made any progress because each `_ensureConnected`
+    // serially waited on a fresh proxy connect).
     setSubmitting(true);
-    const minLoadingTime = 3000;
     const startTime = Date.now();
+    const minLoadingTime = 1500; // brief hold so the spinner is visible
 
     try {
       const apiCall = data.mode === 'join' ? groupsAPI.joinChannels : groupsAPI.leaveChannels;
+      const actionWord = data.mode === 'join' ? 'joined' : 'left';
 
       const joinPayload = { targetIds: data.targetIds };
       if (data.sessionListId) {
@@ -960,27 +968,84 @@ export default function Groups() {
       } else {
         joinPayload.sessionIds = (data.sessionIds || []).map(id => parseInt(id));
       }
+
       const response = await apiCall(joinPayload);
+      const queued = response?.data?.data || {};
+      const opId = queued.opId;
+      const total = queued.total || 0;
+
+      if (!opId) {
+        // Fallback for older deployments that still return inline 200.
+        const inlineResult = queued;
+        const inlineSuccess = data.mode === 'join' ? inlineResult.joined : inlineResult.left;
+        if ((inlineResult.failed || 0) === 0 && (inlineResult.skipped || 0) === 0) {
+          showSuccess(`All ${inlineSuccess} operation(s) ${actionWord} successfully.`, 'Complete');
+        } else {
+          showSuccess(
+            `${inlineSuccess || 0} ${actionWord}, ${inlineResult.failed || 0} failed, ${inlineResult.skipped || 0} skipped.`,
+            'Partial Success',
+          );
+        }
+        fetchOperations();
+        return;
+      }
+
+      showSuccess(
+        `Queued ${total} ${data.mode} operation(s). Tracking progress in Operation History.`,
+        data.mode === 'join' ? 'Join Queued' : 'Leave Queued',
+      );
+      fetchOperations();
+
+      // Poll operation status. Backend writes Redis progress every
+      // session/target pair so this is cheap. We bail after a generous
+      // ceiling so a runaway job never holds the spinner forever — the
+      // job continues server-side and is visible in Operation History.
+      const POLL_INTERVAL_MS = 2500;
+      const POLL_CEILING_MS = 10 * 60 * 1000; // 10 minutes
+      const pollStarted = Date.now();
+      let finalOp = null;
+      while (Date.now() - pollStarted < POLL_CEILING_MS) {
+        await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL_MS));
+        try {
+          const opResp = await groupsAPI.getOperation(opId);
+          const opData = opResp?.data?.data?.operation || opResp?.data?.data || {};
+          if (['completed', 'failed', 'cancelled'].includes(opData.status)) {
+            finalOp = opData;
+            break;
+          }
+        } catch (pollErr) {
+          // Transient — keep polling. If it persists, the timeout below fires.
+        }
+      }
 
       const elapsed = Date.now() - startTime;
       const remaining = Math.max(0, minLoadingTime - elapsed);
-      await new Promise(resolve => setTimeout(resolve, remaining));
+      await new Promise((resolve) => setTimeout(resolve, remaining));
 
-      const result = response.data.data;
-      const successCount = data.mode === 'join' ? result.joined : result.left;
-      const failed = result.failed || 0;
-      const skipped = result.skipped || 0;
-      const total = result.total || 0;
+      if (!finalOp) {
+        showError(
+          'Job is still running after the polling window expired. Check Operation History for live progress.',
+          'Still Running',
+        );
+        return;
+      }
 
-      const actionWord = data.mode === 'join' ? 'joined' : 'left';
-      const failWord = data.mode === 'join' ? 'join' : 'leave';
+      const success = finalOp.successCount || 0;
+      const failed = finalOp.failedCount || 0;
+      const skipped = Math.max(0, (finalOp.totalUsers || total) - success - failed);
+      const totalRun = finalOp.totalUsers || total;
 
-      if (failed === 0 && skipped === 0) {
-        showSuccess(`All ${successCount} session(s) ${actionWord} successfully to ${data.targetIds.length} target(s).`, 'Complete');
-      } else if (successCount > 0) {
-        showSuccess(`${successCount} ${actionWord}, ${failed} failed, ${skipped} skipped out of ${total} operation(s).`, 'Partial Success');
+      if (finalOp.status === 'cancelled') {
+        showError(`Operation cancelled. ${success} ${actionWord} so far, ${failed} failed.`, 'Cancelled');
+      } else if (failed === 0 && skipped === 0) {
+        showSuccess(`All ${success} session(s) ${actionWord} successfully.`, 'Complete');
+      } else if (success > 0) {
+        showSuccess(
+          `${success} ${actionWord}, ${failed} failed, ${skipped} skipped out of ${totalRun}.`,
+          'Partial Success',
+        );
       } else {
-        showError(`All ${failed} operation(s) failed. Check logs for details.`, 'Failed');
+        showError(`All ${failed} operation(s) failed. Open Operation History for details.`, 'Failed');
       }
 
       fetchOperations();

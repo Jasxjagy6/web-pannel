@@ -387,6 +387,118 @@ html[data-platform="telegram"][data-tg-theme="light"] .text-primary-300 {
   color: #1d4ed8 !important;
 }
 
+/* ---------------------------------------------------------------
+   Status alert / banner colors in light mode.
+
+   Sessions page (and a couple of others) builds emerald / amber /
+   rose / red banners with the dark-mode ramp directly:
+
+       <div className="border border-emerald-500/20 bg-emerald-500/5">
+         <span className="text-emerald-300">Anti-revoke posture: healthy</span>
+         <p   className="text-emerald-200/70">All N sessions ...</p>
+       </div>
+
+   That ramp (`*-200`, `*-300`) is barely visible on a white card,
+   so the banner copy literally disappears. We re-map every status
+   text shade to its high-contrast counterpart on white and warm
+   the bg/border tints just enough so the card edge still reads
+   as "amber alert" / "emerald healthy" / "rose error".
+
+   The shades follow Tailwind's own `*-700` family, which is the
+   accessibility-tested on-white pair for these alert hues.
+   --------------------------------------------------------------- */
+html[data-platform="telegram"][data-tg-theme="light"] .text-emerald-100,
+html[data-platform="telegram"][data-tg-theme="light"] .text-emerald-200,
+html[data-platform="telegram"][data-tg-theme="light"] .text-emerald-300,
+html[data-platform="telegram"][data-tg-theme="light"] .text-emerald-400,
+html[data-platform="telegram"][data-tg-theme="light"] .text-emerald-200\/70,
+html[data-platform="telegram"][data-tg-theme="light"] .text-emerald-200\/80,
+html[data-platform="telegram"][data-tg-theme="light"] .text-emerald-300\/80 {
+  color: #047857 !important; /* emerald-700 */
+}
+html[data-platform="telegram"][data-tg-theme="light"] .text-amber-100,
+html[data-platform="telegram"][data-tg-theme="light"] .text-amber-200,
+html[data-platform="telegram"][data-tg-theme="light"] .text-amber-300,
+html[data-platform="telegram"][data-tg-theme="light"] .text-amber-400,
+html[data-platform="telegram"][data-tg-theme="light"] .text-amber-100\/90,
+html[data-platform="telegram"][data-tg-theme="light"] .text-amber-200\/80 {
+  color: #b45309 !important; /* amber-700 */
+}
+html[data-platform="telegram"][data-tg-theme="light"] .text-rose-100,
+html[data-platform="telegram"][data-tg-theme="light"] .text-rose-200,
+html[data-platform="telegram"][data-tg-theme="light"] .text-rose-300,
+html[data-platform="telegram"][data-tg-theme="light"] .text-rose-400 {
+  color: #be123c !important; /* rose-700 */
+}
+html[data-platform="telegram"][data-tg-theme="light"] .text-red-100,
+html[data-platform="telegram"][data-tg-theme="light"] .text-red-200,
+html[data-platform="telegram"][data-tg-theme="light"] .text-red-300,
+html[data-platform="telegram"][data-tg-theme="light"] .text-red-400 {
+  color: #b91c1c !important; /* red-700 */
+}
+html[data-platform="telegram"][data-tg-theme="light"] .text-yellow-100,
+html[data-platform="telegram"][data-tg-theme="light"] .text-yellow-200,
+html[data-platform="telegram"][data-tg-theme="light"] .text-yellow-300,
+html[data-platform="telegram"][data-tg-theme="light"] .text-yellow-400 {
+  color: #a16207 !important; /* yellow-700 */
+}
+html[data-platform="telegram"][data-tg-theme="light"] .text-blue-100,
+html[data-platform="telegram"][data-tg-theme="light"] .text-blue-200,
+html[data-platform="telegram"][data-tg-theme="light"] .text-blue-300,
+html[data-platform="telegram"][data-tg-theme="light"] .text-blue-400 {
+  color: #1d4ed8 !important; /* blue-700 */
+}
+html[data-platform="telegram"][data-tg-theme="light"] .text-sky-100,
+html[data-platform="telegram"][data-tg-theme="light"] .text-sky-200,
+html[data-platform="telegram"][data-tg-theme="light"] .text-sky-300,
+html[data-platform="telegram"][data-tg-theme="light"] .text-sky-400 {
+  color: #0369a1 !important; /* sky-700 */
+}
+
+/* Banner backgrounds — the `bg-*-500/5` tint is essentially
+   invisible on white. Lift it slightly so the card still reads
+   as "tinted" without overpowering the copy. */
+html[data-platform="telegram"][data-tg-theme="light"] .bg-emerald-500\/5  { background-color: rgba(16, 185, 129, 0.08) !important; }
+html[data-platform="telegram"][data-tg-theme="light"] .bg-emerald-500\/10 { background-color: rgba(16, 185, 129, 0.12) !important; }
+html[data-platform="telegram"][data-tg-theme="light"] .bg-amber-500\/5    { background-color: rgba(245, 158, 11, 0.10) !important; }
+html[data-platform="telegram"][data-tg-theme="light"] .bg-amber-500\/10   { background-color: rgba(245, 158, 11, 0.14) !important; }
+html[data-platform="telegram"][data-tg-theme="light"] .bg-rose-500\/5     { background-color: rgba(244, 63, 94, 0.08) !important; }
+html[data-platform="telegram"][data-tg-theme="light"] .bg-rose-500\/10    { background-color: rgba(244, 63, 94, 0.12) !important; }
+html[data-platform="telegram"][data-tg-theme="light"] .bg-red-500\/5      { background-color: rgba(239, 68, 68, 0.08) !important; }
+html[data-platform="telegram"][data-tg-theme="light"] .bg-red-500\/10     { background-color: rgba(239, 68, 68, 0.12) !important; }
+html[data-platform="telegram"][data-tg-theme="light"] .bg-yellow-500\/5   { background-color: rgba(234, 179, 8, 0.10) !important; }
+html[data-platform="telegram"][data-tg-theme="light"] .bg-yellow-500\/10  { background-color: rgba(234, 179, 8, 0.14) !important; }
+html[data-platform="telegram"][data-tg-theme="light"] .bg-blue-500\/5     { background-color: rgba(59, 130, 246, 0.08) !important; }
+html[data-platform="telegram"][data-tg-theme="light"] .bg-blue-500\/10    { background-color: rgba(59, 130, 246, 0.12) !important; }
+html[data-platform="telegram"][data-tg-theme="light"] .bg-sky-500\/5      { background-color: rgba(14, 165, 233, 0.08) !important; }
+html[data-platform="telegram"][data-tg-theme="light"] .bg-sky-500\/10     { background-color: rgba(14, 165, 233, 0.12) !important; }
+
+/* Banner borders — keep the colored edge but at a tone that
+   reads against white. */
+html[data-platform="telegram"][data-tg-theme="light"] .border-emerald-500\/20 { border-color: rgba(5, 150, 105, 0.30) !important; }
+html[data-platform="telegram"][data-tg-theme="light"] .border-emerald-500\/30 { border-color: rgba(5, 150, 105, 0.40) !important; }
+html[data-platform="telegram"][data-tg-theme="light"] .border-amber-500\/20   { border-color: rgba(217, 119, 6, 0.32) !important; }
+html[data-platform="telegram"][data-tg-theme="light"] .border-amber-500\/30   { border-color: rgba(217, 119, 6, 0.42) !important; }
+html[data-platform="telegram"][data-tg-theme="light"] .border-rose-500\/20    { border-color: rgba(225, 29, 72, 0.30) !important; }
+html[data-platform="telegram"][data-tg-theme="light"] .border-rose-500\/30    { border-color: rgba(225, 29, 72, 0.40) !important; }
+html[data-platform="telegram"][data-tg-theme="light"] .border-red-500\/20     { border-color: rgba(220, 38, 38, 0.30) !important; }
+html[data-platform="telegram"][data-tg-theme="light"] .border-red-500\/30     { border-color: rgba(220, 38, 38, 0.40) !important; }
+html[data-platform="telegram"][data-tg-theme="light"] .border-yellow-500\/20  { border-color: rgba(202, 138, 4, 0.32) !important; }
+html[data-platform="telegram"][data-tg-theme="light"] .border-yellow-500\/30  { border-color: rgba(202, 138, 4, 0.42) !important; }
+html[data-platform="telegram"][data-tg-theme="light"] .border-blue-500\/20    { border-color: rgba(37, 99, 235, 0.30) !important; }
+html[data-platform="telegram"][data-tg-theme="light"] .border-blue-500\/30    { border-color: rgba(37, 99, 235, 0.40) !important; }
+html[data-platform="telegram"][data-tg-theme="light"] .border-sky-500\/20     { border-color: rgba(2, 132, 199, 0.30) !important; }
+html[data-platform="telegram"][data-tg-theme="light"] .border-sky-500\/30     { border-color: rgba(2, 132, 199, 0.40) !important; }
+
+/* Inline `<code>` chip used inside the amber tutorial banner. The
+   default `bg-amber-500/10` reads OK in dark mode but on the new
+   amber-tinted card in light mode it disappears. Give it a touch
+   more saturation so the highlight stays legible. */
+html[data-platform="telegram"][data-tg-theme="light"] .bg-emerald-500\/10,
+html[data-platform="telegram"][data-tg-theme="light"] .bg-amber-500\/10 {
+  /* covered above — keep override single-source */
+}
+
 /* Soft animated theme transition — the user's hard requirement is
    "no lag". A blanket `transition: background-color 200ms` on every
    element would cost real frames; instead we just give the html /
