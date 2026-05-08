@@ -543,7 +543,14 @@ class DistributionEngine {
             lastError.includes('USER_NOT_FOUND') ||
             lastError.includes('USERNAME_NOT_OCCUPIED') ||
             lastError.includes('USER_ID_INVALID') ||
-            lastError.includes('PEER_ID_INVALID')
+            lastError.includes('PEER_ID_INVALID') ||
+            // Existing-but-non-user handles (channels / groups / bots)
+            // and outright invalid usernames also belong in the
+            // `not_found` bucket — they're never going to succeed for
+            // a DM, regardless of which session attempts them.
+            lastError.includes('USERNAME_INVALID') ||
+            lastError.includes('Could not resolve user') ||
+            /No user has\s+"/i.test(lastError)
           ) {
             audienceFilter
               .recordObservedFromEntry(

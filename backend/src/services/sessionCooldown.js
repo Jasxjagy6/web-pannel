@@ -50,12 +50,23 @@ async function markFloodCooldown(sessionId, seconds, reason = null) {
   const wait = clampSeconds(seconds);
   if (wait < MIN_RECORDED_FLOOD_SECONDS) return;
   try {
+    // Use `make_interval(secs => ...)` so PostgreSQL can infer the
+    // bound parameter as `integer` directly, instead of inferring TEXT
+    // from `$2 || ' seconds'` and then failing the
+    // `cooldown_seconds = $2` assignment with
+    //   "column 'cooldown_seconds' is of type integer but expression
+    //    is of type text".
+    // The `$2::integer` cast on the same line keeps the planner from
+    // re-deriving TEXT from the OR-branch.
     await pool.query(
       `UPDATE sessions
-          SET cooldown_until   = GREATEST(COALESCE(cooldown_until, NOW()), NOW() + ($2 || ' seconds')::interval),
+          SET cooldown_until   = GREATEST(
+                                   COALESCE(cooldown_until, NOW()),
+                                   NOW() + make_interval(secs => $2::integer)
+                                 ),
               cooldown_reason  = COALESCE($3, cooldown_reason),
               cooldown_set_at  = NOW(),
-              cooldown_seconds = $2
+              cooldown_seconds = $2::integer
         WHERE id = $1`,
       [sid, wait, reason ? String(reason).slice(0, 200) : null]
     );

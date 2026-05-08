@@ -124,10 +124,40 @@ function classifyTmeBody(html) {
     /tgme_page_action/.test(lower) ||
     /tgme_action_button_label/.test(lower) ||
     /tgme_action_button_new/.test(lower);
-  if (hasContactOg || hasActionBlock) return STATUS.LIVE;
-  // Channel / group pages use og:title "Telegram: Contact" too. If neither
-  // marker is present this is the generic homepage → handle does not exist.
-  return STATUS.NOT_FOUND;
+  if (!(hasContactOg || hasActionBlock)) {
+    // Generic homepage → handle does not exist (or banned/reserved).
+    return STATUS.NOT_FOUND;
+  }
+  // The t.me page exists. Now distinguish a real *user* handle from a
+  // channel / group / bot handle — `contacts.ResolveUsername` only
+  // resolves users, so passing channel/group handles through to the
+  // worker is wasteful (`USERNAME_INVALID` / `Could not resolve user`).
+  //
+  // Cheap, conservative checks:
+  //   * `tgme_page_extra` saying "N subscribers" / "N members" → channel/group
+  //   * action button labelled "VIEW CHANNEL" / "JOIN CHANNEL" / "VIEW GROUP" / "JOIN GROUP" → channel/group
+  //   * action button labelled "VIEW BOT" / "START BOT" or `tgme_page_extra`
+  //     literally "Bot" → bot
+  // Anything else with the contact frame is treated as a user (LIVE).
+  const isChannelOrGroup =
+    /<div class="tgme_page_extra"[^>]*>[^<]*(?:subscribers?|members?\b|members?\s*,\s*\d)/i.test(
+      html
+    ) ||
+    /tgme_action_button_label[^>]*>\s*(?:view|join)\s+(?:channel|group)\b/i.test(lower) ||
+    /tgme_action_button_new[^>]*>\s*(?:view|join)\s+(?:channel|group)\b/i.test(lower);
+  if (isChannelOrGroup) {
+    // Same status as a deleted/non-existent user from the add-members
+    // perspective: the runner can't add it to a target group.
+    return STATUS.NOT_FOUND;
+  }
+  const isBot =
+    /<div class="tgme_page_extra"[^>]*>\s*bot\s*<\/div>/i.test(html) ||
+    /tgme_action_button_label[^>]*>\s*(?:view|start)\s+bot\b/i.test(lower) ||
+    /tgme_action_button_new[^>]*>\s*(?:view|start)\s+bot\b/i.test(lower);
+  if (isBot) {
+    return STATUS.NOT_FOUND;
+  }
+  return STATUS.LIVE;
 }
 
 async function fetchWithTimeout(url, timeoutMs) {
