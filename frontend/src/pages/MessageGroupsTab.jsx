@@ -42,14 +42,17 @@ export default function MessageGroupsTab() {
     }
   }, []);
 
-  // Fetch job history
+  // Fetch job history. NOTE: the /messages/jobs endpoint returns
+  // jobs in camelCase (jobType, createdAt, messageContent, etc.) —
+  // this tab used to filter on `job.job_type === 'bulk_groups'`,
+  // which never matched, so the history panel always rendered
+  // empty. Match on `jobType` instead.
   const fetchJobHistory = useCallback(async () => {
     setJobHistoryLoading(true);
     try {
       const response = await getJobs({ page: 1, limit: 20 });
       const jobs = response.data.data?.jobs || [];
-      // Filter only bulk_groups jobs
-      setJobHistory(jobs.filter(j => j.job_type === 'bulk_groups'));
+      setJobHistory(jobs.filter((j) => j.jobType === 'bulk_groups'));
     } catch (err) {
       console.warn('Failed to fetch job history:', parseApiError(err));
     } finally {
@@ -381,13 +384,24 @@ https://t.me/example_group
                     )}
                   </div>
                   <div className="text-xs text-gray-400 space-y-1">
-                    <p>{job.total_count || 0} group(s) &middot; {formatRelativeTime(job.created_at)}</p>
-                    {job.started_at && (
-                      <p>Started: {formatRelativeTime(job.started_at)}</p>
+                    <p>
+                      {(job.totalCount ?? 0)} target(s)
+                      {' '}&middot;{' '}
+                      Sent {(job.sentCount ?? 0)}
+                      {(job.failedCount ?? 0) > 0 && (
+                        <> &middot; Failed {job.failedCount}</>
+                      )}
+                      {' '}&middot;{' '}
+                      {formatRelativeTime(job.createdAt)}
+                    </p>
+                    {job.completedAt && (
+                      <p>Completed: {formatRelativeTime(job.completedAt)}</p>
                     )}
                   </div>
-                  {job.message && (
-                    <p className="mt-2 text-sm text-gray-300 line-clamp-2">{job.message}</p>
+                  {job.messageContent && (
+                    <p className="mt-2 text-sm text-gray-300 line-clamp-2">
+                      {job.messageContent}
+                    </p>
                   )}
                 </div>
               </div>

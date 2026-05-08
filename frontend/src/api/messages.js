@@ -31,3 +31,22 @@ export const previewMessage = (data) => api.post('/messages/preview', data);
 export const sendBulkToGroups = (data) => api.post('/messages/bulk-groups', data);
 
 export const sendBulkToUsers = (data) => api.post('/messages/bulk-users', data);
+
+// ---------------------------------------------------------------------
+// Recurring group-message schedules. Backed by `message_schedules`;
+// see backend/src/services/messageScheduleService.js. Each schedule
+// stores the same selection a one-shot bulk-groups send would, plus
+// an `intervalMinutes` cool-down. The server-side tick loop keeps
+// re-dispatching the same job after each completion until the
+// operator cancels it.
+// ---------------------------------------------------------------------
+
+export const createSchedule = (data) => api.post('/messages/schedules', data);
+
+export const listSchedules = (params) => api.get('/messages/schedules', { params });
+
+export const getSchedule = (id) => api.get(`/messages/schedules/${id}`);
+
+export const cancelSchedule = (id) => api.post(`/messages/schedules/${id}/cancel`);
+
+export const cancelAllSchedules = () => api.post('/messages/schedules/cancel-all');
