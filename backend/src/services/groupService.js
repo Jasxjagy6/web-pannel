@@ -665,6 +665,57 @@ class GroupService {
       //      (subsequent rounds just skip it).
       const peerFloodSessions = new Set(); // session.id values that hit PEER_FLOOD
 
+      // ---------------------------------------------------------------
+      // In-job "skip these users" registry.
+      //
+      // Once any session in this job sees that user X is privacy-restricted
+      // (USER_PRIVACY_RESTRICT, USER_NOT_MUTUAL_CONTACT, USER_CHANNELS_TOO_MUCH)
+      // or non-existent (USERNAME_INVALID, USER_DEACTIVATED, USER_ID_INVALID,
+      // ...), every other session that later reaches the same prepared
+      // entry will short-circuit instead of making another doomed
+      // contacts.ResolveUsername / channels.InviteToChannel round-trip.
+      //
+      // Keyed by every candidate identifier on the prepared entry so the
+      // skip works regardless of which candidate the next session would
+      // have picked from the chain.
+      const inJobSkipReasons = new Map(); // candidate-key → { reason, kind }
+
+      const prepKeysFor = (prepared) => {
+        const out = new Set();
+        const push = (v) => {
+          if (v == null) return;
+          out.add(String(v).toLowerCase());
+        };
+        const cands = Array.isArray(prepared && prepared.candidates) ? prepared.candidates : [];
+        for (const c of cands) push(c);
+        if (prepared && prepared.identifier) push(prepared.identifier);
+        const e = prepared && prepared.entry;
+        if (e) {
+          push(e.telegram_id);
+          push(e.id);
+          push(e.username);
+          push(e.phone);
+        }
+        return out;
+      };
+
+      const lookupSkip = (prepared) => {
+        if (inJobSkipReasons.size === 0) return null;
+        for (const k of prepKeysFor(prepared)) {
+          const hit = inJobSkipReasons.get(k);
+          if (hit) return hit;
+        }
+        return null;
+      };
+
+      const markSkip = (prepared, kind, reason) => {
+        for (const k of prepKeysFor(prepared)) {
+          if (!inJobSkipReasons.has(k)) {
+            inJobSkipReasons.set(k, { kind, reason });
+          }
+        }
+      };
+
       for (let tIdx = 0; tIdx < targetIds.length; tIdx++) {
         const targetId = targetIds[tIdx];
 
@@ -727,6 +778,23 @@ class GroupService {
                 sessionId: session.id,
                 success: false,
               };
+
+              // Short-circuit: another session already determined this
+              // user is either privacy-restricted or non-existent. Don't
+              // waste a contacts.ResolveUsername / InviteToChannel
+              // round-trip — the answer won't change because of which
+              // session is asking.
+              const priorSkip = lookupSkip(prepared);
+              if (priorSkip) {
+                userResult.skipped = true;
+                userResult.error =
+                  priorSkip.kind === 'privacy_restricted'
+                    ? `Skipped: another session in this job hit privacy/access on this user (${priorSkip.reason || 'privacy'})`
+                    : `Skipped: another session in this job determined this user is unreachable (${priorSkip.reason || 'not_found'})`;
+                skippedCount++;
+                results.push(userResult);
+                continue;
+              }
 
               // Some Telegram errors mean "this identifier won't work,
               // try the next one" rather than "this user is unreachable".
@@ -853,19 +921,29 @@ class GroupService {
                   errMsg.includes('USER_PRIVACY_RESTRICT') ||
                   errMsg.includes('PRIVACY_RESTRICTED') ||
                   errMsg.includes('USER_NOT_MUTUAL_CONTACT') ||
-                  errMsg.includes('USER_CHANNELS_TOO_MUCH')
+                  errMsg.includes('USER_CHANNELS_TOO_MUCH') ||
+                  errMsg.includes('Telegram dropped invite (privacy/restricted)')
                 ) {
                   userResult.error = 'Privacy settings prevent adding';
                   userResult.skipped = true;
                   skippedCount++;
-                  // Tag this entry as `dm_only` in the audience cache
-                  // so the next group-add skips it but bulk-DM picks
-                  // it up. Best-effort — never block the loop.
-                  audienceFilter
-                    .recordObservedFromEntry(prepared.entry, 'privacy_restricted', errMsg, 'observed-add')
-                    .catch((rErr) =>
-                      logger.warn(`audienceFilter.recordObserved (privacy) failed: ${rErr.message}`)
+                  // Block every other session in this job from re-trying
+                  // this user — the answer won't change.
+                  markSkip(prepared, 'privacy_restricted', 'USER_PRIVACY_RESTRICT');
+                  // Persist the observation immediately so the *next*
+                  // job benefits via the cache (audience filter pulls
+                  // privacy_restricted entries into `dmOnly` and out of
+                  // the add-members eligible list).
+                  try {
+                    await audienceFilter.recordObservedFromEntry(
+                      prepared.entry,
+                      'privacy_restricted',
+                      errMsg,
+                      'observed-add'
                     );
+                  } catch (rErr) {
+                    logger.warn(`audienceFilter.recordObserved (privacy) failed: ${rErr.message}`);
+                  }
                 }
                 // Handle user already in group
                 else if (
@@ -891,23 +969,41 @@ class GroupService {
                   userResult.error = 'User is banned or restricted';
                   failedCount++;
                 }
-                // Handle user not found / deactivated → cache as
-                // not_found so the next job skips them and the list
-                // is purged on the next filter pass.
+                // Handle user not found / deactivated / unresolvable
+                // username → cache as `not_found` so the next job skips
+                // them entirely. The audience filter's HTTP probe can't
+                // distinguish "user vs. channel/bot/group handle" from
+                // the t.me homepage, so handles like @SomeChannel pass
+                // the probe but blow up on contacts.ResolveUsername at
+                // run time. Recording these here is what makes the
+                // next run actually drop them.
                 else if (
                   errMsg.includes('USER_DEACTIVATED') ||
                   errMsg.includes('INPUT_USER_DEACTIVATED') ||
                   errMsg.includes('USER_NOT_FOUND') ||
                   errMsg.includes('USERNAME_NOT_OCCUPIED') ||
-                  errMsg.includes('USER_ID_INVALID')
+                  errMsg.includes('USER_ID_INVALID') ||
+                  errMsg.includes('USERNAME_INVALID') ||
+                  // The wrapped error string emitted by telegramService
+                  // when every candidate in the chain fails resolution.
+                  errMsg.includes('Could not resolve user') ||
+                  // GramJS' message when contacts.ResolveUsername returns
+                  // an empty result for an existing-but-non-user handle.
+                  /No user has\s+"/i.test(errMsg)
                 ) {
                   userResult.error = errMsg;
                   failedCount++;
-                  audienceFilter
-                    .recordObservedFromEntry(prepared.entry, 'not_found', errMsg, 'observed-add')
-                    .catch((rErr) =>
-                      logger.warn(`audienceFilter.recordObserved (not_found) failed: ${rErr.message}`)
+                  markSkip(prepared, 'not_found', errMsg);
+                  try {
+                    await audienceFilter.recordObservedFromEntry(
+                      prepared.entry,
+                      'not_found',
+                      errMsg,
+                      'observed-add'
                     );
+                  } catch (rErr) {
+                    logger.warn(`audienceFilter.recordObserved (not_found) failed: ${rErr.message}`);
+                  }
                 }
                 // Generic failure
                 else {
