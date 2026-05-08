@@ -103,7 +103,7 @@ export function Modal({
   return (
     <div
       ref={overlayRef}
-      className="fixed inset-0 z-50 flex items-center justify-center p-4"
+      className="fixed inset-0 z-50 flex items-center justify-center p-4 animate-fade-in"
       onClick={handleBackdropClick}
       role="dialog"
       aria-modal="true"
@@ -116,7 +116,7 @@ export function Modal({
       <div
         ref={modalRef}
         tabIndex={-1}
-        className={`relative w-full ${widthClass} bg-dark-800 rounded-xl border border-white/10 shadow-2xl transform transition-all max-h-[90vh] flex flex-col`}
+        className={`relative w-full ${widthClass} bg-dark-800 rounded-2xl border border-white/10 shadow-2xl transform transition-all max-h-[90vh] flex flex-col overflow-hidden`}
       >
         {/* Header */}
         <div className="flex items-center justify-between px-6 py-4 border-b border-white/5 shrink-0">
