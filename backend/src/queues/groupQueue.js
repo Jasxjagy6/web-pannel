@@ -1,6 +1,7 @@
 const { Queue, Worker, QueueEvents } = require('bullmq');
 const groupService = require('../services/groupService');
 const logger = require('../utils/logger');
+const { withJobLock, QUEUED_BEHIND_LOCK } = require('../utils/jobLock');
 
 const GROUP_QUEUE_NAME = 'group-jobs';
 
@@ -43,30 +44,67 @@ class GroupQueueManager {
     this.worker = new Worker(
       GROUP_QUEUE_NAME,
       async (job) => {
-        const { type, sessionId, targetGroupId, userList, options, userId, groupId, settings, rules, title, members, userIdTarget, opId, sessionIds, targetIds } = job.data;
+        const { type, sessionId, targetGroupId, userList, options, userId, groupId, settings, rules, title, members, userIdTarget, opId, sessionIds, targetIds, params } = job.data;
 
-        if (type === 'add-members') {
-          return await groupService.addMembersToGroup(sessionId, targetGroupId, userList, options, userId);
-        } else if (type === 'configure-spam') {
-          return await groupService.configureGroupSpam(sessionId, groupId, settings, userId);
-        } else if (type === 'auto-manage') {
-          return await groupService.autoManageGroup(groupId, rules, userId);
-        } else if (type === 'list-groups') {
-          return await groupService.listGroups(sessionId, userId);
-        } else if (type === 'get-info') {
-          return await groupService.getGroupInfo(sessionId, groupId, userId);
-        } else if (type === 'create-group') {
-          return await groupService.createGroup(sessionId, title, members, userId);
-        } else if (type === 'remove-member') {
-          return await groupService.removeMember(sessionId, groupId, userIdTarget, userId);
-        } else if (type === 'join-channels' || type === 'leave-channels') {
-          // Bulk join/leave: sessions are processed in parallel (with a
-          // concurrency cap) inside the service, against every target.
-          // The opId / sessionIds / targetIds are pre-validated by the
-          // controller so the worker just runs the loop.
-          const operation = type === 'join-channels' ? 'join_channels' : 'leave_channels';
-          return await groupService.runJoinLeaveJob({ opId, operation, userId, sessionIds, targetIds });
+        // Job-types that drive heavy multi-session Telegram traffic must
+        // run strictly one-at-a-time per (user, category). The lock is a
+        // Redis SET-NX-EX with a long TTL; if it's held the job is
+        // re-queued as a delayed job and a sentinel is returned so the
+        // worker exits cleanly (BullMQ keeps the job alive).
+        // Lighter inspection-style jobs (list-groups, get-info, etc.) skip
+        // the lock so the operator can inspect groups even while a long
+        // add-members run is in flight.
+        const heavyCategory = (() => {
+          if (type === 'add-members' || type === 'add-members-bulk') return 'group:add-members';
+          if (type === 'join-channels') return 'group:join';
+          if (type === 'leave-channels') return 'group:leave';
+          return null;
+        })();
+
+        const run = async () => {
+          if (type === 'add-members') {
+            return await groupService.addMembersToGroup(sessionId, targetGroupId, userList, options, userId);
+          } else if (type === 'add-members-bulk') {
+            // Async UI path: groupController.addMembers handed us a
+            // pre-created opId + the full add-members params. We run the
+            // multi-session/multi-target add via addMembersToGroups so
+            // progress, cancel, and error reporting stay in the existing
+            // group_operations row.
+            return await groupService.addMembersToGroups(
+              { ...(params || {}), opId },
+              userId
+            );
+          } else if (type === 'configure-spam') {
+            return await groupService.configureGroupSpam(sessionId, groupId, settings, userId);
+          } else if (type === 'auto-manage') {
+            return await groupService.autoManageGroup(groupId, rules, userId);
+          } else if (type === 'list-groups') {
+            return await groupService.listGroups(sessionId, userId);
+          } else if (type === 'get-info') {
+            return await groupService.getGroupInfo(sessionId, groupId, userId);
+          } else if (type === 'create-group') {
+            return await groupService.createGroup(sessionId, title, members, userId);
+          } else if (type === 'remove-member') {
+            return await groupService.removeMember(sessionId, groupId, userIdTarget, userId);
+          } else if (type === 'join-channels' || type === 'leave-channels') {
+            const operation = type === 'join-channels' ? 'join_channels' : 'leave_channels';
+            return await groupService.runJoinLeaveJob({ opId, operation, userId, sessionIds, targetIds });
+          }
+        };
+
+        if (!heavyCategory) return run();
+
+        const result = await withJobLock(
+          job,
+          { userId: String(userId), category: heavyCategory },
+          run
+        );
+        if (result === QUEUED_BEHIND_LOCK) {
+          // BullMQ has already moved this job to the delayed set; signal
+          // success on this attempt so the worker doesn't spin.
+          return { queuedBehindLock: true, lockCategory: heavyCategory };
         }
+        return result;
       },
       { connection: redisConnection, concurrency: 5 }
     );

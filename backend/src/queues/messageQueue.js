@@ -1,6 +1,7 @@
 const { Queue, Worker, QueueEvents } = require('bullmq');
 const messageService = require('../services/messageService');
 const logger = require('../utils/logger');
+const { withJobLock, QUEUED_BEHIND_LOCK } = require('../utils/jobLock');
 
 const MESSAGE_QUEUE_NAME = 'message-jobs';
 
@@ -41,15 +42,35 @@ class MessageQueueManager {
       async (job) => {
         const { type, sessionId, targetId, message, options, userId, sourceId, messageId, groupId, params } = job.data;
 
-        if (type === 'send') {
-          return await messageService.sendMessage(sessionId, targetId, message, options, userId);
-        } else if (type === 'bulk') {
-          return await messageService.sendBulkMessage(params, userId);
-        } else if (type === 'group-message') {
-          return await messageService.sendMessageToGroup(sessionId, groupId, message, userId);
-        } else if (type === 'forward') {
-          return await messageService.forwardMessage(sessionId, targetId, messageId, sourceId, userId);
+        // Bulk messaging is the only message-queue job that drives heavy
+        // multi-session Telegram traffic; serialize it per (user, category)
+        // so a second bulk job for the same user waits for the first to
+        // finish (or fail) before starting.
+        const heavyCategory = type === 'bulk' ? 'message:bulk' : null;
+
+        const run = async () => {
+          if (type === 'send') {
+            return await messageService.sendMessage(sessionId, targetId, message, options, userId);
+          } else if (type === 'bulk') {
+            return await messageService.sendBulkMessage(params, userId);
+          } else if (type === 'group-message') {
+            return await messageService.sendMessageToGroup(sessionId, groupId, message, userId);
+          } else if (type === 'forward') {
+            return await messageService.forwardMessage(sessionId, targetId, messageId, sourceId, userId);
+          }
+        };
+
+        if (!heavyCategory) return run();
+
+        const result = await withJobLock(
+          job,
+          { userId: String(userId), category: heavyCategory },
+          run
+        );
+        if (result === QUEUED_BEHIND_LOCK) {
+          return { queuedBehindLock: true, lockCategory: heavyCategory };
         }
+        return result;
       },
       { connection: redisConnection, concurrency: 5 }
     );

@@ -2657,7 +2657,9 @@ class TelegramService {
             `Flood wait detected for session ${sessionId}: ${waitSeconds}s (retry ${retries}/${maxRetries})`
           );
 
-          // Anti-revoke Phase 3 (B15): record long flood waits.
+          // Long flood waits (≥30s) get pushed to two stores:
+          //   - tg_session_health (legacy anti-revoke risk model)
+          //   - sessions.cooldown_until (new job-eligibility gate)
           if (waitSeconds >= 30) {
             try {
               const cfg = require('../config/telegram');
@@ -2680,6 +2682,14 @@ class TelegramService {
                 ).catch(() => {});
               }
             } catch { /* best-effort */ }
+            try {
+              const sessionCooldown = require('./sessionCooldown');
+              await sessionCooldown.markFloodCooldown(
+                sessionId,
+                waitSeconds,
+                `FLOOD_WAIT_${waitSeconds}`
+              );
+            } catch { /* best-effort */ }
           }
 
           await sleep(waitSeconds * 1000);
@@ -2690,8 +2700,11 @@ class TelegramService {
         // session as spam, and the cooldown is hours / days — not 30s.
         // Retrying every 30s for 5 attempts just burns 2.5 minutes per
         // call (and per call site there can be hundreds), without any
-        // chance of recovery in that window. Fail fast so callers can
-        // abort the whole batch and surface a real error to the UI.
+        // chance of recovery in that window. Fail fast AND mark the
+        // session on cooldown so the worker session-pickers stop
+        // handing it more work for a while (privacy/2fa/login pages
+        // don't read the cooldown field, so the operator can still
+        // recover the session manually).
         if (errorMessage.includes('PEER_FLOOD')) {
           logger.warn(
             `Peer flood detected for session ${sessionId}: not retrying (account-level cooldown is hours, not seconds)`
@@ -2705,6 +2718,10 @@ class TelegramService {
                 fingerprint: { source: 'peer_flood', retries },
               });
             }
+          } catch { /* best-effort */ }
+          try {
+            const sessionCooldown = require('./sessionCooldown');
+            await sessionCooldown.markPeerFlood(sessionId, 'PEER_FLOOD');
           } catch { /* best-effort */ }
           throw this._handleTelegramError(error);
         }

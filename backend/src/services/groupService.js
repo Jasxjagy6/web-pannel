@@ -8,6 +8,8 @@ const {
   collectTelegramTargetCandidates,
 } = require('../utils/telegramTargetNormalizer');
 const distributionPlanner = require('./distributionPlanner');
+const audienceFilter = require('./audienceFilterService');
+const sessionCooldown = require('./sessionCooldown');
 
 /**
  * Default delay in milliseconds between batch operations.
