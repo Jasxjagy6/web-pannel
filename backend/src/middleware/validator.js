@@ -93,6 +93,13 @@ const schemas = {
     // seconds, per-item delay in milliseconds.
     mode: Joi.string().valid('auto', 'manual').default('auto'),
     perSessionBurst: Joi.number().integer().min(1).max(500).optional(),
+    // Hard per-session-per-burst ceiling. The redesigned add-members
+    // runner clamps `perSessionBurst` to this value across all auto
+    // bands so a session never gets pushed into PEER_FLOOD territory
+    // in a single rotation. Defaults to 4 server-side; capped at 50
+    // here so an operator override can't accidentally re-introduce
+    // the old "70 invites in a row" behaviour.
+    maxPerSession: Joi.number().integer().min(1).max(50).optional(),
     cooldownSecMin: Joi.number().integer().min(0).max(1800).optional(),
     cooldownSecMax: Joi.number().integer().min(0).max(1800).optional(),
     itemDelayMsMin: Joi.number().integer().min(0).max(600000).optional(),

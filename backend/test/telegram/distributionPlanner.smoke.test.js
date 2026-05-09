@@ -56,18 +56,44 @@ function nearly(actual, expected, tol = 0) {
 })();
 
 (function autoGroupLargeRatio() {
-  // 5000 users / 10 sessions = 500/session => 70 burst, 1-5min cooldown.
+  // 5000 users / 10 sessions = 500/session.
+  //
+  // The redesigned `group_add` policy hard-clamps `perSessionBurst`
+  // to `GROUP_ADD_DEFAULT_MAX_BURST` (4) across all auto bands so a
+  // single session never gets pushed into PEER_FLOOD territory in
+  // one rotation. The legacy 70-burst band is still used to choose
+  // the cooldown range (1-5 min between rotations) but the actual
+  // burst the runner executes is clamped to 4.
   const p = planner.plan({
     totalItems: 5000,
     sessionIds: Array.from({ length: 10 }, (_, i) => i + 1),
     workType: 'group_add',
     mode: 'auto',
   });
-  assert.strictEqual(p.perSessionBurst, 70);
-  assert.ok(p.rounds >= 7);
+  assert.strictEqual(p.perSessionBurst, 4,
+    `expected hard clamp at 4, got ${p.perSessionBurst}`);
+  assert.strictEqual(p.maxPerSessionBurst, 4);
+  // 5000 / (10 sessions × 4) = 125 rounds.
+  assert.ok(p.rounds >= 100, `expected >=100 rounds, got ${p.rounds}`);
   assert.strictEqual(p.cooldownSecMin, 60);
   assert.strictEqual(p.cooldownSecMax, 300);
   console.log('autoGroupLargeRatio: OK');
+})();
+
+(function autoGroupLargeRatioOperatorOverride() {
+  // Operators who really know their fleet can opt out of the
+  // institutional ceiling via `maxPerSessionBurst`.
+  const p = planner.plan({
+    totalItems: 5000,
+    sessionIds: Array.from({ length: 10 }, (_, i) => i + 1),
+    workType: 'group_add',
+    mode: 'auto',
+    maxPerSessionBurst: 70,
+  });
+  assert.strictEqual(p.perSessionBurst, 70,
+    `with explicit override should be 70, got ${p.perSessionBurst}`);
+  assert.strictEqual(p.maxPerSessionBurst, 70);
+  console.log('autoGroupLargeRatioOperatorOverride: OK');
 })();
 
 // ---------------------------------------------------------------------------
@@ -106,6 +132,10 @@ function nearly(actual, expected, tol = 0) {
 // ---------------------------------------------------------------------------
 
 (function manualPassthrough() {
+  // Manual mode still honours operator knobs, but the redesigned
+  // `group_add` policy clamps `perSessionBurst` to the hard
+  // institutional ceiling (4 by default). Cooldown / item-delay
+  // pass through verbatim.
   const p = planner.plan({
     totalItems: 200,
     sessionIds: [1, 2, 3, 4],
@@ -117,12 +147,34 @@ function nearly(actual, expected, tol = 0) {
     itemDelayMsMin: 20_000,
     itemDelayMsMax: 45_000,
   });
-  assert.strictEqual(p.perSessionBurst, 25);
+  assert.strictEqual(p.perSessionBurst, 4,
+    `manual perSessionBurst should be clamped to 4, got ${p.perSessionBurst}`);
+  assert.strictEqual(p.maxPerSessionBurst, 4);
   assert.strictEqual(p.cooldownSecMin, 90);
   assert.strictEqual(p.cooldownSecMax, 240);
   assert.strictEqual(p.itemDelayMsMin, 20_000);
   assert.strictEqual(p.itemDelayMsMax, 45_000);
   console.log('manualPassthrough: OK');
+})();
+
+(function manualPassthroughWithExplicitCap() {
+  // When operators explicitly raise `maxPerSessionBurst`, manual
+  // values up to that ceiling pass through unmodified.
+  const p = planner.plan({
+    totalItems: 200,
+    sessionIds: [1, 2, 3, 4],
+    workType: 'group_add',
+    mode: 'manual',
+    perSessionBurst: 25,
+    maxPerSessionBurst: 30,
+    cooldownSecMin: 90,
+    cooldownSecMax: 240,
+    itemDelayMsMin: 20_000,
+    itemDelayMsMax: 45_000,
+  });
+  assert.strictEqual(p.perSessionBurst, 25);
+  assert.strictEqual(p.maxPerSessionBurst, 30);
+  console.log('manualPassthroughWithExplicitCap: OK');
 })();
 
 (function manualSwapsReversedRanges() {

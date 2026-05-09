@@ -19,6 +19,111 @@ const sessionCooldown = require('./sessionCooldown');
 const DEFAULT_DELAY_MS = 3000;
 
 /**
+ * Hard ceiling Telegram empirically tolerates for
+ * `channels.InviteToChannel` invites in a tight burst before it starts
+ * marking sessions as PEER_FLOOD. Above ~4-5 invites per session per
+ * burst, even a "warm" account starts drawing account-level spam
+ * flags. This is the default for the new redesigned add-members
+ * scheduler; operators can override via `params.maxPerSession`.
+ */
+const DEFAULT_MAX_ADDS_PER_SESSION = 4;
+
+/**
+ * `lists.source` prefixes that mean "the operator uploaded this list".
+ * Uploaded lists are deduplicated before the run so we never burn an
+ * invite request on the same target twice. Scraped lists (`source =
+ * 'job_<scrape_id>'`) skip dedup because the panel scraper already
+ * emits one row per user.
+ */
+const UPLOADED_LIST_SOURCE_PREFIXES = ['import_', 'manual_', 'merge_'];
+
+/**
+ * Heuristic match for "this list looks uploaded, dedup it" used when
+ * we have a `source` string but it doesn't match a well-known prefix.
+ * Anything starting with `job_` or `scrape_` is treated as scraped.
+ */
+function isUploadedListSource(source) {
+  if (!source) return true;
+  const s = String(source).toLowerCase();
+  if (s.startsWith('job_')) return false;
+  if (s.startsWith('scrape_')) return false;
+  if (s.startsWith('scraped_')) return false;
+  return UPLOADED_LIST_SOURCE_PREFIXES.some((p) => s.startsWith(p)) ||
+    s === 'manual' || s === 'manual_input';
+}
+
+/**
+ * Build a stable canonical key for a userList entry. The first non-empty
+ * identifier wins (numeric id > username > phone) so two rows that
+ * disagree on, say, casing of the username still collapse to one.
+ *
+ * Returns `null` for entries with no usable identifier — those rows
+ * are kept as-is and surfaced as `unaddressable` later in the pipeline.
+ */
+function dedupKeyForEntry(entry) {
+  if (!entry || typeof entry !== 'object') {
+    if (entry == null) return null;
+    const s = String(entry).trim();
+    if (!s) return null;
+    if (/^\d{4,}$/.test(s)) return `id:${s}`;
+    return `u:${s.replace(/^@+/, '').toLowerCase()}`;
+  }
+  const tgId = entry.telegram_id ?? entry.telegramId ?? entry.id;
+  if (tgId != null) {
+    const s = String(tgId).trim();
+    if (s && /^\d+$/.test(s)) return `id:${s}`;
+  }
+  const uname = entry.username;
+  if (uname != null) {
+    const s = String(uname).trim().replace(/^@+/, '');
+    // Numeric "usernames" are scrape artifacts and aren't valid
+    // Telegram handles — collapse them with their numeric-id sibling
+    // by reusing the `id:` namespace so they don't double-count.
+    if (s) {
+      if (/^\d+$/.test(s)) return `id:${s}`;
+      return `u:${s.toLowerCase()}`;
+    }
+  }
+  const phone = entry.phone;
+  if (phone != null) {
+    const s = String(phone).trim().replace(/[^+\d]/g, '');
+    if (s) return `p:${s}`;
+  }
+  return null;
+}
+
+/**
+ * Dedup an uploaded userList in-memory, preserving order. Returns the
+ * deduped list along with a count of rows dropped. Rows with no
+ * identifier are passed through untouched so the existing
+ * `unaddressable` handling still surfaces them.
+ *
+ * Pure / side-effect-free.
+ */
+function dedupUploadedUserList(userList) {
+  if (!Array.isArray(userList)) return { deduped: [], dropped: 0 };
+  const seen = new Set();
+  const deduped = [];
+  let dropped = 0;
+  for (const entry of userList) {
+    const key = dedupKeyForEntry(entry);
+    if (key == null) {
+      // Keep the row; the downstream pipeline will mark it
+      // unaddressable and report it on the op result.
+      deduped.push(entry);
+      continue;
+    }
+    if (seen.has(key)) {
+      dropped++;
+      continue;
+    }
+    seen.add(key);
+    deduped.push(entry);
+  }
+  return { deduped, dropped };
+}
+
+/**
  * Default batch size for adding members.
  */
 const DEFAULT_BATCH_SIZE = 10;
@@ -240,9 +345,16 @@ class GroupService {
       cooldownSecMax,
       itemDelayMsMin,
       itemDelayMsMax,
+      // Hard per-session-per-burst ceiling. Defaults to
+      // `DEFAULT_MAX_ADDS_PER_SESSION` (4) — the empirical Telegram-safe
+      // value above which sessions start drawing PEER_FLOOD. The
+      // planner will clamp `perSessionBurst` to this value regardless
+      // of what auto-mode would otherwise pick.
+      maxPerSession,
       // Optional source list id — when set the audience filter
       // persists status back into list_items and purges NOT_FOUND
-      // rows from the list.
+      // rows from the list. Also drives source-aware deduplication
+      // (uploaded lists are deduped, scraped lists pass through).
       listId = null,
       // Optional pre-created group_operations row id. The async/queued
       // controller path inserts the row before queuing so the UI can
@@ -435,7 +547,68 @@ class GroupService {
     let preparedUsers = [];
     let unaddressable = [];
     let verifiedSessions;
+    let dedupStats = { applied: false, before: 0, after: 0, dropped: 0, source: null };
     try {
+      // -----------------------------------------------------------------
+      // Source-aware deduplication (run BEFORE the audience filter so
+      // we don't waste filter probes on rows that are about to be
+      // collapsed). Uploaded / manual / merged lists get deduped by
+      // canonical key; scraped lists (`source = 'job_<id>'`) skip
+      // dedup so the panel's own scrape output is never altered.
+      //
+      // Operator quote, verbatim: "duplicates id from the list must
+      // be filtered out before starting the actual job (the lists
+      // that were obtained by scrapping users though pannel must not
+      // be fitered. Only uploaded lists must be filtered)."
+      // -----------------------------------------------------------------
+      let listSource = null;
+      if (listId != null) {
+        try {
+          const listLookup = await pool.query(
+            'SELECT source FROM lists WHERE id = $1 AND user_id = $2 LIMIT 1',
+            [listId, userId]
+          );
+          if (listLookup.rows.length > 0) {
+            listSource = listLookup.rows[0].source || null;
+          }
+        } catch (srcErr) {
+          logger.warn(
+            `addMembersToGroups: lists.source lookup failed for list ${listId}: ${srcErr.message}`
+          );
+        }
+      }
+      // No `listId` ⇒ manual input from the Groups page; treat as
+      // uploaded (always dedup). Otherwise consult the prefix
+      // heuristic — `job_*` / `scrape_*` are skipped, everything else
+      // is treated as uploaded.
+      const shouldDedup = listId == null ? true : isUploadedListSource(listSource);
+      dedupStats = {
+        applied: false,
+        before: Array.isArray(userList) ? userList.length : 0,
+        after: Array.isArray(userList) ? userList.length : 0,
+        dropped: 0,
+        source: listSource,
+        listId: listId != null ? Number(listId) : null,
+      };
+      if (shouldDedup && Array.isArray(userList) && userList.length > 1) {
+        const { deduped, dropped } = dedupUploadedUserList(userList);
+        if (dropped > 0) {
+          logger.info(
+            `addMembersToGroups: deduped ${dropped} duplicate row(s) from ${dedupStats.before} → ${deduped.length}`,
+            { userId, listId, source: listSource }
+          );
+        }
+        userList = deduped;
+        dedupStats.applied = true;
+        dedupStats.after = deduped.length;
+        dedupStats.dropped = dropped;
+      } else if (!shouldDedup) {
+        logger.info(
+          `addMembersToGroups: skipping dedup for scraped list (source=${listSource})`,
+          { userId, listId }
+        );
+      }
+
       // Surface the 'filtering' phase to the UI as soon as we start
       // the audience pass.
       await markPhase('filtering', { total: userList.length });
@@ -623,6 +796,19 @@ class GroupService {
     // knobs we map them through so existing flows behave the same as
     // before (auto-mode picks a burst that matches `batchSize` for
     // small jobs anyway).
+    // Resolve the hard per-session-per-burst cap. Operators may
+    // override via `maxPerSession`; otherwise we apply the
+    // institutional default (4) which keeps sessions well below the
+    // PEER_FLOOD trigger empirically observed for
+    // `channels.InviteToChannel`.
+    const effectiveMaxPerSession = (() => {
+      const raw = Number(maxPerSession);
+      if (Number.isFinite(raw) && raw > 0) {
+        return Math.min(50, Math.max(1, Math.floor(raw)));
+      }
+      return DEFAULT_MAX_ADDS_PER_SESSION;
+    })();
+
     const planParams = {
       totalItems: preparedUsers.length,
       sessionIds: verifiedSessions.map((s) => s.id),
@@ -631,6 +817,11 @@ class GroupService {
       perSessionBurst: perSessionBurst != null
         ? perSessionBurst
         : (mode === 'manual' ? batchSize : undefined),
+      // Hard ceiling — the planner clamps the chosen burst to this
+      // value across all auto-mode bands, so even a wildly overshot
+      // operator override can't push a session into PEER_FLOOD
+      // territory in one rotation.
+      maxPerSessionBurst: effectiveMaxPerSession,
       cooldownSecMin,
       cooldownSecMax,
       itemDelayMsMin: itemDelayMsMin != null
@@ -649,9 +840,17 @@ class GroupService {
         sessionCount: verifiedSessions.length,
         targetCount: targetIds.length,
         userListSize: userList.length,
+        dedup: {
+          applied: dedupStats.applied,
+          before: dedupStats.before,
+          after: dedupStats.after,
+          dropped: dedupStats.dropped,
+          source: dedupStats.source,
+        },
         plan: {
           mode: plan.mode,
           perSessionBurst: plan.perSessionBurst,
+          maxPerSession: plan.maxPerSessionBurst,
           rounds: plan.rounds,
           cooldownSec: [plan.cooldownSecMin, plan.cooldownSecMax],
           itemDelayMs: [plan.itemDelayMsMin, plan.itemDelayMsMax],
@@ -761,31 +960,56 @@ class GroupService {
     const tgService = telegramService;
 
     try {
-      // Step 1: Verify session membership in targets
-      // For each target, check if at least one session is a member
-      const sessionMemberships = {}; // sessionId -> {targetId: isMember}
-      
-      for (const targetId of targetIds) {
-        for (const session of verifiedSessions) {
-          const key = `${session.id}:${targetId}`;
-          try {
-            const entity = await tgService._resolveEntity(session.id, targetId);
-            sessionMemberships[key] = !!entity;
-            logger.info(`Session ${session.id} ${entity ? 'IS' : 'is NOT'} member of ${targetId}`, { sessionId: session.id, targetId });
-          } catch (err) {
-            sessionMemberships[key] = false;
-            logger.warn(`Session ${session.id} cannot access ${targetId}: ${err.message}`);
-          }
-        }
+      // -----------------------------------------------------------------
+      // NOTE: We deliberately do NOT pre-check session membership in
+      // each target before the runner starts.
+      //
+      // The previous implementation called `_resolveEntity(session, target)`
+      // for every (session × target) pair before the first invite, which
+      // for an N×M fleet emitted N*M `getDialogs` / `messages.getFullChat`
+      // round-trips. Telegram counts those toward the same per-account
+      // rate budget that drives PEER_FLOOD, so the pre-check was directly
+      // contributing to the failure mode it was supposed to prevent.
+      //
+      // Operator quote, verbatim: "I think currently system firstly check
+      // whether session is a member of group or not and that is extra
+      // request which is causing telegram peer flood limits. So it must
+      // not check just start the job if it's fails move to next session
+      // with next I'd or username."
+      //
+      // We replace the pre-check with a lazy `brokenSessionTargets`
+      // denylist: when a session's first invite to a given target fails
+      // with a *target-side* error (CHANNEL_PRIVATE / CHAT_INVALID / not
+      // a member / not enough rights / "could not resolve group"), we
+      // mark `${session.id}:${targetId}` as broken and skip every
+      // remaining user in the burst for that pair. The runner moves on
+      // to the next session for the same target without making further
+      // failed round-trips. User-side errors (PRIVACY_RESTRICT,
+      // USER_DEACTIVATED, etc.) keep their existing in-job skip
+      // behaviour so other sessions don't re-burn requests on doomed
+      // users.
+      // -----------------------------------------------------------------
+      const brokenSessionTargets = new Set(); // `${sessionId}:${targetId}`
 
-        // Check if at least one session is a member of this target
-        const anyMember = verifiedSessions.some(s => sessionMemberships[`${s.id}:${targetId}`]);
-        if (!anyMember) {
-          logger.warn(`No session is a member of ${targetId}. Attempting to add sessions first.`);
-          // Note: We can't programmatically add sessions to groups without admin rights
-          // The user must ensure at least one session is in the target
-        }
-      }
+      // Patterns that indicate the failure was on the **target/group**
+      // side rather than the **user** side — i.e. this session simply
+      // cannot operate against this target, so we should switch to the
+      // next session instead of trying the next user.
+      const isTargetSideFailure = (msg) => {
+        if (!msg) return false;
+        const m = String(msg);
+        return (
+          m.includes('CHAT_ADMIN_REQUIRED') ||
+          m.includes('CHAT_WRITE_FORBIDDEN') ||
+          m.includes('CHANNEL_PRIVATE') ||
+          m.includes('CHANNEL_INVALID') ||
+          m.includes('CHAT_INVALID') ||
+          m.includes('CHAT_FORBIDDEN') ||
+          m.includes('Could not resolve group') ||
+          m.includes('USER_NOT_PARTICIPANT') ||
+          m.includes('CHAT_GUEST_SEND_FORBIDDEN')
+        );
+      };
 
       // Step 2/3/4 — rotation runner.
       //
@@ -856,39 +1080,77 @@ class GroupService {
       for (let tIdx = 0; tIdx < targetIds.length; tIdx++) {
         const targetId = targetIds[tIdx];
 
-        const availableSessions = verifiedSessions.filter(
-          (s) => sessionMemberships[`${s.id}:${targetId}`]
-        );
-
-        if (availableSessions.length === 0) {
-          logger.error(`No available sessions for target ${targetId}, skipping`);
-          for (const prepared of preparedUsers) {
-            results.push({
-              userId: prepared.identifier,
-              targetId,
-              success: false,
-              error: 'No session is a member of this target',
-              skipped: true,
-            });
-            skippedCount++;
-          }
-          continue;
-        }
+        // No pre-check: the runner uses every verified, non-cooldown
+        // session and discovers target accessibility lazily. Sessions
+        // that fail with a target-side error are added to
+        // `brokenSessionTargets` mid-burst and skipped on the next pass.
+        const availableSessions = verifiedSessions.slice();
 
         const burst = plan.perSessionBurst;
         const sessionsForRotation = availableSessions.map((s) => s.id);
 
-        // Total rounds for THIS target (depends on # available sessions).
-        const itemsPerRound = sessionsForRotation.length * burst;
-        const targetRounds = Math.max(1, Math.ceil(preparedUsers.length / itemsPerRound));
+        // Per-target work queue. Starts as the full prepared-users list
+        // and is refilled with users that need to be retried on a
+        // different session when one is marked broken mid-burst. Each
+        // pass through the outer `while` is a self-contained rotation
+        // over the queue with whatever sessions are still live for
+        // this target. Capped at `MAX_FAILOVER_PASSES` so we don't
+        // loop forever if every session ends up broken.
+        let pendingForTarget = preparedUsers.slice();
+        let failoverPass = 0;
+        const MAX_FAILOVER_PASSES = 4;
+
+        while (pendingForTarget.length > 0 && failoverPass < MAX_FAILOVER_PASSES) {
+          failoverPass++;
+
+          // Sessions that can still try this target. Strict filter:
+          // not on PEER_FLOOD, not marked broken for this specific
+          // target.
+          const liveSessions = availableSessions.filter(
+            (s) =>
+              !peerFloodSessions.has(s.id) &&
+              !brokenSessionTargets.has(`${s.id}:${targetId}`)
+          );
+          if (liveSessions.length === 0) {
+            // Every session has either burned out or been marked
+            // broken for this target. Mark the rest of the queue as
+            // skipped — there's literally nothing left to try.
+            for (const prepared of pendingForTarget) {
+              results.push({
+                userId: prepared.identifier,
+                targetId,
+                success: false,
+                error:
+                  'No live session can access this target (all sessions failed target-side or are on PEER_FLOOD)',
+                skipped: true,
+              });
+              skippedCount++;
+            }
+            pendingForTarget = [];
+            break;
+          }
+
+          // Snapshot the queue for THIS pass; failed users (target-side)
+          // get pushed to `nextPending` and become the queue for the
+          // next pass.
+          const queueThisPass = pendingForTarget;
+          const nextPending = [];
+
+          // Total rounds for THIS pass (depends on # live sessions).
+          const itemsPerRound = liveSessions.length * burst;
+          const targetRounds = Math.max(
+            1,
+            Math.ceil(queueThisPass.length / itemsPerRound)
+          );
 
         for (let round = 0; round < targetRounds; round++) {
-          for (let sIdx = 0; sIdx < availableSessions.length; sIdx++) {
-            const session = availableSessions[sIdx];
+          for (let sIdx = 0; sIdx < liveSessions.length; sIdx++) {
+            const session = liveSessions[sIdx];
             if (peerFloodSessions.has(session.id)) continue; // skip dead sessions
+            if (brokenSessionTargets.has(`${session.id}:${targetId}`)) continue;
 
             const start = round * itemsPerRound + sIdx * burst;
-            const usersChunk = preparedUsers.slice(start, start + burst);
+            const usersChunk = queueThisPass.slice(start, start + burst);
             if (usersChunk.length === 0) continue;
 
             // Check cancellation at the top of every (round, session)
@@ -904,6 +1166,8 @@ class GroupService {
 
           {
             let burstHitPeerFlood = false;
+            let burstHitTargetSideFailure = false;
+            let targetSideFailureChunkIdx = -1;
             for (let chunkIdx = 0; chunkIdx < usersChunk.length; chunkIdx++) {
               const prepared = usersChunk[chunkIdx];
               const candidates = prepared.candidates && prepared.candidates.length > 0
@@ -1133,16 +1397,32 @@ class GroupService {
                   userResult.skipped = true;
                   skippedCount++;
                 }
-                // Handle admin required
-                // Handle admin required or write forbidden
-                else if (
-                  errMsg.includes('CHAT_ADMIN_REQUIRED') ||
-                  errMsg.includes('CHAT_WRITE_FORBIDDEN') ||
-                  errMsg.includes('CHAT_ADMIN_REQUIRED')
-                ) {
-                  userResult.error = 'Session needs admin rights with "Add Members" permission in this target';
-                  failedCount++;
+                // Target-side failure — this session simply can't
+                // operate against this target (admin missing, channel
+                // private, not a participant, group resolution failed).
+                // The same answer applies to every user in the burst,
+                // so we mark `(session, target)` broken in
+                // `brokenSessionTargets`, fail over the remaining users
+                // in the burst (including this one) to a different
+                // session in the next pass, and stop probing this
+                // target with this session for the rest of the job.
+                //
+                // We deliberately do NOT push `userResult` for this
+                // user — the retry on a different session will produce
+                // the canonical result. We also do NOT increment
+                // `failedCount` here for the same reason.
+                else if (isTargetSideFailure(errMsg)) {
+                  brokenSessionTargets.add(`${session.id}:${targetId}`);
+                  burstHitTargetSideFailure = true;
+                  targetSideFailureChunkIdx = chunkIdx;
+                  logger.warn(
+                    `Target-side failure: session ${session.id} → ${targetId} marked broken (${errMsg}); failing over ${usersChunk.length - chunkIdx} user(s) to next session`,
+                    { opId }
+                  );
+                  break;
                 }
+                // Handle user banned in channel after the broader
+                // target-side check above so we still detect bans.
                 // Handle user banned or restricted
                 else if (errMsg.includes('USER_BANNED_IN_CHANNEL') || errMsg.includes('USER_RESTRICTED')) {
                   userResult.error = 'User is banned or restricted';
@@ -1267,6 +1547,17 @@ class GroupService {
               }
             }
 
+            // Re-queue any users in this burst that were affected by a
+            // target-side failure. The user that triggered the bail
+            // (at `targetSideFailureChunkIdx`) and every unattempted
+            // user after it both go onto `nextPending` so a different
+            // session in the next pass can take a swing.
+            if (burstHitTargetSideFailure && targetSideFailureChunkIdx >= 0) {
+              for (let r = targetSideFailureChunkIdx; r < usersChunk.length; r++) {
+                nextPending.push(usersChunk[r]);
+              }
+            }
+
             // Update progress (Redis snapshot for the burst). Per-user
             // socket fan-out + DB writes happen inside `emitItemProgress`
             // above; this is the burst-summary that drives the Redis
@@ -1297,11 +1588,17 @@ class GroupService {
           } // end (round, session) block
 
           // Cooldown between rotations (skip after the last round and
-          // when no cooldown was configured).
-          const liveSessions = availableSessions.filter((s) => !peerFloodSessions.has(s.id));
+          // when no cooldown was configured). `roundLiveSessions`
+          // re-filters at this point because PEER_FLOOD may have
+          // fired during the round we just finished.
+          const roundLiveSessions = liveSessions.filter(
+            (s) =>
+              !peerFloodSessions.has(s.id) &&
+              !brokenSessionTargets.has(`${s.id}:${targetId}`)
+          );
           if (
             round < targetRounds - 1 &&
-            liveSessions.length > 0 &&
+            roundLiveSessions.length > 0 &&
             plan.cooldownSecMax > 0
           ) {
             if (await isCancelled(opId)) {
@@ -1312,7 +1609,7 @@ class GroupService {
             const cooldownSec =
               plan.cooldownSecMin + Math.random() * (plan.cooldownSecMax - plan.cooldownSecMin);
             logger.info(
-              `Cooldown between rotations: ${cooldownSec.toFixed(0)}s (target=${targetId}, round=${round + 1}/${targetRounds})`,
+              `Cooldown between rotations: ${cooldownSec.toFixed(0)}s (target=${targetId}, pass=${failoverPass}, round=${round + 1}/${targetRounds})`,
               { opId }
             );
             await updateProgress(opId, {
@@ -1330,6 +1627,18 @@ class GroupService {
             await sleep(cooldownSec * 1000);
           }
         }
+
+          // End of this fail-over pass. Roll any users that need to be
+          // retried on a different session into `pendingForTarget` so
+          // the next iteration of the outer while picks them up.
+          pendingForTarget = nextPending;
+          if (pendingForTarget.length > 0) {
+            logger.info(
+              `Fail-over pass ${failoverPass} for target ${targetId}: ${pendingForTarget.length} user(s) need retry on a different session`,
+              { opId }
+            );
+          }
+        } // end while (pendingForTarget.length > 0 && failoverPass < MAX)
       }
 
       // Finalise
@@ -1349,6 +1658,28 @@ class GroupService {
           stats: audienceStats,
           dmOnly: audienceDmOnly.length,
           dropped: audienceDropped.length,
+        },
+        // Source-aware dedup stats so the UI can surface "X dupes
+        // removed before the run started" without re-running the
+        // dedup pass on the response.
+        dedup: {
+          applied: dedupStats.applied,
+          before: dedupStats.before,
+          after: dedupStats.after,
+          dropped: dedupStats.dropped,
+          source: dedupStats.source,
+          listId: dedupStats.listId,
+        },
+        // Distribution-plan summary so the UI can show the operator
+        // exactly which knobs the planner picked, including the new
+        // hard per-session cap.
+        plan: {
+          mode: plan.mode,
+          perSessionBurst: plan.perSessionBurst,
+          maxPerSession: plan.maxPerSessionBurst,
+          rounds: plan.rounds,
+          cooldownSec: [plan.cooldownSecMin, plan.cooldownSecMax],
+          itemDelayMs: [plan.itemDelayMsMin, plan.itemDelayMsMax],
         },
         cooldownSkipped: verifiedSessions.cooldownSkipped || [],
       };
@@ -2229,4 +2560,14 @@ class GroupService {
   }
 }
 
-module.exports = new GroupService();
+const groupService = new GroupService();
+
+// Expose the pure dedup helpers as static properties so unit tests
+// can exercise them in isolation without spinning up the full
+// service / DB / Redis.
+groupService.dedupUploadedUserList = dedupUploadedUserList;
+groupService.dedupKeyForEntry = dedupKeyForEntry;
+groupService.isUploadedListSource = isUploadedListSource;
+groupService.DEFAULT_MAX_ADDS_PER_SESSION = DEFAULT_MAX_ADDS_PER_SESSION;
+
+module.exports = groupService;
