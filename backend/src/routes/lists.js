@@ -20,6 +20,14 @@ router.post('/merge', listController.mergeLists);
 // POST /api/lists/:id/deduplicate
 router.post('/:id/deduplicate', listController.deduplicateList);
 
+// POST /api/lists/normalize-all - normalize every list owned by the
+// caller. Mounted before `/:id/normalize` so the `normalize-all`
+// literal isn't shadowed by the param matcher.
+router.post('/normalize-all', listController.normalizeAllLists);
+
+// POST /api/lists/:id/normalize
+router.post('/:id/normalize', listController.normalizeList);
+
 // GET /api/lists - List all
 router.get('/', listController.listLists);
 

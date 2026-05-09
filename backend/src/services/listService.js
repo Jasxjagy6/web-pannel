@@ -47,6 +47,18 @@ const HEADER_MAPPINGS = {
   tg_id: 'telegram_id',
   tgid: 'telegram_id',
   uid: 'telegram_id',
+  // Panel-scraper exports header the numeric id column as
+  // "Identifier" — the column repeats the user_id when no public
+  // username is available. Map it to telegram_id so those exports
+  // import cleanly without manual munging.
+  identifier: 'telegram_id',
+  // Some operator-built CSVs use "tg_user_id" / "tgUserId" /
+  // "telegram_user_id" verbatim. Accept all of them.
+  tg_user_id: 'telegram_id',
+  tguserid: 'telegram_id',
+  telegram_user_id: 'telegram_id',
+  telegramuserid: 'telegram_id',
+  user_telegram_id: 'telegram_id',
 
   // Username variants
   username: 'username',
@@ -1423,6 +1435,247 @@ class ListService {
     } finally {
       client.release();
     }
+  }
+
+  // =========================================================================
+  // Normalize Operations
+  // =========================================================================
+
+  /**
+   * Re-coerce every row of an existing list through the same parser
+   * helpers used at import time. The canonical shape we converge on is
+   * `{ telegram_id, username }` — the two fields the messaging /
+   * group-add workers actually consume. Junk values (UUID stubs,
+   * numeric stand-ins for "no public username", whitespace-only fields)
+   * are scrubbed in-place; rows that had no usable identifier afterwards
+   * are dropped.
+   *
+   * Idempotent: running it twice on the same list is a no-op the second
+   * time. Existing access_hash / first_name / last_name / phone columns
+   * are preserved verbatim.
+   *
+   * Returns a small report so the UI can show what changed.
+   *
+   * @param {number|string} userId - The user who owns the list
+   * @param {number|string} listId - The list to normalize
+   * @returns {Promise<{
+   *   listId: number,
+   *   listName: string,
+   *   totalScanned: number,
+   *   updated: number,
+   *   removed: number,
+   *   totalAfter: number
+   * }>}
+   */
+  async normalizeList(userId, listId) {
+    logger.info(`Normalizing list ${listId} for user ${userId}`, { userId, listId });
+
+    const list = await validateListOwnership(listId, userId);
+
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+
+      const rowsResult = await client.query(
+        `SELECT id, telegram_id, username, first_name, last_name, phone
+           FROM list_items
+          WHERE list_id = $1`,
+        [listId]
+      );
+      const rows = rowsResult.rows;
+      const totalScanned = rows.length;
+
+      let updated = 0;
+      let removed = 0;
+      const idsToDelete = [];
+
+      for (const row of rows) {
+        const originalTgId = row.telegram_id != null ? String(row.telegram_id) : null;
+        const originalUsername = row.username != null ? String(row.username) : null;
+        const originalFirst = row.first_name != null ? String(row.first_name) : null;
+        const originalLast = row.last_name != null ? String(row.last_name) : null;
+
+        // The CSV parser already runs every row through buildEntryFromRaw,
+        // which means inputs that are already canonical are returned
+        // unchanged. We feed each persisted row through the same helper
+        // so a re-run picks up newly-recognised columns (e.g. operators
+        // who imported a list before the `identifier` header alias was
+        // wired up) and scrubs numeric-stand-in usernames retroactively.
+        const built = buildEntryFromRaw({
+          telegram_id: originalTgId,
+          username: originalUsername,
+          first_name: originalFirst,
+          last_name: originalLast,
+          phone: row.phone != null ? String(row.phone) : null,
+        });
+
+        if (!built) {
+          idsToDelete.push(row.id);
+          removed++;
+          continue;
+        }
+
+        // Same canonicalisation rules as the parser: when only a
+        // numeric Identifier is available, the row should NOT carry a
+        // numeric "username" — the worker treats `@<digits>` as a
+        // resolution attempt that's guaranteed to fail and would burn
+        // session capacity for nothing.
+        const newTgId = built.telegram_id || null;
+        const newUsername = built.username || null;
+        const newFirst = built.first_name || null;
+        const newLast = built.last_name || null;
+
+        const changed =
+          (originalTgId || null) !== (newTgId || null) ||
+          (originalUsername || null) !== (newUsername || null) ||
+          (originalFirst || null) !== (newFirst || null) ||
+          (originalLast || null) !== (newLast || null);
+
+        if (changed) {
+          await client.query(
+            `UPDATE list_items
+                SET telegram_id = $1,
+                    username = $2,
+                    first_name = $3,
+                    last_name = $4
+              WHERE id = $5`,
+            [newTgId, newUsername, newFirst, newLast, row.id]
+          );
+          updated++;
+        }
+      }
+
+      if (idsToDelete.length > 0) {
+        await client.query(
+          'DELETE FROM list_items WHERE id = ANY($1::int[])',
+          [idsToDelete]
+        );
+      }
+
+      const afterResult = await client.query(
+        'SELECT COUNT(*) as total FROM list_items WHERE list_id = $1',
+        [listId]
+      );
+      const totalAfter = parseInt(afterResult.rows[0].total, 10);
+
+      // Keep lists.items_count consistent with list_items so the UI
+      // counts on the listing page don't go stale after a normalize.
+      await client.query(
+        'UPDATE lists SET items_count = $1 WHERE id = $2',
+        [totalAfter, listId]
+      );
+
+      await client.query('COMMIT');
+
+      logger.info(`Normalized list ${listId}`, {
+        listId,
+        userId,
+        totalScanned,
+        updated,
+        removed,
+        totalAfter,
+      });
+
+      return {
+        listId: Number(listId),
+        listName: list.name,
+        totalScanned,
+        updated,
+        removed,
+        totalAfter,
+      };
+    } catch (error) {
+      await client.query('ROLLBACK');
+      logger.error(`Failed to normalize list ${listId}`, {
+        error: error.message,
+      });
+      throw new AppError(
+        `Failed to normalize list: ${error.message}`,
+        500,
+        'NORMALIZE_FAILED'
+      );
+    } finally {
+      client.release();
+    }
+  }
+
+  /**
+   * Bulk variant of {@link normalizeList} — runs the same in-place
+   * canonicalisation against every list owned by the user. Each list is
+   * processed in its own transaction so a failure in one doesn't roll
+   * back the others; the response surfaces per-list outcomes for the
+   * UI.
+   *
+   * @param {number|string} userId - The user who owns the lists
+   * @returns {Promise<{
+   *   totalLists: number,
+   *   succeeded: number,
+   *   failed: number,
+   *   totalScanned: number,
+   *   updated: number,
+   *   removed: number,
+   *   results: Array<{
+   *     listId: number,
+   *     listName: string|null,
+   *     success: boolean,
+   *     totalScanned?: number,
+   *     updated?: number,
+   *     removed?: number,
+   *     totalAfter?: number,
+   *     error?: string
+   *   }>
+   * }>}
+   */
+  async normalizeAllLists(userId) {
+    const listsResult = await pool.query(
+      `SELECT id, name FROM lists WHERE user_id = $1 ORDER BY id ASC`,
+      [userId]
+    );
+    const lists = listsResult.rows;
+
+    let succeeded = 0;
+    let failed = 0;
+    let totalScanned = 0;
+    let updatedTotal = 0;
+    let removedTotal = 0;
+    const results = [];
+
+    for (const lst of lists) {
+      try {
+        const r = await this.normalizeList(userId, lst.id);
+        succeeded++;
+        totalScanned += r.totalScanned;
+        updatedTotal += r.updated;
+        removedTotal += r.removed;
+        results.push({
+          listId: Number(lst.id),
+          listName: r.listName,
+          success: true,
+          totalScanned: r.totalScanned,
+          updated: r.updated,
+          removed: r.removed,
+          totalAfter: r.totalAfter,
+        });
+      } catch (err) {
+        failed++;
+        results.push({
+          listId: Number(lst.id),
+          listName: lst.name,
+          success: false,
+          error: err && err.message ? err.message : 'Normalize failed',
+        });
+      }
+    }
+
+    return {
+      totalLists: lists.length,
+      succeeded,
+      failed,
+      totalScanned,
+      updated: updatedTotal,
+      removed: removedTotal,
+      results,
+    };
   }
 
   // =========================================================================

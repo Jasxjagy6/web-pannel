@@ -34,6 +34,7 @@ import {
   Check,
   LogIn,
   LogOut,
+  Edit3,
 } from 'lucide-react';
 import {
   UserGroupIcon,
@@ -271,7 +272,19 @@ or -1001234567890
 // ============================================================
 
 function AddMembersForm({ sessions, targetLists, onSubmit, submitting }) {
+  // Two ways to feed the worker:
+  //   - 'list':   pull items from a saved Lists row (existing flow)
+  //   - 'manual': operator pastes user IDs / @usernames directly. Mixed
+  //               input is supported; the frontend coerces every line
+  //               into `{ telegram_id, username }` before submitting so
+  //               the worker uses the same fallback path it already has
+  //               for list-sourced rows (id → username; numeric-only
+  //               username strings are skipped locally before any
+  //               session request goes out, so the run can't burn into
+  //               peer-flood for an unreachable handle).
+  const [sourceMode, setSourceMode] = useState('list');
   const [sourceList, setSourceList] = useState('');
+  const [manualUsers, setManualUsers] = useState('');
   const [targetType, setTargetType] = useState('group'); // 'group' or 'channel'
   const [targetIds, setTargetIds] = useState('');
   const [selectedSessionIds, setSelectedSessionIds] = useState([]);
@@ -290,14 +303,55 @@ function AddMembersForm({ sessions, targetLists, onSubmit, submitting }) {
   const [previewError, setPreviewError] = useState(null);
   const previewSeq = useRef(0);
 
+  // Manual entries: parse on the fly so validation / preview can
+  // count what will actually be sent. One token per line; commas
+  // inside a line are also accepted so an operator can paste a
+  // single CSV row without re-typing it. Each token resolves to:
+  //   - `{ telegram_id: <digits> }` when the token is purely numeric
+  //   - `{ username: <handle> }`   for everything else (the leading
+  //     `@`, if any, is stripped). Numeric-only usernames are NEVER
+  //     produced by this parser, which is the same rule the backend
+  //     parser uses to skip resolving `@<digits>` (would always fail
+  //     and cost session capacity).
+  const parsedManualUsers = useMemo(() => {
+    if (!manualUsers || !manualUsers.trim()) return [];
+    const tokens = manualUsers
+      .split(/[\s,]+/)
+      .map((s) => s.trim())
+      .filter(Boolean);
+    const seen = new Set();
+    const out = [];
+    for (const tok of tokens) {
+      const stripped = tok.replace(/^@+/, '').trim();
+      if (!stripped) continue;
+      if (/^\d+$/.test(stripped)) {
+        // Numeric → telegram_id
+        if (seen.has(`id:${stripped}`)) continue;
+        seen.add(`id:${stripped}`);
+        out.push({ telegram_id: stripped, username: null });
+      } else {
+        // Non-numeric → username. Telegram handles are letters,
+        // digits and underscores only; we don't enforce that here
+        // because the worker already validates and the operator
+        // may want a more permissive paste.
+        const lower = stripped.toLowerCase();
+        if (seen.has(`u:${lower}`)) continue;
+        seen.add(`u:${lower}`);
+        out.push({ telegram_id: null, username: stripped });
+      }
+    }
+    return out;
+  }, [manualUsers]);
+
   // Resolve the source-list size so the preview can show realistic
   // per-session burst counts. We re-use whatever the user already
   // selected — no extra API hits unless the size isn't known yet.
   const targetUserCount = useMemo(() => {
+    if (sourceMode === 'manual') return parsedManualUsers.length;
     const sel = targetLists.find((l) => String(l.id) === String(sourceList));
     if (!sel) return 0;
     return Number(sel.user_count || sel.userCount || sel.member_count || 0);
-  }, [targetLists, sourceList]);
+  }, [sourceMode, parsedManualUsers, targetLists, sourceList]);
 
   // Multiplied by however many target groups the operator pasted in.
   const targetCount = useMemo(() => {
@@ -359,7 +413,13 @@ function AddMembersForm({ sessions, targetLists, onSubmit, submitting }) {
 
   const validate = () => {
     const newErrors = {};
-    if (!sourceList) newErrors.sourceList = 'Please select a source list.';
+    if (sourceMode === 'list') {
+      if (!sourceList) newErrors.sourceList = 'Please select a source list.';
+    } else {
+      if (parsedManualUsers.length === 0) {
+        newErrors.manualUsers = 'Paste at least one user ID or @username.';
+      }
+    }
     if (!targetIds.trim()) newErrors.targetIds = 'Please enter at least one target.';
     if (sessionPickMode === 'list') {
       if (!selectedSessionListId) newErrors.session = 'Please pick a session list.';
@@ -384,7 +444,9 @@ function AddMembersForm({ sessions, targetLists, onSubmit, submitting }) {
       .filter(t => t.length > 0);
 
     const submitPayload = {
-      sourceList,
+      sourceMode,
+      sourceList: sourceMode === 'list' ? sourceList : '',
+      manualUsers: sourceMode === 'manual' ? parsedManualUsers : null,
       targetIds: targets,
       targetType,
       delayMin: Number(delayMin),
@@ -401,6 +463,7 @@ function AddMembersForm({ sessions, targetLists, onSubmit, submitting }) {
 
     // Reset
     setSourceList('');
+    setManualUsers('');
     setTargetIds('');
     setSelectedSessionIds([]);
     setSelectedSessionListId('');
@@ -438,31 +501,93 @@ function AddMembersForm({ sessions, targetLists, onSubmit, submitting }) {
 
   return (
     <form onSubmit={handleSubmit} className="space-y-5">
-      {/* Source List */}
+      {/* Source mode picker — choose between a saved list or a
+          paste-in-IDs/@usernames input. */}
       <div>
         <label className={labelClass}>
           <span className="flex items-center gap-1.5">
             <ListFilter className="w-3.5 h-3.5 text-gray-500" />
-            Source List
+            Source
           </span>
         </label>
-        <select
-          value={sourceList}
-          onChange={(e) => setSourceList(e.target.value)}
-          className={`${inputBase} ${errors.sourceList ? inputError : inputNormal}`}
-        >
-          <option value="">Select a source list...</option>
-          {targetLists.map((list) => (
-            <option key={list.id} value={list.id}>
-              {list.name} ({formatNumber(list.itemsCount || list.count || 0)} users)
-            </option>
-          ))}
-        </select>
-        {errors.sourceList && <p className="mt-1 text-xs text-red-400">{errors.sourceList}</p>}
-        {targetLists.length === 0 && (
-          <p className="mt-1 text-xs text-amber-400">No lists available. Import or scrape users first.</p>
-        )}
+        <div className="flex gap-2">
+          <button
+            type="button"
+            onClick={() => setSourceMode('list')}
+            className={`flex-1 rounded-lg border px-4 py-2.5 text-sm font-medium transition flex items-center justify-center gap-2 ${
+              sourceMode === 'list'
+                ? 'border-primary-500/50 bg-primary-500/10 text-primary-400'
+                : 'border-white/10 bg-dark-900 text-gray-400 hover:text-white'
+            }`}
+          >
+            <ListFilter className="w-4 h-4" />
+            From list
+          </button>
+          <button
+            type="button"
+            onClick={() => setSourceMode('manual')}
+            className={`flex-1 rounded-lg border px-4 py-2.5 text-sm font-medium transition flex items-center justify-center gap-2 ${
+              sourceMode === 'manual'
+                ? 'border-primary-500/50 bg-primary-500/10 text-primary-400'
+                : 'border-white/10 bg-dark-900 text-gray-400 hover:text-white'
+            }`}
+          >
+            <Edit3 className="w-4 h-4" />
+            Manual input
+          </button>
+        </div>
       </div>
+
+      {sourceMode === 'list' ? (
+        <div>
+          <label className={labelClass}>
+            <span className="flex items-center gap-1.5">
+              <ListFilter className="w-3.5 h-3.5 text-gray-500" />
+              Source List
+            </span>
+          </label>
+          <select
+            value={sourceList}
+            onChange={(e) => setSourceList(e.target.value)}
+            className={`${inputBase} ${errors.sourceList ? inputError : inputNormal}`}
+          >
+            <option value="">Select a source list...</option>
+            {targetLists.map((list) => (
+              <option key={list.id} value={list.id}>
+                {list.name} ({formatNumber(list.itemsCount || list.count || 0)} users)
+              </option>
+            ))}
+          </select>
+          {errors.sourceList && <p className="mt-1 text-xs text-red-400">{errors.sourceList}</p>}
+          {targetLists.length === 0 && (
+            <p className="mt-1 text-xs text-amber-400">No lists available. Import or scrape users first.</p>
+          )}
+        </div>
+      ) : (
+        <div>
+          <label className={labelClass}>
+            <span className="flex items-center gap-1.5">
+              <Edit3 className="w-3.5 h-3.5 text-gray-500" />
+              Users (one per line; mix IDs and @usernames)
+            </span>
+          </label>
+          <textarea
+            value={manualUsers}
+            onChange={(e) => setManualUsers(e.target.value)}
+            placeholder={"6434893178\n@example_user\n@another_handle\n7000000000"}
+            rows={6}
+            className={`${inputBase} font-mono text-xs ${errors.manualUsers ? inputError : inputNormal}`}
+          />
+          <div className="mt-1 flex items-center justify-between text-xs">
+            <span className="text-gray-500">
+              {parsedManualUsers.length > 0
+                ? `${formatNumber(parsedManualUsers.length)} unique user${parsedManualUsers.length === 1 ? '' : 's'} parsed`
+                : 'Numeric tokens become user IDs; everything else becomes a @username.'}
+            </span>
+            {errors.manualUsers && <span className="text-red-400">{errors.manualUsers}</span>}
+          </div>
+        </div>
+      )}
 
       {/* Target Type */}
       <div>
@@ -952,30 +1077,53 @@ export default function Groups() {
     const startTime = Date.now();
 
     try {
-      // Fetch items from selected list. Forward `access_hash` alongside
-      // the canonical fields so the backend can build an `InputUser`
-      // directly when the list row was scraped — without it the worker
-      // can only resolve users by @handle, which is unreliable for
-      // numeric-id-only rows (Telegram says "Could not find the input
-      // entity" for any stranger user without a cached hash).
-      const listResponse = await listsAPI.getItems(data.sourceList, { limit: 10000 });
-      const users = (listResponse.data.data?.items || []).map((item) => ({
-        telegram_id: item.telegram_id || item.telegramId,
-        username: item.username,
-        first_name: item.first_name || item.firstName,
-        last_name: item.last_name || item.lastName,
-        phone: item.phone,
-        access_hash:
-          item.access_hash !== undefined && item.access_hash !== null
-            ? item.access_hash
-            : item.accessHash !== undefined && item.accessHash !== null
-              ? item.accessHash
-              : null,
-      }));
+      let users;
+      if (data.sourceMode === 'manual') {
+        // Manual input: the form already coerced every line into the
+        // canonical shape, so no API hit is needed. The backend's
+        // resolver chain handles `{ telegram_id }` → `@username`
+        // fallback the same way it does for list-sourced rows; numeric
+        // usernames are produced by neither path so peer-flood is not
+        // triggered for unreachable handles.
+        users = (data.manualUsers || []).map((u) => ({
+          telegram_id: u.telegram_id || null,
+          username: u.username || null,
+          first_name: null,
+          last_name: null,
+          phone: null,
+          access_hash: null,
+        }));
 
-      if (users.length === 0) {
-        showError('The selected list has no users. Please import or scrape users first.', 'Empty List');
-        return;
+        if (users.length === 0) {
+          showError('Paste at least one user ID or @username.', 'Empty Input');
+          return;
+        }
+      } else {
+        // Fetch items from selected list. Forward `access_hash` alongside
+        // the canonical fields so the backend can build an `InputUser`
+        // directly when the list row was scraped — without it the worker
+        // can only resolve users by @handle, which is unreliable for
+        // numeric-id-only rows (Telegram says "Could not find the input
+        // entity" for any stranger user without a cached hash).
+        const listResponse = await listsAPI.getItems(data.sourceList, { limit: 10000 });
+        users = (listResponse.data.data?.items || []).map((item) => ({
+          telegram_id: item.telegram_id || item.telegramId,
+          username: item.username,
+          first_name: item.first_name || item.firstName,
+          last_name: item.last_name || item.lastName,
+          phone: item.phone,
+          access_hash:
+            item.access_hash !== undefined && item.access_hash !== null
+              ? item.access_hash
+              : item.accessHash !== undefined && item.accessHash !== null
+                ? item.accessHash
+                : null,
+        }));
+
+        if (users.length === 0) {
+          showError('The selected list has no users. Please import or scrape users first.', 'Empty List');
+          return;
+        }
       }
 
       const addMembersPayload = {
