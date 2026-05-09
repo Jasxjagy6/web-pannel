@@ -428,6 +428,60 @@ class TelegramClientService {
       me = await tgService.getMe(sessionId);
     } catch (err) {
       const msg = String(err && err.message || err);
+
+      // 1) Permanent auth errors (AUTH_KEY_UNREGISTERED, SESSION_REVOKED,
+      //    etc.) mean Telegram has invalidated this session out-of-band
+      //    — usually because the user terminated it from another
+      //    device. Without this branch the controller surfaces the
+      //    raw GramJS message as a 500 INTERNAL_ERROR, which is what
+      //    operators were hitting when they "couldn't login active
+      //    sessions" from the panel. Mark the row revoked so the
+      //    sessions list updates immediately, then return a clean
+      //    401 the UI can render as "session needs re-upload".
+      if (tgService.isPermanentAuthError(err)) {
+        try {
+          const accountInfoForUpdate =
+            (row.account_info && typeof row.account_info === 'object')
+              ? { ...row.account_info }
+              : (() => {
+                  try {
+                    return row.account_info ? JSON.parse(row.account_info) : {};
+                  } catch {
+                    return {};
+                  }
+                })();
+          accountInfoForUpdate.lastError = msg;
+          accountInfoForUpdate.lastErrorAt = new Date().toISOString();
+          accountInfoForUpdate.revokedAt =
+            accountInfoForUpdate.revokedAt || new Date().toISOString();
+          await pool.query(
+            `UPDATE sessions
+                SET is_logged_in = FALSE,
+                    status       = 'revoked',
+                    account_info = $2,
+                    updated_at   = NOW()
+              WHERE id = $1`,
+            [sessionId, JSON.stringify(accountInfoForUpdate)]
+          );
+          logger.warn(
+            `connect(${sessionId}): permanent auth error from getMe; flagged session revoked in DB: ${msg}`,
+            { userId }
+          );
+        } catch (markErr) {
+          logger.warn(
+            `connect(${sessionId}): could not flag session revoked: ${markErr.message}`,
+            { userId }
+          );
+        }
+        throw new AppError(
+          'This session has been revoked remotely (auth key invalidated). Please re-upload or re-login it.',
+          401,
+          'SESSION_REVOKED_REMOTELY'
+        );
+      }
+
+      // 2) GramJS-versus-newer-Telegram-TL parser mismatch — recoverable
+      //    via the cached identity we stored at login time.
       const isParseRecvError =
         (err && err.name === 'TypeNotFoundError') ||
         msg.includes('Could not find a matching Constructor ID') ||
