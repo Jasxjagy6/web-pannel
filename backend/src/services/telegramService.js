@@ -1765,16 +1765,51 @@ class TelegramService {
   async getMe(sessionId) {
     await this._ensureConnected(sessionId);
 
-    try {
-      const me = await this._withFloodRetry(sessionId, async () => {
-        return await this.clients.get(String(sessionId)).client.getMe();
-      });
+    // GramJS 2.26.21 doesn't know about every TL constructor in
+    // Telegram's current Layer 198+ schema (e.g. paymentsCheckedGiftCode,
+    // some new updates types). When Telegram's MTProto receive loop
+    // hands back an Update payload that includes one of those, GramJS
+    // surfaces a `TypeNotFoundError: Could not find a matching
+    // Constructor ID ...` on whichever invoke promise is pending —
+    // even though our request itself is fine. Retry a couple of times
+    // before giving up; the bad bytes have already drained from the
+    // socket, so the next call lands on a fresh response cycle.
+    const isParseRecvError = (err) => {
+      if (!err) return false;
+      const msg = String(err.message || err);
+      return (
+        err.name === 'TypeNotFoundError' ||
+        msg.includes('Could not find a matching Constructor ID') ||
+        msg.includes('matching Constructor ID for the TLObject')
+      );
+    };
 
-      return normalizeEntity(me);
-    } catch (error) {
-      logger.error(`Failed to getMe for session ${sessionId}`, { error: error.message });
-      throw this._handleTelegramError(error);
+    let lastError = null;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        const me = await this._withFloodRetry(sessionId, async () => {
+          return await this.clients.get(String(sessionId)).client.getMe();
+        });
+        return normalizeEntity(me);
+      } catch (error) {
+        lastError = error;
+        if (isParseRecvError(error) && attempt < 2) {
+          logger.warn(
+            `getMe(${sessionId}) hit TLObject parse error (attempt ${attempt + 1}/3): ${error.message}`
+          );
+          // Yield to the event loop so the broken update finishes
+          // unwinding before the retry.
+          await new Promise((resolve) => setTimeout(resolve, 250));
+          continue;
+        }
+        break;
+      }
     }
+
+    logger.error(`Failed to getMe for session ${sessionId}`, {
+      error: lastError ? lastError.message : 'unknown',
+    });
+    throw this._handleTelegramError(lastError);
   }
 
   /**

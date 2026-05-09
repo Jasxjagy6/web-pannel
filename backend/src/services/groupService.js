@@ -620,10 +620,16 @@ class GroupService {
           userId,
           context: 'add-members',
           options: {
-            // Group-add jobs explicitly skip privacy-restricted users —
-            // the API will refuse to add them anyway.
-            includePrivacyRestricted: false,
-            purgeNotFound: true,
+            // Per the operator's "just start the job" requirement, we
+            // no longer let the audience filter block the run for
+            // privacy-restricted or stale not_found rows. The runner's
+            // in-job skip cache (`inJobSkipReasons`) already prevents
+            // wasted retries when a session confirms a user is
+            // privacy-restricted, and `recordObservedFromEntry` keeps
+            // the cache fresh after each attempt. Pre-classifying
+            // here only matters for stats / UI surfacing.
+            includePrivacyRestricted: true,
+            purgeNotFound: false,
           },
         });
         audienceStats = audienceResult.stats;
@@ -638,12 +644,18 @@ class GroupService {
         // entries directly.
         if (Array.isArray(audienceResult.eligible) && audienceResult.eligible.length > 0) {
           userList = audienceResult.eligible;
-        } else if (Array.isArray(audienceResult.eligible)) {
-          // Filter ran cleanly but yielded zero eligible rows. Reflect
-          // that in `userList` so the empty-check below catches it.
-          userList = [];
         }
-        logger.info('addMembersToGroups: audience filter applied', {
+        // Important: if the filter classified every row as
+        // not_found / privacy_restricted (eligible.length === 0), we
+        // KEEP the original userList so the runner can attempt them
+        // anyway. Privacy / not-found classifications can be stale —
+        // a user who blocked invites yesterday might allow them
+        // today. The runner discovers the truth on the first invite
+        // and updates the cache via `recordObservedFromEntry`. This
+        // preserves the operator's "just try, fall through to next
+        // session" intent without burning N×M requests on rows we
+        // already know are doomed.
+        logger.info('addMembersToGroups: audience filter applied (advisory)', {
           userId,
           listId,
           stats: audienceStats,
@@ -660,8 +672,11 @@ class GroupService {
       }
 
       if (!userList || userList.length === 0) {
+        // We only get here if the input list itself was empty — which
+        // is already validated by the controller. Keep the throw as a
+        // defensive guard but with a non-misleading message.
         throw new AppError(
-          'All audience entries were filtered out (not_found or privacy-restricted).',
+          'No users to process: the input list is empty.',
           400,
           'NO_ELIGIBLE_USERS'
         );
