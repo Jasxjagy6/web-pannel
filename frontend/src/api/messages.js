@@ -32,6 +32,15 @@ export const sendBulkToGroups = (data) => api.post('/messages/bulk-groups', data
 
 export const sendBulkToUsers = (data) => api.post('/messages/bulk-users', data);
 
+// Single-User Mass DM. The body shape mirrors the backend validator:
+//   { sessionIds | sessionListId, targets: string[1..3], message,
+//     messageType?, delaySeconds?, async? }
+// Each session DMs every target sequentially with `delaySeconds` between
+// sends. The 3-target hard cap and 1..120-second delay band are enforced
+// server-side; the form should match those bounds.
+export const sendSingleUserMassDm = (data) =>
+  api.post('/messages/single-user-mass-dm', data);
+
 // ---------------------------------------------------------------------
 // Recurring group-message schedules. Backed by `message_schedules`;
 // see backend/src/services/messageScheduleService.js. Each schedule
