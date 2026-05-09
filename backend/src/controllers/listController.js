@@ -183,6 +183,92 @@ const listController = {
   }),
 
   /**
+   * Re-coerce every row of a list through the import-time parser so
+   * legacy imports (or any list whose rows reference deleted columns
+   * like `Identifier` that the panel didn't recognise pre-fix) are
+   * brought into the canonical `{ telegram_id, username }` shape that
+   * the messaging / group-add workers consume.
+   *
+   * List ID comes from req.params.id.
+   */
+  normalizeList: asyncHandler(async (req, res) => {
+    const userId = req.user.id;
+    const listId = req.params.id;
+
+    if (!listId) {
+      throw new AppError('List ID is required', 400, 'MISSING_LIST_ID');
+    }
+
+    const result = await listService.normalizeList(userId, listId);
+
+    await reportService.logActivity(
+      userId,
+      'list_import',
+      'list',
+      listId,
+      {
+        action: 'normalize',
+        totalScanned: result.totalScanned,
+        updated: result.updated,
+        removed: result.removed,
+        totalAfter: result.totalAfter,
+      }
+    );
+
+    logger.info(`List ${listId} normalized by user ${userId}`, {
+      totalScanned: result.totalScanned,
+      updated: result.updated,
+      removed: result.removed,
+    });
+
+    return res.status(200).json({
+      success: true,
+      data: result,
+    });
+  }),
+
+  /**
+   * Apply the same normalization to every list owned by the user. Each
+   * list is processed in its own transaction so a failure on one list
+   * doesn't roll back the others — the response surfaces per-list
+   * outcomes.
+   */
+  normalizeAllLists: asyncHandler(async (req, res) => {
+    const userId = req.user.id;
+    const result = await listService.normalizeAllLists(userId);
+
+    await reportService.logActivity(
+      userId,
+      'list_import',
+      'list',
+      null,
+      {
+        action: 'normalize_all',
+        totalLists: result.totalLists,
+        succeeded: result.succeeded,
+        failed: result.failed,
+        totalScanned: result.totalScanned,
+        updated: result.updated,
+        removed: result.removed,
+      }
+    );
+
+    logger.info(`All lists normalized by user ${userId}`, {
+      totalLists: result.totalLists,
+      succeeded: result.succeeded,
+      failed: result.failed,
+      totalScanned: result.totalScanned,
+      updated: result.updated,
+      removed: result.removed,
+    });
+
+    return res.status(200).json({
+      success: true,
+      data: result,
+    });
+  }),
+
+  /**
    * Export a list in the specified format.
    *
    * List ID comes from req.params.id.

@@ -21,6 +21,7 @@ import {
   ChevronRight,
   Layers,
   Send,
+  Wand2,
 } from 'lucide-react';
 import { Modal } from '../components/common/Modal';
 import { useToast } from '../components/common/Toast';
@@ -107,6 +108,8 @@ export default function Lists() {
   const [exportingList, setExportingList] = useState(null);
   const [deleteTarget, setDeleteTarget] = useState(null);
   const [selectedLists, setSelectedLists] = useState([]);
+  const [normalizingId, setNormalizingId] = useState(null);
+  const [normalizingAll, setNormalizingAll] = useState(false);
 
   const fetchLists = useCallback(async () => {
     setListsLoading(true);
@@ -253,6 +256,51 @@ export default function Lists() {
     setExportingList(null);
   };
 
+  // Re-coerce one list's rows through the import-time parser so legacy
+  // imports (or rows that referenced an unrecognised CSV header at the
+  // time, e.g. `Identifier`) are brought into the canonical
+  // `{ telegram_id, username }` shape that messaging / group-add
+  // workers consume. Numeric-stand-in usernames are scrubbed and rows
+  // with no usable identifier are dropped.
+  const handleNormalize = async (list) => {
+    if (normalizingId) return;
+    setNormalizingId(list.id);
+    try {
+      const resp = await listsAPI.normalize(list.id);
+      const r = resp?.data?.data || {};
+      showSuccess(
+        `Normalized "${list.name}": ${r.updated || 0} updated, ${r.removed || 0} removed, ${r.totalAfter || 0} now usable.`,
+        'Convert Complete'
+      );
+      fetchLists();
+    } catch (err) {
+      showError(parseApiError(err), 'Convert failed');
+    } finally {
+      setNormalizingId(null);
+    }
+  };
+
+  const handleNormalizeAll = async () => {
+    if (normalizingAll) return;
+    setNormalizingAll(true);
+    try {
+      const resp = await listsAPI.normalizeAll();
+      const r = resp?.data?.data || {};
+      const failed = Number(r.failed || 0);
+      const summary = `${r.succeeded || 0}/${r.totalLists || 0} lists, ${r.updated || 0} rows updated, ${r.removed || 0} dropped`;
+      if (failed > 0) {
+        showError(`${summary} (${failed} failed)`, 'Convert Partial');
+      } else {
+        showSuccess(summary, 'All Lists Converted');
+      }
+      fetchLists();
+    } catch (err) {
+      showError(parseApiError(err), 'Convert failed');
+    } finally {
+      setNormalizingAll(false);
+    }
+  };
+
   const handleMerge = async () => {
     if (mergeSelected.length < 2) {
       showError('Select at least 2 lists to merge.', 'Merge Error');
@@ -348,6 +396,15 @@ export default function Lists() {
               Merge ({selectedLists.length})
             </button>
           )}
+          <button
+            onClick={handleNormalizeAll}
+            disabled={normalizingAll || lists.length === 0}
+            title="Re-parse every list so each row is in the canonical user_id,username format. Numeric-stand-in usernames are scrubbed; unaddressable rows are dropped."
+            className="inline-flex items-center gap-2 rounded-lg border border-white/10 bg-white/5 px-4 py-2 text-sm font-medium text-white hover:bg-white/10 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+          >
+            {normalizingAll ? <Loader2 className="h-4 w-4 animate-spin" /> : <Wand2 className="h-4 w-4" />}
+            {normalizingAll ? 'Converting...' : 'Convert all to supported format'}
+          </button>
           <button
             onClick={() => { setShowCreateModal(true); resetCreateForm(); }}
             className="inline-flex items-center gap-2 rounded-lg bg-primary-600 px-4 py-2 text-sm font-medium text-white hover:bg-primary-700 transition-colors focus:outline-none focus:ring-2 focus:ring-primary-500 focus:ring-offset-2 focus:ring-offset-dark-950"
@@ -463,6 +520,18 @@ export default function Lists() {
                           title="Send DM to list"
                         >
                           <Send className="h-4 w-4" />
+                        </button>
+                        <button
+                          onClick={() => handleNormalize(list)}
+                          disabled={normalizingId === list.id}
+                          className="rounded-lg p-1.5 text-gray-400 hover:bg-white/5 hover:text-amber-400 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                          title="Convert this list to supported format (canonical user_id,username)"
+                        >
+                          {normalizingId === list.id ? (
+                            <Loader2 className="h-4 w-4 animate-spin" />
+                          ) : (
+                            <Wand2 className="h-4 w-4" />
+                          )}
                         </button>
                         <div className="relative">
                           <button

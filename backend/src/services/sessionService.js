@@ -1692,87 +1692,157 @@ class SessionService {
   async deleteSession(sessionId, userId) {
     logger.info(`Deleting session`, { sessionId, userId });
 
-    const client = await pool.connect();
-    try {
-      await client.query('BEGIN');
-
-      // Fetch the session — scoped to platform='telegram' so this
-      // service can never accidentally delete an Instagram row.
-      const sessionResult = await client.query(
-        `SELECT id, user_id, session_file_path, status, is_logged_in
-         FROM sessions WHERE id = $1 AND user_id = $2 AND platform = 'telegram' FOR UPDATE`,
-        [sessionId, userId]
+    // Coerce to integer so a string id like '0123' or anything that
+    // accidentally arrived as a path-decoded value doesn't get sent
+    // straight into the SQL parser. PG would reject a non-numeric
+    // value with `invalid input syntax for type integer` (a 22P02 the
+    // generic error handler used to surface as a 400 to the UI),
+    // which is what blocked some operators from clearing revoked rows
+    // when the row id was passed in via a URL with a trailing slash
+    // or a stale local cache. We accept either an integer or a string
+    // of digits — anything else fails fast with a clear message.
+    const numericId = Number.parseInt(sessionId, 10);
+    if (!Number.isFinite(numericId) || numericId <= 0) {
+      throw new AppError(
+        `Invalid session ID: ${sessionId}`,
+        400,
+        'INVALID_SESSION_ID'
       );
-
-      if (sessionResult.rows.length === 0) {
-        await client.query('ROLLBACK');
-        throw new AppError(`Session not found or access denied: ${sessionId}`, 404, 'SESSION_NOT_FOUND');
-      }
-
-      const session = sessionResult.rows[0];
-
-      // OTP Relay: tear down any listeners that referenced this
-      // session as either watch source or relay destination before
-      // we kill the client.
-      try {
-        const otpRelayService = require('./otpRelayService');
-        await otpRelayService.onSessionDisconnected(String(sessionId)).catch(() => {});
-      } catch { /* best-effort */ }
-
-      // Disconnect telegram client if active
-      if (session.is_logged_in) {
-        try {
-          await this._disconnectSessionClient(String(sessionId));
-          logger.info(`Disconnected telegram client for session ${sessionId}`);
-        } catch (disconnectError) {
-          logger.warn(`Failed to disconnect client for session ${sessionId}`, {
-            error: disconnectError.message,
-          });
-          // Continue with deletion even if disconnect fails
-        }
-      }
-
-      // Delete from database. Cascades to tg_otp_relays via the
-      // ON DELETE CASCADE FK on watch_session_id / relay_session_id,
-      // so attachments referencing this session are automatically
-      // cleaned up.
-      await client.query('DELETE FROM sessions WHERE id = $1', [sessionId]);
-
-      await client.query('COMMIT');
-
-      // Delete file from disk (outside transaction since file ops can't be rolled back)
-      let fileDeleted = false;
-      if (session.session_file_path) {
-        const fullPath = path.join(uploadDir, session.session_file_path);
-        try {
-          if (await fs.pathExists(fullPath)) {
-            await fs.unlink(fullPath);
-            fileDeleted = true;
-            logger.info(`Deleted session file: ${fullPath}`);
-          }
-        } catch (fileError) {
-          logger.warn(`Failed to delete session file: ${fullPath}`, {
-            error: fileError.message,
-          });
-        }
-      }
-
-      logger.info(`Session deleted successfully`, {
-        sessionId,
-        fileDeleted,
-      });
-
-      return {
-        success: true,
-        sessionId: session.id,
-        fileDeleted,
-      };
-    } catch (error) {
-      await client.query('ROLLBACK');
-      throw error;
-    } finally {
-      client.release();
     }
+
+    // 1. Ownership check (no row lock — `FOR UPDATE` here was strictly
+    //    pessimistic and could deadlock against the auth-revoke
+    //    background worker that updates `status='revoked'` on the same
+    //    row, which is exactly the row the user is trying to delete).
+    let session;
+    try {
+      const sessionResult = await pool.query(
+        `SELECT id, user_id, session_file_path, status, is_logged_in
+           FROM sessions
+          WHERE id = $1 AND user_id = $2 AND platform = 'telegram'`,
+        [numericId, userId]
+      );
+      if (sessionResult.rows.length === 0) {
+        throw new AppError(
+          `Session not found or access denied: ${sessionId}`,
+          404,
+          'SESSION_NOT_FOUND'
+        );
+      }
+      session = sessionResult.rows[0];
+    } catch (lookupError) {
+      if (lookupError instanceof AppError) throw lookupError;
+      throw new AppError(
+        `Failed to look up session: ${lookupError.message}`,
+        500,
+        'SESSION_LOOKUP_FAILED'
+      );
+    }
+
+    // 2. Best-effort cleanup of side-effects. NONE of these may throw
+    //    out of this function; a session must always be deletable
+    //    even if a downstream client is wedged or the OTP relay
+    //    service is unreachable. Revoked sessions in particular have
+    //    no live GramJS client and can have stale OTP listeners that
+    //    used to make this path 500.
+    try {
+      const otpRelayService = require('./otpRelayService');
+      await otpRelayService.onSessionDisconnected(String(numericId)).catch(() => {});
+    } catch { /* best-effort */ }
+
+    // The previous gate `if (session.is_logged_in)` skipped the
+    // disconnect for any row whose `is_logged_in` flag had already
+    // been flipped to false (revoked, expired, or just logged out).
+    // GramJS however keeps an entry in `this.clients` for the lifetime
+    // of the worker, even after the auth key is invalidated, so a
+    // stale connection often DID exist for revoked sessions. We
+    // unconditionally try to tear it down — the underlying
+    // `disconnectSession` no-ops when no client is registered.
+    try {
+      await this._disconnectSessionClient(String(numericId));
+    } catch (disconnectError) {
+      logger.warn(`Failed to disconnect client for session ${numericId} during delete`, {
+        error: disconnectError.message,
+      });
+      // Continue with deletion regardless — the row goes away even
+      // if the network teardown couldn't run.
+    }
+
+    // 3. Single-shot DELETE. Cascades to tg_otp_relays / message_logs
+    //    / scrape_jobs / etc via the ON DELETE CASCADE / SET NULL FKs
+    //    set up in migration v16. We use `pool.query` directly (no
+    //    explicit transaction) because the only mutation here is the
+    //    DELETE itself; any FK CASCADE happens in the same statement.
+    let rowsDeleted = 0;
+    try {
+      const delResult = await pool.query(
+        `DELETE FROM sessions WHERE id = $1 AND user_id = $2 AND platform = 'telegram'`,
+        [numericId, userId]
+      );
+      rowsDeleted = delResult.rowCount || 0;
+    } catch (delError) {
+      // PG `foreign_key_violation` (23503) — surfaces when an old
+      // database is missing one of the v16 cascade FKs. Map to a 409
+      // with a helpful message so the operator can ask support to
+      // run the migration; previously this came through as a generic
+      // 500 / 400 with no actionable info.
+      if (delError && delError.code === '23503') {
+        logger.error('FK violation on session delete (migration v16 not applied?)', {
+          sessionId: numericId,
+          detail: delError.detail,
+          constraint: delError.constraint,
+        });
+        throw new AppError(
+          `This session is referenced by another record that doesn't allow cascade deletes ` +
+            `(constraint: ${delError.constraint || 'unknown'}). Ask the panel admin to run ` +
+            `migration v16.`,
+          409,
+          'SESSION_DELETE_FK_VIOLATION'
+        );
+      }
+      throw new AppError(
+        `Failed to delete session: ${delError.message}`,
+        500,
+        'SESSION_DELETE_FAILED'
+      );
+    }
+
+    if (rowsDeleted === 0) {
+      // Race: somebody else deleted the row between our SELECT and
+      // DELETE. Treat as success — the session is gone, which is
+      // exactly what the caller asked for.
+      logger.info(`Session ${numericId} already gone before delete`);
+    }
+
+    // 4. Best-effort file unlink. Never throws; a failed unlink
+    //    leaves an orphaned file but doesn't fail the API call.
+    let fileDeleted = false;
+    if (session.session_file_path) {
+      const fullPath = path.join(uploadDir, session.session_file_path);
+      try {
+        if (await fs.pathExists(fullPath)) {
+          await fs.unlink(fullPath);
+          fileDeleted = true;
+          logger.info(`Deleted session file: ${fullPath}`);
+        }
+      } catch (fileError) {
+        logger.warn(`Failed to delete session file: ${fullPath}`, {
+          error: fileError.message,
+        });
+      }
+    }
+
+    logger.info(`Session deleted successfully`, {
+      sessionId: numericId,
+      status: session.status,
+      fileDeleted,
+    });
+
+    return {
+      success: true,
+      sessionId: session.id,
+      fileDeleted,
+    };
   }
 
   /**

@@ -7,6 +7,12 @@ export const listsAPI = {
   createFromScrape: (data) => api.post('/lists/from-scrape', data),
   merge: (data) => api.post('/lists/merge', data),
   deduplicate: (id) => api.post(`/lists/${id}/deduplicate`),
+  // Re-coerce every row of an existing list through the import-time
+  // parser. Cleans up legacy imports whose rows reference deleted
+  // columns (e.g. `Identifier`) or carry numeric "username" values
+  // that the worker can't resolve.
+  normalize: (id) => api.post(`/lists/${id}/normalize`),
+  normalizeAll: () => api.post('/lists/normalize-all'),
   list: (params) => api.get('/lists', { params }),
   get: (id) => api.get(`/lists/${id}`),
   getItems: (id, params) => api.get(`/lists/${id}/items`, { params }),
