@@ -187,7 +187,10 @@ function _normalizeDialog(dialog, ownId) {
   return {
     peerType,
     peerId: id,
-    accessHash: _toIdNum(entity.accessHash),
+    // Preserve full int64 precision: real access_hashes routinely
+    // exceed 2^53 and Number-coercion would silently corrupt them,
+    // breaking any later InputUser/InputPeer construction by the UI.
+    accessHash: entity.accessHash != null ? String(entity.accessHash) : null,
     title: _entityTitle(entity),
     username: entity.username || null,
     isSelf: peerType === 'user' && ownId != null && id === ownId,

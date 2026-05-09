@@ -101,6 +101,39 @@ function extractFloodSeconds(errorMessage) {
 }
 
 /**
+ * Coerce a Telegram-style int64 value (BigInt / number / string) to a
+ * lossless decimal string. **Critical** for `access_hash`: the raw
+ * `Number(bigint)` coercion silently truncates anything >= 2^53, which
+ * is most real access_hashes. Persisting a truncated value to the
+ * BIGINT column then makes every later `InputUser({userId, accessHash})`
+ * fail with "Could not find the input entity" because the hash on file
+ * no longer matches what Telegram has on its side.
+ *
+ * @param {bigint|number|string|null|undefined} v
+ * @returns {string|null}
+ */
+function bigintToString(v) {
+  if (v === null || v === undefined) return null;
+  if (typeof v === 'bigint') return v.toString();
+  if (typeof v === 'number') {
+    if (!Number.isFinite(v)) return null;
+    return String(Math.trunc(v));
+  }
+  if (typeof v === 'string') {
+    const s = v.trim();
+    if (!s) return null;
+    return /^-?\d+$/.test(s) ? s : null;
+  }
+  // GramJS sometimes wraps int64 values in `{ value, ... }` shapes;
+  // fall back to `toString()` when it's available.
+  if (v && typeof v.toString === 'function') {
+    const s = v.toString();
+    return /^-?\d+$/.test(s) ? s : null;
+  }
+  return null;
+}
+
+/**
  * Normalize a Telegram entity to a standard user/group object.
  * @param {object} entity - Raw GramJS entity
  * @returns {object|null} Normalized entity data
@@ -108,9 +141,12 @@ function extractFloodSeconds(errorMessage) {
 function normalizeEntity(entity) {
   if (!entity) return null;
 
+  // `accessHash` MUST go through `bigintToString` (not `Number`) — most
+  // real Telegram access_hashes exceed 2^53 and `Number(bigint)` would
+  // truncate them, breaking every later `InputUser` construction.
   const base = {
     id: entity.id ? Number(entity.id) : null,
-    accessHash: entity.accessHash ? Number(entity.accessHash) : null,
+    accessHash: bigintToString(entity.accessHash),
   };
 
   // User entity
@@ -216,7 +252,12 @@ function normalizeParticipant(participant) {
     isContact: !!user.contact,
     isMutualContact: !!user.mutualContact,
     isCloseFriend: !!user.closeFriend,
-    accessHash: user.accessHash ? Number(user.accessHash) : null,
+    // Persist the FULL int64 access_hash as a decimal string. Using
+    // `Number()` here truncates real access_hashes (which routinely
+    // exceed 2^53) and silently corrupts `scraped_users.access_hash`,
+    // which then makes every numeric-id invite later in the pipeline
+    // fail with "Could not find the input entity".
+    accessHash: bigintToString(user.accessHash),
     langCode: user.langCode || null,
     status,
     lastSeenAt: lastSeen,
@@ -1143,7 +1184,30 @@ class TelegramService {
         accessHash: userOptions && userOptions.accessHash,
       });
       if (!userEntity) {
-        throw new Error(`Could not resolve user to add: ${userId}`);
+        // Make the failure diagnosable from the Operation History UI.
+        // The most common cause for a numeric-id row with no further
+        // fallback is a missing or stale access_hash — say so plainly
+        // instead of the generic "could not resolve" line, which has
+        // historically led operators to think the panel was broken
+        // when in fact Telegram simply doesn't have enough info to
+        // route the invite.
+        const idStr = String(userId);
+        const looksNumeric = /^\d+$/.test(idStr);
+        const hadHash = userOptions && userOptions.accessHash;
+        let reason;
+        if (looksNumeric && !hadHash) {
+          reason =
+            'Could not resolve user by numeric id alone — the row has no access_hash on file. ' +
+            'Re-scrape the source group via the panel (the scrape captures access_hash automatically) ' +
+            'or include access_hash in the imported CSV.';
+        } else if (looksNumeric && hadHash) {
+          reason =
+            'Could not resolve user by numeric id even with the cached access_hash — Telegram ' +
+            'returned UserEmpty (account is deactivated, deleted, or the hash is invalid for this session).';
+        } else {
+          reason = `Could not resolve user to add: ${userId}`;
+        }
+        throw new Error(reason);
       }
 
       const inputUser = new Api.InputUser({
