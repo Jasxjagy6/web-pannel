@@ -1792,6 +1792,740 @@ class ReportService {
 
     return { activities, pagination };
   }
+
+  // =========================================================================
+  // Panel Overview & Per-Category Summaries (institutional reports)
+  // =========================================================================
+
+  /**
+   * Resolve the period filter into concrete start/end dates.
+   * Supports the same period strings as the per-target reports plus 'all'
+   * (no lower bound). Custom requires periodStart + periodEnd.
+   *
+   * @private
+   */
+  _resolveOverviewPeriod(period, customDates = {}) {
+    const endDate = moment().endOf('day');
+
+    if (period === 'all') {
+      return { startDate: moment('1970-01-01'), endDate };
+    }
+
+    if (period === 'custom') {
+      const { periodStart, periodEnd } = customDates || {};
+      if (!periodStart || !periodEnd) {
+        throw new AppError(
+          'periodStart and periodEnd are required when period="custom"',
+          400,
+          'MISSING_CUSTOM_DATES'
+        );
+      }
+      const startDate = moment(periodStart).startOf('day');
+      const customEnd = moment(periodEnd).endOf('day');
+      if (!startDate.isValid() || !customEnd.isValid()) {
+        throw new AppError('periodStart/periodEnd are invalid dates', 400, 'INVALID_DATES');
+      }
+      if (startDate.isAfter(customEnd)) {
+        throw new AppError('periodStart must be on or before periodEnd', 400, 'INVALID_PERIOD_RANGE');
+      }
+      return { startDate, endDate: customEnd };
+    }
+
+    return resolvePeriod(period || '7d');
+  }
+
+  /**
+   * Generate a panel-wide overview report scoped to a period.
+   *
+   * Returns KPIs (sessions / messaging / scraping / group ops / lists),
+   * daily time-series for sends + scrapes + group-ops, and distribution
+   * breakdowns for sessions-by-status, messaging-by-job-type,
+   * scraping-by-target-type, and group-ops-by-operation. All numbers are
+   * scoped to the requesting user via sessions.user_id ownership.
+   *
+   * @param {number|string} userId
+   * @param {string} period - '24h'|'7d'|'30d'|'90d'|'custom'|'all'
+   * @param {object} [customDates] - { periodStart, periodEnd } for period='custom'
+   * @returns {Promise<object>}
+   */
+  async getOverview(userId, period = '7d', customDates = {}) {
+    logger.info(`Generating panel overview for user ${userId}`, { period });
+
+    const { startDate, endDate } = this._resolveOverviewPeriod(period, customDates);
+    const startISO = startDate.toISOString();
+    const endISO = endDate.toISOString();
+
+    // All-time KPIs (re-uses the existing dashboard aggregation).
+    const dashboard = await this.getDashboardStats(userId);
+
+    // -------- Period-scoped messaging stats --------
+    const msgPeriodResult = await pool.query(
+      `SELECT
+         COUNT(*) AS jobs,
+         COALESCE(SUM(mj.sent_count), 0) AS sent,
+         COALESCE(SUM(mj.failed_count), 0) AS failed,
+         COALESCE(SUM(mj.skipped_count), 0) AS skipped,
+         COALESCE(SUM(mj.total_count), 0) AS attempted
+       FROM messaging_jobs mj
+       INNER JOIN sessions s ON mj.session_id = s.id
+       WHERE s.user_id = $1 AND mj.created_at BETWEEN $2 AND $3`,
+      [userId, startISO, endISO]
+    );
+    const msgPeriodRow = msgPeriodResult.rows[0];
+
+    // -------- Period-scoped scraping stats --------
+    const scrapePeriodResult = await pool.query(
+      `SELECT
+         COUNT(*) AS jobs,
+         COALESCE(SUM(sj.total_found), 0) AS found,
+         COUNT(*) FILTER (WHERE sj.status = 'completed') AS completed,
+         COUNT(*) FILTER (WHERE sj.status = 'failed') AS failed,
+         COUNT(*) FILTER (WHERE sj.status = 'cancelled') AS cancelled
+       FROM scraping_jobs sj
+       INNER JOIN sessions s ON sj.session_id = s.id
+       WHERE s.user_id = $1 AND sj.created_at BETWEEN $2 AND $3`,
+      [userId, startISO, endISO]
+    );
+    const scrapePeriodRow = scrapePeriodResult.rows[0];
+
+    // -------- Period-scoped group-ops stats --------
+    const groupPeriodResult = await pool.query(
+      `SELECT
+         COUNT(*) AS ops,
+         COALESCE(SUM(go.success_count), 0) AS success,
+         COALESCE(SUM(go.failed_count), 0) AS failed,
+         COALESCE(SUM(go.total_count), 0) AS attempted
+       FROM group_operations go
+       INNER JOIN sessions s ON go.session_id = s.id
+       WHERE s.user_id = $1 AND go.created_at BETWEEN $2 AND $3`,
+      [userId, startISO, endISO]
+    );
+    const groupPeriodRow = groupPeriodResult.rows[0];
+
+    // -------- Daily time series (one row per calendar day in [start,end]) --------
+    // We render the full bucket range from the client side (Recharts), so
+    // even days with zero activity must be present. We do the bucket build
+    // here in Node rather than in SQL — easier to reason about + portable
+    // across pg versions.
+    const dayKeys = [];
+    {
+      const cursor = startDate.clone().startOf('day');
+      const last = endDate.clone().startOf('day');
+      while (!cursor.isAfter(last)) {
+        dayKeys.push(cursor.format('YYYY-MM-DD'));
+        cursor.add(1, 'day');
+      }
+    }
+    const emptySeries = () => Object.fromEntries(dayKeys.map((d) => [d, 0]));
+
+    // Daily sent/failed (from messaging_jobs, attribute to created_at day).
+    const msgDailyResult = await pool.query(
+      `SELECT
+         to_char(mj.created_at, 'YYYY-MM-DD') AS day,
+         COALESCE(SUM(mj.sent_count), 0) AS sent,
+         COALESCE(SUM(mj.failed_count), 0) AS failed
+       FROM messaging_jobs mj
+       INNER JOIN sessions s ON mj.session_id = s.id
+       WHERE s.user_id = $1 AND mj.created_at BETWEEN $2 AND $3
+       GROUP BY day
+       ORDER BY day`,
+      [userId, startISO, endISO]
+    );
+    const sentByDay = emptySeries();
+    const failedByDay = emptySeries();
+    for (const row of msgDailyResult.rows) {
+      sentByDay[row.day] = parseInt(row.sent, 10);
+      failedByDay[row.day] = parseInt(row.failed, 10);
+    }
+
+    // Daily scraping found (from scraping_jobs.created_at).
+    const scrapeDailyResult = await pool.query(
+      `SELECT
+         to_char(sj.created_at, 'YYYY-MM-DD') AS day,
+         COALESCE(SUM(sj.total_found), 0) AS found,
+         COUNT(*) AS jobs
+       FROM scraping_jobs sj
+       INNER JOIN sessions s ON sj.session_id = s.id
+       WHERE s.user_id = $1 AND sj.created_at BETWEEN $2 AND $3
+       GROUP BY day
+       ORDER BY day`,
+      [userId, startISO, endISO]
+    );
+    const scrapedByDay = emptySeries();
+    const scrapeJobsByDay = emptySeries();
+    for (const row of scrapeDailyResult.rows) {
+      scrapedByDay[row.day] = parseInt(row.found, 10);
+      scrapeJobsByDay[row.day] = parseInt(row.jobs, 10);
+    }
+
+    // Daily group-op success/failed.
+    const groupDailyResult = await pool.query(
+      `SELECT
+         to_char(go.created_at, 'YYYY-MM-DD') AS day,
+         COALESCE(SUM(go.success_count), 0) AS success,
+         COALESCE(SUM(go.failed_count), 0) AS failed
+       FROM group_operations go
+       INNER JOIN sessions s ON go.session_id = s.id
+       WHERE s.user_id = $1 AND go.created_at BETWEEN $2 AND $3
+       GROUP BY day
+       ORDER BY day`,
+      [userId, startISO, endISO]
+    );
+    const groupSuccessByDay = emptySeries();
+    const groupFailedByDay = emptySeries();
+    for (const row of groupDailyResult.rows) {
+      groupSuccessByDay[row.day] = parseInt(row.success, 10);
+      groupFailedByDay[row.day] = parseInt(row.failed, 10);
+    }
+
+    const timeSeries = dayKeys.map((day) => ({
+      day,
+      sent: sentByDay[day],
+      failed: failedByDay[day],
+      scraped: scrapedByDay[day],
+      scrapeJobs: scrapeJobsByDay[day],
+      groupSuccess: groupSuccessByDay[day],
+      groupFailed: groupFailedByDay[day],
+    }));
+
+    // -------- Distribution breakdowns --------
+    // Messaging jobs by job_type (period-scoped).
+    const msgTypeResult = await pool.query(
+      `SELECT COALESCE(mj.job_type, 'unknown') AS job_type, COUNT(*) AS jobs,
+              COALESCE(SUM(mj.sent_count), 0) AS sent,
+              COALESCE(SUM(mj.failed_count), 0) AS failed
+       FROM messaging_jobs mj
+       INNER JOIN sessions s ON mj.session_id = s.id
+       WHERE s.user_id = $1 AND mj.created_at BETWEEN $2 AND $3
+       GROUP BY job_type
+       ORDER BY jobs DESC`,
+      [userId, startISO, endISO]
+    );
+    const messagingByType = msgTypeResult.rows.map((r) => ({
+      jobType: r.job_type,
+      jobs: parseInt(r.jobs, 10),
+      sent: parseInt(r.sent, 10),
+      failed: parseInt(r.failed, 10),
+    }));
+
+    // Scraping by target_type.
+    const scrapeTypeResult = await pool.query(
+      `SELECT COALESCE(sj.target_type, 'unknown') AS target_type,
+              COUNT(*) AS jobs,
+              COALESCE(SUM(sj.total_found), 0) AS found
+       FROM scraping_jobs sj
+       INNER JOIN sessions s ON sj.session_id = s.id
+       WHERE s.user_id = $1 AND sj.created_at BETWEEN $2 AND $3
+       GROUP BY target_type
+       ORDER BY jobs DESC`,
+      [userId, startISO, endISO]
+    );
+    const scrapingByType = scrapeTypeResult.rows.map((r) => ({
+      targetType: r.target_type,
+      jobs: parseInt(r.jobs, 10),
+      found: parseInt(r.found, 10),
+    }));
+
+    // Group ops by operation.
+    const groupOpTypeResult = await pool.query(
+      `SELECT COALESCE(go.operation, 'unknown') AS operation,
+              COUNT(*) AS ops,
+              COALESCE(SUM(go.success_count), 0) AS success,
+              COALESCE(SUM(go.failed_count), 0) AS failed
+       FROM group_operations go
+       INNER JOIN sessions s ON go.session_id = s.id
+       WHERE s.user_id = $1 AND go.created_at BETWEEN $2 AND $3
+       GROUP BY operation
+       ORDER BY ops DESC`,
+      [userId, startISO, endISO]
+    );
+    const groupOpsByOperation = groupOpTypeResult.rows.map((r) => ({
+      operation: r.operation,
+      ops: parseInt(r.ops, 10),
+      success: parseInt(r.success, 10),
+      failed: parseInt(r.failed, 10),
+    }));
+
+    // Messaging job statuses (period-scoped).
+    const msgStatusResult = await pool.query(
+      `SELECT COALESCE(mj.status, 'unknown') AS status, COUNT(*) AS jobs
+       FROM messaging_jobs mj
+       INNER JOIN sessions s ON mj.session_id = s.id
+       WHERE s.user_id = $1 AND mj.created_at BETWEEN $2 AND $3
+       GROUP BY status
+       ORDER BY jobs DESC`,
+      [userId, startISO, endISO]
+    );
+    const messagingByStatus = msgStatusResult.rows.map((r) => ({
+      status: r.status,
+      jobs: parseInt(r.jobs, 10),
+    }));
+
+    const periodSentTotal = parseInt(msgPeriodRow.sent, 10);
+    const periodFailedTotal = parseInt(msgPeriodRow.failed, 10);
+    const periodAttempted = parseInt(msgPeriodRow.attempted, 10);
+    const periodMsgSuccessRate = periodAttempted > 0
+      ? Math.round((periodSentTotal / periodAttempted) * 10000) / 100
+      : 0;
+
+    const periodScrapeCompleted = parseInt(scrapePeriodRow.completed, 10);
+    const periodScrapeFailed = parseInt(scrapePeriodRow.failed, 10);
+    const periodScrapeFinished = periodScrapeCompleted + periodScrapeFailed;
+    const periodScrapeSuccessRate = periodScrapeFinished > 0
+      ? Math.round((periodScrapeCompleted / periodScrapeFinished) * 10000) / 100
+      : 0;
+
+    const periodGroupAttempted = parseInt(groupPeriodRow.attempted, 10);
+    const periodGroupSuccess = parseInt(groupPeriodRow.success, 10);
+    const periodGroupSuccessRate = periodGroupAttempted > 0
+      ? Math.round((periodGroupSuccess / periodGroupAttempted) * 10000) / 100
+      : 0;
+
+    return {
+      period: {
+        key: period || '7d',
+        start: startISO,
+        end: endISO,
+        days: dayKeys.length,
+      },
+      // All-time totals (handy for the very top KPI cards).
+      allTime: {
+        sessions: dashboard.sessions,
+        messaging: {
+          totalJobs: dashboard.messaging.totalJobs,
+          totalSent: dashboard.messaging.totalSent,
+          totalFailed: dashboard.messaging.totalFailed,
+          totalSkipped: dashboard.messaging.totalSkipped,
+          successRate: dashboard.messaging.successRate,
+        },
+        scraping: {
+          totalJobs: dashboard.scraping.totalJobs,
+          totalUsersFound: dashboard.scraping.totalUsersFound,
+          uniqueScrapedUsers: dashboard.scraping.uniqueScrapedUsers,
+          successRate: dashboard.scraping.successRate,
+        },
+        groupOperations: dashboard.groupOperations,
+        lists: dashboard.lists,
+      },
+      // Same shape but scoped to the period filter.
+      periodTotals: {
+        messaging: {
+          jobs: parseInt(msgPeriodRow.jobs, 10),
+          sent: periodSentTotal,
+          failed: periodFailedTotal,
+          skipped: parseInt(msgPeriodRow.skipped, 10),
+          attempted: periodAttempted,
+          successRate: periodMsgSuccessRate,
+        },
+        scraping: {
+          jobs: parseInt(scrapePeriodRow.jobs, 10),
+          found: parseInt(scrapePeriodRow.found, 10),
+          completed: periodScrapeCompleted,
+          failed: periodScrapeFailed,
+          cancelled: parseInt(scrapePeriodRow.cancelled, 10),
+          successRate: periodScrapeSuccessRate,
+        },
+        groupOperations: {
+          ops: parseInt(groupPeriodRow.ops, 10),
+          success: periodGroupSuccess,
+          failed: parseInt(groupPeriodRow.failed, 10),
+          attempted: periodGroupAttempted,
+          successRate: periodGroupSuccessRate,
+        },
+      },
+      timeSeries,
+      distributions: {
+        messagingByType,
+        messagingByStatus,
+        scrapingByType,
+        groupOpsByOperation,
+        sessionsByStatus: [
+          { status: 'active', count: dashboard.sessions.active },
+          { status: 'inactive', count: dashboard.sessions.inactive },
+          { status: 'uploaded', count: dashboard.sessions.uploaded },
+          { status: 'error', count: dashboard.sessions.error },
+          { status: 'revoked', count: dashboard.sessions.revoked },
+          { status: 'expired', count: dashboard.sessions.expired },
+        ].filter((b) => b.count > 0),
+      },
+      topSessions: dashboard.topSessions,
+      recentActivity: dashboard.recentActivity,
+      generatedAt: new Date().toISOString(),
+    };
+  }
+
+  /**
+   * List sessions with their per-session aggregate stats (sent / failed /
+   * scraped / group ops). Used by the Reports page Sessions tab.
+   */
+  async getSessionsSummary(userId, { page = 1, limit = 20, sortBy = 'sent', sortDir = 'desc' } = {}) {
+    const { offset, limit: pageSize } = applyPagination(null, page, limit);
+
+    const allowedSorts = {
+      sent: 'total_sent',
+      failed: 'total_failed',
+      scraped: 'total_scraped',
+      jobs: 'total_jobs',
+      created_at: 's.created_at',
+    };
+    const sortColumn = allowedSorts[sortBy] || allowedSorts.sent;
+    const sortOrder = String(sortDir).toUpperCase() === 'ASC' ? 'ASC' : 'DESC';
+
+    const countResult = await pool.query(
+      `SELECT COUNT(*)::int AS total FROM sessions WHERE user_id = $1`,
+      [userId]
+    );
+    const total = countResult.rows[0].total;
+
+    const result = await pool.query(
+      `SELECT s.id, s.phone, s.status, s.created_at, s.is_logged_in,
+              COALESCE(msg.total_sent, 0) AS total_sent,
+              COALESCE(msg.total_failed, 0) AS total_failed,
+              COALESCE(msg.total_jobs, 0) AS total_jobs,
+              COALESCE(scr.total_scraped, 0) AS total_scraped,
+              COALESCE(scr.total_scrape_jobs, 0) AS total_scrape_jobs,
+              COALESCE(gop.total_group_ops, 0) AS total_group_ops,
+              COALESCE(gop.total_group_success, 0) AS total_group_success
+       FROM sessions s
+       LEFT JOIN (
+         SELECT session_id,
+                SUM(sent_count) AS total_sent,
+                SUM(failed_count) AS total_failed,
+                COUNT(*) AS total_jobs
+         FROM messaging_jobs
+         GROUP BY session_id
+       ) msg ON s.id = msg.session_id
+       LEFT JOIN (
+         SELECT session_id,
+                SUM(total_found) AS total_scraped,
+                COUNT(*) AS total_scrape_jobs
+         FROM scraping_jobs
+         GROUP BY session_id
+       ) scr ON s.id = scr.session_id
+       LEFT JOIN (
+         SELECT session_id,
+                COUNT(*) AS total_group_ops,
+                SUM(success_count) AS total_group_success
+         FROM group_operations
+         GROUP BY session_id
+       ) gop ON s.id = gop.session_id
+       WHERE s.user_id = $1
+       ORDER BY ${sortColumn} ${sortOrder} NULLS LAST, s.id DESC
+       LIMIT $2 OFFSET $3`,
+      [userId, pageSize, offset]
+    );
+
+    const sessions = result.rows.map((row) => ({
+      id: row.id,
+      phone: row.phone,
+      status: row.status,
+      isLoggedIn: row.is_logged_in,
+      createdAt: row.created_at,
+      totalSent: parseInt(row.total_sent, 10),
+      totalFailed: parseInt(row.total_failed, 10),
+      totalJobs: parseInt(row.total_jobs, 10),
+      totalScraped: parseInt(row.total_scraped, 10),
+      totalScrapeJobs: parseInt(row.total_scrape_jobs, 10),
+      totalGroupOps: parseInt(row.total_group_ops, 10),
+      totalGroupSuccess: parseInt(row.total_group_success, 10),
+    }));
+
+    return { sessions, pagination: buildPagination(page, limit, total) };
+  }
+
+  /**
+   * List messaging jobs scoped to the user, with optional jobType / status
+   * filters. Used by the Reports page Messaging tab.
+   */
+  async getMessagingSummary(userId, params = {}) {
+    const {
+      page = 1, limit = 20, jobType, status,
+      periodStart, periodEnd,
+    } = params;
+    const { offset, limit: pageSize } = applyPagination(null, page, limit);
+
+    const conditions = ['s.user_id = $1'];
+    const values = [userId];
+    let i = 2;
+    if (jobType) { conditions.push(`mj.job_type = $${i++}`); values.push(jobType); }
+    if (status)  { conditions.push(`mj.status = $${i++}`);  values.push(status); }
+    if (periodStart) { conditions.push(`mj.created_at >= $${i++}`); values.push(periodStart); }
+    if (periodEnd)   { conditions.push(`mj.created_at <= $${i++}`); values.push(periodEnd); }
+
+    const where = conditions.join(' AND ');
+
+    const countResult = await pool.query(
+      `SELECT COUNT(*)::int AS total
+       FROM messaging_jobs mj
+       INNER JOIN sessions s ON mj.session_id = s.id
+       WHERE ${where}`,
+      values
+    );
+    const total = countResult.rows[0].total;
+
+    const result = await pool.query(
+      `SELECT mj.id, mj.job_type, mj.status, mj.message_type,
+              mj.total_count, mj.sent_count, mj.failed_count, mj.skipped_count,
+              mj.target_list, mj.options, mj.created_at, mj.completed_at,
+              s.id AS session_id, s.phone AS session_phone
+       FROM messaging_jobs mj
+       INNER JOIN sessions s ON mj.session_id = s.id
+       WHERE ${where}
+       ORDER BY mj.created_at DESC
+       LIMIT $${i++} OFFSET $${i++}`,
+      [...values, pageSize, offset]
+    );
+
+    const jobs = result.rows.map((row) => {
+      const targets = Array.isArray(row.target_list) ? row.target_list
+        : (row.target_list && Array.isArray(row.target_list.targets)
+          ? row.target_list.targets : []);
+      return {
+        id: row.id,
+        jobType: row.job_type,
+        status: row.status,
+        messageType: row.message_type,
+        totalCount: row.total_count,
+        sentCount: row.sent_count,
+        failedCount: row.failed_count,
+        skippedCount: row.skipped_count,
+        targetCount: targets.length,
+        options: row.options || {},
+        sessionId: row.session_id,
+        sessionPhone: row.session_phone,
+        createdAt: row.created_at,
+        completedAt: row.completed_at,
+      };
+    });
+
+    return { jobs, pagination: buildPagination(page, limit, total) };
+  }
+
+  /**
+   * List scraping jobs scoped to the user, with optional status /
+   * targetType filters.
+   */
+  async getScrapingSummary(userId, params = {}) {
+    const {
+      page = 1, limit = 20, status, targetType,
+      periodStart, periodEnd,
+    } = params;
+    const { offset, limit: pageSize } = applyPagination(null, page, limit);
+
+    const conditions = ['s.user_id = $1'];
+    const values = [userId];
+    let i = 2;
+    if (status)     { conditions.push(`sj.status = $${i++}`);      values.push(status); }
+    if (targetType) { conditions.push(`sj.target_type = $${i++}`); values.push(targetType); }
+    if (periodStart) { conditions.push(`sj.created_at >= $${i++}`); values.push(periodStart); }
+    if (periodEnd)   { conditions.push(`sj.created_at <= $${i++}`); values.push(periodEnd); }
+
+    const where = conditions.join(' AND ');
+
+    const countResult = await pool.query(
+      `SELECT COUNT(*)::int AS total
+       FROM scraping_jobs sj
+       INNER JOIN sessions s ON sj.session_id = s.id
+       WHERE ${where}`,
+      values
+    );
+    const total = countResult.rows[0].total;
+
+    const result = await pool.query(
+      `SELECT sj.id, sj.target_type, sj.target_id, sj.target_title,
+              sj.status, sj.progress, sj.total_found, sj.options,
+              sj.created_at, sj.completed_at,
+              s.id AS session_id, s.phone AS session_phone
+       FROM scraping_jobs sj
+       INNER JOIN sessions s ON sj.session_id = s.id
+       WHERE ${where}
+       ORDER BY sj.created_at DESC
+       LIMIT $${i++} OFFSET $${i++}`,
+      [...values, pageSize, offset]
+    );
+
+    const jobs = result.rows.map((row) => ({
+      id: row.id,
+      targetType: row.target_type,
+      targetId: row.target_id,
+      targetTitle: row.target_title,
+      status: row.status,
+      progress: row.progress,
+      totalFound: row.total_found,
+      options: row.options || {},
+      sessionId: row.session_id,
+      sessionPhone: row.session_phone,
+      createdAt: row.created_at,
+      completedAt: row.completed_at,
+    }));
+
+    return { jobs, pagination: buildPagination(page, limit, total) };
+  }
+
+  /**
+   * List group operations scoped to the user, with optional status /
+   * operation filters.
+   */
+  async getGroupOpsSummary(userId, params = {}) {
+    const {
+      page = 1, limit = 20, status, operation,
+      periodStart, periodEnd,
+    } = params;
+    const { offset, limit: pageSize } = applyPagination(null, page, limit);
+
+    const conditions = ['go.user_id = $1'];
+    const values = [userId];
+    let i = 2;
+    if (status)    { conditions.push(`go.status = $${i++}`);    values.push(status); }
+    if (operation) { conditions.push(`go.operation = $${i++}`); values.push(operation); }
+    if (periodStart) { conditions.push(`go.created_at >= $${i++}`); values.push(periodStart); }
+    if (periodEnd)   { conditions.push(`go.created_at <= $${i++}`); values.push(periodEnd); }
+
+    const where = conditions.join(' AND ');
+
+    const countResult = await pool.query(
+      `SELECT COUNT(*)::int AS total
+       FROM group_operations go
+       WHERE ${where}`,
+      values
+    );
+    const total = countResult.rows[0].total;
+
+    const result = await pool.query(
+      `SELECT go.id, go.target_group_id, go.operation, go.operation_type,
+              go.status, go.total_count, go.total_users,
+              go.success_count, go.failed_count, go.options,
+              go.created_at, go.completed_at,
+              s.id AS session_id, s.phone AS session_phone
+       FROM group_operations go
+       LEFT JOIN sessions s ON go.session_id = s.id
+       WHERE ${where}
+       ORDER BY go.created_at DESC
+       LIMIT $${i++} OFFSET $${i++}`,
+      [...values, pageSize, offset]
+    );
+
+    const operations = result.rows.map((row) => ({
+      id: row.id,
+      targetGroupId: row.target_group_id,
+      operation: row.operation,
+      operationType: row.operation_type,
+      status: row.status,
+      totalCount: row.total_count,
+      totalUsers: row.total_users,
+      successCount: row.success_count,
+      failedCount: row.failed_count,
+      options: row.options || {},
+      sessionId: row.session_id,
+      sessionPhone: row.session_phone,
+      createdAt: row.created_at,
+      completedAt: row.completed_at,
+    }));
+
+    return { operations, pagination: buildPagination(page, limit, total) };
+  }
+
+  /**
+   * List target lists with item counts. Used by the Reports Lists tab.
+   */
+  async getListsSummary(userId, params = {}) {
+    const { page = 1, limit = 20, type } = params;
+    const { offset, limit: pageSize } = applyPagination(null, page, limit);
+
+    const conditions = ['user_id = $1'];
+    const values = [userId];
+    let i = 2;
+    if (type) { conditions.push(`type = $${i++}`); values.push(type); }
+    const where = conditions.join(' AND ');
+
+    const countResult = await pool.query(
+      `SELECT COUNT(*)::int AS total FROM lists WHERE ${where}`,
+      values
+    );
+    const total = countResult.rows[0].total;
+
+    const result = await pool.query(
+      `SELECT id, name, type, items_count, source, created_at
+       FROM lists
+       WHERE ${where}
+       ORDER BY created_at DESC
+       LIMIT $${i++} OFFSET $${i++}`,
+      [...values, pageSize, offset]
+    );
+
+    const lists = result.rows.map((row) => ({
+      id: row.id,
+      name: row.name,
+      type: row.type,
+      itemsCount: row.items_count,
+      source: row.source,
+      createdAt: row.created_at,
+    }));
+
+    return { lists, pagination: buildPagination(page, limit, total) };
+  }
+
+  /**
+   * Render a panel-overview report in the requested export format.
+   * Returns { content, filename, mimeType }, similar to exportReport().
+   */
+  async exportOverview(userId, period = '7d', format = 'json', customDates = {}) {
+    if (!VALID_EXPORT_FORMATS.includes(format)) {
+      throw new AppError(
+        `Invalid export format: ${format}. Supported: ${VALID_EXPORT_FORMATS.join(', ')}`,
+        400,
+        'INVALID_FORMAT'
+      );
+    }
+
+    const overview = await this.getOverview(userId, period, customDates);
+    const stamp = moment().format('YYYYMMDD_HHmmss');
+
+    if (format === 'json') {
+      return {
+        content: JSON.stringify(overview, null, 2),
+        filename: `panel_overview_${period}_${stamp}.json`,
+        mimeType: 'application/json',
+      };
+    }
+
+    // CSV: emit one row per day (the time-series) and append summary rows
+    // for distributions / KPIs at the bottom so a single file captures
+    // everything.
+    const lines = [];
+    lines.push('# Panel overview');
+    lines.push(`# Period: ${overview.period.key} (${overview.period.start} -> ${overview.period.end})`);
+    lines.push(`# Generated: ${overview.generatedAt}`);
+    lines.push('');
+    lines.push('day,sent,failed,scraped,scrape_jobs,group_success,group_failed');
+    for (const row of overview.timeSeries) {
+      lines.push([row.day, row.sent, row.failed, row.scraped, row.scrapeJobs, row.groupSuccess, row.groupFailed].join(','));
+    }
+    lines.push('');
+    lines.push('# Messaging by job_type (period)');
+    lines.push('job_type,jobs,sent,failed');
+    for (const row of overview.distributions.messagingByType) {
+      lines.push([row.jobType, row.jobs, row.sent, row.failed].join(','));
+    }
+    lines.push('');
+    lines.push('# Scraping by target_type (period)');
+    lines.push('target_type,jobs,found');
+    for (const row of overview.distributions.scrapingByType) {
+      lines.push([row.targetType, row.jobs, row.found].join(','));
+    }
+    lines.push('');
+    lines.push('# Group ops by operation (period)');
+    lines.push('operation,ops,success,failed');
+    for (const row of overview.distributions.groupOpsByOperation) {
+      lines.push([row.operation, row.ops, row.success, row.failed].join(','));
+    }
+
+    return {
+      content: lines.join('\n') + '\n',
+      filename: `panel_overview_${period}_${stamp}.csv`,
+      mimeType: 'text/csv',
+    };
+  }
 }
 
 module.exports = new ReportService();

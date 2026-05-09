@@ -390,6 +390,154 @@ const reportController = {
       },
     });
   }),
+
+  // ---------------------------------------------------------------------
+  // Panel-wide reports (institutional-level)
+  // ---------------------------------------------------------------------
+
+  /**
+   * GET /api/reports/overview - Panel-wide overview report.
+   *
+   * Query params: period (24h|7d|30d|90d|custom|all, default 7d),
+   * periodStart, periodEnd (required for period=custom).
+   */
+  getOverview: asyncHandler(async (req, res) => {
+    const userId = req.user.id;
+    const { period, periodStart, periodEnd } = req.query;
+    const reportPeriod = period || '7d';
+    const customDates = (reportPeriod === 'custom')
+      ? { periodStart, periodEnd }
+      : {};
+
+    const overview = await reportService.getOverview(userId, reportPeriod, customDates);
+
+    return res.status(200).json({
+      success: true,
+      data: overview,
+    });
+  }),
+
+  /**
+   * GET /api/reports/sessions/summary - Per-session aggregated stats.
+   *
+   * Query params: page, limit, sortBy (sent|failed|scraped|jobs|created_at),
+   * sortDir (asc|desc).
+   */
+  getSessionsSummary: asyncHandler(async (req, res) => {
+    const userId = req.user.id;
+    const page = req.query.page ? parseInt(req.query.page, 10) : 1;
+    const limit = req.query.limit ? parseInt(req.query.limit, 10) : 20;
+    const sortBy = req.query.sortBy || 'sent';
+    const sortDir = req.query.sortDir || 'desc';
+
+    const result = await reportService.getSessionsSummary(userId, {
+      page, limit, sortBy, sortDir,
+    });
+
+    return res.status(200).json({
+      success: true,
+      data: result,
+    });
+  }),
+
+  /**
+   * GET /api/reports/messaging/summary - Messaging job report.
+   *
+   * Query params: page, limit, jobType, status, periodStart, periodEnd.
+   */
+  getMessagingSummary: asyncHandler(async (req, res) => {
+    const userId = req.user.id;
+    const result = await reportService.getMessagingSummary(userId, {
+      page: req.query.page ? parseInt(req.query.page, 10) : 1,
+      limit: req.query.limit ? parseInt(req.query.limit, 10) : 20,
+      jobType: req.query.jobType || undefined,
+      status: req.query.status || undefined,
+      periodStart: req.query.periodStart || undefined,
+      periodEnd: req.query.periodEnd || undefined,
+    });
+    return res.status(200).json({ success: true, data: result });
+  }),
+
+  /**
+   * GET /api/reports/scraping/summary - Scraping job report.
+   *
+   * Query params: page, limit, status, targetType, periodStart, periodEnd.
+   */
+  getScrapingSummary: asyncHandler(async (req, res) => {
+    const userId = req.user.id;
+    const result = await reportService.getScrapingSummary(userId, {
+      page: req.query.page ? parseInt(req.query.page, 10) : 1,
+      limit: req.query.limit ? parseInt(req.query.limit, 10) : 20,
+      status: req.query.status || undefined,
+      targetType: req.query.targetType || undefined,
+      periodStart: req.query.periodStart || undefined,
+      periodEnd: req.query.periodEnd || undefined,
+    });
+    return res.status(200).json({ success: true, data: result });
+  }),
+
+  /**
+   * GET /api/reports/group-ops/summary - Group-operations report.
+   *
+   * Query params: page, limit, status, operation, periodStart, periodEnd.
+   */
+  getGroupOpsSummary: asyncHandler(async (req, res) => {
+    const userId = req.user.id;
+    const result = await reportService.getGroupOpsSummary(userId, {
+      page: req.query.page ? parseInt(req.query.page, 10) : 1,
+      limit: req.query.limit ? parseInt(req.query.limit, 10) : 20,
+      status: req.query.status || undefined,
+      operation: req.query.operation || undefined,
+      periodStart: req.query.periodStart || undefined,
+      periodEnd: req.query.periodEnd || undefined,
+    });
+    return res.status(200).json({ success: true, data: result });
+  }),
+
+  /**
+   * GET /api/reports/lists/summary - Lists report.
+   *
+   * Query params: page, limit, type.
+   */
+  getListsSummary: asyncHandler(async (req, res) => {
+    const userId = req.user.id;
+    const result = await reportService.getListsSummary(userId, {
+      page: req.query.page ? parseInt(req.query.page, 10) : 1,
+      limit: req.query.limit ? parseInt(req.query.limit, 10) : 20,
+      type: req.query.type || undefined,
+    });
+    return res.status(200).json({ success: true, data: result });
+  }),
+
+  /**
+   * GET /api/reports/export/overview - Download the panel overview as
+   * CSV or JSON.
+   *
+   * Query params: format (csv|json, default json), period, periodStart, periodEnd.
+   */
+  exportOverview: asyncHandler(async (req, res) => {
+    const userId = req.user.id;
+    const format = (req.query.format || 'json').toLowerCase();
+    const period = req.query.period || '7d';
+    const customDates = (period === 'custom')
+      ? { periodStart: req.query.periodStart, periodEnd: req.query.periodEnd }
+      : {};
+
+    const { content, filename, mimeType } = await reportService.exportOverview(
+      userId, period, format, customDates
+    );
+
+    await reportService.logActivity(userId, 'report_export', 'report', null, {
+      reportType: 'overview',
+      period,
+      format,
+    });
+
+    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+    res.setHeader('Content-Type', mimeType);
+    res.setHeader('Content-Length', Buffer.byteLength(content));
+    return res.status(200).send(content);
+  }),
 };
 
 module.exports = reportController;
