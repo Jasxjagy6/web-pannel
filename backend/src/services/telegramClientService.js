@@ -414,7 +414,57 @@ class TelegramClientService {
       await tgService._ensureConnected(sessionId);
     }
 
-    const me = await tgService.getMe(sessionId);
+    // The "open in another window" UI calls /connect first to verify
+    // the underlying GramJS client is alive AND grab the user's
+    // identity for the title bar. `getMe` already retries internally
+    // on TypeNotFoundError (a known GramJS-versus-newer-Telegram-TL
+    // mismatch coming from concurrent update streams), but if it
+    // ultimately fails we'd rather hand the UI a cached identity
+    // (we already saved telegramId / username / firstName during
+    // login) than 500 the entire window. The MTProto socket itself
+    // is up; only the response parser choked on an unrelated update.
+    let me;
+    try {
+      me = await tgService.getMe(sessionId);
+    } catch (err) {
+      const msg = String(err && err.message || err);
+      const isParseRecvError =
+        (err && err.name === 'TypeNotFoundError') ||
+        msg.includes('Could not find a matching Constructor ID') ||
+        msg.includes('matching Constructor ID for the TLObject');
+
+      if (!isParseRecvError) throw err;
+
+      const cached = (row.account_info && typeof row.account_info === 'object')
+        ? row.account_info
+        : (() => {
+            try {
+              return row.account_info ? JSON.parse(row.account_info) : null;
+            } catch {
+              return null;
+            }
+          })();
+
+      if (cached && (cached.telegramId || cached.username || cached.firstName)) {
+        logger.warn(
+          `connect(${sessionId}): getMe TLObject parse error; serving cached identity from account_info so the UI window can still open: ${msg}`
+        );
+        me = {
+          id: cached.telegramId || null,
+          username: cached.username || null,
+          firstName: cached.firstName || null,
+          lastName: cached.lastName || null,
+          phone: cached.phone || row.phone || null,
+          isPremium: cached.isPremium || false,
+          isVerified: cached.isVerified || false,
+          _cached: true,
+        };
+      } else {
+        // No cached identity — surface the original error.
+        throw err;
+      }
+    }
+
     return {
       sessionId,
       connected: true,

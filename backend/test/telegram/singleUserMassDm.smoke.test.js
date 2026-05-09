@@ -167,5 +167,171 @@ async function withStubbedSessions(stub, fn) {
 
   console.log('service.noSessions: OK');
 
+  // ────────────────────────────────────────────────────────────────
+  // 4. _processSingleUserMassDm: per-job dead-target cache short-
+  //    circuits remaining sessions without burning resolve requests.
+  //    Locks in the fix for "mass DM only worked from 4/54 sessions"
+  //    where every session redundantly tried to resolve the same
+  //    typo'd handle.
+  // ────────────────────────────────────────────────────────────────
+  await (async () => {
+    const pool = require('../../src/config/database').pool;
+    const telegramService = require('../../src/services/telegramService');
+
+    const origPoolQuery = pool.query.bind(pool);
+    const origSendMessage = telegramService.sendMessage.bind(telegramService);
+    const origNotify = messageService._notifyProgress.bind(messageService);
+    const origFinalize = messageService._finalizeJob.bind(messageService);
+
+    const queryLog = [];
+    const updateRevoked = [];
+    pool.query = async (sql, params) => {
+      queryLog.push({ sql, params });
+      const text = String(sql).replace(/\s+/g, ' ').trim();
+      if (text.startsWith('SELECT status FROM messaging_jobs')) {
+        return { rows: [{ status: 'running' }] };
+      }
+      if (text.startsWith('UPDATE sessions') && text.includes("status = 'revoked'")) {
+        updateRevoked.push(params);
+        return { rows: [] };
+      }
+      // Every other UPDATE / INSERT against messaging_jobs / message_logs
+      // is fine to pretend-acknowledge.
+      return { rows: [] };
+    };
+
+    let sendCalls = 0;
+    telegramService.sendMessage = async (sessionId, target, _message) => {
+      sendCalls++;
+      // Every attempt fails with the unresolvable-target pattern.
+      if (sessionId === '101') {
+        const err = new Error('Telegram API error: AUTH_KEY_UNREGISTERED');
+        throw err;
+      }
+      const err = new Error('Telegram API error: Could not resolve target: @typo');
+      throw err;
+    };
+
+    messageService._notifyProgress = async () => {};
+    messageService._finalizeJob = async () => {};
+
+    try {
+      await messageService._processSingleUserMassDm(
+        9999,
+        [
+          { id: 100, user_id: 1, status: 'active' },
+          { id: 101, user_id: 1, status: 'active' },
+          { id: 102, user_id: 1, status: 'active' },
+          { id: 103, user_id: 1, status: 'active' },
+          { id: 104, user_id: 1, status: 'active' },
+        ],
+        ['@typo'],
+        'hello',
+        0, // delaySeconds=0 to keep test fast
+        1
+      );
+
+      // Session 100: real attempt → fails with "Could not resolve" → @typo cached as dead.
+      // Session 101: real attempt → fails with AUTH_KEY_UNREGISTERED → revoked cache.
+      //   (still "real" even though the target was already cached because session 101
+      //   would have been queried first IF we ran target-major; but since we DO run
+      //   target-major, @typo gets cached on session 100, so 101..104 ALL skip.)
+      // Actual result given target-major loop: session 100 burns 1 send, the rest skip.
+      assert.strictEqual(
+        sendCalls,
+        1,
+        `expected only the first session to call sendMessage; got ${sendCalls}`
+      );
+    } finally {
+      pool.query = origPoolQuery;
+      telegramService.sendMessage = origSendMessage;
+      messageService._notifyProgress = origNotify;
+      messageService._finalizeJob = origFinalize;
+    }
+    console.log('worker.deadTargetCache: OK');
+  })();
+
+  // ────────────────────────────────────────────────────────────────
+  // 5. _processSingleUserMassDm: AUTH_KEY_UNREGISTERED on session A
+  //    flags the session as revoked AND skips remaining (target,
+  //    sessionA) pairs in this job.
+  // ────────────────────────────────────────────────────────────────
+  await (async () => {
+    const pool = require('../../src/config/database').pool;
+    const telegramService = require('../../src/services/telegramService');
+
+    const origPoolQuery = pool.query.bind(pool);
+    const origSendMessage = telegramService.sendMessage.bind(telegramService);
+    const origNotify = messageService._notifyProgress.bind(messageService);
+    const origFinalize = messageService._finalizeJob.bind(messageService);
+
+    const updateRevoked = [];
+    pool.query = async (sql, params) => {
+      const text = String(sql).replace(/\s+/g, ' ').trim();
+      if (text.startsWith('SELECT status FROM messaging_jobs')) {
+        return { rows: [{ status: 'running' }] };
+      }
+      if (text.startsWith('UPDATE sessions') && text.includes("status = 'revoked'")) {
+        updateRevoked.push(params);
+        return { rows: [] };
+      }
+      return { rows: [] };
+    };
+
+    const sendOrder = [];
+    telegramService.sendMessage = async (sessionId, target, _message) => {
+      sendOrder.push({ sessionId, target });
+      if (sessionId === '300') {
+        throw new Error('Telegram API error: AUTH_KEY_UNREGISTERED (caused by messages.SendMessage)');
+      }
+      // Session 301 succeeds with target A. Session 301 succeeds with target B.
+      return { messageId: Math.floor(Math.random() * 100000) };
+    };
+
+    messageService._notifyProgress = async () => {};
+    messageService._finalizeJob = async () => {};
+
+    try {
+      await messageService._processSingleUserMassDm(
+        9998,
+        [
+          { id: 300, user_id: 1, status: 'active' },
+          { id: 301, user_id: 1, status: 'active' },
+        ],
+        ['@a', '@b'],
+        'hi',
+        0,
+        1
+      );
+
+      // Loop order is target-major:
+      //   target @a → session 300 (fails AUTH_KEY_UNREGISTERED, revoked cached) → session 301 (success)
+      //   target @b → session 300 (fast-skipped from revokedSessionIds)         → session 301 (success)
+      // So sendMessage should be called 3 times, not 4.
+      assert.strictEqual(
+        sendOrder.length,
+        3,
+        `expected 3 sendMessage calls; got ${sendOrder.length}: ${JSON.stringify(sendOrder)}`
+      );
+      assert.deepStrictEqual(
+        sendOrder.map((c) => `${c.sessionId}→${c.target}`),
+        ['300→@a', '301→@a', '301→@b'],
+        `unexpected order: ${JSON.stringify(sendOrder)}`
+      );
+      assert.strictEqual(
+        updateRevoked.length,
+        1,
+        `expected sessions table flagged once; got ${updateRevoked.length}`
+      );
+      assert.deepStrictEqual(updateRevoked[0], [300, 1]);
+    } finally {
+      pool.query = origPoolQuery;
+      telegramService.sendMessage = origSendMessage;
+      messageService._notifyProgress = origNotify;
+      messageService._finalizeJob = origFinalize;
+    }
+    console.log('worker.revokedSessionCache: OK');
+  })();
+
   console.log('singleUserMassDm.smoke.test: OK');
 })();

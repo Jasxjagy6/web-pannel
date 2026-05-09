@@ -2795,6 +2795,48 @@ class MessageService {
     const results = [];
     const totalSends = sessions.length * targets.length;
 
+    // Per-job dead-target cache. When the FIRST session reports an
+    // unresolvable target (USERNAME_NOT_OCCUPIED / "No user has X as
+    // username" / "Could not resolve target: @X" / USERNAME_INVALID),
+    // we add the target to this set so the remaining sessions skip
+    // it locally without each independently burning a
+    // `contacts.ResolveUsername` API call. Without this cache, a
+    // typo'd handle on a 50-session job spends 50 resolve requests
+    // (and risks per-session FLOOD_WAIT) just to learn what the
+    // first session already discovered. Same pattern as
+    // `brokenSessionTargets` in groupService.addMembersToGroups.
+    const deadTargets = new Set();
+    const isUnresolvableTargetError = (msg) => {
+      if (!msg) return false;
+      const m = String(msg);
+      return (
+        m.includes('USERNAME_NOT_OCCUPIED') ||
+        m.includes('USERNAME_INVALID') ||
+        m.includes('Could not resolve target') ||
+        m.includes('No user has') ||
+        m.includes('PEER_ID_INVALID') ||
+        m.includes('Could not find input entity')
+      );
+    };
+
+    // Per-job revoked-session cache. AUTH_KEY_UNREGISTERED means the
+    // account logged this session out remotely; no other request from
+    // this session in this job is going to succeed. Flag the row in
+    // sessions table so future jobs skip it, and exclude it from this
+    // job's remaining iterations.
+    const revokedSessionIds = new Set();
+    const isRevokedSessionError = (msg) => {
+      if (!msg) return false;
+      const m = String(msg);
+      return (
+        m.includes('AUTH_KEY_UNREGISTERED') ||
+        m.includes('AUTH_KEY_INVALID') ||
+        m.includes('USER_DEACTIVATED') ||
+        m.includes('SESSION_REVOKED') ||
+        m.includes('SESSION_EXPIRED')
+      );
+    };
+
     await pool.query(
       `UPDATE messaging_jobs SET status = 'running' WHERE id = $1`,
       [jobId]
@@ -2838,6 +2880,66 @@ class MessageService {
             success: false,
           };
 
+          // Fast-skip 1: target already proven unresolvable in this job.
+          // No API call, no inter-send sleep — there's nothing for
+          // Telegram to do, and waiting `delaySeconds` between
+          // skipped sends just delays the rest of the job for no gain.
+          if (deadTargets.has(String(target))) {
+            result.skipped = true;
+            result.error = 'Target unresolvable (cached from earlier session in this job)';
+            skippedCount.value++;
+            await pool.query(
+              `INSERT INTO message_logs (job_id, session_id, target_id, status, error_message, sent_at)
+               VALUES ($1, $2, $3, 'skipped', $4, NOW())`,
+              [jobId, session.id, String(target), result.error]
+            );
+            results.push(result);
+            sendsDone++;
+
+            await pool.query(
+              `UPDATE messaging_jobs
+                  SET sent_count = $1, failed_count = $2, skipped_count = $3
+                WHERE id = $4`,
+              [sentCount.value, failedCount.value, skippedCount.value, jobId]
+            );
+            await this._notifyProgress(jobId, {
+              job_id: jobId,
+              status: 'running',
+              total: totalSends,
+              sent: sentCount.value,
+              failed: failedCount.value,
+              skipped: skippedCount.value,
+              session_id: session.id,
+              target: String(target),
+            });
+            continue; // No sleep
+          }
+
+          // Fast-skip 2: session already proven revoked in this job.
+          if (revokedSessionIds.has(session.id)) {
+            result.skipped = true;
+            result.error = 'Session revoked (cached from earlier failure in this job)';
+            skippedCount.value++;
+            await pool.query(
+              `INSERT INTO message_logs (job_id, session_id, target_id, status, error_message, sent_at)
+               VALUES ($1, $2, $3, 'skipped', $4, NOW())`,
+              [jobId, session.id, String(target), result.error]
+            );
+            results.push(result);
+            sendsDone++;
+            await this._notifyProgress(jobId, {
+              job_id: jobId,
+              status: 'running',
+              total: totalSends,
+              sent: sentCount.value,
+              failed: failedCount.value,
+              skipped: skippedCount.value,
+              session_id: session.id,
+              target: String(target),
+            });
+            continue; // No sleep
+          }
+
           try {
             const sendResult = await telegramService.sendMessage(
               String(session.id),
@@ -2865,6 +2967,39 @@ class MessageService {
               `Single-user mass DM: session ${session.id} → ${target} failed: ${err.message}`,
               { jobId }
             );
+
+            // Cache classification updates so the rest of the job
+            // doesn't repeat doomed work.
+            if (isUnresolvableTargetError(err.message)) {
+              deadTargets.add(String(target));
+              logger.info(
+                `Single-user mass DM job ${jobId}: target ${target} marked unresolvable; remaining ${sessions.length - si - 1} session(s) for this target will skip without burning resolve requests`,
+                { jobId }
+              );
+            }
+            if (isRevokedSessionError(err.message)) {
+              revokedSessionIds.add(session.id);
+              // Mark the session row revoked so future jobs skip it
+              // entirely — best-effort, don't fail the job if the
+              // update can't run.
+              try {
+                await pool.query(
+                  `UPDATE sessions
+                      SET status = 'revoked', is_logged_in = FALSE, updated_at = NOW()
+                    WHERE id = $1 AND user_id = $2`,
+                  [session.id, userId]
+                );
+                logger.warn(
+                  `Single-user mass DM job ${jobId}: session ${session.id} revoked (AUTH_KEY_UNREGISTERED); flagged in DB`,
+                  { jobId }
+                );
+              } catch (markErr) {
+                logger.warn(
+                  `Failed to flag revoked session ${session.id}: ${markErr.message}`,
+                  { jobId }
+                );
+              }
+            }
           }
 
           results.push(result);
