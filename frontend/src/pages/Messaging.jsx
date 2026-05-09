@@ -1324,12 +1324,22 @@ export default function Messaging() {
         )}
       </div>
 
-      {/* Tab Navigation */}
+      {/* Tab Navigation
+          On narrow viewports the row is horizontally scrollable so every
+          tab (including Single User / History) stays reachable; on >=md
+          screens it falls back to even-width tabs that fill the row. */}
       <div className="rounded-xl border border-white/5 bg-dark-800 overflow-hidden">
-        <div className="flex border-b border-white/5">
+        <div
+          className="flex flex-nowrap overflow-x-auto md:overflow-visible border-b border-white/5 scrollbar-thin scrollbar-track-transparent scrollbar-thumb-white/10"
+          role="tablist"
+          aria-label="Messaging sections"
+        >
           <button
+            type="button"
+            role="tab"
+            aria-selected={activeTab === 'users'}
             onClick={() => setActiveTab('users')}
-            className={`flex-1 px-5 py-3 text-sm font-medium transition flex items-center justify-center gap-2 ${
+            className={`shrink-0 md:flex-1 whitespace-nowrap px-4 sm:px-5 py-3 text-sm font-medium transition flex items-center justify-center gap-2 ${
               activeTab === 'users'
                 ? 'border-b-2 border-primary-500 text-primary-400 bg-primary-500/5'
                 : 'text-gray-400 hover:text-white hover:bg-white/5'
@@ -1339,8 +1349,11 @@ export default function Messaging() {
             Users
           </button>
           <button
+            type="button"
+            role="tab"
+            aria-selected={activeTab === 'groups'}
             onClick={() => setActiveTab('groups')}
-            className={`flex-1 px-5 py-3 text-sm font-medium transition flex items-center justify-center gap-2 ${
+            className={`shrink-0 md:flex-1 whitespace-nowrap px-4 sm:px-5 py-3 text-sm font-medium transition flex items-center justify-center gap-2 ${
               activeTab === 'groups'
                 ? 'border-b-2 border-primary-500 text-primary-400 bg-primary-500/5'
                 : 'text-gray-400 hover:text-white hover:bg-white/5'
@@ -1350,8 +1363,11 @@ export default function Messaging() {
             Groups
           </button>
           <button
+            type="button"
+            role="tab"
+            aria-selected={activeTab === 'schedule'}
             onClick={() => setActiveTab('schedule')}
-            className={`flex-1 px-5 py-3 text-sm font-medium transition flex items-center justify-center gap-2 ${
+            className={`shrink-0 md:flex-1 whitespace-nowrap px-4 sm:px-5 py-3 text-sm font-medium transition flex items-center justify-center gap-2 ${
               activeTab === 'schedule'
                 ? 'border-b-2 border-primary-500 text-primary-400 bg-primary-500/5'
                 : 'text-gray-400 hover:text-white hover:bg-white/5'
@@ -1361,8 +1377,11 @@ export default function Messaging() {
             Schedule
           </button>
           <button
+            type="button"
+            role="tab"
+            aria-selected={activeTab === 'single-user'}
             onClick={() => setActiveTab('single-user')}
-            className={`flex-1 px-5 py-3 text-sm font-medium transition flex items-center justify-center gap-2 ${
+            className={`shrink-0 md:flex-1 whitespace-nowrap px-4 sm:px-5 py-3 text-sm font-medium transition flex items-center justify-center gap-2 ${
               activeTab === 'single-user'
                 ? 'border-b-2 border-primary-500 text-primary-400 bg-primary-500/5'
                 : 'text-gray-400 hover:text-white hover:bg-white/5'
@@ -1372,8 +1391,11 @@ export default function Messaging() {
             Single User
           </button>
           <button
+            type="button"
+            role="tab"
+            aria-selected={activeTab === 'history'}
             onClick={() => setActiveTab('history')}
-            className={`flex-1 px-5 py-3 text-sm font-medium transition flex items-center justify-center gap-2 ${
+            className={`shrink-0 md:flex-1 whitespace-nowrap px-4 sm:px-5 py-3 text-sm font-medium transition flex items-center justify-center gap-2 ${
               activeTab === 'history'
                 ? 'border-b-2 border-primary-500 text-primary-400 bg-primary-500/5'
                 : 'text-gray-400 hover:text-white hover:bg-white/5'
