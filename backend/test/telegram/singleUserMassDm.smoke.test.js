@@ -168,11 +168,14 @@ async function withStubbedSessions(stub, fn) {
   console.log('service.noSessions: OK');
 
   // ────────────────────────────────────────────────────────────────
-  // 4. _processSingleUserMassDm: per-job dead-target cache short-
-  //    circuits remaining sessions without burning resolve requests.
-  //    Locks in the fix for "mass DM only worked from 4/54 sessions"
-  //    where every session redundantly tried to resolve the same
-  //    typo'd handle.
+  // 4. _processSingleUserMassDm: per-job dead-target cache requires
+  //    >=2 *alive* session confirmations of a target-side error
+  //    pattern (USERNAME_NOT_OCCUPIED / USERNAME_INVALID /
+  //    PEER_ID_INVALID / etc.) before it short-circuits the rest.
+  //    Locks in the fix for the bug where a single session reporting
+  //    a generic "Could not resolve target" — which often came from
+  //    a session-side AUTH_KEY_UNREGISTERED — was enough to blacklist
+  //    a *real* handle for every remaining session in the job.
   // ────────────────────────────────────────────────────────────────
   await (async () => {
     const pool = require('../../src/config/database').pool;
@@ -200,16 +203,19 @@ async function withStubbedSessions(stub, fn) {
       return { rows: [] };
     };
 
-    let sendCalls = 0;
+    // Sub-test 4a: TARGET-SIDE failures from multiple alive sessions
+    // DO short-circuit. After 2 confirmations (sessions 100 + 102) the
+    // remaining session(s) skip. Session 101 is the AUTH_KEY case and
+    // its failure does NOT count toward the dead-target tally — it
+    // counts toward the revoked-session cache instead.
+    let sendCallsA = 0;
     telegramService.sendMessage = async (sessionId, target, _message) => {
-      sendCalls++;
-      // Every attempt fails with the unresolvable-target pattern.
+      sendCallsA++;
       if (sessionId === '101') {
-        const err = new Error('Telegram API error: AUTH_KEY_UNREGISTERED');
-        throw err;
+        throw new Error('Telegram API error: AUTH_KEY_UNREGISTERED');
       }
-      const err = new Error('Telegram API error: Could not resolve target: @typo');
-      throw err;
+      // Target-side error — a real Telegram USERNAME_NOT_OCCUPIED.
+      throw new Error('Telegram API error: USERNAME_NOT_OCCUPIED');
     };
 
     messageService._notifyProgress = async () => {};
@@ -219,11 +225,11 @@ async function withStubbedSessions(stub, fn) {
       await messageService._processSingleUserMassDm(
         9999,
         [
-          { id: 100, user_id: 1, status: 'active' },
-          { id: 101, user_id: 1, status: 'active' },
-          { id: 102, user_id: 1, status: 'active' },
-          { id: 103, user_id: 1, status: 'active' },
-          { id: 104, user_id: 1, status: 'active' },
+          { id: 100, user_id: 1, status: 'active' }, // confirms target-dead (1/2)
+          { id: 101, user_id: 1, status: 'active' }, // AUTH_KEY → revoked, no target tally
+          { id: 102, user_id: 1, status: 'active' }, // confirms target-dead (2/2) → cache armed
+          { id: 103, user_id: 1, status: 'active' }, // skipped via cache
+          { id: 104, user_id: 1, status: 'active' }, // skipped via cache
         ],
         ['@typo'],
         'hello',
@@ -231,16 +237,16 @@ async function withStubbedSessions(stub, fn) {
         1
       );
 
-      // Session 100: real attempt → fails with "Could not resolve" → @typo cached as dead.
-      // Session 101: real attempt → fails with AUTH_KEY_UNREGISTERED → revoked cache.
-      //   (still "real" even though the target was already cached because session 101
-      //   would have been queried first IF we ran target-major; but since we DO run
-      //   target-major, @typo gets cached on session 100, so 101..104 ALL skip.)
-      // Actual result given target-major loop: session 100 burns 1 send, the rest skip.
+      // 100, 101, 102 all called sendMessage; 103 + 104 skipped via cache.
       assert.strictEqual(
-        sendCalls,
-        1,
-        `expected only the first session to call sendMessage; got ${sendCalls}`
+        sendCallsA,
+        3,
+        `expected 3 sendMessage calls (2 target confirmations + 1 auth error before cache armed); got ${sendCallsA}`
+      );
+      // AUTH_KEY_UNREGISTERED should have flagged session 101 in DB.
+      assert.ok(
+        updateRevoked.some((p) => p && p[0] === 101),
+        'expected session 101 to be flagged revoked'
       );
     } finally {
       pool.query = origPoolQuery;
@@ -248,7 +254,71 @@ async function withStubbedSessions(stub, fn) {
       messageService._notifyProgress = origNotify;
       messageService._finalizeJob = origFinalize;
     }
-    console.log('worker.deadTargetCache: OK');
+    console.log('worker.deadTargetCache.targetSide: OK');
+  })();
+
+  // ────────────────────────────────────────────────────────────────
+  // 4b. _processSingleUserMassDm: a generic "Could not resolve target"
+  //     error (the pattern that previously blacklisted real handles)
+  //     does NOT trigger the dead-target cache by itself. Every session
+  //     gets a real attempt — operators can rely on per-session
+  //     entity resolution to tell them whether the user truly exists.
+  // ────────────────────────────────────────────────────────────────
+  await (async () => {
+    const pool = require('../../src/config/database').pool;
+    const telegramService = require('../../src/services/telegramService');
+
+    const origPoolQuery = pool.query.bind(pool);
+    const origSendMessage = telegramService.sendMessage.bind(telegramService);
+    const origNotify = messageService._notifyProgress.bind(messageService);
+    const origFinalize = messageService._finalizeJob.bind(messageService);
+
+    pool.query = async (sql) => {
+      const text = String(sql).replace(/\s+/g, ' ').trim();
+      if (text.startsWith('SELECT status FROM messaging_jobs')) {
+        return { rows: [{ status: 'running' }] };
+      }
+      return { rows: [] };
+    };
+
+    let sendCallsB = 0;
+    telegramService.sendMessage = async () => {
+      sendCallsB++;
+      // Generic resolution-failure shape the OLD classifier matched.
+      throw new Error('Telegram API error: Could not resolve target: @binolt');
+    };
+
+    messageService._notifyProgress = async () => {};
+    messageService._finalizeJob = async () => {};
+
+    try {
+      await messageService._processSingleUserMassDm(
+        9999,
+        [
+          { id: 200, user_id: 1, status: 'active' },
+          { id: 201, user_id: 1, status: 'active' },
+          { id: 202, user_id: 1, status: 'active' },
+          { id: 203, user_id: 1, status: 'active' },
+          { id: 204, user_id: 1, status: 'active' },
+        ],
+        ['@binolt'],
+        'hello',
+        0,
+        1
+      );
+
+      assert.strictEqual(
+        sendCallsB,
+        5,
+        `expected every session to attempt the manual @binolt target — generic "Could not resolve" should NOT pre-blacklist; got ${sendCallsB}`
+      );
+    } finally {
+      pool.query = origPoolQuery;
+      telegramService.sendMessage = origSendMessage;
+      messageService._notifyProgress = origNotify;
+      messageService._finalizeJob = origFinalize;
+    }
+    console.log('worker.deadTargetCache.genericResolveDoesNotBlacklist: OK');
   })();
 
   // ────────────────────────────────────────────────────────────────

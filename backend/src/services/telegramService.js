@@ -1549,10 +1549,23 @@ class TelegramService {
     await this._ensureConnected(sessionId);
 
     try {
-      // Resolve member InputUsers
+      // Resolve member InputUsers. `_resolveEntity` now throws on
+      // failure (instead of returning null) so we can distinguish
+      // session-vs-target failures upstream — wrap each member so a
+      // single bad handle doesn't kill the whole group creation.
       const inputUsers = [];
       for (const userId of members) {
-        const userEntity = await this._resolveEntity(sessionId, userId);
+        let userEntity = null;
+        try {
+          userEntity = await this._resolveEntity(sessionId, userId);
+        } catch (resolveErr) {
+          if (this.isPermanentAuthError(resolveErr)) throw resolveErr;
+          logger.warn(`createGroup: could not resolve member ${userId}; skipping`, {
+            sessionId,
+            error: resolveErr && resolveErr.message,
+          });
+          continue;
+        }
         if (userEntity) {
           inputUsers.push(
             new Api.InputUser({
@@ -2378,6 +2391,20 @@ class TelegramService {
       ? this._normalizeAccessHashHint(accessHashHint)
       : null;
 
+    // Track the most recent error from any resolution attempt. We use
+    // this so callers can distinguish session-level fatal errors
+    // (AUTH_KEY_UNREGISTERED, SESSION_REVOKED, …) from genuine
+    // target-side errors (USERNAME_NOT_OCCUPIED, USERNAME_INVALID, …).
+    // Without this, every catch block here used to swallow the error,
+    // we'd return `null`, and the caller would throw a generic
+    // "Could not resolve target" — which the in-job dead-target caches
+    // mis-classified as a target failure and used to blacklist real
+    // users after one revoked session tripped the resolution chain.
+    let lastResolveError = null;
+    const recordErr = (err) => {
+      if (err) lastResolveError = err;
+    };
+
     try {
       // If it's already a resolved entity, return it
       if (identifier && typeof identifier === 'object' && identifier.className) {
@@ -2414,6 +2441,8 @@ class TelegramService {
           // garbled access_hash doesn't permanently block resolution
           // — many scraped hashes are still valid even when GetUsers
           // returns UserEmpty for the row (privacy / deactivated).
+          recordErr(hintErr);
+          if (this.isPermanentAuthError(hintErr)) throw hintErr;
           logger.debug(`Numeric+accessHash resolution failed for ${idStr}`, {
             sessionId,
             error: hintErr && hintErr.message,
@@ -2447,6 +2476,8 @@ class TelegramService {
             }
           }
         } catch (inviteError) {
+          recordErr(inviteError);
+          if (this.isPermanentAuthError(inviteError)) throw inviteError;
           logger.debug(`Invite link resolution failed`, { error: inviteError.message });
           // Continue to try other resolution methods
         }
@@ -2463,8 +2494,12 @@ class TelegramService {
               return await client.getEntity(username);
             });
             if (entity) return entity;
-          } catch {
-            // Username not found, continue to other methods
+          } catch (uErr) {
+            // Username resolution failed. Re-throw permanent auth
+            // errors so the caller can flag the *session* (not the
+            // target). Other errors fall through to the next method.
+            recordErr(uErr);
+            if (this.isPermanentAuthError(uErr)) throw uErr;
           }
         }
       }
@@ -2490,7 +2525,9 @@ class TelegramService {
           if (result.users && result.users.length > 0) {
             return result.users[0];
           }
-        } catch {
+        } catch (pErr) {
+          recordErr(pErr);
+          if (this.isPermanentAuthError(pErr)) throw pErr;
           // Phone number not found, continue
         }
       }
@@ -2505,7 +2542,9 @@ class TelegramService {
             return await client.getEntity(numericId);
           });
           if (entity) return entity;
-        } catch {
+        } catch (nErr) {
+          recordErr(nErr);
+          if (this.isPermanentAuthError(nErr)) throw nErr;
           // Direct entity get failed
         }
 
@@ -2527,7 +2566,9 @@ class TelegramService {
           if (entity && entity.length > 0 && entity[0].className !== 'UserEmpty') {
             return entity[0];
           }
-        } catch {
+        } catch (gErr) {
+          recordErr(gErr);
+          if (this.isPermanentAuthError(gErr)) throw gErr;
           // User lookup failed
         }
       }
@@ -2538,14 +2579,45 @@ class TelegramService {
           return await client.getEntity(idStr);
         });
         if (entity) return entity;
-      } catch {
+      } catch (lErr) {
+        recordErr(lErr);
+        if (this.isPermanentAuthError(lErr)) throw lErr;
         // Final attempt failed
       }
 
+      // All resolution methods returned without finding an entity.
+      // If we recorded an underlying error from any method, surface
+      // its message so callers can classify the failure correctly
+      // (target-side vs. flood vs. transient transport). Otherwise
+      // fall back to `null` for backward compatibility.
+      if (lastResolveError) {
+        const tagged = new Error(
+          lastResolveError.message || String(lastResolveError)
+        );
+        tagged.cause = lastResolveError;
+        if (lastResolveError.errorMessage) {
+          tagged.errorMessage = lastResolveError.errorMessage;
+        }
+        if (lastResolveError.code) tagged.code = lastResolveError.code;
+        throw tagged;
+      }
       return null;
     } catch (error) {
+      // Permanent auth errors must always bubble up so the caller can
+      // mark the session revoked instead of blaming the target.
+      if (this.isPermanentAuthError(error)) {
+        logger.warn(`Resolve entity hit permanent auth error for ${identifier}`, {
+          sessionId,
+          error: error.message,
+        });
+        throw error;
+      }
       logger.error(`Failed to resolve entity: ${identifier}`, { error: error.message });
-      return null;
+      // Re-throw the underlying error so callers can classify it.
+      // Backward compatibility: most call sites just check `if (!entity)`
+      // to throw their own "Could not resolve target" message; that
+      // path still works because they catch the error from this throw.
+      throw error;
     }
   }
 

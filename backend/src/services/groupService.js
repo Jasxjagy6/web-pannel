@@ -613,7 +613,22 @@ class GroupService {
       // the audience pass.
       await markPhase('filtering', { total: userList.length });
 
-      try {
+      // Run the audience filter ONLY for manually uploaded lists.
+      // Manual direct entry (`listId == null`) and panel-scraped
+      // lists (`source = 'job_*'`) skip the filter entirely per the
+      // operator's verbatim rule: "filtering should only and only
+      // works for the lists that were uploaded manually (not
+      // scrapped by pannel). For other places where manual ID or
+      // usernames are entered the job must started directly without
+      // checking the filtering system."
+      const shouldRunAudienceFilter =
+        listId != null && isUploadedListSource(listSource);
+      if (!shouldRunAudienceFilter) {
+        logger.info(
+          'addMembersToGroups: skipping audience filter (manual entry or scraped list)',
+          { userId, listId, source: listSource }
+        );
+      } else try {
         const audienceResult = await audienceFilter.filterUserList({
           userList,
           listId,

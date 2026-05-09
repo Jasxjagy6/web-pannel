@@ -645,6 +645,12 @@ const messageController = {
       messageType = 'text',
       usersPerRound = 5,
       delayBetweenRounds = 60,
+      // sourceType / listId let the service decide whether to run the
+      // audience filter. Default to 'manual' so direct entries skip
+      // filtering (operator's "just start the job" rule). The frontend
+      // sends 'list' + listId only when the user picked a saved list.
+      sourceType,
+      listId,
     } = req.body;
 
     const sessionIds = await resolveSessionIdsFromRequest(req, rawSessionIds || []);
@@ -671,6 +677,8 @@ const messageController = {
       messageType,
       usersPerRound: parseInt(usersPerRound, 10),
       delayBetweenRounds: parseInt(delayBetweenRounds, 10),
+      sourceType: sourceType || 'manual',
+      listId: listId != null ? parseInt(listId, 10) : null,
     }, userId);
 
     await reportService.logActivity(

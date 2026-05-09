@@ -205,6 +205,54 @@ function isFatalSessionError(errorMessage) {
   return fatalPatterns.some((p) => errorMessage.includes(p));
 }
 
+/**
+ * Heuristic match for "this list source is an uploaded list", mirroring
+ * `groupService.isUploadedListSource`. Anything starting with `job_` or
+ * `scrape_*` is treated as scraped; everything else is treated as
+ * uploaded so the audience filter runs.
+ *
+ * NULL / unknown sources fall through to "uploaded" — the historical
+ * default before the panel started tagging scrape jobs explicitly.
+ */
+function isUploadedListSourceString(source) {
+  if (!source) return true;
+  const s = String(source).toLowerCase();
+  if (s.startsWith('job_')) return false;
+  if (s.startsWith('scrape_')) return false;
+  if (s.startsWith('scraped_')) return false;
+  return true;
+}
+
+/**
+ * Resolve `lists.source` for a given (listId, userId) pair and decide
+ * whether the audience filter should run against it. Returns `false`
+ * when the list is missing, owned by another user, or scraped by the
+ * panel. Best-effort: any DB error logs and returns `false` (skip
+ * filter, just run the job — operator's "just start the job" rule).
+ *
+ * @param {number|string} listId
+ * @param {number|string} userId
+ * @returns {Promise<boolean>}
+ */
+async function _isUploadedListById(listId, userId) {
+  if (listId == null) return false;
+  try {
+    const result = await pool.query(
+      'SELECT source FROM lists WHERE id = $1 AND user_id = $2 LIMIT 1',
+      [listId, userId]
+    );
+    if (result.rows.length === 0) return false;
+    const source = result.rows[0].source;
+    return isUploadedListSourceString(source);
+  } catch (err) {
+    logger.warn(
+      `_isUploadedListById: lists.source lookup failed for list ${listId}; treating as non-uploaded (skip filter): ${err.message}`,
+      { userId }
+    );
+    return false;
+  }
+}
+
 // =========================================================================
 // Distribution Engine
 // =========================================================================
@@ -983,42 +1031,57 @@ class MessageService {
     let audienceDmOnly = 0;
     let audienceDropped = 0;
     if (sourceType === 'list' && Array.isArray(targetList) && targetList.length > 0) {
-      try {
-        const audienceResult = await audienceFilter.filterUserList({
-          userList: targetList,
-          listId: sourceId || null,
-          userId,
-          context: 'send-bulk',
-          options: {
-            includePrivacyRestricted: true,
-            purgeNotFound: true,
-          },
-        });
-        audienceStats = audienceResult.stats;
-        audienceDmOnly = (audienceResult.dmOnly || []).length;
-        audienceDropped = (audienceResult.dropped || []).length;
-        if (Array.isArray(audienceResult.eligible) && audienceResult.eligible.length > 0) {
-          // `audienceResult.eligible` is already projected into the
-          // worker-friendly shape (`{ ...raw, _filter_kind, _filter_status }`).
-          // Mapping `.raw` here would replace every entry with
-          // `undefined` and downstream normalizeTargetId would reject
-          // them all.
-          targetList = audienceResult.eligible;
-          params.targetList = targetList;
+      // Run the audience filter ONLY when the source is a manually
+      // uploaded list (`lists.source` is `import_*` / `manual_*` /
+      // `merge_*` / NULL). Panel-scraped lists (`source = 'job_*'`)
+      // and manual direct entry skip the filter — operators want
+      // those to start the job directly without pre-filtering.
+      const filterEligible = sourceId != null
+        ? await _isUploadedListById(sourceId, userId)
+        : false;
+      if (filterEligible) {
+        try {
+          const audienceResult = await audienceFilter.filterUserList({
+            userList: targetList,
+            listId: sourceId || null,
+            userId,
+            context: 'send-bulk',
+            options: {
+              includePrivacyRestricted: true,
+              purgeNotFound: true,
+            },
+          });
+          audienceStats = audienceResult.stats;
+          audienceDmOnly = (audienceResult.dmOnly || []).length;
+          audienceDropped = (audienceResult.dropped || []).length;
+          if (Array.isArray(audienceResult.eligible) && audienceResult.eligible.length > 0) {
+            // `audienceResult.eligible` is already projected into the
+            // worker-friendly shape (`{ ...raw, _filter_kind, _filter_status }`).
+            // Mapping `.raw` here would replace every entry with
+            // `undefined` and downstream normalizeTargetId would reject
+            // them all.
+            targetList = audienceResult.eligible;
+            params.targetList = targetList;
+          }
+          logger.info('sendBulkMessage: audience filter applied (uploaded list)', {
+            userId,
+            sourceId,
+            stats: audienceStats,
+            dmOnly: audienceDmOnly,
+            dropped: audienceDropped,
+          });
+        } catch (filterErr) {
+          logger.warn('sendBulkMessage: audience filter failed; using raw list', {
+            error: filterErr.message,
+            userId,
+            sourceId,
+          });
         }
-        logger.info('sendBulkMessage: audience filter applied', {
-          userId,
-          sourceId,
-          stats: audienceStats,
-          dmOnly: audienceDmOnly,
-          dropped: audienceDropped,
-        });
-      } catch (filterErr) {
-        logger.warn('sendBulkMessage: audience filter failed; using raw list', {
-          error: filterErr.message,
-          userId,
-          sourceId,
-        });
+      } else {
+        logger.info(
+          'sendBulkMessage: skipping audience filter (manual entry or scraped list)',
+          { userId, sourceId, sourceType }
+        );
       }
     }
 
@@ -2379,9 +2442,18 @@ class MessageService {
       messageType = 'text',
       usersPerRound = 5,
       delayBetweenRounds = 60,
-      // Optional source list id — when set the audience filter
-      // persists status back into list_items.
+      // Optional source list id — when set AND the list was uploaded
+      // (not scraped by the panel itself), the audience filter
+      // persists status back into list_items. Manual entries and
+      // scraped lists bypass the filter entirely per the operator's
+      // explicit rule:
+      //   "filtering should only and only works for the lists that
+      //    were uploaded manually (not scrapped by pannel). For
+      //    other places where manual ID or usernames are entered the
+      //    job must started directly without checking the filtering
+      //    system."
       listId = null,
+      sourceType = 'manual',
     } = params;
     let users = params.users;
 
@@ -2401,40 +2473,55 @@ class MessageService {
       throw new AppError('Message is required', 400, 'EMPTY_MESSAGE');
     }
 
-    // ─── Pre-job audience filter ─────────────────────────────────
-    // Bulk-DM keeps privacy-restricted users (they can still receive
-    // DMs); we only drop NOT_FOUND / deactivated rows.
-    try {
-      const audienceResult = await audienceFilter.filterUserList({
-        userList: users,
-        listId,
-        userId,
-        context: 'send-bulk-users',
-        options: {
-          includePrivacyRestricted: true,
-          purgeNotFound: true,
-        },
-      });
-      if (Array.isArray(audienceResult.eligible) && audienceResult.eligible.length > 0) {
-        // `audienceResult.eligible` is already projected into the
-        // worker-friendly shape; mapping `.raw` would yield undefined
-        // entries.
-        users = audienceResult.eligible;
-        params.users = users;
+    // ─── Pre-job audience filter (uploaded lists only) ──────────
+    // Run the audience filter ONLY when the source is a manually
+    // uploaded list. Skip for manual direct entry and for
+    // panel-scraped lists — those start the job directly.
+    const filterEligible =
+      sourceType === 'list' && listId != null
+        ? await _isUploadedListById(listId, userId)
+        : false;
+    if (filterEligible) {
+      // Bulk-DM keeps privacy-restricted users (they can still receive
+      // DMs); we only drop NOT_FOUND / deactivated rows.
+      try {
+        const audienceResult = await audienceFilter.filterUserList({
+          userList: users,
+          listId,
+          userId,
+          context: 'send-bulk-users',
+          options: {
+            includePrivacyRestricted: true,
+            purgeNotFound: true,
+          },
+        });
+        if (Array.isArray(audienceResult.eligible) && audienceResult.eligible.length > 0) {
+          // `audienceResult.eligible` is already projected into the
+          // worker-friendly shape; mapping `.raw` would yield undefined
+          // entries.
+          users = audienceResult.eligible;
+          params.users = users;
+        }
+        logger.info('sendBulkToUsers: audience filter applied (uploaded list)', {
+          userId,
+          listId,
+          sourceType,
+          stats: audienceResult.stats,
+          dmOnly: (audienceResult.dmOnly || []).length,
+          dropped: (audienceResult.dropped || []).length,
+        });
+      } catch (filterErr) {
+        logger.warn('sendBulkToUsers: audience filter failed; using raw list', {
+          error: filterErr.message,
+          userId,
+          listId,
+        });
       }
-      logger.info('sendBulkToUsers: audience filter applied', {
-        userId,
-        listId,
-        stats: audienceResult.stats,
-        dmOnly: (audienceResult.dmOnly || []).length,
-        dropped: (audienceResult.dropped || []).length,
-      });
-    } catch (filterErr) {
-      logger.warn('sendBulkToUsers: audience filter failed; using raw list', {
-        error: filterErr.message,
-        userId,
-        listId,
-      });
+    } else {
+      logger.info(
+        'sendBulkToUsers: skipping audience filter (manual entry or scraped list)',
+        { userId, listId, sourceType }
+      );
     }
 
     if (!users || users.length === 0) {
@@ -2795,27 +2882,47 @@ class MessageService {
     const results = [];
     const totalSends = sessions.length * targets.length;
 
-    // Per-job dead-target cache. When the FIRST session reports an
-    // unresolvable target (USERNAME_NOT_OCCUPIED / "No user has X as
-    // username" / "Could not resolve target: @X" / USERNAME_INVALID),
-    // we add the target to this set so the remaining sessions skip
-    // it locally without each independently burning a
-    // `contacts.ResolveUsername` API call. Without this cache, a
-    // typo'd handle on a 50-session job spends 50 resolve requests
-    // (and risks per-session FLOOD_WAIT) just to learn what the
-    // first session already discovered. Same pattern as
-    // `brokenSessionTargets` in groupService.addMembersToGroups.
+    // Per-job dead-target cache. We mark a target as unresolvable
+    // ONLY when at least two distinct *alive* sessions independently
+    // confirm a target-side error (USERNAME_NOT_OCCUPIED,
+    // USERNAME_INVALID, PEER_ID_INVALID, USER_ID_INVALID,
+    // INPUT_USER_DEACTIVATED). Single-session "Could not resolve
+    // target" used to be enough to blacklist a real handle for the
+    // rest of the run — that produced the bug where a typo'd or
+    // revoked session falsely doomed every remaining attempt for a
+    // genuine username.
+    //
+    // Operator quote, verbatim:
+    //   "filtering should only and only works for the lists that
+    //    were uploaded manually … For other places where manual ID
+    //    or usernames are entered the job must started directly
+    //    without checking the filtering system."
+    //
+    // Single-user mass DM is a *manual entry* surface, so we keep
+    // the cache disabled by default and only opt in after multiple
+    // alive sessions agree the user is gone.
+    const TARGET_DEAD_CONFIRMATIONS = 2;
     const deadTargets = new Set();
+    const targetFailureSessions = new Map(); // target → Set<sessionId>
+    // Patterns that ONLY ever come from a target-side failure — never
+    // from a session-level auth issue. We deliberately drop the broad
+    // "Could not resolve target" and "Could not find input entity"
+    // patterns the previous classifier matched: those used to fire
+    // when the *session* was dead, blaming the target.
     const isUnresolvableTargetError = (msg) => {
       if (!msg) return false;
       const m = String(msg);
       return (
         m.includes('USERNAME_NOT_OCCUPIED') ||
         m.includes('USERNAME_INVALID') ||
-        m.includes('Could not resolve target') ||
-        m.includes('No user has') ||
         m.includes('PEER_ID_INVALID') ||
-        m.includes('Could not find input entity')
+        m.includes('USER_ID_INVALID') ||
+        m.includes('INPUT_USER_DEACTIVATED') ||
+        // GramJS' user-friendly translation of USERNAME_NOT_OCCUPIED.
+        // Only matches inside our sendMessage error chain — the bare
+        // "No user has X" string from gramjs internal logging never
+        // makes it onto the thrown error message text we see here.
+        /No user has\s+"/i.test(m)
       );
     };
 
@@ -2831,6 +2938,7 @@ class MessageService {
       return (
         m.includes('AUTH_KEY_UNREGISTERED') ||
         m.includes('AUTH_KEY_INVALID') ||
+        m.includes('AUTH_KEY_DUPLICATED') ||
         m.includes('USER_DEACTIVATED') ||
         m.includes('SESSION_REVOKED') ||
         m.includes('SESSION_EXPIRED')
@@ -2970,14 +3078,37 @@ class MessageService {
 
             // Cache classification updates so the rest of the job
             // doesn't repeat doomed work.
-            if (isUnresolvableTargetError(err.message)) {
-              deadTargets.add(String(target));
-              logger.info(
-                `Single-user mass DM job ${jobId}: target ${target} marked unresolvable; remaining ${sessions.length - si - 1} session(s) for this target will skip without burning resolve requests`,
-                { jobId }
-              );
+            const sessionLooksRevoked = isRevokedSessionError(err.message);
+            if (isUnresolvableTargetError(err.message) && !sessionLooksRevoked) {
+              // Only count target-side failures from sessions that
+              // are NOT themselves revoked. A revoked session's
+              // resolve attempts can't be trusted — every call from
+              // a dead auth_key fails, but the failure says nothing
+              // about whether the *target* exists. Without this
+              // gate, one bad session in a 50-session run was enough
+              // to blacklist a real, healthy username for the
+              // remaining 49 sessions.
+              const targetKey = String(target);
+              let confirmers = targetFailureSessions.get(targetKey);
+              if (!confirmers) {
+                confirmers = new Set();
+                targetFailureSessions.set(targetKey, confirmers);
+              }
+              confirmers.add(session.id);
+              if (confirmers.size >= TARGET_DEAD_CONFIRMATIONS) {
+                deadTargets.add(targetKey);
+                logger.info(
+                  `Single-user mass DM job ${jobId}: target ${target} marked unresolvable after ${confirmers.size} alive-session confirmations; remaining ${sessions.length - si - 1} session(s) for this target will skip without burning resolve requests`,
+                  { jobId }
+                );
+              } else {
+                logger.info(
+                  `Single-user mass DM job ${jobId}: session ${session.id} reported target ${target} unresolvable (${confirmers.size}/${TARGET_DEAD_CONFIRMATIONS} confirmations); will retry from other sessions`,
+                  { jobId }
+                );
+              }
             }
-            if (isRevokedSessionError(err.message)) {
+            if (sessionLooksRevoked) {
               revokedSessionIds.add(session.id);
               // Mark the session row revoked so future jobs skip it
               // entirely — best-effort, don't fail the job if the
@@ -3222,4 +3353,6 @@ module.exports = new MessageService();
 module.exports.__internal = {
   normalizeTargetId,
   isRetryableError,
+  isUploadedListSourceString,
+  _isUploadedListById,
 };
