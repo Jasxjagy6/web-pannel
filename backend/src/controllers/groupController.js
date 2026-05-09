@@ -41,6 +41,7 @@ const groupController = {
       // Distribution controls
       mode,
       perSessionBurst,
+      maxPerSession,
       cooldownSecMin,
       cooldownSecMax,
       itemDelayMsMin,
@@ -102,6 +103,7 @@ const groupController = {
       batchSize: batchSize ? parseInt(batchSize, 10) : undefined,
       mode: mode || 'auto',
       perSessionBurst: perSessionBurst != null ? parseInt(perSessionBurst, 10) : undefined,
+      maxPerSession: maxPerSession != null ? parseInt(maxPerSession, 10) : undefined,
       cooldownSecMin: cooldownSecMin != null ? parseInt(cooldownSecMin, 10) : undefined,
       cooldownSecMax: cooldownSecMax != null ? parseInt(cooldownSecMax, 10) : undefined,
       itemDelayMsMin: itemDelayMsMin != null ? parseInt(itemDelayMsMin, 10) : undefined,
@@ -135,6 +137,7 @@ const groupController = {
           batchSize: options.batchSize,
           mode: options.mode,
           perSessionBurst: options.perSessionBurst,
+          maxPerSession: options.maxPerSession,
           cooldownSecMin: options.cooldownSecMin,
           cooldownSecMax: options.cooldownSecMax,
           itemDelayMsMin: options.itemDelayMsMin,
@@ -753,6 +756,7 @@ const groupController = {
       userCount,
       mode,
       perSessionBurst,
+      maxPerSession,
       cooldownSecMin,
       cooldownSecMax,
       itemDelayMsMin,
@@ -811,6 +815,9 @@ const groupController = {
       workType: 'group_add',
       mode: mode || 'auto',
       perSessionBurst: perSessionBurst != null ? Number(perSessionBurst) : undefined,
+      // Forward the new hard burst ceiling so the preview reflects
+      // exactly what the runner will execute (default 4 server-side).
+      maxPerSessionBurst: maxPerSession != null ? Number(maxPerSession) : undefined,
       cooldownSecMin: cooldownSecMin != null ? Number(cooldownSecMin) : undefined,
       cooldownSecMax: cooldownSecMax != null ? Number(cooldownSecMax) : undefined,
       itemDelayMsMin: itemDelayMsMin != null ? Number(itemDelayMsMin) : undefined,

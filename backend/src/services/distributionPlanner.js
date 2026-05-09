@@ -46,6 +46,19 @@ const LIMITS = {
 };
 
 /**
+ * Hard ceiling Telegram empirically tolerates for
+ * `channels.InviteToChannel` before it starts marking sessions as
+ * PEER_FLOOD. Above ~4-5 invites in a tight burst, even a "warm"
+ * account starts drawing account-level spam flags. The
+ * `addMembersToGroups` runner enforces this as a session-level burst
+ * cap and the planner clamps `perSessionBurst` to it by default for
+ * `group_add` work; operators can override via
+ * `params.maxPerSessionBurst` if they really know what they're doing
+ * on a particular fleet.
+ */
+const GROUP_ADD_DEFAULT_MAX_BURST = 4;
+
+/**
  * Auto-mode policy.
  *
  * `ratioBands` are evaluated in order; the first band whose
@@ -190,6 +203,27 @@ function plan(params = {}) {
   if (!Array.isArray(sessionIds) || sessionIds.length === 0) {
     throw new Error('distributionPlanner.plan: at least one session is required');
   }
+
+  // Per-session burst ceiling. For `group_add` we default to the
+  // empirical Telegram-safe value (`GROUP_ADD_DEFAULT_MAX_BURST`).
+  // For `bulk_message` no ceiling is enforced because bulk DM uses
+  // a different rate-limit profile (per-second outgoing messages,
+  // not the spam-flag heuristic that `channels.InviteToChannel`
+  // triggers). Operators can override per-call.
+  const rawMaxBurst = Number(params.maxPerSessionBurst);
+  let maxPerSessionBurst;
+  if (Number.isFinite(rawMaxBurst) && rawMaxBurst > 0) {
+    maxPerSessionBurst = _clamp(
+      Math.floor(rawMaxBurst),
+      LIMITS.perSessionBurst.min,
+      LIMITS.perSessionBurst.max
+    );
+  } else if (workType === 'group_add') {
+    maxPerSessionBurst = GROUP_ADD_DEFAULT_MAX_BURST;
+  } else {
+    maxPerSessionBurst = LIMITS.perSessionBurst.max;
+  }
+
   const items = Math.max(0, Math.floor(Number(totalItems) || 0));
   if (items === 0) {
     return {
@@ -228,7 +262,7 @@ function plan(params = {}) {
     perSessionBurst = _clamp(
       band.perSessionBurst(ratio),
       LIMITS.perSessionBurst.min,
-      LIMITS.perSessionBurst.max
+      maxPerSessionBurst
     );
     [cooldownSecMin, cooldownSecMax] = _normPair(
       band.cooldownSecMin,
@@ -249,7 +283,7 @@ function plan(params = {}) {
     perSessionBurst = _clamp(
       Number(params.perSessionBurst) || band.perSessionBurst(ratio),
       LIMITS.perSessionBurst.min,
-      LIMITS.perSessionBurst.max
+      maxPerSessionBurst
     );
     [cooldownSecMin, cooldownSecMax] = _normPair(
       params.cooldownSecMin,
@@ -322,6 +356,7 @@ function plan(params = {}) {
     totalItems: items,
     sessionCount,
     perSessionBurst,
+    maxPerSessionBurst,
     cooldownSecMin,
     cooldownSecMax,
     itemDelayMsMin,
@@ -396,6 +431,7 @@ module.exports = {
   buildQueues,
   LIMITS,
   AUTO_POLICY,
+  GROUP_ADD_DEFAULT_MAX_BURST,
   VALID_MODES,
   VALID_WORK_TYPES,
 };
