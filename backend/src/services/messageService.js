@@ -1471,8 +1471,8 @@ class MessageService {
    * @param {string} params.status - Filter by job status
    * @returns {Promise<{ jobs: Array<object>, pagination: object }>}
    */
-  async listJobs(userId, { page = 1, limit = 20, sort = 'created_at', order = 'DESC', status } = {}) {
-    logger.info(`Listing messaging jobs for user ${userId}`, { page, limit, sort, order, status });
+  async listJobs(userId, { page = 1, limit = 20, sort = 'created_at', order = 'DESC', status, jobType } = {}) {
+    logger.info(`Listing messaging jobs for user ${userId}`, { page, limit, sort, order, status, jobType });
 
     const { offset, limit: pageSize } = applyPagination(null, page, limit);
     const validSortFields = ['created_at', 'completed_at', 'total_count', 'sent_count', 'failed_count', 'id'];
@@ -1486,6 +1486,25 @@ class MessageService {
       queryConditions.push(`mj.status = $${paramIndex}`);
       queryParams.push(status);
       paramIndex++;
+    }
+
+    // Optional job-type filter so callers (e.g. the Single-User
+    // Mass DM History tab) can scope listings to one job_type
+    // instead of paging through every messaging job. Accepts a
+    // string ("single_user_mass_dm") or array of strings.
+    if (jobType !== undefined && jobType !== null && jobType !== '') {
+      const types = Array.isArray(jobType)
+        ? jobType.filter((t) => typeof t === 'string' && t.length > 0)
+        : (typeof jobType === 'string' && jobType.length > 0 ? [jobType] : []);
+      if (types.length === 1) {
+        queryConditions.push(`mj.job_type = $${paramIndex}`);
+        queryParams.push(types[0]);
+        paramIndex++;
+      } else if (types.length > 1) {
+        queryConditions.push(`mj.job_type = ANY($${paramIndex}::text[])`);
+        queryParams.push(types);
+        paramIndex++;
+      }
     }
 
     const whereClause = queryConditions.join(' AND ');
@@ -2615,6 +2634,283 @@ class MessageService {
     } catch (outerErr) {
       logger.error(`Bulk users job ${jobId} failed: ${outerErr.message}`);
       await this._finalizeJob(jobId, 'failed', sentCount.value, failedCount.value, skippedCount.value, results);
+    }
+  }
+
+  // =========================================================================
+  // Single-User Mass DM
+  //
+  // The operator picks 1..3 target users, a message, a per-send delay,
+  // and one or more sessions. Every selected session DMs every
+  // target, with `delaySeconds` inserted BETWEEN consecutive sends.
+  //
+  // Loop shape (target-major, session-minor):
+  //   for each target T:
+  //     for each session S:
+  //       S → DM(T, message)
+  //       sleep(delaySeconds)   # except after the very last send
+  //
+  // The 3-target hard cap is enforced by the validator, but we
+  // re-check here to keep the service safe when called directly
+  // (tests, scripted callers). Cancellation is honoured at every
+  // pre-send gate via `messaging_jobs.status = 'cancelled'`.
+  // =========================================================================
+
+  /**
+   * Create a single-user mass-DM job.
+   *
+   * @param {object} params
+   * @param {number[]} params.sessionIds       - Sessions to fan out from.
+   * @param {string[]} params.targets          - 1..3 target identifiers
+   *                                              (numeric id, @username,
+   *                                              or bare username).
+   * @param {string}   params.message          - Message body (<=4096).
+   * @param {string}  [params.messageType]     - 'text'|'html'|'markdown'.
+   * @param {number}  [params.delaySeconds=3]  - Wait between sends.
+   * @param {number|string} userId             - Authorisation context.
+   * @returns {Promise<{ jobId, status, total, sessionCount }>}
+   */
+  async sendSingleUserMassDm(params, userId) {
+    const {
+      sessionIds,
+      message,
+      messageType = 'text',
+      delaySeconds = 3,
+    } = params;
+    const targets = Array.isArray(params.targets) ? params.targets : [];
+
+    if (!userId) {
+      throw new AppError('User ID is required', 400, 'MISSING_USER_ID');
+    }
+    if (!sessionIds || sessionIds.length === 0) {
+      throw new AppError('At least one session is required', 400, 'NO_SESSIONS');
+    }
+    if (targets.length === 0) {
+      throw new AppError('At least one target is required', 400, 'NO_TARGETS');
+    }
+    if (targets.length > 3) {
+      throw new AppError(
+        'A maximum of 3 targets is allowed for single-user mass DM',
+        400,
+        'TOO_MANY_TARGETS'
+      );
+    }
+    if (!message || message.trim().length === 0) {
+      throw new AppError('Message is required', 400, 'EMPTY_MESSAGE');
+    }
+    const delaySec = Number.isFinite(Number(delaySeconds)) ? Math.max(1, Math.min(120, parseInt(delaySeconds, 10))) : 3;
+
+    // Strip duplicates / empty strings while preserving order.
+    const cleanTargets = [];
+    const seen = new Set();
+    for (const raw of targets) {
+      const t = String(raw || '').trim();
+      if (!t) continue;
+      const key = t.toLowerCase();
+      if (seen.has(key)) continue;
+      seen.add(key);
+      cleanTargets.push(t);
+    }
+    if (cleanTargets.length === 0) {
+      throw new AppError('At least one valid target is required', 400, 'NO_VALID_TARGETS');
+    }
+
+    // Verify session ownership (and skip cooldown'd sessions).
+    const verifiedSessions = await this._verifyMultipleSessionsOwnership(sessionIds, userId);
+    if (verifiedSessions.length === 0) {
+      throw new AppError('No valid sessions found', 404, 'NO_VALID_SESSIONS');
+    }
+
+    const totalSends = cleanTargets.length * verifiedSessions.length;
+
+    logger.info(
+      `Starting single-user mass DM: ${cleanTargets.length} target(s), ${verifiedSessions.length} session(s), ${delaySec}s delay`,
+      { userId, totalSends }
+    );
+
+    // Persist the job. The schema only has a single `session_id`
+    // column; mirror sendBulkToUsers and stash the full session list
+    // (plus the target list and the delay knob) in `options`.
+    const jobResult = await pool.query(
+      `INSERT INTO messaging_jobs (
+        user_id, session_id, job_type, target_list, message_content, message_type,
+        status, total_count, sent_count, failed_count, skipped_count, options, created_at
+      ) VALUES ($1, $2, 'single_user_mass_dm', $3, $4, $5, 'pending', $6, 0, 0, 0, $7, NOW())
+      RETURNING id`,
+      [
+        userId,
+        verifiedSessions[0].id,
+        JSON.stringify(cleanTargets),
+        message,
+        messageType,
+        totalSends,
+        JSON.stringify({
+          delaySeconds: delaySec,
+          targetCount: cleanTargets.length,
+          sessionIds: verifiedSessions.map((s) => s.id),
+        }),
+      ]
+    );
+
+    const jobId = jobResult.rows[0].id;
+
+    // Fire-and-forget worker. Errors are caught inside the worker so
+    // the API can return 202 immediately.
+    this._processSingleUserMassDm(
+      jobId,
+      verifiedSessions,
+      cleanTargets,
+      message,
+      delaySec,
+      userId
+    ).catch((err) => {
+      logger.error(`Single-user mass DM job ${jobId} failed with error: ${err.message}`);
+    });
+
+    return {
+      jobId,
+      status: 'pending',
+      total: totalSends,
+      sessionCount: verifiedSessions.length,
+      targetCount: cleanTargets.length,
+      delaySeconds: delaySec,
+      message: 'Job queued and will process in background',
+    };
+  }
+
+  /**
+   * Internal worker for single-user mass DM.
+   *
+   * Iterates target-major: for each target, every session sends in
+   * sequence with `delaySeconds` between sends. The delay is pasted
+   * between every send except the very last one (no point sleeping
+   * once we're done). Cancellation is checked before each send.
+   *
+   * @private
+   */
+  async _processSingleUserMassDm(jobId, sessions, targets, message, delaySeconds, userId) { // eslint-disable-line no-unused-vars
+    const sentCount = { value: 0 };
+    const failedCount = { value: 0 };
+    const skippedCount = { value: 0 };
+    const results = [];
+    const totalSends = sessions.length * targets.length;
+
+    await pool.query(
+      `UPDATE messaging_jobs SET status = 'running' WHERE id = $1`,
+      [jobId]
+    );
+
+    await this._notifyProgress(jobId, {
+      job_id: jobId,
+      status: 'running',
+      total: totalSends,
+      sent: 0,
+      failed: 0,
+      skipped: 0,
+    });
+
+    let sendsDone = 0;
+    try {
+      for (let ti = 0; ti < targets.length; ti++) {
+        const target = targets[ti];
+        for (let si = 0; si < sessions.length; si++) {
+          const session = sessions[si];
+
+          // Cancellation gate.
+          const jobStatus = await pool.query(
+            'SELECT status FROM messaging_jobs WHERE id = $1',
+            [jobId]
+          );
+          if (jobStatus.rows[0]?.status === 'cancelled') {
+            logger.info(`Single-user mass DM job ${jobId} cancelled`, {
+              jobId, sentCount: sentCount.value, failedCount: failedCount.value,
+            });
+            await this._finalizeJob(
+              jobId, 'cancelled',
+              sentCount.value, failedCount.value, skippedCount.value, results
+            );
+            return;
+          }
+
+          const result = {
+            sessionId: session.id,
+            target: String(target),
+            success: false,
+          };
+
+          try {
+            const sendResult = await telegramService.sendMessage(
+              String(session.id),
+              String(target),
+              message
+            );
+            result.success = true;
+            result.messageId = sendResult.messageId;
+            sentCount.value++;
+
+            await pool.query(
+              `INSERT INTO message_logs (job_id, session_id, target_id, status, sent_at)
+               VALUES ($1, $2, $3, 'sent', NOW())`,
+              [jobId, session.id, String(target)]
+            );
+          } catch (err) {
+            result.error = err.message;
+            failedCount.value++;
+            await pool.query(
+              `INSERT INTO message_logs (job_id, session_id, target_id, status, error_message, sent_at)
+               VALUES ($1, $2, $3, 'failed', $4, NOW())`,
+              [jobId, session.id, String(target), err.message]
+            );
+            logger.warn(
+              `Single-user mass DM: session ${session.id} → ${target} failed: ${err.message}`,
+              { jobId }
+            );
+          }
+
+          results.push(result);
+          sendsDone++;
+
+          await pool.query(
+            `UPDATE messaging_jobs
+                SET sent_count = $1, failed_count = $2, skipped_count = $3
+              WHERE id = $4`,
+            [sentCount.value, failedCount.value, skippedCount.value, jobId]
+          );
+
+          await this._notifyProgress(jobId, {
+            job_id: jobId,
+            status: 'running',
+            total: totalSends,
+            sent: sentCount.value,
+            failed: failedCount.value,
+            skipped: skippedCount.value,
+            session_id: session.id,
+            target: String(target),
+          });
+
+          // Pause between consecutive sends. Skip the sleep after
+          // the very last send — nothing else is going to fire.
+          if (sendsDone < totalSends && delaySeconds > 0) {
+            await sleep(delaySeconds * 1000);
+          }
+        }
+      }
+
+      await this._finalizeJob(
+        jobId, 'completed',
+        sentCount.value, failedCount.value, skippedCount.value, results
+      );
+
+      logger.info(
+        `Single-user mass DM job ${jobId} completed: ${sentCount.value} sent, ${failedCount.value} failed`,
+        { jobId }
+      );
+    } catch (outerErr) {
+      logger.error(`Single-user mass DM job ${jobId} failed: ${outerErr.message}`);
+      await this._finalizeJob(
+        jobId, 'failed',
+        sentCount.value, failedCount.value, skippedCount.value, results
+      );
     }
   }
 

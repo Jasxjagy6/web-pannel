@@ -43,6 +43,17 @@ router.post('/bulk-groups', messageController.sendBulkToGroups);
 // POST /api/messages/bulk-users - Send to multiple users with rate limiting
 router.post('/bulk-users', messageController.sendBulkToUsers);
 
+// POST /api/messages/single-user-mass-dm
+//   Single-User Mass DM: 1..3 target users, every selected session
+//   DMs each target with a per-send delay (in seconds). Validated by
+//   the `singleUserMassDm` Joi schema.
+router.post(
+  '/single-user-mass-dm',
+  messageLimiter,
+  validate(schemas.singleUserMassDm),
+  messageController.sendSingleUserMassDm
+);
+
 // ---------------------------------------------------------------------
 // Recurring group-message schedules (Messaging > Schedule tab).
 // IMPORTANT: must be declared BEFORE the catch-all `/:id` routes

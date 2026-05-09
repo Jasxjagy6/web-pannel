@@ -20,6 +20,8 @@ import { Modal } from '../components/common/Modal';
 import StatusBadge from '../components/common/StatusBadge';
 import MessageGroupsTab from './MessageGroupsTab';
 import MessageSchedulesTab from './MessageSchedulesTab';
+import MessageSingleUserTab from './MessageSingleUserTab';
+import MessageSingleUserHistoryTab from './MessageSingleUserHistoryTab';
 import {
   Send,
   Loader2,
@@ -46,6 +48,8 @@ import {
   BarChart3,
   Search,
   Group,
+  AtSign,
+  History as HistoryIcon,
 } from 'lucide-react';
 import {
   PaperClipIcon,
@@ -812,7 +816,13 @@ export default function Messaging() {
   // 'users' → one-shot DM bulk send
   // 'groups' → one-shot bulk-groups send
   // 'schedule' → recurring bulk-groups schedule
+  // 'single-user' → single-user mass DM (1..3 targets, all sessions)
+  // 'history' → history of single-user mass DM jobs
   const [activeTab, setActiveTab] = useState('users');
+
+  // Bumped whenever a Single-User Mass DM job is queued so the
+  // History tab below can refresh without polling on its own.
+  const [singleUserHistoryRefresh, setSingleUserHistoryRefresh] = useState(0);
 
   // Composer state
   const [message, setMessage] = useState('');
@@ -1299,7 +1309,11 @@ export default function Messaging() {
               ? 'Compose and send messages to target users across multiple sessions'
               : activeTab === 'groups'
               ? 'Send messages to multiple groups/channels with rate limiting'
-              : 'Schedule a recurring send: same message + groups + sessions, re-runs after each completion until cancelled'}
+              : activeTab === 'schedule'
+              ? 'Schedule a recurring send: same message + groups + sessions, re-runs after each completion until cancelled'
+              : activeTab === 'single-user'
+              ? 'Send the same message to up to 3 users from every selected session, with a delay between each send'
+              : 'History of Single-User Mass DM jobs (status, sends, targets, sessions, delay)'}
           </p>
         </div>
         {connected && (
@@ -1345,6 +1359,28 @@ export default function Messaging() {
           >
             <Clock className="w-4 h-4" />
             Schedule
+          </button>
+          <button
+            onClick={() => setActiveTab('single-user')}
+            className={`flex-1 px-5 py-3 text-sm font-medium transition flex items-center justify-center gap-2 ${
+              activeTab === 'single-user'
+                ? 'border-b-2 border-primary-500 text-primary-400 bg-primary-500/5'
+                : 'text-gray-400 hover:text-white hover:bg-white/5'
+            }`}
+          >
+            <AtSign className="w-4 h-4" />
+            Single User
+          </button>
+          <button
+            onClick={() => setActiveTab('history')}
+            className={`flex-1 px-5 py-3 text-sm font-medium transition flex items-center justify-center gap-2 ${
+              activeTab === 'history'
+                ? 'border-b-2 border-primary-500 text-primary-400 bg-primary-500/5'
+                : 'text-gray-400 hover:text-white hover:bg-white/5'
+            }`}
+          >
+            <HistoryIcon className="w-4 h-4" />
+            History
           </button>
         </div>
       </div>
@@ -1737,8 +1773,17 @@ export default function Messaging() {
         </>
       ) : activeTab === 'groups' ? (
         <MessageGroupsTab />
-      ) : (
+      ) : activeTab === 'schedule' ? (
         <MessageSchedulesTab />
+      ) : activeTab === 'single-user' ? (
+        <MessageSingleUserTab
+          onJobQueued={() => {
+            setSingleUserHistoryRefresh((n) => n + 1);
+            setActiveTab('history');
+          }}
+        />
+      ) : (
+        <MessageSingleUserHistoryTab refreshKey={singleUserHistoryRefresh} />
       )}
     </div>
   );

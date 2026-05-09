@@ -385,6 +385,13 @@ const messageController = {
     const sort = req.query.sort || 'created_at';
     const order = req.query.order || 'DESC';
     const status = req.query.status || undefined;
+    // Optional job-type filter. Accepts either a comma-separated
+    // string (`?jobType=single_user_mass_dm`) or repeat-style arrays
+    // (`?jobType=a&jobType=b`). The service normalises both shapes.
+    let jobType = req.query.jobType;
+    if (typeof jobType === 'string' && jobType.includes(',')) {
+      jobType = jobType.split(',').map((s) => s.trim()).filter(Boolean);
+    }
 
     const { jobs, pagination } = await messageService.listJobs(userId, {
       page,
@@ -392,6 +399,7 @@ const messageController = {
       sort,
       order,
       status,
+      jobType,
     });
 
     return res.status(200).json({
@@ -681,6 +689,130 @@ const messageController = {
       jobId: result.jobId,
       sessionCount: sessionIds.length,
       userCount: users.length,
+    });
+
+    return res.status(202).json({
+      success: true,
+      data: result,
+    });
+  }),
+
+  /**
+   * Send a single message to 1..3 target users from many sessions
+   * sequentially (Single-User Mass DM).
+   *
+   * Body: {
+   *   sessionIds?:    number[]        (or `sessionListId`),
+   *   sessionListId?: number|string,
+   *   targets:        string[]        (1..3 entries),
+   *   message:        string          (<=4096),
+   *   messageType?:   'text'|'html'|'markdown',
+   *   delaySeconds?:  number          (1..120, default 3),
+   *   async?:         boolean         (queue via BullMQ when true),
+   * }
+   */
+  sendSingleUserMassDm: asyncHandler(async (req, res) => {
+    const userId = req.user.id;
+    const {
+      sessionIds: rawSessionIds,
+      targets,
+      message,
+      messageType = 'text',
+      delaySeconds = 3,
+      async: asyncFlag,
+    } = req.body || {};
+
+    if (!Array.isArray(targets) || targets.length === 0) {
+      throw new AppError('targets array is required', 400, 'NO_TARGETS');
+    }
+    if (targets.length > 3) {
+      throw new AppError(
+        'A maximum of 3 targets is allowed for single-user mass DM',
+        400,
+        'TOO_MANY_TARGETS'
+      );
+    }
+    if (!message || String(message).trim().length === 0) {
+      throw new AppError('message content is required', 400, 'EMPTY_MESSAGE');
+    }
+
+    const sessionIds = await resolveSessionIdsFromRequest(req, rawSessionIds || []);
+    if (!Array.isArray(sessionIds) || sessionIds.length === 0) {
+      throw new AppError(
+        'sessionIds array (or a non-empty sessionListId) is required',
+        400,
+        'NO_SESSIONS'
+      );
+    }
+
+    const params = {
+      sessionIds,
+      targets,
+      message: String(message).trim(),
+      messageType,
+      delaySeconds: parseInt(delaySeconds, 10) || 3,
+    };
+
+    // Async mode parks the work in BullMQ. The default path runs the
+    // service inline — the service itself fires-and-forgets the
+    // sending loop, so the HTTP response still returns immediately.
+    if (asyncFlag === true || asyncFlag === 'true') {
+      const queueJob = await messageQueue.addJob({
+        type: 'single_user_mass_dm',
+        params,
+        userId,
+      });
+
+      await reportService.logActivity(
+        userId,
+        'message_single_user_mass_dm_start',
+        'messaging_job',
+        null,
+        {
+          queueJobId: queueJob.id,
+          sessionCount: sessionIds.length,
+          targetCount: params.targets.length,
+          delaySeconds: params.delaySeconds,
+        }
+      );
+
+      logger.info(`Single-user mass DM queued by user ${userId}`, {
+        queueJobId: queueJob.id,
+        sessionCount: sessionIds.length,
+        targetCount: params.targets.length,
+      });
+
+      return res.status(202).json({
+        success: true,
+        data: {
+          queueJobId: queueJob.id,
+          status: 'queued',
+          totalTargets: params.targets.length,
+          sessionCount: sessionIds.length,
+          delaySeconds: params.delaySeconds,
+        },
+      });
+    }
+
+    const result = await messageService.sendSingleUserMassDm(params, userId);
+
+    await reportService.logActivity(
+      userId,
+      'message_single_user_mass_dm_start',
+      'messaging_job',
+      result.jobId,
+      {
+        jobId: result.jobId,
+        sessionCount: result.sessionCount,
+        targetCount: result.targetCount,
+        delaySeconds: result.delaySeconds,
+      }
+    );
+
+    logger.info(`Single-user mass DM job ${result.jobId} started by user ${userId}`, {
+      jobId: result.jobId,
+      sessionCount: result.sessionCount,
+      targetCount: result.targetCount,
     });
 
     return res.status(202).json({

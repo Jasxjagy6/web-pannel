@@ -46,7 +46,13 @@ class MessageQueueManager {
         // multi-session Telegram traffic; serialize it per (user, category)
         // so a second bulk job for the same user waits for the first to
         // finish (or fail) before starting.
-        const heavyCategory = type === 'bulk' ? 'message:bulk' : null;
+        // Single-User Mass DM also drives multi-session traffic but
+        // with a much smaller fan-out (≤3 targets) — give it its own
+        // serialisation lane so it doesn't queue behind a long
+        // bulk-DM job that's saturating the same user's sessions.
+        let heavyCategory = null;
+        if (type === 'bulk') heavyCategory = 'message:bulk';
+        else if (type === 'single_user_mass_dm') heavyCategory = 'message:single_user_mass_dm';
 
         const run = async () => {
           if (type === 'send') {
@@ -57,6 +63,8 @@ class MessageQueueManager {
             return await messageService.sendMessageToGroup(sessionId, groupId, message, userId);
           } else if (type === 'forward') {
             return await messageService.forwardMessage(sessionId, targetId, messageId, sourceId, userId);
+          } else if (type === 'single_user_mass_dm') {
+            return await messageService.sendSingleUserMassDm(params, userId);
           }
         };
 

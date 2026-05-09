@@ -99,6 +99,28 @@ const schemas = {
     itemDelayMsMax: Joi.number().integer().min(0).max(600000).optional(),
   }).or('sessionIds', 'sessionListId'),
 
+  // Single-User Mass DM
+  // ---------------------------------------------------------------
+  // Operator picks 1..3 target users (username / @username / numeric
+  // Telegram id), a message, a per-send delay, and one or more
+  // sessions. Every selected session DMs every target, with the
+  // delay (in seconds) inserted BETWEEN consecutive sends. The
+  // 3-target hard cap is intentional: pushing the same DM to many
+  // strangers from one session is the fastest way to trigger
+  // PEER_FLOOD / SPAM_BLOCK on the account.
+  singleUserMassDm: Joi.object({
+    sessionIds: Joi.array().items(Joi.number().integer().positive()).min(1).optional(),
+    sessionListId: Joi.alternatives().try(Joi.number().integer().positive(), Joi.string()).optional(),
+    // Targets: 1..3 strings (username, @username or numeric id).
+    targets: Joi.array().items(Joi.string().trim().min(1).max(64)).min(1).max(3).required(),
+    message: Joi.string().min(1).max(4096).required(),
+    messageType: Joi.string().valid('text', 'html', 'markdown').default('text'),
+    // Per-send delay in seconds. 1..120 keeps the slowest legitimate
+    // composition usable while preventing 0-second runaway loops.
+    delaySeconds: Joi.number().integer().min(1).max(120).default(3),
+    async: Joi.alternatives().try(Joi.boolean(), Joi.string()).optional(),
+  }).or('sessionIds', 'sessionListId'),
+
   addMembersToGroup: Joi.object({
     // New multi-session mode
     sessionIds: Joi.array().items(Joi.number().integer().positive()).min(1).optional(),
