@@ -18,6 +18,19 @@ const logger = require('../utils/logger');
 const telegramConfig = require('../config/telegram');
 const { encrypt, decrypt } = require('../utils/crypto');
 const fingerprint = require('../utils/deviceFingerprint');
+const sessionLock = require('./sessionOwnershipLock');
+
+// 1000+ session scale-out: optional Redis-backed mutex over the
+// MTProto auth_key. With STRICT_SESSION_LOCK=true, two processes
+// (e.g. the API server + a sharded sessionWorker) cannot both connect
+// the same session at the same time — Telegram's spam server treats
+// duplicate auth_key connects as anomalous and frequently invalidates
+// the key out-of-band, which would mean every affected session is
+// permanently lost (StringSession can't be re-issued). Default is OFF
+// so today's single-process panel keeps behaving exactly like before.
+const STRICT_SESSION_LOCK = process.env.STRICT_SESSION_LOCK === 'true';
+const SESSION_LOCK_HOLDER_ID =
+  process.env.SESSION_LOCK_HOLDER_ID || `proc-${process.pid}`;
 
 /**
  * Maximum number of retries for flood wait errors before giving up.
@@ -323,7 +336,110 @@ class TelegramService {
      */
     this._floodWaits = new Map();
 
-    logger.info('TelegramService initialized');
+    /**
+     * Session ownership lock fencing tokens, keyed by sessionId. When
+     * STRICT_SESSION_LOCK=true the entry exists for every session this
+     * process has acquired; the drain handler uses it to release every
+     * lock cleanly on SIGTERM (so the next worker can take ownership
+     * immediately rather than waiting for the lock TTL to expire).
+     * @type {Map<string, string>}
+     */
+    this._sessionLocks = new Map();
+
+    /**
+     * Heartbeat timer handle keyed by sessionId. The heartbeat refreshes
+     * the Redis lock TTL while we still hold the MTProto connection;
+     * if the refresh ever returns "lock no longer ours" we know another
+     * worker has taken over and we MUST disconnect to avoid a duplicate
+     * auth_key connection.
+     * @type {Map<string, NodeJS.Timer>}
+     */
+    this._sessionLockHeartbeats = new Map();
+
+    logger.info(
+      `TelegramService initialized${
+        STRICT_SESSION_LOCK ? ' [STRICT_SESSION_LOCK on]' : ''
+      }`
+    );
+  }
+
+  /**
+   * Acquire the cluster-wide session ownership lock for `sessionId`.
+   * No-op unless STRICT_SESSION_LOCK is on.
+   *
+   * Fail-open: if Redis is unreachable, the lock service returns a
+   * sentinel "noop token" and we proceed as today (relying on the
+   * in-process Map for safety). This matches the policy in
+   * `utils/jobLock.js`.
+   *
+   * @returns {Promise<boolean>} false only if STRICT mode is on and
+   *          another worker definitively owns this session.
+   * @private
+   */
+  async _acquireSessionLock(sessionId) {
+    if (!STRICT_SESSION_LOCK) return true;
+    if (this._sessionLocks.has(String(sessionId))) return true; // already ours
+    const result = await sessionLock.acquire(sessionId, SESSION_LOCK_HOLDER_ID);
+    if (!result) return false; // owned by another holder
+    this._sessionLocks.set(String(sessionId), result.token);
+    // Spin up a heartbeat to keep the TTL alive while we hold the
+    // MTProto connection. setInterval is unref'd so it doesn't keep
+    // the process alive on its own.
+    const t = setInterval(async () => {
+      const tok = this._sessionLocks.get(String(sessionId));
+      if (!tok) {
+        clearInterval(t);
+        this._sessionLockHeartbeats.delete(String(sessionId));
+        return;
+      }
+      try {
+        const stillOurs = await sessionLock.refresh(sessionId, tok);
+        if (!stillOurs) {
+          logger.warn(
+            `Session ${sessionId} lock taken over by another worker — disconnecting locally`
+          );
+          // Drop our in-process state. Do NOT delete the row from DB —
+          // the session is fine, just owned by someone else now.
+          this._sessionLocks.delete(String(sessionId));
+          clearInterval(t);
+          this._sessionLockHeartbeats.delete(String(sessionId));
+          const entry = this.clients.get(String(sessionId));
+          if (entry && entry.client) {
+            try { await entry.client.disconnect(); } catch { /* ignore */ }
+          }
+          this.clients.delete(String(sessionId));
+        }
+      } catch (err) {
+        logger.warn(`Session ${sessionId} lock refresh failed: ${err.message}`);
+      }
+    }, sessionLock._internal.DEFAULT_HEARTBEAT_MS);
+    if (t.unref) t.unref();
+    this._sessionLockHeartbeats.set(String(sessionId), t);
+    return true;
+  }
+
+  /**
+   * Release the cluster-wide session ownership lock for `sessionId`,
+   * if held. Called whenever we evict the in-process client (disconnect,
+   * graceful drain, lock-stolen-by-other-worker).
+   *
+   * @private
+   */
+  async _releaseSessionLock(sessionId) {
+    const sid = String(sessionId);
+    const t = this._sessionLockHeartbeats.get(sid);
+    if (t) {
+      clearInterval(t);
+      this._sessionLockHeartbeats.delete(sid);
+    }
+    const tok = this._sessionLocks.get(sid);
+    if (!tok) return;
+    this._sessionLocks.delete(sid);
+    try {
+      await sessionLock.release(sessionId, tok);
+    } catch (err) {
+      logger.warn(`Session ${sessionId} lock release failed: ${err.message}`);
+    }
   }
 
   // =========================================================================
@@ -626,6 +742,10 @@ class TelegramService {
       this.clients.delete(sessionId);
       this.sessionStore.delete(sessionId);
       this._floodWaits.delete(sessionId);
+      // Release the cluster-wide ownership lock so the next worker
+      // (or a worker on a fresh deploy) can take this session over
+      // immediately. Safe no-op when STRICT_SESSION_LOCK is off.
+      try { await this._releaseSessionLock(sessionId); } catch (_) { /* ignore */ }
 
       logger.info(`Session disconnected: ${sessionId}`);
 
@@ -2192,6 +2312,23 @@ class TelegramService {
    */
   async _ensureConnected(sessionId, opts = {}) {
     const sessionIdStr = String(sessionId);
+
+    // 1000+ session scale-out hook: before we open or reuse an MTProto
+    // connection, take the cluster-wide ownership lock for this
+    // session. This prevents two processes from connecting the same
+    // auth_key simultaneously (the #1 cause of accidental session
+    // invalidation). When STRICT_SESSION_LOCK is off (default) this
+    // is a no-op and behaviour matches today's single-process panel.
+    const ownsLock = await this._acquireSessionLock(sessionId);
+    if (!ownsLock) {
+      const err = new Error(
+        `Session ${sessionId} is currently owned by another worker. Refusing to open a second MTProto connection on the same auth_key.`
+      );
+      err.code = 'SESSION_LOCKED_BY_OTHER_WORKER';
+      err.statusCode = 409;
+      throw err;
+    }
+
     let entry = this.clients.get(sessionIdStr);
 
     logger.debug(`_ensureConnected called for sessionId: "${sessionIdStr}", found: ${!!entry}`);

@@ -321,6 +321,37 @@ async function cmdDeploy(args) {
     // 2. build / pull image
     imageTag = await deploy.buildOrPullImage({ buildMode, registry, sha: targetSha, log });
 
+    // 2b. (optional) Session safety preflight — for the 1000+ session
+    //     scale-out, snapshot every active session's encrypted bytes
+    //     so we can confirm post-deploy that no session was lost.
+    //     The user's hard rule is "if I lost them from pannel I will
+    //     completely lost them" — so any regression detected post-
+    //     deploy aborts with exit 2.
+    //
+    //     Off by default (operators have to opt in via
+    //     SESSION_SAFETY_VERIFY=true) until the script has been run
+    //     in dry-run mode at least once on the target environment.
+    //     Set SESSION_SAFETY_BASELINE_DIR to control where the
+    //     baseline JSON is written (default: /var/lib/web-pannel).
+    let sessionBaselinePath = null;
+    if (process.env.SESSION_SAFETY_VERIFY === 'true') {
+      const baselineDir = process.env.SESSION_SAFETY_BASELINE_DIR || '/var/lib/web-pannel';
+      sessionBaselinePath = path.join(baselineDir, `session-baseline-${targetSha}.json`);
+      log(colorize(`session-safety: capturing baseline → ${sessionBaselinePath}`, 'info'));
+      try {
+        await run('node', [
+          path.join(REPO_ROOT, 'backend', 'scripts', 'verify-sessions.js'),
+          '--json',
+          '--save', sessionBaselinePath,
+        ], { cwd: REPO_ROOT });
+      } catch (err) {
+        // Baseline failure shouldn't block the deploy — but it
+        // means we can't run the post-check, so demote to warning.
+        log(colorize(`session-safety: baseline capture failed (${err.message}); skipping post-check`, 'warn'));
+        sessionBaselinePath = null;
+      }
+    }
+
     // 3. migrations — pre-flight check first
     if (!args['skip-migrate']) {
       await deploy.runMigrations({ imageTag, sha: targetSha, dbEnv: dbEnv(), log, mode: 'apply' });
@@ -390,6 +421,37 @@ async function cmdDeploy(args) {
       oldFrontendColor !== newFrontendColor
     ) {
       await deploy.stopFrontendColor({ color: oldFrontendColor, log });
+    }
+
+    // 9b. (optional) Session safety post-check — confirm every
+    //     session that was readable in the pre-deploy baseline is
+    //     still readable now. Any regression here means a migration
+    //     or code change touched session bytes; we exit with a
+    //     non-zero status so the operator can roll back via
+    //     `bin/upgrade rollback`.
+    if (sessionBaselinePath) {
+      log(colorize('session-safety: verifying no sessions regressed since baseline', 'info'));
+      try {
+        await run('node', [
+          path.join(REPO_ROOT, 'backend', 'scripts', 'verify-sessions.js'),
+          '--json',
+          '--baseline', sessionBaselinePath,
+        ], { cwd: REPO_ROOT });
+        log(colorize('session-safety: post-check OK', 'info'));
+      } catch (err) {
+        // verify-sessions exits 2 on regression. We exit non-zero
+        // ourselves so the operator's deploy script / runbook
+        // notices and triggers a rollback.
+        log(colorize(`session-safety: REGRESSION detected post-deploy: ${err.message}`, 'error'));
+        log(colorize('Run `bin/upgrade rollback` to restore the previous color.', 'error'));
+        audit.appendFileLine({
+          event: 'deploy.session_regression',
+          sha: targetSha,
+          ref,
+          baseline: sessionBaselinePath,
+        });
+        process.exit(2);
+      }
     }
 
     // 10. persist state
