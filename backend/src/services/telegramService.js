@@ -1310,6 +1310,52 @@ class TelegramService {
       };
     } catch (error) {
       logger.error(`Failed to add user ${userId} to group ${groupId}`, { error: error.message });
+      // Translate a few message-context Telegram errors into language
+      // that's accurate for the *add-members* flow. Operators were
+      // confused by literal mappings like "You cannot send messages
+      // in this chat." for CHAT_WRITE_FORBIDDEN — the panel never
+      // tried to send a message; what actually happened is the
+      // inviting session lost permission to operate against the
+      // group (kicked, banned, restricted, channel set to admin-
+      // only invites, etc.). Mapping to a clearer message lets them
+      // diagnose without grepping the GramJS source.
+      //
+      // We rethrow as an Error (not via _handleTelegramError) so the
+      // generic mapper doesn't overwrite the contextual message.
+      // Downstream classifiers in groupService still match on the
+      // raw Telegram code thanks to the `[CODE]` prefix we keep.
+      const raw = error && error.message ? String(error.message) : '';
+      const wrap = (telegramCode, friendly) => {
+        const e = new Error(`[${telegramCode}] ${friendly}`);
+        e.code = telegramCode;
+        e.statusCode = 403;
+        e.cause = error;
+        return e;
+      };
+      if (/CHAT_WRITE_FORBIDDEN/i.test(raw)) {
+        throw wrap(
+          'CHAT_WRITE_FORBIDDEN',
+          `Session cannot add members to this group — the inviting account has been kicked, banned, or restricted in ${groupId}. Try a different session, or have the account rejoin the group manually.`
+        );
+      }
+      if (/CHAT_ADMIN_REQUIRED/i.test(raw)) {
+        throw wrap(
+          'CHAT_ADMIN_REQUIRED',
+          `Session must be an admin of ${groupId} to add members. Either grant admin to the inviting account, or pick a session that is already an admin.`
+        );
+      }
+      if (/USER_NOT_PARTICIPANT/i.test(raw)) {
+        throw wrap(
+          'USER_NOT_PARTICIPANT',
+          `Inviting session is not a participant of ${groupId}. The session must be a member of the group before it can add other users.`
+        );
+      }
+      if (/CHAT_FORBIDDEN|CHANNEL_PRIVATE/i.test(raw)) {
+        throw wrap(
+          /CHANNEL_PRIVATE/i.test(raw) ? 'CHANNEL_PRIVATE' : 'CHAT_FORBIDDEN',
+          `Inviting session has lost access to ${groupId} (private/forbidden). Re-join from this account or use a session that still has access.`
+        );
+      }
       throw this._handleTelegramError(error);
     }
   }

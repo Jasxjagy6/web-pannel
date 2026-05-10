@@ -143,4 +143,68 @@ assert.strictEqual(
   'normalize should return the highest-priority candidate (id first)'
 );
 
+// --- addMemberToGroup: contextual error translation ---
+//
+// When `messages.AddChatUser` / `channels.InviteToChannel` fail with
+// CHAT_WRITE_FORBIDDEN, the panel must NOT surface "You cannot send
+// messages in this chat" — operators reading that message reasonably
+// thought the panel was using the wrong RPC. The catch block in
+// `addMemberToGroup` translates the literal Telegram code into a
+// message that reflects what actually happened in an add-members
+// context (kicked / banned / restricted) while keeping `[CODE]`
+// prefixed so downstream classifiers in `groupService` still match.
+(async () => {
+  const tg = require('../../src/services/telegramService');
+  const sid = '__ctx_test__';
+
+  const cases = [
+    {
+      label: 'CHAT_WRITE_FORBIDDEN',
+      raw: 'CHAT_WRITE_FORBIDDEN',
+      code: 'CHAT_WRITE_FORBIDDEN',
+      needle: /kicked, banned, or restricted/,
+    },
+    {
+      label: 'CHAT_ADMIN_REQUIRED',
+      raw: 'CHAT_ADMIN_REQUIRED',
+      code: 'CHAT_ADMIN_REQUIRED',
+      needle: /must be an admin/,
+    },
+    {
+      label: 'USER_NOT_PARTICIPANT',
+      raw: 'USER_NOT_PARTICIPANT (caused by channels.InviteToChannel)',
+      code: 'USER_NOT_PARTICIPANT',
+      needle: /not a participant/,
+    },
+    {
+      label: 'CHANNEL_PRIVATE',
+      raw: 'CHANNEL_PRIVATE',
+      code: 'CHANNEL_PRIVATE',
+      needle: /lost access/,
+    },
+  ];
+
+  for (const c of cases) {
+    tg._ensureConnected = async () => {};
+    tg.clients = new Map([[sid, {
+      client: { invoke: async () => { throw new Error(c.raw); } },
+    }]]);
+    tg._resolveEntity = async (_s, target) => (target === '@buyersgc'
+      ? { className: 'Channel', id: 1, accessHash: 1 }
+      : { id: 2, accessHash: 2 });
+    tg._withFloodRetry = async (_s, fn) => fn();
+
+    let err;
+    try {
+      await tg.addMemberToGroup(sid, '@buyersgc', '12345');
+    } catch (e) { err = e; }
+    if (!err) throw new Error(`[${c.label}] expected throw`);
+    if (err.code !== c.code) throw new Error(`[${c.label}] expected code ${c.code}, got ${err.code}`);
+    if (!err.message.startsWith(`[${c.code}]`)) throw new Error(`[${c.label}] expected [${c.code}] prefix, got ${err.message}`);
+    if (!c.needle.test(err.message)) throw new Error(`[${c.label}] expected ${c.needle}, got ${err.message}`);
+    if (!err.message.includes('@buyersgc')) throw new Error(`[${c.label}] expected target name in message`);
+  }
+  console.log('addMemberToGroup.contextualErrors: OK');
+})().catch((e) => { console.error(e); process.exit(1); });
+
 console.log('groupAddMembers.smoke.test: OK');

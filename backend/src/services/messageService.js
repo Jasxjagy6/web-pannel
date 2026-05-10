@@ -1582,12 +1582,20 @@ class MessageService {
     );
     const total = parseInt(countResult.rows[0].total, 10);
 
-    // Get paginated results
+    // Get paginated results.
+    //
+    // We include `target_list` here (operators wanted to see *which*
+    // usernames/IDs a single-user mass DM job ran against, straight
+    // from the History tab — without having to open the per-job
+    // detail view). For very large bulk jobs the column can be huge,
+    // so the row mapper below truncates the parsed array to a small
+    // preview and exposes a separate `targetCount` count, keeping
+    // wire-size predictable.
     const jobsResult = await pool.query(
       `SELECT mj.id, mj.session_id, mj.job_type, mj.message_type,
               mj.message_content, mj.media_path, mj.status,
               mj.total_count, mj.sent_count, mj.failed_count, mj.skipped_count,
-              mj.options, mj.created_at, mj.completed_at,
+              mj.target_list, mj.options, mj.created_at, mj.completed_at,
               s.phone as session_phone
        FROM messaging_jobs mj
        JOIN sessions s ON mj.session_id = s.id
@@ -1597,27 +1605,51 @@ class MessageService {
       [...queryParams, pageSize, offset]
     );
 
-    const jobs = jobsResult.rows.map((row) => ({
-      id: row.id,
-      sessionId: row.session_id,
-      sessionPhone: row.session_phone,
-      jobType: row.job_type,
-      messageType: row.message_type,
-      messageContent: row.message_content
-        ? (row.message_content.length > 100
-            ? row.message_content.substring(0, 100) + '...'
-            : row.message_content)
-        : null,
-      mediaPath: row.media_path,
-      status: row.status,
-      totalCount: row.total_count,
-      sentCount: row.sent_count,
-      failedCount: row.failed_count,
-      skippedCount: row.skipped_count,
-      options: parseJson(row.options),
-      createdAt: row.created_at,
-      completedAt: row.completed_at,
-    }));
+    // Truncate each job's target_list to a small preview so the
+    // payload stays bounded for big bulk jobs while single-user
+    // mass DM jobs (typically 1..3 targets) still render in full.
+    const TARGETS_PREVIEW_LIMIT = 25;
+    const jobs = jobsResult.rows.map((row) => {
+      const parsedTargets = parseJson(row.target_list);
+      let targetsPreview = null;
+      let targetCount = null;
+      if (Array.isArray(parsedTargets)) {
+        targetCount = parsedTargets.length;
+        targetsPreview =
+          parsedTargets.length > TARGETS_PREVIEW_LIMIT
+            ? parsedTargets.slice(0, TARGETS_PREVIEW_LIMIT)
+            : parsedTargets;
+      } else if (parsedTargets && typeof parsedTargets === 'object') {
+        // Some legacy jobs store target_list as a wrapper object —
+        // pass it through verbatim and let the UI decide.
+        targetsPreview = parsedTargets;
+      }
+      return {
+        id: row.id,
+        sessionId: row.session_id,
+        sessionPhone: row.session_phone,
+        jobType: row.job_type,
+        messageType: row.message_type,
+        messageContent: row.message_content
+          ? (row.message_content.length > 100
+              ? row.message_content.substring(0, 100) + '...'
+              : row.message_content)
+          : null,
+        mediaPath: row.media_path,
+        status: row.status,
+        totalCount: row.total_count,
+        sentCount: row.sent_count,
+        failedCount: row.failed_count,
+        skippedCount: row.skipped_count,
+        targets: targetsPreview,
+        targetCount,
+        targetsTruncated:
+          Array.isArray(parsedTargets) && parsedTargets.length > TARGETS_PREVIEW_LIMIT,
+        options: parseJson(row.options),
+        createdAt: row.created_at,
+        completedAt: row.completed_at,
+      };
+    });
 
     const pagination = buildPagination(page, limit, total);
 

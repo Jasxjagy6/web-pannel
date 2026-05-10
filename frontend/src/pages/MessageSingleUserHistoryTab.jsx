@@ -187,10 +187,11 @@ export default function MessageSingleUserHistoryTab({ refreshKey }) {
 }
 
 function JobRow({ job, onCancel }) {
-  // The list endpoint truncates target_list out of the row payload —
-  // we still render whatever is available from `options.targetCount`
-  // and `options.sessionIds` so the operator can see the shape of the
-  // job at a glance.
+  // The list endpoint now returns a preview of the job's target_list
+  // (the actual usernames/IDs the job ran against). For single-user
+  // mass DM jobs the list is small (1..3) so we render it inline; for
+  // bulk jobs the backend caps the preview at 25 entries and exposes
+  // `targetsTruncated` so we know to show a "+N more" pill.
   const opts = job.options || {};
   const total = job.totalCount ?? 0;
   const sent = job.sentCount ?? 0;
@@ -198,6 +199,16 @@ function JobRow({ job, onCancel }) {
   const skipped = job.skippedCount ?? 0;
   const progress = total > 0 ? ((sent + failed + skipped) / total) * 100 : 0;
   const cancellable = job.status === 'pending' || job.status === 'running';
+
+  // Single-user mass DM persists `target_list` as a JSON array of
+  // strings; surface them so the operator can see exactly *who* the
+  // job DM'd straight from the History row.
+  const targets = Array.isArray(job.targets) ? job.targets : [];
+  const targetCount = job.targetCount ?? opts.targetCount ?? targets.length;
+  const truncatedRemainder =
+    job.targetsTruncated && targetCount > targets.length
+      ? targetCount - targets.length
+      : 0;
 
   return (
     <div className="space-y-2 p-4 hover:bg-white/[0.02]">
@@ -218,6 +229,29 @@ function JobRow({ job, onCancel }) {
         )}
       </div>
 
+      {targets.length > 0 && (
+        <div className="flex flex-wrap items-center gap-1.5">
+          <span className="text-[11px] uppercase tracking-wide text-gray-500">
+            Targets:
+          </span>
+          {targets.map((t, idx) => (
+            <span
+              key={`${job.id}-target-${idx}-${String(t)}`}
+              className="inline-flex items-center gap-1 rounded-md border border-white/10 bg-dark-900 px-2 py-0.5 font-mono text-xs text-primary-300"
+              title={String(t)}
+            >
+              <AtSign className="h-3 w-3 opacity-60" />
+              {String(t)}
+            </span>
+          ))}
+          {truncatedRemainder > 0 && (
+            <span className="rounded-md border border-white/10 bg-dark-900 px-2 py-0.5 text-xs text-gray-400">
+              +{truncatedRemainder} more
+            </span>
+          )}
+        </div>
+      )}
+
       <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-gray-400">
         <span className="inline-flex items-center gap-1">
           <Send className="h-3 w-3" />
@@ -237,7 +271,7 @@ function JobRow({ job, onCancel }) {
         )}
         <span className="inline-flex items-center gap-1">
           <AtSign className="h-3 w-3" />
-          {opts.targetCount ?? '?'} target(s)
+          {targetCount ?? '?'} target(s)
         </span>
         <span className="inline-flex items-center gap-1">
           <Users className="h-3 w-3" />
