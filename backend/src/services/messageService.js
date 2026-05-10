@@ -14,7 +14,6 @@ const { AppError } = require('../utils/errorHandler');
 const { buildPagination, applyPagination, applySorting } = require('../utils/pagination');
 const { redisClient } = require('../config/redis');
 const distributionPlanner = require('./distributionPlanner');
-const audienceFilter = require('./audienceFilterService');
 
 // =========================================================================
 // Constants
@@ -203,54 +202,6 @@ function isFatalSessionError(errorMessage) {
     'AUTH_KEY_UNREGISTERED',
   ];
   return fatalPatterns.some((p) => errorMessage.includes(p));
-}
-
-/**
- * Heuristic match for "this list source is an uploaded list", mirroring
- * `groupService.isUploadedListSource`. Anything starting with `job_` or
- * `scrape_*` is treated as scraped; everything else is treated as
- * uploaded so the audience filter runs.
- *
- * NULL / unknown sources fall through to "uploaded" — the historical
- * default before the panel started tagging scrape jobs explicitly.
- */
-function isUploadedListSourceString(source) {
-  if (!source) return true;
-  const s = String(source).toLowerCase();
-  if (s.startsWith('job_')) return false;
-  if (s.startsWith('scrape_')) return false;
-  if (s.startsWith('scraped_')) return false;
-  return true;
-}
-
-/**
- * Resolve `lists.source` for a given (listId, userId) pair and decide
- * whether the audience filter should run against it. Returns `false`
- * when the list is missing, owned by another user, or scraped by the
- * panel. Best-effort: any DB error logs and returns `false` (skip
- * filter, just run the job — operator's "just start the job" rule).
- *
- * @param {number|string} listId
- * @param {number|string} userId
- * @returns {Promise<boolean>}
- */
-async function _isUploadedListById(listId, userId) {
-  if (listId == null) return false;
-  try {
-    const result = await pool.query(
-      'SELECT source FROM lists WHERE id = $1 AND user_id = $2 LIMIT 1',
-      [listId, userId]
-    );
-    if (result.rows.length === 0) return false;
-    const source = result.rows[0].source;
-    return isUploadedListSourceString(source);
-  } catch (err) {
-    logger.warn(
-      `_isUploadedListById: lists.source lookup failed for list ${listId}; treating as non-uploaded (skip filter): ${err.message}`,
-      { userId }
-    );
-    return false;
-  }
 }
 
 // =========================================================================
@@ -566,50 +517,6 @@ class DistributionEngine {
           // skip it). Other retries can still pick a different one.
           if (lastError.includes('PEER_FLOOD')) {
             deadSessions.add(usedSessionId);
-          }
-
-          // Cache observed target outcomes so the next job's pre-job
-          // filter doesn't waste a probe / quota on this row. Done
-          // best-effort and never blocks the send loop.
-          if (
-            lastError.includes('USER_PRIVACY_RESTRICT') ||
-            lastError.includes('PRIVACY_RESTRICTED')
-          ) {
-            audienceFilter
-              .recordObservedFromEntry(
-                { telegram_id: String(targetId), username: String(targetId) },
-                'privacy_restricted',
-                lastError,
-                'observed-dm'
-              )
-              .catch((rErr) =>
-                logger.warn(`audienceFilter.recordObserved (dm-privacy) failed: ${rErr.message}`)
-              );
-          } else if (
-            lastError.includes('USER_DEACTIVATED') ||
-            lastError.includes('INPUT_USER_DEACTIVATED') ||
-            lastError.includes('USER_NOT_FOUND') ||
-            lastError.includes('USERNAME_NOT_OCCUPIED') ||
-            lastError.includes('USER_ID_INVALID') ||
-            lastError.includes('PEER_ID_INVALID') ||
-            // Existing-but-non-user handles (channels / groups / bots)
-            // and outright invalid usernames also belong in the
-            // `not_found` bucket — they're never going to succeed for
-            // a DM, regardless of which session attempts them.
-            lastError.includes('USERNAME_INVALID') ||
-            lastError.includes('Could not resolve user') ||
-            /No user has\s+"/i.test(lastError)
-          ) {
-            audienceFilter
-              .recordObservedFromEntry(
-                { telegram_id: String(targetId), username: String(targetId) },
-                'not_found',
-                lastError,
-                'observed-dm'
-              )
-              .catch((rErr) =>
-                logger.warn(`audienceFilter.recordObserved (dm-not_found) failed: ${rErr.message}`)
-              );
           }
 
           if (!isRetryableError(lastError)) {
@@ -1019,71 +926,13 @@ class MessageService {
       throw new AppError('Message content is required', 400, 'EMPTY_MESSAGE');
     }
 
-    // ─── Pre-job audience filter ─────────────────────────────────
-    // For list-sourced jobs we run the dedupe + classify + cache
-    // pipeline so we don't burn session quota on already-known
-    // not_found / privacy_restricted users. DM jobs keep
-    // privacy-restricted entries (`includePrivacyRestricted: true`)
-    // — the user explicitly said dm_only entries should still
-    // receive DMs. Fail open: if the filter throws we fall back to
-    // the raw target list.
-    let audienceStats = null;
-    let audienceDmOnly = 0;
-    let audienceDropped = 0;
-    if (sourceType === 'list' && Array.isArray(targetList) && targetList.length > 0) {
-      // Run the audience filter ONLY when the source is a manually
-      // uploaded list (`lists.source` is `import_*` / `manual_*` /
-      // `merge_*` / NULL). Panel-scraped lists (`source = 'job_*'`)
-      // and manual direct entry skip the filter — operators want
-      // those to start the job directly without pre-filtering.
-      const filterEligible = sourceId != null
-        ? await _isUploadedListById(sourceId, userId)
-        : false;
-      if (filterEligible) {
-        try {
-          const audienceResult = await audienceFilter.filterUserList({
-            userList: targetList,
-            listId: sourceId || null,
-            userId,
-            context: 'send-bulk',
-            options: {
-              includePrivacyRestricted: true,
-              purgeNotFound: true,
-            },
-          });
-          audienceStats = audienceResult.stats;
-          audienceDmOnly = (audienceResult.dmOnly || []).length;
-          audienceDropped = (audienceResult.dropped || []).length;
-          if (Array.isArray(audienceResult.eligible) && audienceResult.eligible.length > 0) {
-            // `audienceResult.eligible` is already projected into the
-            // worker-friendly shape (`{ ...raw, _filter_kind, _filter_status }`).
-            // Mapping `.raw` here would replace every entry with
-            // `undefined` and downstream normalizeTargetId would reject
-            // them all.
-            targetList = audienceResult.eligible;
-            params.targetList = targetList;
-          }
-          logger.info('sendBulkMessage: audience filter applied (uploaded list)', {
-            userId,
-            sourceId,
-            stats: audienceStats,
-            dmOnly: audienceDmOnly,
-            dropped: audienceDropped,
-          });
-        } catch (filterErr) {
-          logger.warn('sendBulkMessage: audience filter failed; using raw list', {
-            error: filterErr.message,
-            userId,
-            sourceId,
-          });
-        }
-      } else {
-        logger.info(
-          'sendBulkMessage: skipping audience filter (manual entry or scraped list)',
-          { userId, sourceId, sourceType }
-        );
-      }
-    }
+    // No pre-job audience filtering: every target the operator
+    // supplied is attempted directly. Per the operator's "the
+    // pannel should try to send messages, add members or whatever
+    // task is given without skipping or filtering anything" rule,
+    // the panel never drops rows up-front for "looks dead /
+    // privacy-restricted" reasons. Real Telegram errors during
+    // send still surface per-target as failures.
 
     // Verify all sessions belong to the user
     const verifiedSessions = await this._verifyMultipleSessionsOwnership(sessionIds, userId);
@@ -2505,60 +2354,15 @@ class MessageService {
       throw new AppError('Message is required', 400, 'EMPTY_MESSAGE');
     }
 
-    // ─── Pre-job audience filter (uploaded lists only) ──────────
-    // Run the audience filter ONLY when the source is a manually
-    // uploaded list. Skip for manual direct entry and for
-    // panel-scraped lists — those start the job directly.
-    const filterEligible =
-      sourceType === 'list' && listId != null
-        ? await _isUploadedListById(listId, userId)
-        : false;
-    if (filterEligible) {
-      // Bulk-DM keeps privacy-restricted users (they can still receive
-      // DMs); we only drop NOT_FOUND / deactivated rows.
-      try {
-        const audienceResult = await audienceFilter.filterUserList({
-          userList: users,
-          listId,
-          userId,
-          context: 'send-bulk-users',
-          options: {
-            includePrivacyRestricted: true,
-            purgeNotFound: true,
-          },
-        });
-        if (Array.isArray(audienceResult.eligible) && audienceResult.eligible.length > 0) {
-          // `audienceResult.eligible` is already projected into the
-          // worker-friendly shape; mapping `.raw` would yield undefined
-          // entries.
-          users = audienceResult.eligible;
-          params.users = users;
-        }
-        logger.info('sendBulkToUsers: audience filter applied (uploaded list)', {
-          userId,
-          listId,
-          sourceType,
-          stats: audienceResult.stats,
-          dmOnly: (audienceResult.dmOnly || []).length,
-          dropped: (audienceResult.dropped || []).length,
-        });
-      } catch (filterErr) {
-        logger.warn('sendBulkToUsers: audience filter failed; using raw list', {
-          error: filterErr.message,
-          userId,
-          listId,
-        });
-      }
-    } else {
-      logger.info(
-        'sendBulkToUsers: skipping audience filter (manual entry or scraped list)',
-        { userId, listId, sourceType }
-      );
-    }
+    // No pre-job audience filtering: every user the operator
+    // supplied is attempted directly. Per the operator's "remove
+    // the filtering users system completly" rule, the panel never
+    // drops rows up-front. Real Telegram errors during send still
+    // surface per-target as failures.
 
     if (!users || users.length === 0) {
       throw new AppError(
-        'All audience entries were filtered out (not_found).',
+        'No users to process: the input list is empty.',
         400,
         'NO_ELIGIBLE_USERS'
       );
@@ -3385,6 +3189,4 @@ module.exports = new MessageService();
 module.exports.__internal = {
   normalizeTargetId,
   isRetryableError,
-  isUploadedListSourceString,
-  _isUploadedListById,
 };

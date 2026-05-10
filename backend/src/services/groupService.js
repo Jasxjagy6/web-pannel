@@ -10,7 +10,6 @@ const {
   getPrimaryTelegramId,
 } = require('../utils/telegramTargetNormalizer');
 const distributionPlanner = require('./distributionPlanner');
-const audienceFilter = require('./audienceFilterService');
 const sessionCooldown = require('./sessionCooldown');
 
 /**
@@ -530,20 +529,12 @@ class GroupService {
       }
     };
 
-    // ─── Pre-job audience filter ────────────────────────────────────
-    // Dedupe + classify (cache + session-less t.me probe) the input
-    // userList BEFORE we burn any session quota. We hard-drop NOT_FOUND
-    // entries (and purge them from the list_items rows when listId is
-    // given), and skip PRIVACY_RESTRICTED entries here because they
-    // can't be added to a group anyway — those rows stay in the list
-    // tagged `dm_only` for the bulk-DM path.
-    //
-    // Failing open is non-negotiable: if Redis/HTTP/DB is degraded we
-    // still want add-members to run on the unfiltered list rather than
-    // hard-failing.
-    let audienceStats = null;
-    let audienceDmOnly = [];
-    let audienceDropped = [];
+    // No pre-job audience filtering: every row in `userList` is
+    // attempted directly against Telegram. Per the operator's
+    // verbatim "remove the filtering users system completly" rule,
+    // we never drop rows for "looks dead / not_found /
+    // privacy-restricted" classifications. Real Telegram errors
+    // during the add still surface per-row in the results.
     let preparedUsers = [];
     let unaddressable = [];
     let verifiedSessions;
@@ -609,82 +600,13 @@ class GroupService {
         );
       }
 
-      // Surface the 'filtering' phase to the UI as soon as we start
-      // the audience pass.
-      await markPhase('filtering', { total: userList.length });
-
-      // Run the audience filter ONLY for manually uploaded lists.
-      // Manual direct entry (`listId == null`) and panel-scraped
-      // lists (`source = 'job_*'`) skip the filter entirely per the
-      // operator's verbatim rule: "filtering should only and only
-      // works for the lists that were uploaded manually (not
-      // scrapped by pannel). For other places where manual ID or
-      // usernames are entered the job must started directly without
-      // checking the filtering system."
-      const shouldRunAudienceFilter =
-        listId != null && isUploadedListSource(listSource);
-      if (!shouldRunAudienceFilter) {
-        logger.info(
-          'addMembersToGroups: skipping audience filter (manual entry or scraped list)',
-          { userId, listId, source: listSource }
-        );
-      } else try {
-        const audienceResult = await audienceFilter.filterUserList({
-          userList,
-          listId,
-          userId,
-          context: 'add-members',
-          options: {
-            // Per the operator's "just start the job" requirement, we
-            // no longer let the audience filter block the run for
-            // privacy-restricted or stale not_found rows. The runner's
-            // in-job skip cache (`inJobSkipReasons`) already prevents
-            // wasted retries when a session confirms a user is
-            // privacy-restricted, and `recordObservedFromEntry` keeps
-            // the cache fresh after each attempt. Pre-classifying
-            // here only matters for stats / UI surfacing.
-            includePrivacyRestricted: true,
-            purgeNotFound: false,
-          },
-        });
-        audienceStats = audienceResult.stats;
-        audienceDmOnly = audienceResult.dmOnly || [];
-        audienceDropped = audienceResult.dropped || [];
-        // `audienceResult.eligible` is already projected into the
-        // worker-friendly shape (`{ ...raw, _filter_kind, _filter_status }`).
-        // Mapping `.raw` here was a bug — there is no `.raw` on the
-        // already-projected entries, so every userList item became
-        // `undefined` and `collectTelegramTargetCandidates` threw
-        // "No usable identifiers found in userList". Use the projected
-        // entries directly.
-        if (Array.isArray(audienceResult.eligible) && audienceResult.eligible.length > 0) {
-          userList = audienceResult.eligible;
-        }
-        // Important: if the filter classified every row as
-        // not_found / privacy_restricted (eligible.length === 0), we
-        // KEEP the original userList so the runner can attempt them
-        // anyway. Privacy / not-found classifications can be stale —
-        // a user who blocked invites yesterday might allow them
-        // today. The runner discovers the truth on the first invite
-        // and updates the cache via `recordObservedFromEntry`. This
-        // preserves the operator's "just try, fall through to next
-        // session" intent without burning N×M requests on rows we
-        // already know are doomed.
-        logger.info('addMembersToGroups: audience filter applied (advisory)', {
-          userId,
-          listId,
-          stats: audienceStats,
-          dmOnly: audienceDmOnly.length,
-          dropped: audienceDropped.length,
-          eligible: userList.length,
-        });
-      } catch (filterErr) {
-        logger.warn('addMembersToGroups: audience filter failed; proceeding with raw userList', {
-          error: filterErr.message,
-          userId,
-          listId,
-        });
-      }
+      // No pre-job audience filtering. Per the operator's verbatim
+      // "remove the filtering users system completly … the pannel
+      // should try to send messages, add members or whatever task
+      // is given without skipping or filtering anything" rule, we
+      // do not pre-classify rows as not_found / privacy_restricted
+      // / dead. The runner attempts each row directly and surfaces
+      // real Telegram errors per-row in the results.
 
       if (!userList || userList.length === 0) {
         // We only get here if the input list itself was empty — which
@@ -916,9 +838,6 @@ class GroupService {
             delayMax,
             batchSize,
             plan,
-            audience: audienceStats,
-            dmOnly: audienceDmOnly.length,
-            dropped: audienceDropped.length,
           }),
         ]
       );
@@ -944,9 +863,6 @@ class GroupService {
             delayMax,
             batchSize,
             plan,
-            audience: audienceStats,
-            dmOnly: audienceDmOnly.length,
-            dropped: audienceDropped.length,
           }),
         ]
       );
@@ -1403,20 +1319,6 @@ class GroupService {
                   // Block every other session in this job from re-trying
                   // this user — the answer won't change.
                   markSkip(prepared, 'privacy_restricted', 'USER_PRIVACY_RESTRICT');
-                  // Persist the observation immediately so the *next*
-                  // job benefits via the cache (audience filter pulls
-                  // privacy_restricted entries into `dmOnly` and out of
-                  // the add-members eligible list).
-                  try {
-                    await audienceFilter.recordObservedFromEntry(
-                      prepared.entry,
-                      'privacy_restricted',
-                      errMsg,
-                      'observed-add'
-                    );
-                  } catch (rErr) {
-                    logger.warn(`audienceFilter.recordObserved (privacy) failed: ${rErr.message}`);
-                  }
                 }
                 // Handle user already in group
                 else if (
@@ -1506,34 +1408,12 @@ class GroupService {
                   userResult.error = errMsg;
                   failedCount++;
                   markSkip(prepared, 'not_found', errMsg);
-                  try {
-                    await audienceFilter.recordObservedFromEntry(
-                      prepared.entry,
-                      'not_found',
-                      errMsg,
-                      'observed-add'
-                    );
-                  } catch (rErr) {
-                    logger.warn(`audienceFilter.recordObserved (not_found) failed: ${rErr.message}`);
-                  }
                 }
                 // Generic failure
                 else {
                   userResult.error = errMsg;
                   failedCount++;
                 }
-              }
-
-              // Cache successful adds as 'live' so the next filter
-              // pass doesn't waste an HTTP probe on them. Done here
-              // (after all the error/retry handling) so the success
-              // case from a FLOOD_WAIT retry is captured too.
-              if (userResult.success) {
-                audienceFilter
-                  .recordObservedFromEntry(prepared.entry, 'live', null, 'observed-add')
-                  .catch((rErr) =>
-                    logger.warn(`audienceFilter.recordObserved (live) failed: ${rErr.message}`)
-                  );
               }
 
               results.push(userResult);
@@ -1684,11 +1564,6 @@ class GroupService {
         failed: failedCount,
         skipped: skippedCount,
         results,
-        audience: {
-          stats: audienceStats,
-          dmOnly: audienceDmOnly.length,
-          dropped: audienceDropped.length,
-        },
         // Source-aware dedup stats so the UI can surface "X dupes
         // removed before the run started" without re-running the
         // dedup pass on the response.
