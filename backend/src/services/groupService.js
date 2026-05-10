@@ -982,46 +982,16 @@ class GroupService {
       // entry will short-circuit instead of making another doomed
       // contacts.ResolveUsername / channels.InviteToChannel round-trip.
       //
-      // Keyed by every candidate identifier on the prepared entry so the
-      // skip works regardless of which candidate the next session would
-      // have picked from the chain.
-      const inJobSkipReasons = new Map(); // candidate-key → { reason, kind }
-
-      const prepKeysFor = (prepared) => {
-        const out = new Set();
-        const push = (v) => {
-          if (v == null) return;
-          out.add(String(v).toLowerCase());
-        };
-        const cands = Array.isArray(prepared && prepared.candidates) ? prepared.candidates : [];
-        for (const c of cands) push(c);
-        if (prepared && prepared.identifier) push(prepared.identifier);
-        const e = prepared && prepared.entry;
-        if (e) {
-          push(e.telegram_id);
-          push(e.id);
-          push(e.username);
-          push(e.phone);
-        }
-        return out;
-      };
-
-      const lookupSkip = (prepared) => {
-        if (inJobSkipReasons.size === 0) return null;
-        for (const k of prepKeysFor(prepared)) {
-          const hit = inJobSkipReasons.get(k);
-          if (hit) return hit;
-        }
-        return null;
-      };
-
-      const markSkip = (prepared, kind, reason) => {
-        for (const k of prepKeysFor(prepared)) {
-          if (!inJobSkipReasons.has(k)) {
-            inJobSkipReasons.set(k, { kind, reason });
-          }
-        }
-      };
+      // No cross-session user skip cache. Per the operator's rule
+      // "no session should skip the job unless session is not
+      // active", we never block one session from attempting a user
+      // just because another session in the same job hit
+      // USER_PRIVACY_RESTRICT / USERNAME_NOT_OCCUPIED / etc. on
+      // that user. Telegram answers can vary between accounts
+      // (cold sessions can fail to resolve a username that warm
+      // sessions resolve fine). We trust real per-attempt errors
+      // and surface them per-row in `results` instead of
+      // pre-empting siblings.
 
       for (let tIdx = 0; tIdx < targetIds.length; tIdx++) {
         const targetId = targetIds[tIdx];
@@ -1126,42 +1096,13 @@ class GroupService {
                 success: false,
               };
 
-              // Short-circuit: another session already determined this
-              // user is either privacy-restricted or non-existent. Don't
-              // waste a contacts.ResolveUsername / InviteToChannel
-              // round-trip — the answer won't change because of which
-              // session is asking.
-              const priorSkip = lookupSkip(prepared);
-              if (priorSkip) {
-                userResult.skipped = true;
-                userResult.error =
-                  priorSkip.kind === 'privacy_restricted'
-                    ? `Skipped: another session in this job hit privacy/access on this user (${priorSkip.reason || 'privacy'})`
-                    : `Skipped: another session in this job determined this user is unreachable (${priorSkip.reason || 'not_found'})`;
-                skippedCount++;
-                results.push(userResult);
-
-                const liveProcessedSkip = addedCount + failedCount + skippedCount;
-                await emitItemProgress({
-                  progress: liveProcessedSkip,
-                  processed: liveProcessedSkip,
-                  added: addedCount,
-                  failed: failedCount,
-                  skipped: skippedCount,
-                  total: userList.length * targetIds.length,
-                  currentTarget: targetId,
-                  currentSession: session.id,
-                  currentRound: round + 1,
-                  totalRounds: targetRounds,
-                  lastUser: {
-                    id: userResult.userId,
-                    success: false,
-                    skipped: true,
-                    error: userResult.error,
-                  },
-                });
-                continue;
-              }
+              // No cross-session short-circuit. Per the operator's
+              // rule "no session should skip the job unless session
+              // is not active", every session attempts every user
+              // for the current target — even if a sibling session
+              // in this job already failed on this user. Real
+              // per-attempt errors get recorded in `results` and
+              // shown in the History tab.
 
               // Some Telegram errors mean "this identifier won't work,
               // try the next one" rather than "this user is unreachable".
@@ -1316,9 +1257,6 @@ class GroupService {
                   userResult.error = 'Privacy settings prevent adding';
                   userResult.skipped = true;
                   skippedCount++;
-                  // Block every other session in this job from re-trying
-                  // this user — the answer won't change.
-                  markSkip(prepared, 'privacy_restricted', 'USER_PRIVACY_RESTRICT');
                 }
                 // Handle user already in group
                 else if (
@@ -1381,7 +1319,6 @@ class GroupService {
                     'Telegram refused (CHAT_MEMBER_ADD_FAILED) — likely Premium-only privacy or a quietly-flagged session';
                   userResult.skipped = true;
                   skippedCount++;
-                  markSkip(prepared, 'privacy_restricted', 'CHAT_MEMBER_ADD_FAILED');
                 }
                 // Handle user not found / deactivated / unresolvable
                 // username → cache as `not_found` so the next job skips
@@ -1407,7 +1344,6 @@ class GroupService {
                 ) {
                   userResult.error = errMsg;
                   failedCount++;
-                  markSkip(prepared, 'not_found', errMsg);
                 }
                 // Generic failure
                 else {

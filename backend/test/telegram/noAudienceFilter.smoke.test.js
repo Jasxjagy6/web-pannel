@@ -100,4 +100,49 @@ for (const file of [MESSAGE_PATH, GROUP_PATH]) {
   );
 }
 
+// 6. The in-job dead-target cache (a second skip mechanism) is gone
+//    from messageService. Per the operator's "no session should skip
+//    the job unless session is not active" rule, no target-side
+//    classifier may pre-empt sibling sessions from attempting a
+//    target. Locks in the @binolt regression where 12 sessions were
+//    blocked from sending after only 2 cold sessions reported "No
+//    user has X" while 4 other sessions in the same job had already
+//    sent to that user successfully.
+{
+  const src = readSource(MESSAGE_PATH);
+  const FORBIDDEN_DEAD_TARGET = [
+    'deadTargets',
+    'targetFailureSessions',
+    'TARGET_DEAD_CONFIRMATIONS',
+    'isUnresolvableTargetError',
+    'alive-session confirmations',
+  ];
+  for (const sym of FORBIDDEN_DEAD_TARGET) {
+    assert.ok(
+      !src.includes(sym),
+      `messageService.js must not reference "${sym}" (dead-target cache is removed)`
+    );
+  }
+}
+
+// 7. The cross-session user-skip cache is gone from groupService.
+//    Same rule: one session reporting USER_PRIVACY_RESTRICT or
+//    USERNAME_NOT_OCCUPIED on a user must not block other sessions
+//    in the same job from attempting that user.
+{
+  const src = readSource(GROUP_PATH);
+  const FORBIDDEN_USER_SKIP = [
+    'inJobSkipReasons',
+    'lookupSkip',
+    'markSkip',
+    'priorSkip',
+  ];
+  for (const sym of FORBIDDEN_USER_SKIP) {
+    assert.ok(
+      !src.includes(sym),
+      `groupService.js must not reference "${sym}" (cross-session user skip cache is removed)`
+    );
+  }
+}
+
 console.log('noAudienceFilter.smoke.test: OK');
