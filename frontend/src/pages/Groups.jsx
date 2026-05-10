@@ -844,7 +844,11 @@ function ActiveOperationsPanel({ operations, onCancel }) {
           // exactly what the worker is doing right now.
           const PHASE_LABELS = {
             queued: 'Queued — waiting for a worker',
-            filtering: 'Filtering audience (deduping + classifying)',
+            // Legacy phase label retained so jobs queued by an older
+            // backend before the filter removal still render a label
+            // until they finish. The current backend never emits this
+            // phase.
+            filtering: 'Preparing job',
             validating: 'Validating sessions (skipping cooldown rows)',
             running: 'Running',
             cooldown: 'Cooldown — pausing between rotations',
@@ -1143,8 +1147,8 @@ export default function Groups() {
         // fan-out).
         async: true,
       };
-      // Forward the source list id so the backend audience filter can
-      // persist not_found / dm_only updates back into list_items.
+      // Forward the source list id so the backend can attribute the
+      // job to the originating list (used by history / dedup).
       if (data.sourceList) {
         const listIdNum = parseInt(data.sourceList, 10);
         if (Number.isFinite(listIdNum)) {
