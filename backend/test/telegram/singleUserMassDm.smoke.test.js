@@ -168,14 +168,13 @@ async function withStubbedSessions(stub, fn) {
   console.log('service.noSessions: OK');
 
   // ────────────────────────────────────────────────────────────────
-  // 4. _processSingleUserMassDm: per-job dead-target cache requires
-  //    >=2 *alive* session confirmations of a target-side error
-  //    pattern (USERNAME_NOT_OCCUPIED / USERNAME_INVALID /
-  //    PEER_ID_INVALID / etc.) before it short-circuits the rest.
-  //    Locks in the fix for the bug where a single session reporting
-  //    a generic "Could not resolve target" — which often came from
-  //    a session-side AUTH_KEY_UNREGISTERED — was enough to blacklist
-  //    a *real* handle for every remaining session in the job.
+  // 4. _processSingleUserMassDm: NO target-side blacklist. Per the
+  //    operator's "no session should skip the job unless session is
+  //    not active" rule, every alive session attempts every target
+  //    even when previous sessions returned a target-side error like
+  //    USERNAME_NOT_OCCUPIED. The only allowed mid-job skip is the
+  //    revoked-session cache (AUTH_KEY_UNREGISTERED → flag session
+  //    revoked → skip its remaining iterations).
   // ────────────────────────────────────────────────────────────────
   await (async () => {
     const pool = require('../../src/config/database').pool;
@@ -203,11 +202,10 @@ async function withStubbedSessions(stub, fn) {
       return { rows: [] };
     };
 
-    // Sub-test 4a: TARGET-SIDE failures from multiple alive sessions
-    // DO short-circuit. After 2 confirmations (sessions 100 + 102) the
-    // remaining session(s) skip. Session 101 is the AUTH_KEY case and
-    // its failure does NOT count toward the dead-target tally — it
-    // counts toward the revoked-session cache instead.
+    // Sub-test 4a: NO target-side short-circuit. Every alive session
+    // attempts the target. Session 101 is revoked (AUTH_KEY) — that's
+    // the only legal skip. Sessions 100, 102, 103, 104 all attempt
+    // even though earlier ones returned USERNAME_NOT_OCCUPIED.
     let sendCallsA = 0;
     telegramService.sendMessage = async (sessionId, target, _message) => {
       sendCallsA++;
@@ -225,11 +223,11 @@ async function withStubbedSessions(stub, fn) {
       await messageService._processSingleUserMassDm(
         9999,
         [
-          { id: 100, user_id: 1, status: 'active' }, // confirms target-dead (1/2)
-          { id: 101, user_id: 1, status: 'active' }, // AUTH_KEY → revoked, no target tally
-          { id: 102, user_id: 1, status: 'active' }, // confirms target-dead (2/2) → cache armed
-          { id: 103, user_id: 1, status: 'active' }, // skipped via cache
-          { id: 104, user_id: 1, status: 'active' }, // skipped via cache
+          { id: 100, user_id: 1, status: 'active' }, // attempts → USERNAME_NOT_OCCUPIED (no skip propagation)
+          { id: 101, user_id: 1, status: 'active' }, // AUTH_KEY → revoked
+          { id: 102, user_id: 1, status: 'active' }, // attempts (no cache to short-circuit)
+          { id: 103, user_id: 1, status: 'active' }, // attempts
+          { id: 104, user_id: 1, status: 'active' }, // attempts
         ],
         ['@typo'],
         'hello',
@@ -237,11 +235,11 @@ async function withStubbedSessions(stub, fn) {
         1
       );
 
-      // 100, 101, 102 all called sendMessage; 103 + 104 skipped via cache.
+      // All 5 sessions called sendMessage — no target-side cache exists anymore.
       assert.strictEqual(
         sendCallsA,
-        3,
-        `expected 3 sendMessage calls (2 target confirmations + 1 auth error before cache armed); got ${sendCallsA}`
+        5,
+        `expected 5 sendMessage calls (every alive session must attempt); got ${sendCallsA}`
       );
       // AUTH_KEY_UNREGISTERED should have flagged session 101 in DB.
       assert.ok(
@@ -254,7 +252,7 @@ async function withStubbedSessions(stub, fn) {
       messageService._notifyProgress = origNotify;
       messageService._finalizeJob = origFinalize;
     }
-    console.log('worker.deadTargetCache.targetSide: OK');
+    console.log('worker.noTargetSkip.everySessionAttempts: OK');
   })();
 
   // ────────────────────────────────────────────────────────────────

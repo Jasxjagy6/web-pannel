@@ -2718,55 +2718,26 @@ class MessageService {
     const results = [];
     const totalSends = sessions.length * targets.length;
 
-    // Per-job dead-target cache. We mark a target as unresolvable
-    // ONLY when at least two distinct *alive* sessions independently
-    // confirm a target-side error (USERNAME_NOT_OCCUPIED,
-    // USERNAME_INVALID, PEER_ID_INVALID, USER_ID_INVALID,
-    // INPUT_USER_DEACTIVATED). Single-session "Could not resolve
-    // target" used to be enough to blacklist a real handle for the
-    // rest of the run — that produced the bug where a typo'd or
-    // revoked session falsely doomed every remaining attempt for a
-    // genuine username.
-    //
-    // Operator quote, verbatim:
-    //   "filtering should only and only works for the lists that
-    //    were uploaded manually … For other places where manual ID
-    //    or usernames are entered the job must started directly
-    //    without checking the filtering system."
-    //
-    // Single-user mass DM is a *manual entry* surface, so we keep
-    // the cache disabled by default and only opt in after multiple
-    // alive sessions agree the user is gone.
-    const TARGET_DEAD_CONFIRMATIONS = 2;
-    const deadTargets = new Set();
-    const targetFailureSessions = new Map(); // target → Set<sessionId>
-    // Patterns that ONLY ever come from a target-side failure — never
-    // from a session-level auth issue. We deliberately drop the broad
-    // "Could not resolve target" and "Could not find input entity"
-    // patterns the previous classifier matched: those used to fire
-    // when the *session* was dead, blaming the target.
-    const isUnresolvableTargetError = (msg) => {
-      if (!msg) return false;
-      const m = String(msg);
-      return (
-        m.includes('USERNAME_NOT_OCCUPIED') ||
-        m.includes('USERNAME_INVALID') ||
-        m.includes('PEER_ID_INVALID') ||
-        m.includes('USER_ID_INVALID') ||
-        m.includes('INPUT_USER_DEACTIVATED') ||
-        // GramJS' user-friendly translation of USERNAME_NOT_OCCUPIED.
-        // Only matches inside our sendMessage error chain — the bare
-        // "No user has X" string from gramjs internal logging never
-        // makes it onto the thrown error message text we see here.
-        /No user has\s+"/i.test(m)
-      );
-    };
+    // No per-job target blacklist. Per the operator's verbatim rule:
+    //   "I don't want any filtering system anymore or no session
+    //    should skip the job unless session is not active"
+    // Every alive session attempts every target. If two sessions
+    // happen to return USERNAME_NOT_OCCUPIED / "No user has X", we
+    // do NOT pre-skip the remaining sessions — Telegram's
+    // contacts.ResolveUsername can return empty for cold sessions
+    // that have never interacted with the username, even when the
+    // username is genuinely live (the same job in the wild had 4
+    // sessions successfully send to @binolt while 2 returned "No
+    // user has binolt as username"). Trusting any classifier here
+    // produces false negatives. Skip nothing.
 
-    // Per-job revoked-session cache. AUTH_KEY_UNREGISTERED means the
-    // account logged this session out remotely; no other request from
-    // this session in this job is going to succeed. Flag the row in
-    // sessions table so future jobs skip it, and exclude it from this
-    // job's remaining iterations.
+    // Per-job revoked-session cache. AUTH_KEY_UNREGISTERED /
+    // SESSION_REVOKED means Telegram itself has logged this session
+    // out — the account is "not active" anymore in the operator's
+    // own words. No other request from this session in this job is
+    // going to succeed. Flag the row in `sessions` table so future
+    // jobs skip it, and exclude it from this job's remaining
+    // iterations. This is the ONLY skip allowed in this runner.
     const revokedSessionIds = new Set();
     const isRevokedSessionError = (msg) => {
       if (!msg) return false;
@@ -2824,42 +2795,16 @@ class MessageService {
             success: false,
           };
 
-          // Fast-skip 1: target already proven unresolvable in this job.
-          // No API call, no inter-send sleep — there's nothing for
-          // Telegram to do, and waiting `delaySeconds` between
-          // skipped sends just delays the rest of the job for no gain.
-          if (deadTargets.has(String(target))) {
-            result.skipped = true;
-            result.error = 'Target unresolvable (cached from earlier session in this job)';
-            skippedCount.value++;
-            await pool.query(
-              `INSERT INTO message_logs (job_id, session_id, target_id, status, error_message, sent_at)
-               VALUES ($1, $2, $3, 'skipped', $4, NOW())`,
-              [jobId, session.id, String(target), result.error]
-            );
-            results.push(result);
-            sendsDone++;
-
-            await pool.query(
-              `UPDATE messaging_jobs
-                  SET sent_count = $1, failed_count = $2, skipped_count = $3
-                WHERE id = $4`,
-              [sentCount.value, failedCount.value, skippedCount.value, jobId]
-            );
-            await this._notifyProgress(jobId, {
-              job_id: jobId,
-              status: 'running',
-              total: totalSends,
-              sent: sentCount.value,
-              failed: failedCount.value,
-              skipped: skippedCount.value,
-              session_id: session.id,
-              target: String(target),
-            });
-            continue; // No sleep
-          }
-
-          // Fast-skip 2: session already proven revoked in this job.
+          // The ONLY allowed fast-skip: session already proven
+          // revoked in this job (Telegram returned
+          // AUTH_KEY_UNREGISTERED / SESSION_REVOKED on a previous
+          // attempt, the row has been flagged in DB as `revoked`).
+          // Per the operator's "no session should skip the job
+          // unless session is not active" rule, a revoked session
+          // is the definition of "not active" — every other request
+          // from it is guaranteed to fail with the same auth error,
+          // so skipping the rest of its iterations saves time
+          // without dropping any genuine attempt.
           if (revokedSessionIds.has(session.id)) {
             result.skipped = true;
             result.error = 'Session revoked (cached from earlier failure in this job)';
@@ -2912,38 +2857,14 @@ class MessageService {
               { jobId }
             );
 
-            // Cache classification updates so the rest of the job
-            // doesn't repeat doomed work.
+            // No target-side classification. Per the operator's
+            // rule, we never blacklist a target mid-job — every
+            // session attempts every target. Real per-attempt errors
+            // are already recorded above in `message_logs` and in
+            // the per-attempt `result.error` so the operator can
+            // see exactly which sessions failed and why, without
+            // pre-empting any sibling session's attempt.
             const sessionLooksRevoked = isRevokedSessionError(err.message);
-            if (isUnresolvableTargetError(err.message) && !sessionLooksRevoked) {
-              // Only count target-side failures from sessions that
-              // are NOT themselves revoked. A revoked session's
-              // resolve attempts can't be trusted — every call from
-              // a dead auth_key fails, but the failure says nothing
-              // about whether the *target* exists. Without this
-              // gate, one bad session in a 50-session run was enough
-              // to blacklist a real, healthy username for the
-              // remaining 49 sessions.
-              const targetKey = String(target);
-              let confirmers = targetFailureSessions.get(targetKey);
-              if (!confirmers) {
-                confirmers = new Set();
-                targetFailureSessions.set(targetKey, confirmers);
-              }
-              confirmers.add(session.id);
-              if (confirmers.size >= TARGET_DEAD_CONFIRMATIONS) {
-                deadTargets.add(targetKey);
-                logger.info(
-                  `Single-user mass DM job ${jobId}: target ${target} marked unresolvable after ${confirmers.size} alive-session confirmations; remaining ${sessions.length - si - 1} session(s) for this target will skip without burning resolve requests`,
-                  { jobId }
-                );
-              } else {
-                logger.info(
-                  `Single-user mass DM job ${jobId}: session ${session.id} reported target ${target} unresolvable (${confirmers.size}/${TARGET_DEAD_CONFIRMATIONS} confirmations); will retry from other sessions`,
-                  { jobId }
-                );
-              }
-            }
             if (sessionLooksRevoked) {
               revokedSessionIds.add(session.id);
               // Mark the session row revoked so future jobs skip it
