@@ -6,7 +6,11 @@
   "scripts": {
     "start": "node src/index.js",
     "dev": "nodemon src/index.js",
-    "db:migrate": "node src/config/database.js --migrate"
+    "db:migrate": "node src/config/database.js --migrate",
+    "session-worker": "node src/workers/sessionWorker.js",
+    "verify-sessions": "node scripts/verify-sessions.js",
+    "check-migration-safety": "node scripts/check-migration-safety.js",
+    "test:smoke:telegram": "for f in test/telegram/*.test.js; do echo \"--- $f ---\" && node \"$f\" || exit 1; done"
   },
   "dependencies": {
     "adm-zip": "^0.5.17",
