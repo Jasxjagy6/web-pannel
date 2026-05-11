@@ -3284,17 +3284,20 @@ class TelegramService {
         }
 
         // PEER_FLOOD is account-level: Telegram has flagged this
-        // session as spam, and the cooldown is hours / days — not 30s.
-        // Retrying every 30s for 5 attempts just burns 2.5 minutes per
-        // call (and per call site there can be hundreds), without any
-        // chance of recovery in that window. Fail fast AND mark the
-        // session on cooldown so the worker session-pickers stop
-        // handing it more work for a while (privacy/2fa/login pages
-        // don't read the cooldown field, so the operator can still
-        // recover the session manually).
+        // session for spammy behaviour. Unlike FLOOD_WAIT_N, PEER_FLOOD
+        // does NOT carry a duration — Telegram never tells us how long
+        // the restriction lasts; it lifts whenever the spam algorithms
+        // decide. Retrying every 30s for 5 attempts just burns 2.5
+        // minutes per call (and per call site there can be hundreds),
+        // without any chance of recovery in that window, so we fail
+        // fast. We also call `markPeerFlood(...)` so operators who have
+        // opted into the panel-side safety lockout (env var
+        // `PEER_FLOOD_COOLDOWN_SECONDS`) get a recorded cooldown; by
+        // default the call is a no-op and the session stays job-
+        // eligible.
         if (errorMessage.includes('PEER_FLOOD')) {
           logger.warn(
-            `Peer flood detected for session ${sessionId}: not retrying (account-level cooldown is hours, not seconds)`
+            `Peer flood detected for session ${sessionId}: not retrying (Telegram does not return a duration for PEER_FLOOD)`
           );
           try {
             const cfg = require('../config/telegram');

@@ -4,15 +4,24 @@
  *
  * Two behaviours:
  *   1. `markFloodCooldown(sessionId, seconds, reason)` — set `cooldown_until`
- *      to `NOW() + seconds`. Long FLOOD_WAITs (≥30s) and PEER_FLOOD both call
- *      this; PEER_FLOOD passes the conservative account-level default (6h).
- *      Idempotent under contention: we always pick the LATER of the existing
- *      `cooldown_until` and the new one so a freshly-arrived 60s wait can
- *      never shorten a still-running 6h PEER_FLOOD lock.
+ *      to `NOW() + seconds`, but ONLY when Telegram itself returned a real
+ *      duration (`FLOOD_WAIT_N`). Idempotent under contention: we always
+ *      pick the LATER of the existing `cooldown_until` and the new one so a
+ *      freshly-arrived 60s wait can never shorten a still-running longer
+ *      flood-wait lock.
  *   2. `isOnCooldown(sessionId)` / `filterEligibleSessionIds(sessionIds)` —
  *      consumers ask whether a session is currently job-eligible. Pages
  *      that legitimately need to operate on a cooldown session (privacy,
  *      2FA, login) just don't call these.
+ *
+ * PEER_FLOOD note: Telegram does NOT return a duration for `PEER_FLOOD` —
+ * it's an account-level spam flag with no defined release time. Earlier
+ * revisions of this file hardcoded a 6h panel-side cooldown for it, which
+ * surfaced to operators as a uniform "5h-ish remaining" badge across every
+ * session and locked them out of group-add / bulk-message work even though
+ * Telegram never told us to wait that long. We no longer impose a hardcoded
+ * cooldown for PEER_FLOOD; operators who want a safety lockout can opt in
+ * by setting `PEER_FLOOD_COOLDOWN_SECONDS` to a non-zero value.
  *
  * Only writes columns introduced in `migration_v24_session_cooldown_*.sql`.
  * Failures are best-effort and never throw — a missing column on an
@@ -22,13 +31,28 @@
 const { pool } = require('../config/database');
 const logger = require('../utils/logger');
 
-const DEFAULT_PEER_FLOOD_SECONDS = 6 * 60 * 60;
 const MIN_RECORDED_FLOOD_SECONDS = 30;
 const MAX_COOLDOWN_SECONDS = 7 * 24 * 60 * 60;
 
+// Operator-configurable safety cooldown applied when Telegram returns
+// PEER_FLOOD (which carries no duration). Default 0 = trust Telegram and do
+// not invent a panel-side cooldown. Set to a positive value (e.g. 21600 for
+// 6h) to re-enable the legacy lockout behaviour.
+const DEFAULT_PEER_FLOOD_SECONDS = (() => {
+  const raw = process.env.PEER_FLOOD_COOLDOWN_SECONDS;
+  if (raw == null || raw === '') return 0;
+  const n = parseInt(raw, 10);
+  if (!Number.isFinite(n) || n < 0) return 0;
+  if (n > MAX_COOLDOWN_SECONDS) return MAX_COOLDOWN_SECONDS;
+  return n;
+})();
+
+// Clamp a caller-supplied wait. Invalid / non-positive input returns 0 so
+// the caller can short-circuit (we used to silently fall back to a 6h
+// hardcoded default, which is what produced the bogus "5h" badges).
 function clampSeconds(seconds) {
   const n = Number(seconds);
-  if (!Number.isFinite(n) || n <= 0) return DEFAULT_PEER_FLOOD_SECONDS;
+  if (!Number.isFinite(n) || n <= 0) return 0;
   if (n > MAX_COOLDOWN_SECONDS) return MAX_COOLDOWN_SECONDS;
   return Math.floor(n);
 }
@@ -48,6 +72,10 @@ async function markFloodCooldown(sessionId, seconds, reason = null) {
   const sid = sessionId == null ? null : String(sessionId);
   if (!sid) return;
   const wait = clampSeconds(seconds);
+  // Drop sub-threshold and zero-second calls. Telegram-supplied FLOOD_WAITs
+  // below 30s aren't worth a panel lockout, and a 0-second call means the
+  // caller had no real duration to record (e.g. PEER_FLOOD with the opt-in
+  // env var unset) — in that case we never invent a cooldown.
   if (wait < MIN_RECORDED_FLOOD_SECONDS) return;
   try {
     // Use `make_interval(secs => ...)` so PostgreSQL can infer the
@@ -77,11 +105,26 @@ async function markFloodCooldown(sessionId, seconds, reason = null) {
 }
 
 /**
- * Convenience: record a PEER_FLOOD lock with the conservative default
- * 6h cooldown.
+ * Convenience: record a PEER_FLOOD event.
+ *
+ * Telegram does not include a duration with PEER_FLOOD, so by default we do
+ * NOT write a panel-side cooldown — the operator can keep using the session
+ * (login / 2FA / privacy / messaging) and the underlying account-level lock
+ * will lift when Telegram's spam algorithms decide. Operators who prefer
+ * the legacy safety lockout can set `PEER_FLOOD_COOLDOWN_SECONDS` to a
+ * positive value (e.g. 21600 for 6h) and the cooldown will be recorded.
  */
 async function markPeerFlood(sessionId, reason = 'PEER_FLOOD') {
-  return markFloodCooldown(sessionId, DEFAULT_PEER_FLOOD_SECONDS, reason);
+  const seconds = DEFAULT_PEER_FLOOD_SECONDS;
+  if (!seconds) {
+    logger.warn(
+      `[cooldown] session ${sessionId} hit PEER_FLOOD — recording event only; ` +
+      `no panel-side cooldown applied (Telegram did not return a duration). ` +
+      `Set PEER_FLOOD_COOLDOWN_SECONDS=<seconds> to re-enable the legacy lockout.`
+    );
+    return;
+  }
+  return markFloodCooldown(sessionId, seconds, reason);
 }
 
 /**
