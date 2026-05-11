@@ -1295,25 +1295,38 @@ export default function Sessions() {
   };
 
   // Open the clone-export modal for the currently-selected sessions.
-  // The modal does its own work; we only filter selection down to
-  // genuinely active rows so the operator doesn't waste a slot on a
-  // revoked or logged-out session.
+  // We exclude only sessions Telegram has clearly revoked / expired /
+  // errored on, because those can't perform `auth.AcceptLoginToken`
+  // anyway. Everything else is forwarded — the backend will surface
+  // the real error per-row if anything is off.
+  //
+  // Field-name notes:
+  //   - listSessions returns the row with `isLoggedIn` (camelCase)
+  //     from the API serializer, but a couple of legacy code paths
+  //     also expose the raw `is_logged_in` (snake_case). Check both.
+  //   - A session can be `is_logged_in=true` while status is
+  //     'uploaded' (not yet hit by /connect) — the backend's own
+  //     "active" filter uses `status IN ('active','uploaded')`, so we
+  //     match that semantics here.
   const handleBulkCloneExport = () => {
     if (selectedIds.size === 0) return;
     const ids = Array.from(selectedIds);
-    const rows = sessions.filter(
-      (s) => ids.includes(s.id) && s.status === 'active' && s.is_logged_in
-    );
+    const isAlive = (s) => {
+      const loggedIn = s.isLoggedIn ?? s.is_logged_in ?? false;
+      const blockedStatuses = new Set(['revoked', 'expired', 'error']);
+      return loggedIn && !blockedStatuses.has(s.status);
+    };
+    const rows = sessions.filter((s) => ids.includes(s.id) && isAlive(s));
     if (rows.length === 0) {
       showError(
-        'None of the selected sessions are active + logged-in. Clone-export only supports live sessions.',
+        'None of the selected sessions look alive — they are either revoked, expired, errored, or not logged in. Try logging them in from the Sessions tab first.',
         'Clone export'
       );
       return;
     }
     if (rows.length < ids.length) {
       showInfo(
-        `${ids.length - rows.length} non-active session(s) were excluded from the clone-export.`,
+        `${ids.length - rows.length} session(s) were excluded (revoked/expired/not logged in).`,
         'Clone export'
       );
     }
