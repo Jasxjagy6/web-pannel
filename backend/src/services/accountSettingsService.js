@@ -5,6 +5,8 @@ const { AppError } = require('../utils/errorHandler');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
+const { FIRST_NAMES, LAST_NAMES, BIOS } = require('../data/randomNamePool');
+const { getAvatars, resolveAvatarPath } = require('../data/randomAvatars');
 
 class AccountSettingsService {
   /**
@@ -189,6 +191,177 @@ class AccountSettingsService {
     }
 
     return filePath;
+  }
+
+  /**
+   * Return the pools the Randomize Mode samples from.
+   *
+   * The frontend reads this once when the page mounts and does all the
+   * sampling client-side, so the user can preview, edit, and re-roll without
+   * round-trips. The backend only ever sees the final per-session
+   * assignments via {@link applyRandomizedAssignments}.
+   *
+   * @returns {{ firstNames: string[], lastNames: string[], bios: string[], avatars: Array<{id:string,fileName:string}> }}
+   */
+  getRandomizePools() {
+    return {
+      firstNames: FIRST_NAMES.slice(),
+      lastNames: LAST_NAMES.slice(),
+      bios: BIOS.slice(),
+      avatars: getAvatars().map(({ id, fileName }) => ({ id, fileName })),
+    };
+  }
+
+  /**
+   * Resolve a bundled avatar ID to an on-disk JPG path.
+   *
+   * @param {string} id
+   * @returns {string|null}
+   */
+  getAvatarFilePath(id) {
+    return resolveAvatarPath(id);
+  }
+
+  /**
+   * Apply per-session randomized assignments. Each entry may carry its own
+   * `firstName`, `lastName`, `username`, `bio`, and/or `avatarId` (the ID of
+   * a bundled avatar from {@link getRandomizePools}). Any field omitted on
+   * a given entry is left untouched on that session.
+   *
+   * @param {object} params
+   * @param {Array<{sessionId:number, firstName?:string, lastName?:string, username?:string, bio?:string, avatarId?:string}>} params.assignments
+   * @param {number} userId
+   */
+  async applyRandomizedAssignments({ assignments }, userId) {
+    if (!userId) {
+      throw new AppError('User ID is required', 400, 'MISSING_USER_ID');
+    }
+    if (!Array.isArray(assignments) || assignments.length === 0) {
+      throw new AppError('At least one assignment is required', 400, 'NO_ASSIGNMENTS');
+    }
+
+    const sessionIds = assignments
+      .map((a) => Number(a.sessionId))
+      .filter((n) => Number.isFinite(n) && n > 0);
+
+    if (sessionIds.length === 0) {
+      throw new AppError('No valid session IDs in assignments', 400, 'NO_VALID_SESSIONS');
+    }
+
+    const sessionRecords = await pool.query(
+      `SELECT id, phone, status FROM sessions WHERE id = ANY($1::int[]) AND user_id = $2`,
+      [sessionIds, userId]
+    );
+
+    const ownedById = new Map(sessionRecords.rows.map((r) => [r.id, r]));
+    if (ownedById.size === 0) {
+      throw new AppError('No valid sessions found', 404, 'NO_VALID_SESSIONS');
+    }
+
+    logger.info(`Starting randomized account-settings update for ${ownedById.size} sessions`, {
+      userId,
+      sessionCount: ownedById.size,
+    });
+
+    const results = [];
+    for (const a of assignments) {
+      const id = Number(a.sessionId);
+      const owned = ownedById.get(id);
+      const sessionResult = {
+        sessionId: id,
+        phone: owned ? owned.phone : null,
+        success: false,
+        errors: [],
+        updatedFields: [],
+      };
+
+      if (!owned) {
+        sessionResult.errors.push('Session not found or not owned by user');
+        results.push(sessionResult);
+        continue;
+      }
+
+      try {
+        const wantsFirst = typeof a.firstName === 'string' && a.firstName.length > 0;
+        const wantsLast = typeof a.lastName === 'string';
+        if (wantsFirst || wantsLast) {
+          try {
+            await telegramService.updateProfile(
+              String(id),
+              wantsFirst ? a.firstName : undefined,
+              wantsLast ? a.lastName : ''
+            );
+            if (wantsFirst) sessionResult.updatedFields.push('firstName');
+            if (wantsLast) sessionResult.updatedFields.push('lastName');
+          } catch (err) {
+            sessionResult.errors.push(`Name update failed: ${err.message}`);
+          }
+        }
+
+        if (typeof a.username === 'string' && a.username.length > 0) {
+          try {
+            await telegramService.updateUsername(String(id), a.username);
+            sessionResult.updatedFields.push('username');
+          } catch (err) {
+            sessionResult.errors.push(`Username update failed: ${err.message}`);
+          }
+        }
+
+        if (typeof a.bio === 'string') {
+          try {
+            await telegramService.updateProfile(String(id), undefined, '', a.bio);
+            sessionResult.updatedFields.push('bio');
+          } catch (err) {
+            sessionResult.errors.push(`Bio update failed: ${err.message}`);
+          }
+        }
+
+        if (typeof a.avatarId === 'string' && a.avatarId.length > 0) {
+          const avatarPath = resolveAvatarPath(a.avatarId);
+          if (!avatarPath) {
+            sessionResult.errors.push(`Unknown avatar id: ${a.avatarId}`);
+          } else {
+            try {
+              await telegramService.updateProfilePhoto(String(id), avatarPath);
+              sessionResult.updatedFields.push('profilePhoto');
+            } catch (err) {
+              sessionResult.errors.push(`Profile photo update failed: ${err.message}`);
+            }
+          }
+        }
+
+        sessionResult.success = sessionResult.updatedFields.length > 0;
+      } catch (err) {
+        sessionResult.errors.push(`Session error: ${err.message}`);
+      }
+
+      results.push(sessionResult);
+    }
+
+    const successCount = results.filter((r) => r.success).length;
+    await pool.query(
+      `INSERT INTO activity_logs (user_id, action, details, created_at)
+       VALUES ($1, 'randomize_account_settings', $2, NOW())`,
+      [
+        userId,
+        JSON.stringify({
+          sessionCount: assignments.length,
+          successCount,
+        }),
+      ]
+    );
+
+    logger.info(
+      `Randomized account-settings update completed: ${successCount}/${assignments.length} succeeded`,
+      { userId }
+    );
+
+    return {
+      total: assignments.length,
+      success: successCount,
+      failed: assignments.length - successCount,
+      results,
+    };
   }
 
   /**

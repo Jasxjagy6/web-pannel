@@ -4,7 +4,13 @@ const accountSettingsController = require('../controllers/accountSettingsControl
 const { authenticate, requireApproved } = require('../middleware/auth');
 const fileUpload = require('../middleware/fileUpload');
 
-// All routes require authentication
+// GET /api/account-settings/randomize/avatars/:id  -- PUBLIC.
+// Streams a bundled avatar JPG so the Randomize Mode preview can render the
+// thumbnail via a plain <img src>. The avatars are static placeholder images
+// shipped with the repo (not user data), so there is no auth here.
+router.get('/randomize/avatars/:id', accountSettingsController.getRandomAvatar);
+
+// All routes BELOW require authentication.
 router.use(authenticate);
 router.use(requireApproved);
 
@@ -13,6 +19,12 @@ router.post('/update', accountSettingsController.updateMultipleSessions);
 
 // POST /api/account-settings/upload-photo - Upload profile photo
 router.post('/upload-photo', fileUpload, accountSettingsController.uploadProfilePhoto);
+
+// GET  /api/account-settings/randomize/pools - Random name/bio/avatar pools
+// POST /api/account-settings/randomize/apply - Apply per-session randomized assignments
+// NOTE: these are registered BEFORE the `/:sessionId` catch-all below.
+router.get('/randomize/pools', accountSettingsController.getRandomizePools);
+router.post('/randomize/apply', accountSettingsController.applyRandomized);
 
 // GET /api/account-settings/:sessionId - Get account settings for a session
 router.get('/:sessionId', accountSettingsController.getAccountSettings);

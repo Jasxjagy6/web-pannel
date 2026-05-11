@@ -13,15 +13,23 @@ import {
   Eye,
   AlertTriangle,
   Shield,
+  Sparkles,
+  Pencil,
 } from 'lucide-react';
 import { useToast } from '../components/common/Toast';
 import { listSessions } from '../api/sessions';
 import { updateAccountSettings, uploadProfilePhoto } from '../api/accountSettings';
 import { parseApiError } from '../utils/formatters';
 import SessionListSwitcher from '../components/common/SessionListSwitcher';
+import AccountRandomizePanel from '../components/settings/AccountRandomizePanel';
 
 export default function AccountSettings() {
   const { showSuccess, showError } = useToast();
+
+  // Top-level mode: 'manual' applies a single value to every selected
+  // session; 'randomize' picks a different value per session from curated
+  // pools (see AccountRandomizePanel).
+  const [mode, setMode] = useState('manual');
 
   // Sessions
   const [sessions, setSessions] = useState([]);
@@ -196,6 +204,95 @@ export default function AccountSettings() {
 
   const inputBase = 'w-full rounded-lg border bg-dark-900 py-2.5 px-3 text-sm text-white placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-primary-500/50 focus:border-primary-500 transition';
 
+  // Full session objects (with phone) for the currently-selected IDs.
+  // Order matches the user's click order so the @x, @x2, @x3 sequence in
+  // Randomize Mode is predictable.
+  const selectedSessionObjects = selectedSessionIds
+    .map((id) => sessions.find((s) => s.id === id))
+    .filter(Boolean);
+
+  // ---- Shared right-column: session selection panel (reused in both modes).
+  const renderSessionPicker = () => (
+    <div className="rounded-xl border border-white/5 bg-dark-800 p-5">
+      <SessionListSwitcher
+        mode={sessionPickMode}
+        onModeChange={setSessionPickMode}
+        selectedSessionListId={selectedSessionListId}
+        onSelectedSessionListIdChange={setSelectedSessionListId}
+        className="mb-4"
+      />
+      {sessionPickMode === 'list' ? null : (
+        <>
+          <div className="flex items-center justify-between mb-3">
+            <h3 className="text-sm font-semibold text-white flex items-center gap-2">
+              <Users className="w-4 h-4 text-primary-500" />
+              Sessions ({selectedSessionIds.length} selected)
+            </h3>
+          </div>
+
+          <div className="flex gap-2 mb-3">
+            <button
+              type="button"
+              onClick={selectAllSessions}
+              className="text-xs text-primary-400 hover:text-primary-300"
+            >
+              Select All Active
+            </button>
+            <span className="text-xs text-gray-600">|</span>
+            <button
+              type="button"
+              onClick={deselectAllSessions}
+              className="text-xs text-gray-400 hover:text-gray-300"
+            >
+              Deselect All
+            </button>
+            <span className="text-xs text-gray-600">|</span>
+            <button
+              type="button"
+              onClick={() => setShowAllSessions(!showAllSessions)}
+              className="text-xs text-gray-400 hover:text-gray-300"
+            >
+              {showAllSessions ? 'Show Active Only' : 'Show All'}
+            </button>
+          </div>
+
+          <div className="max-h-96 overflow-y-auto rounded-lg border border-white/10 bg-dark-900 p-2 space-y-1">
+            {displayedSessions.map((s) => {
+              const isSelected = selectedSessionIds.includes(s.id);
+              const isActive = s.status?.toLowerCase() === 'active' || s.is_logged_in;
+              return (
+                <button
+                  key={s.id}
+                  type="button"
+                  onClick={() => toggleSession(s.id)}
+                  disabled={!isActive}
+                  className={`w-full flex items-center gap-2 px-3 py-2 rounded-md text-sm transition ${
+                    isSelected
+                      ? 'bg-primary-500/20 text-primary-300 border border-primary-500/30'
+                      : 'hover:bg-white/5 text-gray-300 border border-transparent'
+                  } ${!isActive ? 'opacity-50 cursor-not-allowed' : ''}`}
+                >
+                  <div className={`w-4 h-4 rounded border flex items-center justify-center flex-shrink-0 ${
+                    isSelected ? 'border-primary-500 bg-primary-500/30' : 'border-gray-600'
+                  }`}>
+                    {isSelected && <Check className="w-3 h-3 text-primary-400" />}
+                  </div>
+                  <span className="truncate">{s.phone || s.id}</span>
+                  {s.username && <span className="text-gray-500 text-xs">@{s.username}</span>}
+                  {!isActive && <span className="text-xs text-gray-500">(inactive)</span>}
+                </button>
+              );
+            })}
+          </div>
+
+          {activeSessions.length === 0 && (
+            <p className="mt-2 text-xs text-amber-400">No active sessions. Please login first.</p>
+          )}
+        </>
+      )}
+    </div>
+  );
+
   return (
     <div className="space-y-6">
       {/* Page Header */}
@@ -231,6 +328,50 @@ export default function AccountSettings() {
         </div>
       </Link>
 
+      {/* Mode tabs */}
+      <div className="inline-flex rounded-xl border border-white/10 bg-dark-800 p-1">
+        <button
+          type="button"
+          onClick={() => setMode('manual')}
+          className={`inline-flex items-center gap-2 rounded-lg px-4 py-2 text-sm font-medium transition ${
+            mode === 'manual'
+              ? 'bg-primary-500/20 text-primary-200 border border-primary-500/30'
+              : 'text-gray-400 hover:text-gray-200'
+          }`}
+        >
+          <Pencil className="w-4 h-4" />
+          Manual
+        </button>
+        <button
+          type="button"
+          onClick={() => setMode('randomize')}
+          className={`inline-flex items-center gap-2 rounded-lg px-4 py-2 text-sm font-medium transition ${
+            mode === 'randomize'
+              ? 'bg-primary-500/20 text-primary-200 border border-primary-500/30'
+              : 'text-gray-400 hover:text-gray-200'
+          }`}
+        >
+          <Sparkles className="w-4 h-4" />
+          Randomize
+        </button>
+      </div>
+
+      {mode === 'randomize' ? (
+        <div className="grid grid-cols-1 xl:grid-cols-2 gap-6">
+          <div className="space-y-6">
+            <AccountRandomizePanel
+              selectedSessions={selectedSessionObjects}
+              showSuccess={showSuccess}
+              showError={showError}
+              onApplied={() => {
+                // Refresh session list so any username changes show up.
+                fetchSessions();
+              }}
+            />
+          </div>
+          <div className="space-y-6">{renderSessionPicker()}</div>
+        </div>
+      ) : (
       <form onSubmit={handleSubmit}>
         <div className="grid grid-cols-1 xl:grid-cols-2 gap-6">
           {/* Left Column: Update Fields */}
@@ -409,85 +550,7 @@ export default function AccountSettings() {
 
           {/* Right Column: Session Selection */}
           <div className="space-y-6">
-            {/* Session Selection */}
-            <div className="rounded-xl border border-white/5 bg-dark-800 p-5">
-              <SessionListSwitcher
-                mode={sessionPickMode}
-                onModeChange={setSessionPickMode}
-                selectedSessionListId={selectedSessionListId}
-                onSelectedSessionListIdChange={setSelectedSessionListId}
-                className="mb-4"
-              />
-              {sessionPickMode === 'list' ? null : (
-              <>
-              <div className="flex items-center justify-between mb-3">
-                <h3 className="text-sm font-semibold text-white flex items-center gap-2">
-                  <Users className="w-4 h-4 text-primary-500" />
-                  Sessions ({selectedSessionIds.length} selected)
-                </h3>
-              </div>
-
-              <div className="flex gap-2 mb-3">
-                <button
-                  type="button"
-                  onClick={selectAllSessions}
-                  className="text-xs text-primary-400 hover:text-primary-300"
-                >
-                  Select All Active
-                </button>
-                <span className="text-xs text-gray-600">|</span>
-                <button
-                  type="button"
-                  onClick={deselectAllSessions}
-                  className="text-xs text-gray-400 hover:text-gray-300"
-                >
-                  Deselect All
-                </button>
-                <span className="text-xs text-gray-600">|</span>
-                <button
-                  type="button"
-                  onClick={() => setShowAllSessions(!showAllSessions)}
-                  className="text-xs text-gray-400 hover:text-gray-300"
-                >
-                  {showAllSessions ? 'Show Active Only' : 'Show All'}
-                </button>
-              </div>
-
-              <div className="max-h-96 overflow-y-auto rounded-lg border border-white/10 bg-dark-900 p-2 space-y-1">
-                {displayedSessions.map((s) => {
-                  const isSelected = selectedSessionIds.includes(s.id);
-                  const isActive = s.status?.toLowerCase() === 'active' || s.is_logged_in;
-                  return (
-                    <button
-                      key={s.id}
-                      type="button"
-                      onClick={() => toggleSession(s.id)}
-                      disabled={!isActive}
-                      className={`w-full flex items-center gap-2 px-3 py-2 rounded-md text-sm transition ${
-                        isSelected
-                          ? 'bg-primary-500/20 text-primary-300 border border-primary-500/30'
-                          : 'hover:bg-white/5 text-gray-300 border border-transparent'
-                      } ${!isActive ? 'opacity-50 cursor-not-allowed' : ''}`}
-                    >
-                      <div className={`w-4 h-4 rounded border flex items-center justify-center flex-shrink-0 ${
-                        isSelected ? 'border-primary-500 bg-primary-500/30' : 'border-gray-600'
-                      }`}>
-                        {isSelected && <Check className="w-3 h-3 text-primary-400" />}
-                      </div>
-                      <span className="truncate">{s.phone || s.id}</span>
-                      {s.username && <span className="text-gray-500 text-xs">@{s.username}</span>}
-                      {!isActive && <span className="text-xs text-gray-500">(inactive)</span>}
-                    </button>
-                  );
-                })}
-              </div>
-
-              {activeSessions.length === 0 && (
-                <p className="mt-2 text-xs text-amber-400">No active sessions. Please login first.</p>
-              )}
-              </>
-              )}
-            </div>
+            {renderSessionPicker()}
 
             {/* Summary */}
             <div className="rounded-xl border border-white/5 bg-dark-800 p-5">
@@ -581,6 +644,7 @@ export default function AccountSettings() {
           </button>
         </div>
       </form>
+      )}
     </div>
   );
 }
