@@ -2844,6 +2844,23 @@ class TelegramService {
       return new Error('Unknown error occurred');
     }
 
+    // Idempotency guard. Several call sites wrap errors through this
+    // helper (e.g. `_withFloodRetry` re-throws via this method, then
+    // the calling function — `getMe`, `addMemberToGroup`, etc. —
+    // catches and pipes through it again). On the second pass the
+    // enriched message no longer contains the symbolic code
+    // (e.g. "The session authorization key is not registered." has no
+    // AUTH_KEY_UNREGISTERED token), so the errorMap patterns miss and
+    // the error falls into the generic 500 branch with code
+    // TELEGRAM_API_ERROR. That's what surfaced in the operator's
+    // session-login flow as a "strange unknown login error" — the
+    // backend lost the symbolic auth-key-revoked code on the second
+    // wrap. If the error already came out of this helper (we tag
+    // with `originalError`), pass it through unchanged.
+    if (error && error.originalError !== undefined) {
+      return error;
+    }
+
     const errorMessage = error.message || String(error);
 
     // Map of known Telegram error codes to human-readable messages

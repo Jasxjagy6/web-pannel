@@ -274,17 +274,54 @@ async function cloneOne(ctx, sessionRow, sessionState, destApiId, destApiHash) {
       sessionState.progress = 50;
       // Panel's authorized client tells Telegram "yes, log in the
       // device that exported this token". This is the QR-scan
-      // equivalent.
-      await sourceClient.invoke(
-        new Api.auth.AcceptLoginToken({ token: tokenBytes })
-      );
+      // equivalent. AUTH_KEY_UNREGISTERED here means the source
+      // session is dead — surface a clear error.
+      try {
+        await sourceClient.invoke(
+          new Api.auth.AcceptLoginToken({ token: tokenBytes })
+        );
+      } catch (acceptErr) {
+        const m = String(acceptErr && acceptErr.message || acceptErr);
+        if (m.includes('AUTH_KEY_UNREGISTERED') || m.includes('SESSION_REVOKED')) {
+          throw new Error(
+            `[SOURCE_SESSION_REVOKED] Source session ${sourceId} was revoked by Telegram — re-login it from the Sessions tab and re-run the export.`
+          );
+        }
+        if (m.includes('FROZEN_METHOD_INVALID')) {
+          throw new Error(
+            `[SOURCE_FROZEN] Source account is frozen / restricted by Telegram — cannot clone.`
+          );
+        }
+        if (m.includes('AUTH_TOKEN_INVALID') || m.includes('AUTH_TOKEN_INVALIDX')) {
+          throw new Error(
+            `[INVALID_TOKEN] Telegram rejected the export token during accept. Try again.`
+          );
+        }
+        throw acceptErr;
+      }
 
+      // ── Finalize: re-invoke auth.ExportLoginToken on the new
+      //    (unauthorized) client. Per Telegram's QR-login protocol
+      //    (mirrored in Telethon `qrlogin.py` and TDLib's qr-auth
+      //    flow), AFTER the authorized side accepts the token, the
+      //    unauthorized side calls ExportLoginToken a second time
+      //    and receives `auth.LoginTokenSuccess { authorization }`.
+      //
+      //    `auth.ImportLoginToken` is ONLY for DC migration (called
+      //    with the migrate-DC token after `LoginTokenMigrateTo`).
+      //    Passing it the original (now-consumed) token returns
+      //    AUTH_TOKEN_EXPIRED — which is exactly what every clone
+      //    in the operator's logs failed with before this fix.
       sessionState.status = 'importing_token';
       sessionState.progress = 70;
       let importResult;
       try {
         importResult = await newClient.invoke(
-          new Api.auth.ImportLoginToken({ token: tokenBytes })
+          new Api.auth.ExportLoginToken({
+            apiId: destApiId,
+            apiHash: destApiHash,
+            exceptIds: [],
+          })
         );
       } catch (importErr) {
         const msg = String(importErr && importErr.message || importErr);
@@ -310,6 +347,26 @@ async function cloneOne(ctx, sessionRow, sessionState, destApiId, destApiHash) {
         } else {
           throw importErr;
         }
+      }
+      // Telegram may need a brief moment between AcceptLoginToken on
+      // the source and the re-export observing it. If we still see a
+      // plain LoginToken (not LoginTokenSuccess yet), poll a few more
+      // times before giving up — observed in practice on slower DCs.
+      let pollsLeft = 6;
+      while (
+        pollsLeft > 0 &&
+        importResult instanceof Api.auth.LoginToken &&
+        !(importResult instanceof Api.auth.LoginTokenSuccess)
+      ) {
+        await new Promise((r) => setTimeout(r, 500));
+        importResult = await newClient.invoke(
+          new Api.auth.ExportLoginToken({
+            apiId: destApiId,
+            apiHash: destApiHash,
+            exceptIds: [],
+          })
+        );
+        pollsLeft--;
       }
       if (!(importResult instanceof Api.auth.LoginTokenSuccess) &&
           !(importResult instanceof Api.auth.Authorization)) {
