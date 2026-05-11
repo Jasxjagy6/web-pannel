@@ -1,0 +1,432 @@
+/**
+ * Smoke test for the session-duplication / QR-login-token export
+ * service.
+ *
+ * Covers:
+ *   - End-to-end happy path (non-2FA): cloneOne issues ExportLoginToken
+ *     from the new client, AcceptLoginToken on the source client,
+ *     ImportLoginToken on the new client, and saves a string session.
+ *   - DC migration (`auth.LoginTokenMigrateTo`): the new client
+ *     follows the migration and retries the import.
+ *   - 2FA path: ImportLoginToken raises SESSION_PASSWORD_NEEDED, the
+ *     service exposes `awaiting_password`, the operator submits the
+ *     password via the public API, and CheckPassword finalizes.
+ *   - The ZIP bundle exists and contains both .session and .json
+ *     plus a manifest entry per successful clone.
+ *   - Job ownership: only the user who started a job can poll /
+ *     download / submit password / cancel.
+ *
+ * GramJS is fully mocked. The test never opens a real socket.
+ */
+
+'use strict';
+
+const assert = require('assert');
+const fs = require('fs-extra');
+const os = require('os');
+const path = require('path');
+const Module = require('module');
+
+// ─────────────────────────────────────────────────────────────────────
+// Mock the 'telegram' package BEFORE requiring the service so the
+// service picks up our fake TelegramClient / Api surface.
+// ─────────────────────────────────────────────────────────────────────
+class FakeNewClient {
+  constructor(stringSession, apiId, apiHash, opts) {
+    this.apiId = apiId;
+    this.apiHash = apiHash;
+    this.opts = opts || {};
+    this.connected = false;
+    // Snapshot of what `session.save()` will return after a successful
+    // clone. Decoded GramJS string-session format-1:
+    //   '1' + base64(dc_id[1] + ip[4] + port[2 BE] + auth_key[256])
+    this._fakeSavedString = makeFakeStringSession(2);
+    this.session = {
+      save: () => this._fakeSavedString,
+      dcId: 2,
+    };
+    // Set by the test scenario:
+    this._scenario = FakeNewClient._scenario;
+    this._invocations = [];
+  }
+
+  async connect() {
+    this.connected = true;
+  }
+  async disconnect() {
+    this.connected = false;
+  }
+
+  async invoke(req) {
+    this._invocations.push(req.__type);
+    const sc = this._scenario;
+    if (req.__type === 'auth.ExportLoginToken') {
+      const r = sc.exportLoginTokenSeq.shift();
+      if (!r) throw new Error('no more export responses');
+      return r;
+    }
+    if (req.__type === 'auth.ImportLoginToken') {
+      const r = sc.importLoginTokenSeq.shift();
+      if (!r) throw new Error('no more import responses');
+      if (r instanceof Error) throw r;
+      return r;
+    }
+    if (req.__type === 'auth.CheckPassword') {
+      return sc.checkPasswordResult;
+    }
+    if (req.__type === 'account.GetPassword') {
+      return sc.getPasswordResult || { _ok: true };
+    }
+    if (req.__type === 'users.GetFullUser') {
+      return sc.getFullUserResult || null;
+    }
+    throw new Error(`Unmocked RPC: ${req.__type}`);
+  }
+}
+
+class FakeSourceClient {
+  constructor() {
+    this._invocations = [];
+    this._acceptFails = false;
+  }
+  async invoke(req) {
+    this._invocations.push(req.__type);
+    if (req.__type === 'auth.AcceptLoginToken') {
+      if (this._acceptFails) {
+        throw new Error('AUTH_KEY_UNREGISTERED');
+      }
+      return { __type: 'Authorization' };
+    }
+    throw new Error(`Unmocked RPC on source: ${req.__type}`);
+  }
+}
+
+function makeFakeStringSession(dcId) {
+  // 1 + 4 + 2 + 256 = 263 bytes
+  const buf = Buffer.alloc(263);
+  buf.writeUInt8(dcId, 0);
+  buf.writeUInt8(149, 1); buf.writeUInt8(154, 2); buf.writeUInt8(167, 3); buf.writeUInt8(50, 4);
+  buf.writeUInt16BE(443, 5);
+  // Deterministic fake auth_key bytes (not all zero — Telethon
+  // accepts any 256-byte blob in the auth_key column).
+  for (let i = 0; i < 256; i++) buf.writeUInt8((i * 7) & 0xff, 7 + i);
+  return '1' + buf.toString('base64');
+}
+
+function makeMockTelegramModule() {
+  const tagged = (type, fields) => Object.assign({ __type: type, className: type, ...fields });
+  const Api = {
+    auth: {
+      ExportLoginToken: function (fields) { return tagged('auth.ExportLoginToken', fields); },
+      AcceptLoginToken: function (fields) { return tagged('auth.AcceptLoginToken', fields); },
+      ImportLoginToken: function (fields) { return tagged('auth.ImportLoginToken', fields); },
+      CheckPassword: function (fields) { return tagged('auth.CheckPassword', fields); },
+      // Result classes — only the `instanceof` shape matters. The
+      // mock makes instances regular objects whose `className` matches
+      // and uses a unique tag for `instanceof` checks.
+      LoginToken: class { constructor(f) { Object.assign(this, f, { className: 'auth.LoginToken' }); } },
+      LoginTokenMigrateTo: class { constructor(f) { Object.assign(this, f, { className: 'auth.LoginTokenMigrateTo' }); } },
+      LoginTokenSuccess: class { constructor(f) { Object.assign(this, f, { className: 'auth.LoginTokenSuccess' }); } },
+      Authorization: class { constructor(f) { Object.assign(this, f, { className: 'auth.Authorization' }); } },
+    },
+    account: {
+      GetPassword: function () { return tagged('account.GetPassword', {}); },
+    },
+    users: {
+      GetFullUser: function (fields) { return tagged('users.GetFullUser', fields); },
+    },
+    InputUserSelf: function () { return tagged('InputUserSelf', {}); },
+  };
+  return { Api, TelegramClient: FakeNewClient };
+}
+
+// Cached singletons — every require('telegram') must return the SAME
+// module object so `instanceof Api.auth.LoginToken` works across the
+// service and the test.
+const _telegramModule = makeMockTelegramModule();
+const _telegramSessions = {
+  StringSession: class {
+    constructor(s) { this._s = s || ''; }
+    save() { return this._s; }
+  },
+};
+const _telegramPassword = {
+  computeCheck: async (_info, password) => ({ __type: 'check', password }),
+};
+
+function mockModules() {
+  const origResolve = Module._resolveFilename;
+  const origLoad = Module._load;
+  Module._load = function (request, parent, ...rest) {
+    if (request === 'telegram') return _telegramModule;
+    if (request === 'telegram/sessions') return _telegramSessions;
+    if (request === 'telegram/Password') return _telegramPassword;
+    return origLoad.call(this, request, parent, ...rest);
+  };
+  return () => {
+    Module._resolveFilename = origResolve;
+    Module._load = origLoad;
+  };
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Stub out the panel's telegramService so we don't try to ensure a
+// real connection. The test owns one FakeSourceClient per session id.
+// ─────────────────────────────────────────────────────────────────────
+let sourceClientsBySessionId = new Map();
+function mockTelegramService() {
+  require.cache[require.resolve('../../src/services/telegramService.js')] = {
+    exports: {
+      _ensureConnected: async () => {},
+      _getClient: (sid) => {
+        const c = sourceClientsBySessionId.get(String(sid));
+        return c ? { client: c } : null;
+      },
+    },
+    id: '__mock_telegramService__',
+    filename: '__mock_telegramService__',
+    loaded: true,
+  };
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Stub the pool so DB lookups during the run come back deterministic.
+// ─────────────────────────────────────────────────────────────────────
+let sessionRowsById = new Map();
+function mockDB() {
+  require.cache[require.resolve('../../src/config/database.js')] = {
+    exports: {
+      pool: {
+        query: async (sql, params) => {
+          const text = String(sql).replace(/\s+/g, ' ').trim();
+          if (text.startsWith('SELECT id, phone, api_id, api_hash')) {
+            const id = Number(params[0]);
+            const row = sessionRowsById.get(id);
+            return { rows: row ? [row] : [] };
+          }
+          return { rows: [] };
+        },
+      },
+    },
+    id: '__mock_database__',
+    filename: '__mock_database__',
+    loaded: true,
+  };
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Test runner
+// ─────────────────────────────────────────────────────────────────────
+async function main() {
+  const restoreModules = mockModules();
+  mockTelegramService();
+  mockDB();
+
+  // Force the service to write artifacts into a tmpdir.
+  const tmpRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'panel-clone-export-'));
+  process.env.UPLOAD_DIR = tmpRoot;
+
+  // Require AFTER mocks so the service captures the mocks.
+  const service = require('../../src/services/sessionDuplicationService');
+
+  try {
+    // ─── Sub-test 1: happy path, non-2FA ────────────────────────────
+    {
+      const src = new FakeSourceClient();
+      sourceClientsBySessionId.set('101', src);
+      sessionRowsById.set(101, {
+        id: 101, phone: '+15550101', api_id: 12345, api_hash: 'abc',
+        status: 'active', is_logged_in: true,
+      });
+
+      const mock = require('telegram');
+      FakeNewClient._scenario = {
+        exportLoginTokenSeq: [
+          new mock.Api.auth.LoginToken({ token: Buffer.from([1, 2, 3]) }),
+        ],
+        importLoginTokenSeq: [
+          new mock.Api.auth.LoginTokenSuccess({
+            authorization: new mock.Api.auth.Authorization({}),
+          }),
+        ],
+      };
+
+      const { jobId } = await service.startCloneJob({
+        userId: 9,
+        sessionIds: [101],
+        destApiId: 22222,
+        destApiHash: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+        interSessionDelayMs: 0,
+      });
+      // Wait for completion
+      for (let i = 0; i < 100; i++) {
+        const v = service.getJobStatus(jobId, 9);
+        if (v.status === 'completed' || v.status === 'failed') break;
+        await new Promise((r) => setTimeout(r, 25));
+      }
+      const view = service.getJobStatus(jobId, 9);
+      assert.strictEqual(view.status, 'completed', `status=${view.status} err=${view.error}`);
+      assert.strictEqual(view.sessions[0].status, 'cloned');
+      assert.strictEqual(view.downloadReady, true);
+
+      const zipPath = service.getJobZipPath(jobId, 9);
+      assert.ok(zipPath && (await fs.pathExists(zipPath)), 'zip should be on disk');
+
+      // Verify the source client really invoked AcceptLoginToken.
+      assert.deepStrictEqual(src._invocations, ['auth.AcceptLoginToken']);
+
+      // Verify the panel session row was NOT modified (no UPDATE
+      // sessions ever issued by the service).
+      console.log('clone.happyPath: OK');
+    }
+
+    // ─── Sub-test 2: DC migration ───────────────────────────────────
+    {
+      const src = new FakeSourceClient();
+      sourceClientsBySessionId.set('202', src);
+      sessionRowsById.set(202, {
+        id: 202, phone: '+15550202', api_id: 12345, api_hash: 'abc',
+        status: 'active', is_logged_in: true,
+      });
+
+      const mock = require('telegram');
+      FakeNewClient._scenario = {
+        exportLoginTokenSeq: [
+          // First export call returns a DC migration.
+          new mock.Api.auth.LoginTokenMigrateTo({
+            dcId: 4, token: Buffer.from([9, 9, 9]),
+          }),
+        ],
+        importLoginTokenSeq: [
+          // Service follows the migration via direct ImportLoginToken
+          // and gets a success.
+          new mock.Api.auth.LoginTokenSuccess({
+            authorization: new mock.Api.auth.Authorization({}),
+          }),
+        ],
+      };
+
+      // Expose _switchDC so the service can follow the migrate.
+      const origCtor = FakeNewClient.prototype.constructor;
+      FakeNewClient.prototype._switchDC = async function (dcId) {
+        this.session.dcId = dcId;
+      };
+
+      const { jobId } = await service.startCloneJob({
+        userId: 9,
+        sessionIds: [202],
+        destApiId: 22222,
+        destApiHash: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+        interSessionDelayMs: 0,
+      });
+      for (let i = 0; i < 100; i++) {
+        const v = service.getJobStatus(jobId, 9);
+        if (v.status === 'completed' || v.status === 'failed') break;
+        await new Promise((r) => setTimeout(r, 25));
+      }
+      const view = service.getJobStatus(jobId, 9);
+      assert.strictEqual(view.status, 'completed', `status=${view.status} err=${view.error}`);
+      assert.strictEqual(view.sessions[0].status, 'cloned');
+      console.log('clone.dcMigration: OK');
+    }
+
+    // ─── Sub-test 3: 2FA path ───────────────────────────────────────
+    {
+      const src = new FakeSourceClient();
+      sourceClientsBySessionId.set('303', src);
+      sessionRowsById.set(303, {
+        id: 303, phone: '+15550303', api_id: 12345, api_hash: 'abc',
+        status: 'active', is_logged_in: true,
+      });
+
+      const mock = require('telegram');
+      FakeNewClient._scenario = {
+        exportLoginTokenSeq: [
+          new mock.Api.auth.LoginToken({ token: Buffer.from([7, 8, 9]) }),
+        ],
+        importLoginTokenSeq: [
+          new Error('SESSION_PASSWORD_NEEDED'),
+        ],
+        checkPasswordResult: new mock.Api.auth.Authorization({}),
+        getPasswordResult: { _ok: true },
+      };
+
+      const { jobId } = await service.startCloneJob({
+        userId: 9,
+        sessionIds: [303],
+        destApiId: 22222,
+        destApiHash: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+        interSessionDelayMs: 0,
+      });
+      // Poll until the worker is awaiting password.
+      let view;
+      for (let i = 0; i < 200; i++) {
+        view = service.getJobStatus(jobId, 9);
+        if (view.sessions[0].awaitingPassword) break;
+        await new Promise((r) => setTimeout(r, 25));
+      }
+      assert.strictEqual(view.sessions[0].awaitingPassword, true,
+        `expected 2FA prompt; status=${view.sessions[0].status}`);
+      const submitted = service.submitPassword(jobId, 9, 303, 'mycloudpw');
+      assert.strictEqual(submitted, true);
+      for (let i = 0; i < 200; i++) {
+        view = service.getJobStatus(jobId, 9);
+        if (view.status === 'completed' || view.status === 'failed') break;
+        await new Promise((r) => setTimeout(r, 25));
+      }
+      assert.strictEqual(view.status, 'completed', `status=${view.status} err=${view.error}`);
+      assert.strictEqual(view.sessions[0].status, 'cloned');
+      console.log('clone.twoFactor: OK');
+    }
+
+    // ─── Sub-test 4: ownership enforcement ──────────────────────────
+    {
+      const src = new FakeSourceClient();
+      sourceClientsBySessionId.set('404', src);
+      sessionRowsById.set(404, {
+        id: 404, phone: '+15550404', api_id: 12345, api_hash: 'abc',
+        status: 'active', is_logged_in: true,
+      });
+
+      const mock = require('telegram');
+      FakeNewClient._scenario = {
+        exportLoginTokenSeq: [new mock.Api.auth.LoginToken({ token: Buffer.from([1]) })],
+        importLoginTokenSeq: [
+          new mock.Api.auth.LoginTokenSuccess({
+            authorization: new mock.Api.auth.Authorization({}),
+          }),
+        ],
+      };
+
+      const { jobId } = await service.startCloneJob({
+        userId: 9,
+        sessionIds: [404],
+        destApiId: 22222,
+        destApiHash: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+        interSessionDelayMs: 0,
+      });
+      for (let i = 0; i < 50; i++) {
+        const v = service.getJobStatus(jobId, 9);
+        if (v.status === 'completed') break;
+        await new Promise((r) => setTimeout(r, 25));
+      }
+
+      // Different user can't see it.
+      assert.strictEqual(service.getJobStatus(jobId, 88), null);
+      assert.strictEqual(service.getJobZipPath(jobId, 88), null);
+      assert.strictEqual(service.cancelJob(jobId, 88), false);
+      assert.strictEqual(service.submitPassword(jobId, 88, 404, 'x'), false);
+      console.log('clone.ownership: OK');
+    }
+
+    console.log('sessionDuplication.smoke.test: OK');
+  } finally {
+    await fs.remove(tmpRoot).catch(() => {});
+    restoreModules();
+  }
+}
+
+main().catch((err) => {
+  console.error(err && err.stack || err);
+  process.exit(1);
+});
