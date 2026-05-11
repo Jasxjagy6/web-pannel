@@ -39,8 +39,16 @@
  * DC migration:
  *   - `auth.ExportLoginToken` can return `auth.LoginTokenMigrateTo`
  *     when the destination DC differs from the new client's current
- *     DC. GramJS handles the redirect via `_switchDC`, then we retry
- *     the export.
+ *     DC. GramJS handles the redirect via `_switchDC`, then we call
+ *     `auth.ImportLoginToken` on the new DC with the migrate token.
+ *
+ *   - This response can show up on BOTH calls to `ExportLoginToken`:
+ *     the initial export AND the re-export that happens after the
+ *     source side AcceptLoginToken completes. Older builds only
+ *     handled the initial-export case and threw
+ *     "Unexpected import result type: auth.LoginTokenMigrateTo" on
+ *     the re-export, leaving the destination session unrecoverable.
+ *     The `_followLoginTokenMigrateTo` helper handles both phases.
  */
 
 'use strict';
@@ -58,6 +66,36 @@ const logger = require('../utils/logger');
 const telegramService = require('./telegramService');
 const telegramConfig = require('../config/telegram');
 const { writeTelethonSessionFile } = require('../utils/gramjsToTelethon');
+
+/**
+ * Switch `client` to `dcId` and call `auth.ImportLoginToken` with
+ * the migrate token Telegram returned. Used by both the initial
+ * ExportLoginToken loop and the post-AcceptLoginToken re-export
+ * (Telegram can hand back LoginTokenMigrateTo on either).
+ *
+ * Returns the response of ImportLoginToken — typically a
+ * `LoginTokenSuccess`, but Telegram is free to return another
+ * `LoginTokenMigrateTo` if the new DC migrates again. The caller is
+ * responsible for re-handling that case inside its retry loop.
+ *
+ * @param {TelegramClient} client       New (unauthorized) client.
+ * @param {object} migrate              The LoginTokenMigrateTo result.
+ * @returns {Promise<object>}           The ImportLoginToken response.
+ */
+async function _followLoginTokenMigrateTo(client, migrate) {
+  if (typeof client._switchDC === 'function') {
+    await client._switchDC(migrate.dcId);
+  } else if (client.session && typeof client.session.setDC === 'function') {
+    client.session.setDC(migrate.dcId, null, null);
+    await client.disconnect();
+    await client.connect();
+  } else {
+    throw new Error(
+      'Cannot follow auth.loginTokenMigrateTo: GramJS exposes neither _switchDC nor session.setDC'
+    );
+  }
+  return client.invoke(new Api.auth.ImportLoginToken({ token: migrate.token }));
+}
 
 // In-memory job registry. One panel process is sufficient for V1 — the
 // operator workflow is interactive and a job lives at most a few
@@ -297,27 +335,7 @@ async function cloneOne(ctx, sessionRow, sessionState, destApiId, destApiHash) {
       if (tokenResult instanceof Api.auth.LoginTokenMigrateTo) {
         migrations++;
         sessionState.progress = 25 + migrations * 2;
-        // Switch the new client to the requested DC and retry the
-        // export. GramJS exposes this as a private method; in v2 it's
-        // `_switchDC`. We call it defensively so a future GramJS rename
-        // doesn't crash the entire job.
-        if (typeof newClient._switchDC === 'function') {
-          await newClient._switchDC(tokenResult.dcId);
-        } else if (typeof newClient.session.setDC === 'function') {
-          newClient.session.setDC(tokenResult.dcId, null, null);
-          await newClient.disconnect();
-          await newClient.connect();
-        } else {
-          throw new Error(
-            `Cannot follow auth.loginTokenMigrateTo: GramJS exposes neither _switchDC nor session.setDC`
-          );
-        }
-        // After DC switch we must call ImportLoginToken with the
-        // returned bytes, NOT re-export. Telegram docs: the migrate
-        // response carries the same token to import on the new DC.
-        const imported = await newClient.invoke(
-          new Api.auth.ImportLoginToken({ token: tokenResult.token })
-        );
+        const imported = await _followLoginTokenMigrateTo(newClient, tokenResult);
         if (imported instanceof Api.auth.LoginTokenSuccess) {
           tokenResult = imported;
           break;
@@ -392,6 +410,19 @@ async function cloneOne(ctx, sessionRow, sessionState, destApiId, destApiHash) {
             exceptIds: [],
           })
         );
+        // The post-Accept re-export can ALSO return
+        // LoginTokenMigrateTo. Handle it the same way as the initial
+        // export — switch DC + ImportLoginToken — before the validity
+        // check below fires the "Unexpected import result type" error
+        // that operators were seeing on cross-DC source accounts.
+        let reMigrations = 0;
+        while (
+          reMigrations < 3 &&
+          importResult instanceof Api.auth.LoginTokenMigrateTo
+        ) {
+          reMigrations++;
+          importResult = await _followLoginTokenMigrateTo(newClient, importResult);
+        }
       } catch (importErr) {
         const msg = String(importErr && importErr.message || importErr);
         if (msg.includes('SESSION_PASSWORD_NEEDED')) {
@@ -435,6 +466,17 @@ async function cloneOne(ctx, sessionRow, sessionState, destApiId, destApiHash) {
             exceptIds: [],
           })
         );
+        // Same defensive MigrateTo handling as the initial re-export
+        // attempt: a slower DC may serve the migrate response inside
+        // the polling window, not just the first re-export.
+        let pollMigrations = 0;
+        while (
+          pollMigrations < 3 &&
+          importResult instanceof Api.auth.LoginTokenMigrateTo
+        ) {
+          pollMigrations++;
+          importResult = await _followLoginTokenMigrateTo(newClient, importResult);
+        }
         pollsLeft--;
       }
       if (!(importResult instanceof Api.auth.LoginTokenSuccess) &&

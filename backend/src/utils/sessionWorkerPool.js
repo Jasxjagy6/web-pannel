@@ -38,10 +38,37 @@
  *     cooldownMsMax:      number,
  *     itemDelayMsMin:     number,
  *     itemDelayMsMax:     number,
+ *     startStaggerMsMin:  number,                // optional, see below
+ *     startStaggerMsMax:  number,
  *     attempt(ctx),                              // user-supplied per-attempt fn
  *     onProgress(snapshot),                      // optional
  *     isCancelled(),                             // optional
  *   }) -> { results: Array<AttemptResult>, stats: PoolStats }
+ *
+ * Cross-session pacing (`startStaggerMs*`)
+ * ----------------------------------------
+ * `itemDelayMs*` paces successive items WITHIN a single session's
+ * burst. For bulk mass-DM where each session has exactly ONE item
+ * per target, this delay never fires — every worker pops its only
+ * item immediately and races every other worker to Telegram. With
+ * 33+ sessions hitting a single user in sub-second concurrency,
+ * Telegram raises an account-level PEER_FLOOD spam flag on every
+ * session involved (see Job 54 in the operator's logs).
+ *
+ * `startStaggerMsMin/Max` introduces an offset BEFORE each worker's
+ * first `attempt()` call: worker N waits `N × pickDelay(min,max)` ms
+ * AFTER popping its first item but BEFORE invoking `attempt()`. The
+ * "after pop" placement is deliberate — for the one-item-per-session
+ * mass-DM shape, every worker pops in the same event-loop tick (FIFO),
+ * which means item i naturally lands on worker i. If we slept before
+ * popping, worker 0 would race through every item alone and we'd just
+ * trade a fan-out PEER_FLOOD across 33 sessions for a single-session
+ * SendMessage flood on session 0. The total wall time of the pool
+ * stays `O(staggerMs × workers)` in the worst case — fine for
+ * institutional batches because the alternative was a sequential
+ * per-item delay across the whole queue. Callers that don't need
+ * cross-session pacing leave these knobs at 0 (the default) and the
+ * behaviour is unchanged.
  *
  * Each `attempt(ctx)` receives:
  *   {
@@ -179,6 +206,8 @@ async function run(cfg) {
     cooldownMsMax = 0,
     itemDelayMsMin = 0,
     itemDelayMsMax = 0,
+    startStaggerMsMin = 0,
+    startStaggerMsMax = 0,
     maxAttemptsPerItem,
   } = cfg;
 
@@ -258,10 +287,21 @@ async function run(cfg) {
    * One session's worker loop. Owns the session row for the
    * duration of one burst. Re-acquires the session from the
    * pool head after the burst's cooldown.
+   *
+   * `startOffsetMs` is the cross-session stagger applied BEFORE
+   * worker N invokes `attempt()` for its first item. We delay
+   * *after* `queue.pop()` rather than before, so the FIFO pop order
+   * still pins items to sessions when `items.length === sessions.length`
+   * (the mass-DM "one target per session" pattern relies on this
+   * happy accident — items[i].sessionId == sessions[i].id when both
+   * arrays are zipped). Without that ordering, worker 0 would race
+   * through every item alone and we'd just trade a fan-out PEER_FLOOD
+   * across 33 sessions for a single-session SendMessage flood.
    */
-  async function sessionWorker(session) {
+  async function sessionWorker(session, startOffsetMs) {
     activeWorkers++;
     let sessionDead = false;
+    let firstAttempt = true;
     try {
       let burstRemaining = perSessionBurst;
 
@@ -275,6 +315,18 @@ async function run(cfg) {
 
         const entry = queue.pop();
         if (!entry) return;
+
+        // Cross-session stagger: each worker sleeps `startOffsetMs`
+        // ONCE, just before its first attempt. We sleep here (after
+        // pop) instead of before the while-loop so the queue's pop
+        // order pins each item to the worker that popped it (see the
+        // function-level comment above).
+        if (firstAttempt) {
+          firstAttempt = false;
+          if (startOffsetMs > 0) {
+            await cancellableSleep(startOffsetMs, isCancelled);
+          }
+        }
 
         const ctx = {
           session,
@@ -425,11 +477,19 @@ async function run(cfg) {
   // off the live pool and run them in parallel. Any sessions left
   // over are unused; that's fine, our throughput is already
   // saturating the queue.
+  //
+  // Workers are staggered by `startStaggerMs*` so a 100-session pool
+  // with 1 item per session doesn't fire 100 requests at Telegram
+  // inside the same second (the PEER_FLOOD failure mode for mass DM).
+  // Worker 0 starts immediately; worker N waits N * pickDelay(min,max).
   const workerPromises = [];
   const initialBatch = Math.min(concurrency, liveSessions.length);
   for (let i = 0; i < initialBatch; i++) {
     const session = liveSessions[i];
-    workerPromises.push(sessionWorker(session));
+    const startOffsetMs = i === 0 || startStaggerMsMax <= 0
+      ? 0
+      : i * pickDelay(startStaggerMsMin, startStaggerMsMax);
+    workerPromises.push(sessionWorker(session, startOffsetMs));
   }
 
   await Promise.all(workerPromises);

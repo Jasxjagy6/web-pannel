@@ -18,6 +18,80 @@ function nearly(actual, expected, tol = 0) {
 // Auto mode — group_add
 // ---------------------------------------------------------------------------
 
+(function autoGroupTinyJobAggressive() {
+  // 27 users / 5 sessions (the reported case). Without the tiny-job
+  // band this used to fall into the 5–20 ratio band (30–60s per-item
+  // delay × 2-3 rounds × 60–180s cooldown ≈ 20+ minutes for a job
+  // operators expected to finish in under five). The tiny-job band
+  // should drop per-item delay to 5–15s and skip the cooldown.
+  const p = planner.plan({
+    totalItems: 27,
+    sessionIds: Array.from({ length: 5 }, (_, i) => i + 1),
+    workType: 'group_add',
+    mode: 'auto',
+  });
+  assert.strictEqual(p.totalItems, 27);
+  assert.strictEqual(p.sessionCount, 5);
+  // Tiny-job band relaxes pacing aggressively.
+  assert.ok(
+    p.itemDelayMsMax <= 15_000,
+    `expected itemDelayMsMax <= 15000, got ${p.itemDelayMsMax}`
+  );
+  assert.ok(
+    p.itemDelayMsMin <= 5_000,
+    `expected itemDelayMsMin <= 5000, got ${p.itemDelayMsMin}`
+  );
+  assert.strictEqual(
+    p.cooldownSecMin,
+    0,
+    `expected zero min cooldown, got ${p.cooldownSecMin}`
+  );
+  assert.ok(
+    p.cooldownSecMax <= 30,
+    `expected cooldownSecMax <= 30, got ${p.cooldownSecMax}`
+  );
+  // perSessionBurst should be ceil(ratio) ≤ 4 ceiling.
+  assert.ok(p.perSessionBurst >= 1 && p.perSessionBurst <= 4);
+  // sum of per-session counts == totalItems.
+  const sum = p.perSession.reduce((a, s) => a + s.count, 0);
+  assert.strictEqual(sum, 27);
+  console.log('autoGroupTinyJobAggressive: OK');
+})();
+
+(function autoGroupTinyJobBoundary() {
+  // 51 items: just over the tiny-job threshold. Should fall back to
+  // the legacy 5–20 / >20 bands (slower pacing).
+  const p = planner.plan({
+    totalItems: 51,
+    sessionIds: Array.from({ length: 5 }, (_, i) => i + 1),
+    workType: 'group_add',
+    mode: 'auto',
+  });
+  // 51 / 5 = 10.2 → legacy 5–20 band → 30–60s per-item, ≥60s cooldown.
+  assert.ok(
+    p.itemDelayMsMin >= 30_000,
+    `boundary: expected legacy per-item delay, got ${p.itemDelayMsMin}`
+  );
+  assert.ok(
+    p.cooldownSecMin >= 60,
+    `boundary: expected legacy cooldown, got ${p.cooldownSecMin}`
+  );
+  console.log('autoGroupTinyJobBoundary: OK');
+})();
+
+(function autoMessageTinyJob() {
+  // bulk_message tiny job: 10 messages × 4 sessions.
+  const p = planner.plan({
+    totalItems: 10,
+    sessionIds: [1, 2, 3, 4],
+    workType: 'bulk_message',
+    mode: 'auto',
+  });
+  assert.ok(p.itemDelayMsMax <= 4_000);
+  assert.strictEqual(p.cooldownSecMin, 0);
+  console.log('autoMessageTinyJob: OK');
+})();
+
 (function autoGroupSmallRatio() {
   // 200 users / 100 sessions -> 2 per session, single pass, no cooldown.
   const p = planner.plan({

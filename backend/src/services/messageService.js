@@ -3065,6 +3065,18 @@ class MessageService {
           target: String(target),
         }));
 
+        // Cross-session pacing: each session has exactly ONE item per
+        // target, so the `itemDelayMs*` knob never fires (it only
+        // paces successive items within a session's burst). Without a
+        // cross-session offset, every worker dispatches its single
+        // SendMessage to Telegram in the same sub-second, which the
+        // platform treats as 33 different accounts spam-hitting one
+        // user — every session gets account-level PEER_FLOOD'd in
+        // under a second (see Job 54 logs). The `startStaggerMs*`
+        // option spaces session starts by `delaySeconds` so the same
+        // pacing the operator picks for "within a session" is applied
+        // ACROSS sessions for the first item.
+        const staggerMs = Math.max(0, Number(delaySeconds) || 0) * 1000;
         const poolResult = await runWorkerPool({
           sessions: targetLiveSessions,
           items: workItems,
@@ -3074,6 +3086,8 @@ class MessageService {
           cooldownMsMax: 0,
           itemDelayMsMin: delaySeconds * 1000,
           itemDelayMsMax: delaySeconds * 1000,
+          startStaggerMsMin: staggerMs,
+          startStaggerMsMax: staggerMs,
           maxAttemptsPerItem: 1,
 
           isCancelled: async () => {
