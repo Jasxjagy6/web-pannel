@@ -1385,7 +1385,17 @@ class TelegramService {
       //
       // We also catch the legacy "empty updates && empty users" reply
       // (older deployments without the Layer 198 wrapper) as a silent
-      // drop — same outcome as a privacy reject.
+      // drop — same outcome as a privacy reject EXCEPT when the user
+      // was already a participant before this call, in which case
+      // Telegram returns the same empty shape because no state change
+      // happened. To avoid mis-reporting already-added users as
+      // PRIVACY_RESTRICT (operator quote: "I check telegram and they
+      // were in but still pannel was showing user privacy restrict
+      // (cached values from previous retries)"), we probe
+      // `channels.GetParticipant` whenever the silent-drop shape fires
+      // and `missingInvitees` was empty — if the user is in, throw
+      // USER_ALREADY_PARTICIPANT so the runner records the row as
+      // "User already in target" instead of a privacy failure.
       if (!isBasicGroup) {
         const missing =
           (inviteResult && (inviteResult.missingInvitees || inviteResult.missing_invitees)) || [];
@@ -1401,11 +1411,72 @@ class TelegramService {
           (Array.isArray(inviteResult && inviteResult.users) && inviteResult.users) ||
           [];
 
-        const silentlyDropped =
-          (Array.isArray(missing) && missing.length > 0) ||
-          (innerUpdates.length === 0 && innerUsers.length === 0);
+        const missingHasEntries = Array.isArray(missing) && missing.length > 0;
+        const emptyResponse = innerUpdates.length === 0 && innerUsers.length === 0;
+        const silentlyDropped = missingHasEntries || emptyResponse;
 
         if (silentlyDropped) {
+          // Empty-response without `missingInvitees` is ambiguous:
+          // it can be "silently dropped (privacy)" OR "user was
+          // already a participant before this call". Disambiguate
+          // with a single `channels.GetParticipant` probe so we
+          // never mis-classify an already-in-group user as a
+          // privacy reject. We only run the probe when
+          // `missingInvitees` is empty — when Telegram explicitly
+          // populates `missingInvitees`, the user is genuinely the
+          // one that was dropped.
+          if (!missingHasEntries && emptyResponse) {
+            try {
+              const probe = await this.clients.get(String(sessionId)).client.invoke(
+                new Api.channels.GetParticipant({
+                  channel: getInputPeer(groupEntity),
+                  participant: inputUser,
+                })
+              );
+              const participant = probe && probe.participant;
+              const pcls = participant && participant.className;
+              // `ChannelParticipantLeft` / `ChannelParticipantBanned`
+              // mean the user is NOT in the group — fall through to
+              // the existing privacy classification. Any other shape
+              // (`ChannelParticipant`, `ChannelParticipantSelf`,
+              // `ChannelParticipantAdmin`, `ChannelParticipantCreator`)
+              // means the user is already in — that's success from
+              // the operator's standpoint ("I tried to add them and
+              // they're in"), but we surface it as
+              // USER_ALREADY_PARTICIPANT so the runner reports it as
+              // "already in target" rather than a fresh add.
+              if (
+                participant &&
+                pcls !== 'ChannelParticipantLeft' &&
+                pcls !== 'ChannelParticipantBanned'
+              ) {
+                logger.info(
+                  `addMemberToGroup: user ${userId} was already a participant of ${groupId} ` +
+                    `(channels.InviteToChannel returned empty updates) — reporting USER_ALREADY_PARTICIPANT`,
+                  { sessionId, participantClass: pcls }
+                );
+                throw new Error('USER_ALREADY_PARTICIPANT');
+              }
+            } catch (probeErr) {
+              const probeMsg = String(probeErr && probeErr.message || probeErr);
+              // The probe itself succeeded but the user is genuinely
+              // not in the group — the catch reraises our own
+              // USER_ALREADY_PARTICIPANT so let that propagate.
+              if (probeMsg.includes('USER_ALREADY_PARTICIPANT')) {
+                throw probeErr;
+              }
+              // `USER_NOT_PARTICIPANT` from GetParticipant is the
+              // canonical "user is genuinely not in the group"
+              // answer. Fall through to the privacy path below.
+              if (!probeMsg.includes('USER_NOT_PARTICIPANT')) {
+                logger.debug(
+                  `addMemberToGroup: channels.GetParticipant probe failed for ${userId} in ${groupId}: ${probeMsg}`,
+                  { sessionId }
+                );
+              }
+            }
+          }
+
           const detail = (Array.isArray(missing) && missing[0]) || {};
           const wouldAllow = detail.premiumWouldAllowInvite || detail.premium_would_allow_invite;
           logger.warn(

@@ -75,6 +75,50 @@ const stageRoot = path.join(uploadsRoot, '_clone_export');
 const DEFAULT_INTER_SESSION_DELAY_MS = 800;
 const PASSWORD_WAIT_TIMEOUT_MS = 5 * 60 * 1000; // 5 min
 const JOB_TTL_MS = 30 * 60 * 1000; // 30 min after completion
+// Bound the new (destination) client's connect step. Without a
+// timeout, a misbehaving DC or blocked egress can leave the clone
+// hung in `connecting_destination` forever, which is what the
+// operator saw as "sessions were 100% active but export failed\" —
+// the row never moved past 15% and never produced a real error.
+const NEW_CLIENT_CONNECT_TIMEOUT_MS = parseInt(
+  process.env.CLONE_EXPORT_CONNECT_TIMEOUT_MS || '20000',
+  10
+);
+// Same bound for the per-RPC calls on the new client. Telegram's
+// QR-login RPCs normally return in <1s; if any one of them stalls,
+// we want a clear timeout error instead of an unbounded wait.
+const NEW_CLIENT_INVOKE_TIMEOUT_MS = parseInt(
+  process.env.CLONE_EXPORT_INVOKE_TIMEOUT_MS || '15000',
+  10
+);
+
+/**
+ * Race a promise against a timeout. Used to bound the destination
+ * client's connect/invoke calls so a stalled DC doesn't leave a clone
+ * hung in `connecting_destination` forever.
+ *
+ * @param {Promise<T>} p
+ * @param {number} ms
+ * @param {string} tag  short label for the timeout error
+ * @returns {Promise<T>}
+ * @template T
+ */
+function withCloneTimeout(p, ms, tag) {
+  let timer = null;
+  return Promise.race([
+    Promise.resolve(p).finally(() => {
+      if (timer) clearTimeout(timer);
+    }),
+    new Promise((_, reject) => {
+      timer = setTimeout(() => {
+        const e = new Error(`[CLONE_TIMEOUT] ${tag} did not complete within ${ms}ms`);
+        e.isTimeout = true;
+        reject(e);
+      }, ms);
+      if (timer.unref) timer.unref();
+    }),
+  ]);
+}
 
 function newJobId() {
   return `clone-${Date.now()}-${crypto.randomBytes(4).toString('hex')}`;
@@ -207,7 +251,32 @@ async function cloneOne(ctx, sessionRow, sessionState, destApiId, destApiHash) {
   });
   ctx.toDisconnect.push(newClient);
 
-  await newClient.connect();
+  // Bound the connect step so a stalled DC / blocked egress never
+  // leaves the clone hung at progress=15. The operator's report was
+  // "all sessions were 100% active but the export failed" with no
+  // per-row error — that's the signature of an unbounded
+  // `client.connect()` on the destination DC.
+  try {
+    await withCloneTimeout(
+      newClient.connect(),
+      NEW_CLIENT_CONNECT_TIMEOUT_MS,
+      `destination client connect (apiId=${destApiId})`
+    );
+  } catch (connErr) {
+    const m = String(connErr && connErr.message || connErr);
+    if (connErr && connErr.isTimeout) {
+      throw new Error(
+        `[DEST_CONNECT_TIMEOUT] Could not reach Telegram with destApiId=${destApiId} within ${NEW_CLIENT_CONNECT_TIMEOUT_MS}ms. ` +
+          `Confirm the destApiId/destApiHash are valid (https://my.telegram.org → API development tools) and that the panel host can reach Telegram DCs directly.`
+      );
+    }
+    if (/API_ID_INVALID|API_ID_PUBLISHED_FLOOD/i.test(m)) {
+      throw new Error(
+        `[DEST_API_INVALID] Telegram rejected destApiId=${destApiId} (${m}). Re-create a fresh api_id/api_hash pair at https://my.telegram.org and try again.`
+      );
+    }
+    throw new Error(`[DEST_CONNECT_FAILED] ${m}`);
+  }
 
   try {
     // 3. ExportLoginToken on the new (unauthorized) client. We may

@@ -114,6 +114,23 @@ export const submitCloneExportPassword = (jobId, sessionId, password) =>
 export const cancelCloneExport = (jobId) =>
   api.post(`/sessions/clone-export/${jobId}/cancel`);
 
+// ── Bulk-login job runner ──────────────────────────────────────────
+// The Sessions page "Login All" button kicks off a background job
+// on the panel that calls /sessions/:id/login for each selected
+// session in turn. The frontend polls the job status and renders a
+// progress modal identical in shape to the clone-export one. This
+// replaces the legacy inline `for-await` loop that produced no
+// per-row visibility for the operator.
+
+export const startBulkLogin = (payload) =>
+  api.post('/sessions/bulk-login/start', payload);
+
+export const getBulkLoginStatus = (jobId) =>
+  api.get(`/sessions/bulk-login/${jobId}/status`);
+
+export const cancelBulkLogin = (jobId) =>
+  api.post(`/sessions/bulk-login/${jobId}/cancel`);
+
 export const downloadCloneExportZip = async (jobId) => {
   const response = await api.get(`/sessions/clone-export/${jobId}/download`, {
     responseType: 'blob',

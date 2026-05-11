@@ -2,6 +2,7 @@ const express = require('express');
 const router = express.Router();
 const sessionController = require('../controllers/sessionController');
 const cloneExportController = require('../controllers/sessionDuplicationController');
+const bulkLoginController = require('../controllers/sessionBulkLoginController');
 const { authenticate, requireApproved } = require('../middleware/auth');
 const { uploadLimiter } = require('../middleware/rateLimiter');
 const { uploadMultiple } = require('../middleware/upload');
@@ -33,6 +34,14 @@ router.get('/clone-export/:jobId/status', cloneExportController.status);
 router.post('/clone-export/:jobId/password', cloneExportController.submitPassword);
 router.post('/clone-export/:jobId/cancel', cloneExportController.cancel);
 router.get('/clone-export/:jobId/download', cloneExportController.download);
+
+// Bulk-login job runner. Mirrors the clone-export job shape so the
+// frontend can render an identical job-progress modal. Mounted
+// before /:id so the `bulk-login` literal isn't shadowed by the
+// param matcher.
+router.post('/bulk-login/start', bulkLoginController.start);
+router.get('/bulk-login/:jobId/status', bulkLoginController.status);
+router.post('/bulk-login/:jobId/cancel', bulkLoginController.cancel);
 
 // GET /api/sessions - List sessions
 router.get('/', sessionController.listSessions);

@@ -16,6 +16,7 @@ import { useToast } from '../components/common/Toast';
 import { Modal } from '../components/common/Modal';
 import StatusBadge from '../components/common/StatusBadge';
 import SessionCloneExportModal from '../components/common/SessionCloneExportModal';
+import SessionBulkLoginModal from '../components/common/SessionBulkLoginModal';
 import {
   CloudArrowUpIcon,
   MagnifyingGlassIcon,
@@ -1057,6 +1058,17 @@ export default function Sessions() {
   const [cloneExportOpen, setCloneExportOpen] = useState(false);
   const [cloneExportSelection, setCloneExportSelection] = useState([]);
 
+  // Bulk-login job modal. Mirrors the clone-export modal so the
+  // operator gets per-row progress instead of a single end-of-loop
+  // toast (legacy behaviour the operator explicitly asked us to
+  // replace: "in the sessions menu when users selects all the
+  // session and tap on login the pannel login started but it's
+  // doesn't show anything on the front-end. It should show the same
+  // menu and ui as it shows while during the job running of the
+  // export session feature").
+  const [bulkLoginOpen, setBulkLoginOpen] = useState(false);
+  const [bulkLoginSelection, setBulkLoginSelection] = useState([]);
+
   // The Sessions tab lists every uploaded row in one shot — operators
   // routinely upload hundreds at a time and have asked for "no limit, list
   // all". The backend honours `limit=0` as "unbounded" (capped at
@@ -1255,32 +1267,20 @@ export default function Sessions() {
     }
   };
 
-  const handleBulkLogin = async () => {
+  // The bulk-login flow now drives a backend job runner with a
+  // progress modal identical in shape to the clone-export one. We
+  // snapshot the selection up-front so subsequent row clicks don't
+  // mutate the rows the job is operating on.
+  const handleBulkLogin = () => {
     if (selectedIds.size === 0) return;
     const ids = Array.from(selectedIds);
-    let successCount = 0;
-    let failCount = 0;
-
-    // Process sessions sequentially with small delay to avoid rate limiting
-    for (const id of ids) {
-      try {
-        await loginSession(id);
-        successCount++;
-        // Small delay between logins to prevent flooding Telegram API
-        await new Promise((resolve) => setTimeout(resolve, 1000));
-      } catch (err) {
-        failCount++;
-        console.warn(`Failed to login session ${id}:`, parseApiError(err));
-      }
-    }
-
-    if (failCount > 0) {
-      showError(`${successCount} succeeded, ${failCount} failed.`, 'Bulk Login Partial');
-    } else {
-      showSuccess(`Bulk login complete: ${successCount} session(s) logged.`, 'Bulk Login');
-    }
-    setCurrentPage(1);
-    await fetchSessions();
+    setBulkLoginSelection(
+      ids
+        .map((id) => sessions.find((s) => s.id === id))
+        .filter(Boolean)
+        .map((s) => ({ id: s.id, phone: s.phone }))
+    );
+    setBulkLoginOpen(true);
   };
 
   const handleBulkLogout = async () => {
@@ -1998,6 +1998,22 @@ export default function Sessions() {
         isOpen={cloneExportOpen}
         onClose={() => setCloneExportOpen(false)}
         selectedSessions={cloneExportSelection}
+      />
+
+      <SessionBulkLoginModal
+        isOpen={bulkLoginOpen}
+        onClose={() => {
+          setBulkLoginOpen(false);
+          setCurrentPage(1);
+          fetchSessions();
+        }}
+        selectedSessions={bulkLoginSelection}
+        onCompleted={() => {
+          // Refresh the table whenever a job finishes so the new
+          // is_logged_in / account_info / status values land in the
+          // UI without the operator having to manually refresh.
+          fetchSessions();
+        }}
       />
     </div>
   );
