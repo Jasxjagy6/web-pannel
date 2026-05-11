@@ -364,18 +364,31 @@ function AddMembersForm({ sessions, targetLists, onSubmit, submitting }) {
 
   const previewSessionIds = useMemo(() => {
     if (sessionPickMode === 'list' && selectedSessionListId) {
-      // We don't know the list's session count without an API call;
-      // fall back to the list's stored count if exposed in the row.
+      // Session-list mode: the backend resolves the list to a session
+      // set via `sessionListId`. We pass an empty array here and let
+      // the effect below send `sessionListId` instead.
       return [];
     }
     return selectedSessionIds.map((id) => String(id));
   }, [sessionPickMode, selectedSessionListId, selectedSessionIds]);
 
+  const previewSessionListId = useMemo(
+    () =>
+      sessionPickMode === 'list' && selectedSessionListId
+        ? Number(selectedSessionListId)
+        : null,
+    [sessionPickMode, selectedSessionListId]
+  );
+
   // Debounced dry-run against the preview endpoint whenever the
   // operator changes any input that affects the plan.
   useEffect(() => {
     const seq = ++previewSeq.current;
-    if (targetCount <= 0 || previewSessionIds.length === 0) {
+    // Either explicit session IDs OR a session-list ID must be set;
+    // otherwise there's nothing to preview.
+    const haveSessionSource =
+      previewSessionIds.length > 0 || previewSessionListId != null;
+    if (targetCount <= 0 || !haveSessionSource) {
       setPreviewPlan(null);
       setPreviewError(null);
       setPreviewLoading(false);
@@ -386,10 +399,14 @@ function AddMembersForm({ sessions, targetLists, onSubmit, submitting }) {
     const handle = setTimeout(async () => {
       try {
         const body = {
-          sessionIds: previewSessionIds,
           targetCount,
           mode: distribution.mode || 'auto',
         };
+        if (previewSessionListId != null) {
+          body.sessionListId = previewSessionListId;
+        } else {
+          body.sessionIds = previewSessionIds;
+        }
         if (distribution.mode === 'manual') {
           if (distribution.perSessionBurst != null) body.perSessionBurst = distribution.perSessionBurst;
           if (distribution.cooldownSecMin != null) body.cooldownSecMin = distribution.cooldownSecMin;
@@ -409,7 +426,7 @@ function AddMembersForm({ sessions, targetLists, onSubmit, submitting }) {
       }
     }, 350);
     return () => clearTimeout(handle);
-  }, [targetCount, previewSessionIds, distribution]);
+  }, [targetCount, previewSessionIds, previewSessionListId, distribution]);
 
   const validate = () => {
     const newErrors = {};

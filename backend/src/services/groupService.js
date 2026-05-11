@@ -177,6 +177,94 @@ async function isCancelled(opId) {
 }
 
 /**
+ * Auto-derive source channel identifiers for a list of prepared users
+ * by looking at where the panel originally scraped them from.
+ *
+ * Strategy (cheapest → costliest):
+ *
+ *   1. If `listId` is provided AND `lists.source` looks like
+ *      `job_<id>`, fetch that scraping job's `target_id` / `target_ids`
+ *      directly. This is a single indexed PK lookup.
+ *   2. Otherwise, look up the numeric Telegram IDs of `preparedUsers`
+ *      in `scraped_users` and aggregate the distinct `target_id` /
+ *      `target_ids` of the scraping jobs that produced them. The
+ *      caller already pre-batches `preparedUsers`, so we can cap the
+ *      IN-list and the result set to keep this bounded.
+ *
+ * The fallback is best-effort: returns an empty array on failure or
+ * when none of the rows came from a panel scrape (uploaded CSV / merge
+ * list / handle-only rows where we have no source attribution).
+ *
+ * @param {Array<{numericId?: string|number, entry?: object}>} preparedUsers
+ * @param {{ listId?: number|string, userId?: number|string }} ctx
+ * @returns {Promise<string[]>}  Channel id / @username / t.me URL strings.
+ */
+async function _autoFetchSourceChannelIdsForUsers(preparedUsers, ctx = {}) {
+  const out = new Set();
+  const collect = (row) => {
+    if (!row) return;
+    if (row.target_id && String(row.target_id).trim()) {
+      out.add(String(row.target_id).trim());
+    }
+    if (Array.isArray(row.target_ids)) {
+      for (const t of row.target_ids) {
+        if (t && String(t).trim()) out.add(String(t).trim());
+      }
+    }
+  };
+
+  // Strategy 1: derive directly from the saved list's source.
+  if (ctx.listId != null) {
+    try {
+      const listRes = await pool.query(
+        'SELECT source FROM lists WHERE id = $1 LIMIT 1',
+        [ctx.listId]
+      );
+      const source = listRes.rows[0] && listRes.rows[0].source;
+      const m = source && String(source).match(/^job_(\d+)$/i);
+      if (m) {
+        const jobRes = await pool.query(
+          'SELECT target_id, target_ids FROM scraping_jobs WHERE id = $1 LIMIT 1',
+          [parseInt(m[1], 10)]
+        );
+        if (jobRes.rows.length > 0) {
+          collect(jobRes.rows[0]);
+          if (out.size > 0) return Array.from(out).slice(0, 10);
+        }
+      }
+    } catch (err) {
+      logger.debug(`auto-fetch sourceChannelIds via lists.source failed: ${err.message}`);
+    }
+  }
+
+  // Strategy 2: join scraped_users → scraping_jobs by telegram_id.
+  const numericIds = [];
+  for (const p of preparedUsers || []) {
+    if (!p) continue;
+    if (p.numericId) numericIds.push(String(p.numericId));
+    else if (p.entry && (p.entry.telegram_id || p.entry.telegramId)) {
+      numericIds.push(String(p.entry.telegram_id || p.entry.telegramId));
+    }
+    if (numericIds.length >= 500) break; // bound the IN-list
+  }
+  if (numericIds.length === 0) return Array.from(out);
+  try {
+    const res = await pool.query(
+      `SELECT DISTINCT sj.target_id, sj.target_ids
+         FROM scraped_users su
+         JOIN scraping_jobs sj ON sj.id = su.job_id
+        WHERE su.telegram_id::text = ANY($1::text[])
+        LIMIT 20`,
+      [numericIds]
+    );
+    for (const row of res.rows) collect(row);
+  } catch (err) {
+    logger.debug(`auto-fetch sourceChannelIds via scraped_users join failed: ${err.message}`);
+  }
+  return Array.from(out).slice(0, 10);
+}
+
+/**
  * Update the progress record in Redis for an operation.
  */
 async function updateProgress(opId, progressData) {
@@ -2424,9 +2512,43 @@ class GroupService {
 
     // Source channel IDs for the resolver cache (enables auth_key-correct
     // access_hash resolution via channels.GetParticipant).
-    const sourceChannelIds = Array.isArray(params.sourceChannelIds)
-      ? params.sourceChannelIds
+    //
+    // When the request body doesn't carry `sourceChannelIds` (the
+    // operator picked a saved list from the Lists tab and never typed
+    // any source channels into the Groups form), but the rows in
+    // `preparedUsers` came from a panel scrape, the scrape itself
+    // already proved every session that joined the source can see
+    // those numeric IDs. We auto-derive the source channels from
+    // `scraping_jobs.target_id / target_ids` so the resolver's
+    // `channels.GetParticipant` fallback can fire on bare-numeric
+    // rows instead of every row failing as "Could not find the input
+    // entity" on fresh sessions.
+    let sourceChannelIds = Array.isArray(params.sourceChannelIds)
+      ? params.sourceChannelIds.slice()
       : (params.sourceChannelId ? [params.sourceChannelId] : []);
+
+    if (sourceChannelIds.length === 0) {
+      try {
+        const auto = await _autoFetchSourceChannelIdsForUsers(
+          preparedUsers,
+          { listId: params.listId, userId }
+        );
+        if (auto.length > 0) {
+          sourceChannelIds = auto;
+          logger.info(
+            `V2 add-members: auto-derived ${auto.length} source channel id(s) for resolver (${auto
+              .slice(0, 3)
+              .join(', ')})`,
+            { opId }
+          );
+        }
+      } catch (err) {
+        logger.warn('V2 add-members: source-channel auto-fetch failed; continuing without it', {
+          opId,
+          error: err && err.message,
+        });
+      }
+    }
 
     // Pre-warm sessions before we start dispatching work.
     await markPhase('warming', {
@@ -2830,5 +2952,6 @@ groupService.dedupUploadedUserList = dedupUploadedUserList;
 groupService.dedupKeyForEntry = dedupKeyForEntry;
 groupService.isUploadedListSource = isUploadedListSource;
 groupService.DEFAULT_MAX_ADDS_PER_SESSION = DEFAULT_MAX_ADDS_PER_SESSION;
+groupService._autoFetchSourceChannelIdsForUsers = _autoFetchSourceChannelIdsForUsers;
 
 module.exports = groupService;

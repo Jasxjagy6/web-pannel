@@ -59,11 +59,30 @@ const LIMITS = {
 const GROUP_ADD_DEFAULT_MAX_BURST = 4;
 
 /**
+ * Threshold under which a job is considered "tiny" and gets
+ * an aggressively relaxed pacing band (much shorter per-item
+ * delays and zero/short cooldown). Operator note:
+ *
+ *   "For small jobs V2 needs to relax pacing aggressively — more
+ *    sessions = more parallelism, but with 5 sessions you can't
+ *    go fast."
+ *
+ * Concretely: with the legacy 5–20 band, 27 users × 5 sessions
+ * planned 30–60 s per-item × 2 rounds × 60–180 s cooldown ≈ 20+
+ * minutes for a job the operator expected to finish in under five.
+ * The PEER_FLOOD risk for absolute item counts at this scale is
+ * negligible, so the tiny-job band trades the conservative inter-
+ * item gap for cross-session parallelism.
+ */
+const TINY_JOB_MAX_ITEMS = 50;
+
+/**
  * Auto-mode policy.
  *
  * `ratioBands` are evaluated in order; the first band whose
- * `maxRatio` is >= the actual `items / sessions` ratio wins. The
- * trailing entry has `maxRatio: Infinity` and acts as the catch-all.
+ * `maxRatio` is >= the actual `items / sessions` ratio AND whose
+ * optional `maxItems` is >= the actual total wins. The trailing
+ * entry has `maxRatio: Infinity` and acts as the catch-all.
  *
  * Defaults are intentionally conservative — they're tuned for
  * institutional use against Telegram's MTProto layer where PEER_FLOOD
@@ -73,6 +92,20 @@ const GROUP_ADD_DEFAULT_MAX_BURST = 4;
 const AUTO_POLICY = {
   group_add: {
     ratioBands: [
+      // Tiny absolute job (≤ 50 users total). Cross-session
+      // parallelism alone keeps each session well under PEER_FLOOD,
+      // so we drop per-item delay from 30–60 s to 5–15 s and skip
+      // the inter-round cooldown. Reported case: 27 users × 5
+      // sessions used to take ~20 min, now ~2 min.
+      {
+        maxItems: TINY_JOB_MAX_ITEMS,
+        maxRatio: Infinity,
+        perSessionBurst: (ratio) => Math.max(1, Math.ceil(ratio)),
+        cooldownSecMin: 0,
+        cooldownSecMax: 30,
+        itemDelayMsMin: 5_000,
+        itemDelayMsMax: 15_000,
+      },
       // ≤ 5 users per session in one pass → just split it,
       // no cooldown needed.
       {
@@ -108,6 +141,19 @@ const AUTO_POLICY = {
   },
   bulk_message: {
     ratioBands: [
+      // Tiny absolute job (≤ 50 messages total). With cross-session
+      // start-stagger the messaging fan-out already respects per-
+      // target spacing, so we keep the relaxed pacing here for any
+      // operator who picks `auto` on a small DM batch.
+      {
+        maxItems: TINY_JOB_MAX_ITEMS,
+        maxRatio: Infinity,
+        perSessionBurst: (ratio) => Math.max(1, Math.ceil(ratio)),
+        cooldownSecMin: 0,
+        cooldownSecMax: 30,
+        itemDelayMsMin: 1_000,
+        itemDelayMsMax: 4_000,
+      },
       // ≤ 50 messages / session → one pass, modest cooldown.
       {
         maxRatio: 50,
@@ -139,6 +185,12 @@ const AUTO_POLICY = {
     ],
   },
 };
+
+function _bandMatches(band, ratio, items) {
+  if (band.maxItems != null && items > band.maxItems) return false;
+  if (band.maxRatio != null && ratio > band.maxRatio) return false;
+  return true;
+}
 
 function _clamp(value, min, max) {
   if (!Number.isFinite(value)) return min;
@@ -249,7 +301,7 @@ function plan(params = {}) {
   const ratio = items / sessionIds.length;
   const policy = AUTO_POLICY[workType];
   const band =
-    policy.ratioBands.find((b) => ratio <= b.maxRatio) ||
+    policy.ratioBands.find((b) => _bandMatches(b, ratio, items)) ||
     policy.ratioBands[policy.ratioBands.length - 1];
 
   let perSessionBurst;

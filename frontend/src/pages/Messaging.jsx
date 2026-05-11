@@ -1040,10 +1040,27 @@ export default function Messaging() {
     return Array.from(selectedSessionIds).map(String);
   }, [sessionPickMode, selectedSessionListId, selectedSessionIds]);
 
+  // When the operator picked a saved session list, the preview still
+  // needs SOMETHING to plan against. The backend's `previewBulk`
+  // accepts `sessionListId` and resolves it server-side via
+  // `resolveSessionIdsFromRequest` — mirroring what every other bulk
+  // endpoint already supports. Previously the effect below bailed on
+  // empty `distSessionIds` and the operator's preview pane stayed
+  // blank.
+  const distSessionListId = useMemo(
+    () =>
+      sessionPickMode === 'list' && selectedSessionListId
+        ? Number(selectedSessionListId)
+        : null,
+    [sessionPickMode, selectedSessionListId]
+  );
+
   // Debounced dry-run for the bulk-message distribution plan.
   useEffect(() => {
     const seq = ++distSeq.current;
-    if (distTargetCount <= 0 || distSessionIds.length === 0) {
+    const haveSessionSource =
+      distSessionIds.length > 0 || distSessionListId != null;
+    if (distTargetCount <= 0 || !haveSessionSource) {
       setDistPlan(null);
       setDistError(null);
       setDistLoading(false);
@@ -1054,10 +1071,14 @@ export default function Messaging() {
     const handle = setTimeout(async () => {
       try {
         const body = {
-          sessionIds: distSessionIds,
           targetCount: distTargetCount,
           mode: distribution.mode || 'auto',
         };
+        if (distSessionListId != null) {
+          body.sessionListId = distSessionListId;
+        } else {
+          body.sessionIds = distSessionIds;
+        }
         if (distribution.mode === 'manual') {
           if (distribution.perSessionBurst != null) body.perSessionBurst = distribution.perSessionBurst;
           if (distribution.cooldownSecMin != null) body.cooldownSecMin = distribution.cooldownSecMin;
@@ -1077,7 +1098,7 @@ export default function Messaging() {
       }
     }, 350);
     return () => clearTimeout(handle);
-  }, [distTargetCount, distSessionIds, distribution]);
+  }, [distTargetCount, distSessionIds, distSessionListId, distribution]);
 
   // --- Actions ---
   const handleBulkSend = async () => {

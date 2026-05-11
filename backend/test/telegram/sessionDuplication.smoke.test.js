@@ -349,6 +349,68 @@ async function main() {
       console.log('clone.dcMigration: OK');
     }
 
+    // ─── Sub-test 2b: DC migration on RE-export (post-Accept) ───────
+    // Telegram can hand back `auth.LoginTokenMigrateTo` on EITHER the
+    // initial ExportLoginToken or on the re-Export that runs after
+    // AcceptLoginToken completes. The initial-export case is covered
+    // above; this sub-test pins the re-Export case that operators hit
+    // in production ("Unexpected import result type: auth.LoginTokenMigrateTo").
+    {
+      const src = new FakeSourceClient();
+      sourceClientsBySessionId.set('252', src);
+      sessionRowsById.set(252, {
+        id: 252, phone: '+15550252', api_id: 12345, api_hash: 'abc',
+        status: 'active', is_logged_in: true,
+      });
+
+      const mock = require('telegram');
+      FakeNewClient._scenario = {
+        exportLoginTokenSeq: [
+          // First export returns a plain LoginToken — proceed to
+          // AcceptLoginToken on the source.
+          new mock.Api.auth.LoginToken({ token: Buffer.from([4, 4, 4]) }),
+          // Re-export AFTER accept returns LoginTokenMigrateTo.
+          new mock.Api.auth.LoginTokenMigrateTo({
+            dcId: 5, token: Buffer.from([5, 5, 5]),
+          }),
+        ],
+        importLoginTokenSeq: [
+          // Service follows the migrate token via ImportLoginToken
+          // on the new DC and finally gets a LoginTokenSuccess.
+          new mock.Api.auth.LoginTokenSuccess({
+            authorization: new mock.Api.auth.Authorization({}),
+          }),
+        ],
+      };
+
+      FakeNewClient.prototype._switchDC = async function (dcId) {
+        this.session.dcId = dcId;
+      };
+
+      const { jobId } = await service.startCloneJob({
+        userId: 9,
+        sessionIds: [252],
+        destApiId: 22222,
+        destApiHash: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+        interSessionDelayMs: 0,
+      });
+      for (let i = 0; i < 100; i++) {
+        const v = service.getJobStatus(jobId, 9);
+        if (v.status === 'completed' || v.status === 'failed') break;
+        await new Promise((r) => setTimeout(r, 25));
+      }
+      const view = service.getJobStatus(jobId, 9);
+      assert.strictEqual(
+        view.status,
+        'completed',
+        `re-export migrate status=${view.status} err=${view.error}`
+      );
+      assert.strictEqual(view.sessions[0].status, 'cloned');
+      // The source side still only sees a single AcceptLoginToken.
+      assert.deepStrictEqual(src._invocations, ['auth.AcceptLoginToken']);
+      console.log('clone.dcMigrationOnReExport: OK');
+    }
+
     // ─── Sub-test 3: 2FA path ───────────────────────────────────────
     {
       const src = new FakeSourceClient();
