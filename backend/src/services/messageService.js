@@ -14,6 +14,7 @@ const { AppError } = require('../utils/errorHandler');
 const { buildPagination, applyPagination, applySorting } = require('../utils/pagination');
 const { redisClient } = require('../config/redis');
 const distributionPlanner = require('./distributionPlanner');
+const { run: runWorkerPool } = require('../utils/sessionWorkerPool');
 
 // =========================================================================
 // Constants
@@ -2712,6 +2713,11 @@ class MessageService {
    * @private
    */
   async _processSingleUserMassDm(jobId, sessions, targets, message, delaySeconds, userId) { // eslint-disable-line no-unused-vars
+    const RUNNER_V2_ENABLED = (process.env.RUNNER_V2_ENABLED || 'true').toLowerCase() !== 'false';
+    if (RUNNER_V2_ENABLED) {
+      return this._processSingleUserMassDmV2(jobId, sessions, targets, message, delaySeconds, userId);
+    }
+
     const sentCount = { value: 0 };
     const failedCount = { value: 0 };
     const skippedCount = { value: 0 };
@@ -2930,6 +2936,261 @@ class MessageService {
       );
     } catch (outerErr) {
       logger.error(`Single-user mass DM job ${jobId} failed: ${outerErr.message}`);
+      await this._finalizeJob(
+        jobId, 'failed',
+        sentCount.value, failedCount.value, skippedCount.value, results
+      );
+    }
+  }
+
+  // =========================================================================
+  // V2 Parallel Worker-Pool Runner (single-user mass DM)
+  // =========================================================================
+
+  /**
+   * Parallel single-user mass DM runner using the worker pool.
+   *
+   * The work model: every session sends to every target. So the work
+   * items are (session, target) pairs. We build one item per target
+   * and let the worker pool fan each item across sessions.
+   *
+   * Wait — the pool assigns one session per item. For mass DM where
+   * ALL sessions must send to EACH target, we need to model the work
+   * differently: each work item is a single (session, target) send,
+   * and we pre-expand the cross-product into the item list.
+   *
+   * @private
+   */
+  async _processSingleUserMassDmV2(jobId, sessions, targets, message, delaySeconds, userId) {
+    const MAX_CONCURRENT = Math.max(1, parseInt(process.env.MAX_CONCURRENT_SESSIONS || '200', 10));
+
+    const sentCount = { value: 0 };
+    const failedCount = { value: 0 };
+    const skippedCount = { value: 0 };
+    const results = [];
+    const totalSends = sessions.length * targets.length;
+
+    const isRevokedSessionError = (msg) => {
+      if (!msg) return false;
+      const m = String(msg);
+      return (
+        m.includes('AUTH_KEY_UNREGISTERED') ||
+        m.includes('AUTH_KEY_INVALID') ||
+        m.includes('AUTH_KEY_DUPLICATED') ||
+        m.includes('USER_DEACTIVATED') ||
+        m.includes('SESSION_REVOKED') ||
+        m.includes('SESSION_EXPIRED')
+      );
+    };
+
+    await pool.query(
+      `UPDATE messaging_jobs SET status = 'running' WHERE id = $1`,
+      [jobId]
+    );
+
+    await this._notifyProgress(jobId, {
+      job_id: jobId,
+      status: 'running',
+      total: totalSends,
+      sent: 0,
+      failed: 0,
+      skipped: 0,
+    });
+
+    // Pre-warm sessions.
+    const warmResult = await telegramService.preWarmSessions(
+      sessions.map((s) => s.id),
+      { concurrency: Math.min(MAX_CONCURRENT, sessions.length) }
+    );
+
+    const warmOkSet = new Set(warmResult.ok);
+    const liveSessions = sessions.filter((s) => warmOkSet.has(String(s.id)));
+    const deadSessions = sessions.filter((s) => !warmOkSet.has(String(s.id)));
+
+    // Mark dead sessions as skipped immediately.
+    for (const dead of deadSessions) {
+      for (const target of targets) {
+        results.push({
+          sessionId: dead.id,
+          target: String(target),
+          success: false,
+          skipped: true,
+          error: 'Session failed to connect during warm-up',
+        });
+        skippedCount.value++;
+      }
+    }
+
+    if (liveSessions.length === 0) {
+      await this._finalizeJob(
+        jobId, 'failed',
+        sentCount.value, failedCount.value, skippedCount.value, results
+      );
+      return;
+    }
+
+    // Cross-target revoked-session tracker. Once a session returns
+    // AUTH_KEY_UNREGISTERED / SESSION_REVOKED on any target, it stays
+    // dead for the rest of the job — exactly like the legacy runner's
+    // `revokedSessionIds` set.
+    const revokedSessionIds = new Set();
+
+    try {
+      for (let ti = 0; ti < targets.length; ti++) {
+        const target = targets[ti];
+
+        // Filter out sessions that were revoked by a previous target's pool.
+        const targetLiveSessions = liveSessions.filter(
+          (s) => !revokedSessionIds.has(s.id)
+        );
+
+        if (targetLiveSessions.length === 0) {
+          // All sessions revoked — skip remaining items for this target.
+          for (const s of liveSessions.filter((s) => revokedSessionIds.has(s.id))) {
+            results.push({
+              sessionId: s.id,
+              target: String(target),
+              success: false,
+              skipped: true,
+              error: 'Session revoked (cached from earlier failure in this job)',
+            });
+            skippedCount.value++;
+          }
+          continue;
+        }
+
+        // One work item per live session — each session sends to this target.
+        const workItems = targetLiveSessions.map((s) => ({
+          sessionId: s.id,
+          target: String(target),
+        }));
+
+        const poolResult = await runWorkerPool({
+          sessions: targetLiveSessions,
+          items: workItems,
+          concurrency: Math.min(MAX_CONCURRENT, liveSessions.length),
+          perSessionBurst: 1,
+          cooldownMsMin: 0,
+          cooldownMsMax: 0,
+          itemDelayMsMin: delaySeconds * 1000,
+          itemDelayMsMax: delaySeconds * 1000,
+          maxAttemptsPerItem: 1,
+
+          isCancelled: async () => {
+            const jobStatus = await pool.query(
+              'SELECT status FROM messaging_jobs WHERE id = $1',
+              [jobId]
+            );
+            return jobStatus.rows[0]?.status === 'cancelled';
+          },
+
+          onProgress: async (snapshot) => {
+            await this._notifyProgress(jobId, {
+              job_id: jobId,
+              status: 'running',
+              total: totalSends,
+              sent: sentCount.value + snapshot.succeeded,
+              failed: failedCount.value + snapshot.failed,
+              skipped: skippedCount.value,
+            });
+          },
+
+          attempt: async ({ session, item }) => {
+            try {
+              const sendResult = await telegramService.sendMessage(
+                String(session.id),
+                item.target,
+                message
+              );
+              await pool.query(
+                `INSERT INTO message_logs (job_id, session_id, target_id, status, sent_at)
+                 VALUES ($1, $2, $3, 'sent', NOW())`,
+                [jobId, session.id, item.target]
+              );
+              return { status: 'ok', extra: { messageId: sendResult.messageId } };
+            } catch (err) {
+              const errMsg = err.message || String(err);
+              await pool.query(
+                `INSERT INTO message_logs (job_id, session_id, target_id, status, error_message, sent_at)
+                 VALUES ($1, $2, $3, 'failed', $4, NOW())`,
+                [jobId, session.id, item.target, errMsg]
+              );
+
+              if (isRevokedSessionError(errMsg)) {
+                // Mark session as revoked in DB.
+                try {
+                  await pool.query(
+                    `UPDATE sessions
+                        SET status = 'revoked', is_logged_in = FALSE, updated_at = NOW()
+                      WHERE id = $1 AND user_id = $2`,
+                    [session.id, userId]
+                  );
+                } catch (_) { /* best-effort */ }
+                return { status: 'session_dead', reason: errMsg };
+              }
+
+              if (errMsg.includes('FLOOD_WAIT')) {
+                const match = errMsg.match(/FLOOD_WAIT_(\d+)/i) || errMsg.match(/(\d+) seconds/i);
+                const floodSec = match ? parseInt(match[1], 10) : 30;
+                return {
+                  status: 'session_cooldown',
+                  reason: errMsg,
+                  cooldownMs: floodSec * 1000,
+                };
+              }
+
+              return { status: 'item_failed', reason: errMsg };
+            }
+          },
+        });
+
+        // Map pool results back, and track revoked sessions.
+        for (const row of poolResult.results) {
+          if (!row) continue;
+          const rowSessionId = row.item ? row.item.sessionId : row.sessionId;
+          const result = {
+            sessionId: rowSessionId,
+            target: row.item ? row.item.target : String(target),
+            success: row.status === 'ok',
+            error: row.reason || null,
+          };
+          if (row.status === 'ok') {
+            result.messageId = row.messageId;
+            sentCount.value++;
+          } else {
+            failedCount.value++;
+            // Track revoked sessions for cross-target skip.
+            if (
+              row.reason &&
+              isRevokedSessionError(row.reason) &&
+              rowSessionId
+            ) {
+              revokedSessionIds.add(rowSessionId);
+            }
+          }
+          results.push(result);
+        }
+
+        // Update DB counts.
+        await pool.query(
+          `UPDATE messaging_jobs
+              SET sent_count = $1, failed_count = $2, skipped_count = $3
+            WHERE id = $4`,
+          [sentCount.value, failedCount.value, skippedCount.value, jobId]
+        );
+      }
+
+      await this._finalizeJob(
+        jobId, 'completed',
+        sentCount.value, failedCount.value, skippedCount.value, results
+      );
+
+      logger.info(
+        `V2 single-user mass DM job ${jobId} completed: ${sentCount.value} sent, ${failedCount.value} failed`,
+        { jobId }
+      );
+    } catch (outerErr) {
+      logger.error(`V2 single-user mass DM job ${jobId} failed: ${outerErr.message}`);
       await this._finalizeJob(
         jobId, 'failed',
         sentCount.value, failedCount.value, skippedCount.value, results

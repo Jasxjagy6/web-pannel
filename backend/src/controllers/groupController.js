@@ -46,6 +46,9 @@ const groupController = {
       cooldownSecMax,
       itemDelayMsMin,
       itemDelayMsMax,
+      sourceChannelIds,
+      sourceChannelId,
+      listId,
     } = req.body;
 
     if (
@@ -108,6 +111,8 @@ const groupController = {
       cooldownSecMax: cooldownSecMax != null ? parseInt(cooldownSecMax, 10) : undefined,
       itemDelayMsMin: itemDelayMsMin != null ? parseInt(itemDelayMsMin, 10) : undefined,
       itemDelayMsMax: itemDelayMsMax != null ? parseInt(itemDelayMsMax, 10) : undefined,
+      sourceChannelIds: Array.isArray(sourceChannelIds) ? sourceChannelIds : (sourceChannelId ? [sourceChannelId] : undefined),
+      listId: listId != null ? listId : undefined,
     };
 
     // Async mode is the default. The Groups UI used to send `async: false`

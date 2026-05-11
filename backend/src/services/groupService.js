@@ -11,6 +11,8 @@ const {
 } = require('../utils/telegramTargetNormalizer');
 const distributionPlanner = require('./distributionPlanner');
 const sessionCooldown = require('./sessionCooldown');
+const { SessionResolverCache } = require('./sessionResolverCache');
+const { run: runWorkerPool } = require('../utils/sessionWorkerPool');
 
 /**
  * Default delay in milliseconds between batch operations.
@@ -904,6 +906,35 @@ class GroupService {
     }
 
     const tgService = telegramService;
+
+    // ===================================================================
+    // V2 parallel worker-pool runner.
+    // ===================================================================
+    const RUNNER_V2_ENABLED = (process.env.RUNNER_V2_ENABLED || 'true').toLowerCase() !== 'false';
+    if (RUNNER_V2_ENABLED) {
+      return this._runAddMembersV2({
+        opId,
+        userId,
+        userList,
+        preparedUsers,
+        unaddressable,
+        targetIds,
+        targetType,
+        verifiedSessions,
+        plan,
+        dedupStats,
+        existingOpId,
+        addedCount,
+        failedCount,
+        skippedCount,
+        results,
+        emitItemProgress,
+        persistRunningProgress,
+        markPhase,
+        markPreflightFailure,
+        params,
+      });
+    }
 
     try {
       // -----------------------------------------------------------------
@@ -2352,6 +2383,395 @@ class GroupService {
       targetIds,
       userId,
     });
+  }
+
+  // =========================================================================
+  // V2 Parallel Worker-Pool Runner (add-members)
+  // =========================================================================
+
+  /**
+   * Parallel add-members runner. Replaces the legacy sequential-session
+   * rotation loop with the `sessionWorkerPool` + `SessionResolverCache`.
+   *
+   * Preserves all UI contracts: websocket `group:progress` events,
+   * Redis progress snapshots, per-row `results` array, DB finalization
+   * via `_finalizeOperation`.
+   *
+   * @private
+   */
+  async _runAddMembersV2(ctx) {
+    const {
+      opId,
+      userId,
+      userList,
+      preparedUsers,
+      targetIds,
+      verifiedSessions,
+      plan,
+      dedupStats,
+      results,
+      emitItemProgress,
+      persistRunningProgress,
+      markPhase,
+      params,
+    } = ctx;
+
+    let { addedCount, failedCount, skippedCount } = ctx;
+
+    const tgService = telegramService;
+    const PRIVACY_QUORUM = Math.max(1, parseInt(process.env.PRIVACY_QUORUM || '1', 10));
+    const MAX_CONCURRENT = Math.max(1, parseInt(process.env.MAX_CONCURRENT_SESSIONS || '200', 10));
+
+    // Source channel IDs for the resolver cache (enables auth_key-correct
+    // access_hash resolution via channels.GetParticipant).
+    const sourceChannelIds = Array.isArray(params.sourceChannelIds)
+      ? params.sourceChannelIds
+      : (params.sourceChannelId ? [params.sourceChannelId] : []);
+
+    // Pre-warm sessions before we start dispatching work.
+    await markPhase('warming', {
+      total: preparedUsers.length,
+      eligible: preparedUsers.length,
+      sessionCount: verifiedSessions.length,
+    });
+    const warmResult = await tgService.preWarmSessions(
+      verifiedSessions.map((s) => s.id),
+      { concurrency: Math.min(MAX_CONCURRENT, verifiedSessions.length) }
+    );
+
+    // Drop permanently dead sessions from the live pool.
+    const warmOkSet = new Set(warmResult.ok);
+    const liveSessions = verifiedSessions.filter((s) => warmOkSet.has(String(s.id)));
+    if (liveSessions.length === 0) {
+      await this._finalizeOperation(opId, 'failed', addedCount, failedCount, skippedCount, results);
+      throw new AppError(
+        'All sessions failed to connect during warm-up',
+        500,
+        'ALL_SESSIONS_DEAD'
+      );
+    }
+
+    logger.info(
+      `V2 add-members: ${liveSessions.length} sessions warmed (${warmResult.failed.length} failed), ` +
+        `${preparedUsers.length} users, ${targetIds.length} target(s), concurrency=${MAX_CONCURRENT}`,
+      { opId }
+    );
+
+    // Helper: target-side failure classifier (same as legacy runner).
+    const isTargetSideFailure = (msg) => {
+      if (!msg) return false;
+      const m = String(msg);
+      return (
+        m.includes('CHAT_ADMIN_REQUIRED') ||
+        m.includes('CHAT_WRITE_FORBIDDEN') ||
+        m.includes('CHANNEL_PRIVATE') ||
+        m.includes('CHANNEL_INVALID') ||
+        m.includes('CHAT_INVALID') ||
+        m.includes('CHAT_FORBIDDEN') ||
+        m.includes('Could not resolve group') ||
+        m.includes('USER_NOT_PARTICIPANT') ||
+        m.includes('CHAT_GUEST_SEND_FORBIDDEN')
+      );
+    };
+
+    const isResolutionError = (msg) => {
+      if (!msg) return false;
+      const m = String(msg);
+      return (
+        m.includes('Could not resolve user') ||
+        m.includes('Could not find the input entity') ||
+        m.includes('PEER_ID_INVALID') ||
+        m.includes('USERNAME_NOT_OCCUPIED') ||
+        m.includes('USERNAME_INVALID') ||
+        m.includes('USER_ID_INVALID')
+      );
+    };
+
+    // Per-target iteration so each target gets its own worker pool run.
+    for (let tIdx = 0; tIdx < targetIds.length; tIdx++) {
+      const targetId = targetIds[tIdx];
+
+      // Build a resolver cache for this target run.
+      const resolverCache = new SessionResolverCache({
+        sourceChannelIds,
+        telegramService: tgService,
+      });
+
+      // Track broken sessions for this target.
+      const brokenSessionsForTarget = new Set();
+
+      // Build work items: each item is a prepared user entry.
+      const workItems = preparedUsers.map((p, idx) => ({
+        ...p,
+        _originalIdx: idx,
+        targetId,
+      }));
+
+      await markPhase('running', {
+        total: preparedUsers.length,
+        currentTarget: targetId,
+      });
+
+      const poolResult = await runWorkerPool({
+        sessions: liveSessions.filter((s) => !brokenSessionsForTarget.has(s.id)),
+        items: workItems,
+        concurrency: MAX_CONCURRENT,
+        perSessionBurst: plan.perSessionBurst,
+        cooldownMsMin: (plan.cooldownSecMin || 0) * 1000,
+        cooldownMsMax: (plan.cooldownSecMax || 0) * 1000,
+        itemDelayMsMin: plan.itemDelayMsMin || 0,
+        itemDelayMsMax: plan.itemDelayMsMax || 0,
+
+        isCancelled: async () => isCancelled(opId),
+
+        onProgress: async (snapshot) => {
+          const processed = addedCount + failedCount + skippedCount +
+            snapshot.succeeded + snapshot.failed;
+          await emitItemProgress({
+            progress: processed,
+            processed,
+            added: addedCount + snapshot.succeeded,
+            failed: failedCount + snapshot.failed,
+            skipped: skippedCount,
+            total: userList.length * targetIds.length,
+            currentTarget: targetId,
+            activeWorkers: snapshot.activeWorkers,
+            remaining: snapshot.remaining,
+          });
+        },
+
+        attempt: async ({ session, item, attemptNum }) => {
+          const prepared = item;
+          const candidates = prepared.candidates && prepared.candidates.length > 0
+            ? prepared.candidates
+            : [prepared.identifier];
+
+          // Check if session is broken for this target.
+          if (brokenSessionsForTarget.has(session.id)) {
+            return { status: 'session_dead', reason: 'Session broken for this target' };
+          }
+
+          // Try to resolve the user via the session-aware resolver cache.
+          let inputUser = null;
+          try {
+            inputUser = await resolverCache.resolve(session, prepared);
+          } catch (resolveErr) {
+            if (tgService.isPermanentAuthError(resolveErr)) {
+              return { status: 'session_dead', reason: resolveErr.message };
+            }
+            // Resolution failure — try the candidate chain directly.
+          }
+
+          // If the resolver cache got us an InputUser, try the invite
+          // directly (skipping the resolver inside addMemberToGroup).
+          // Otherwise, fall back to the legacy per-candidate chain.
+          let addErr = null;
+
+          if (inputUser) {
+            try {
+              await tgService.addMemberToGroup(
+                session.id,
+                targetId,
+                String(inputUser.userId),
+                { accessHash: String(inputUser.accessHash) }
+              );
+              return { status: 'ok' };
+            } catch (e) {
+              addErr = e;
+            }
+          } else {
+            // Candidate chain fallback.
+            for (let cIdx = 0; cIdx < candidates.length; cIdx++) {
+              const userTelegramId = candidates[cIdx];
+              const candidateOptions =
+                prepared.accessHash &&
+                prepared.numericId &&
+                String(userTelegramId) === String(prepared.numericId)
+                  ? { accessHash: prepared.accessHash }
+                  : undefined;
+              try {
+                await tgService.addMemberToGroup(
+                  session.id,
+                  targetId,
+                  userTelegramId,
+                  candidateOptions
+                );
+                return { status: 'ok' };
+              } catch (e) {
+                addErr = e;
+                if (cIdx + 1 < candidates.length && isResolutionError(e && e.message)) {
+                  continue;
+                }
+                break;
+              }
+            }
+          }
+
+          // Classify the error.
+          if (!addErr) {
+            return { status: 'item_failed', reason: 'No candidate resolved' };
+          }
+
+          const errMsg = addErr.message || String(addErr);
+
+          // Permanent auth error → kill the session.
+          if (tgService.isPermanentAuthError(addErr)) {
+            return { status: 'session_dead', reason: errMsg };
+          }
+
+          // PEER_FLOOD → kill the session for the rest of the run.
+          if (errMsg.includes('PEER_FLOOD') || errMsg.includes('Too many actions performed')) {
+            brokenSessionsForTarget.add(session.id);
+            return { status: 'session_dead', reason: 'PEER_FLOOD' };
+          }
+
+          // FLOOD_WAIT → session cooldown.
+          if (errMsg.includes('FLOOD_WAIT')) {
+            const floodSeconds = extractFloodSeconds(errMsg);
+            return {
+              status: 'session_cooldown',
+              reason: `FLOOD_WAIT_${floodSeconds}`,
+              cooldownMs: floodSeconds * 1000,
+            };
+          }
+
+          // Target-side failure → session is broken for this target.
+          if (isTargetSideFailure(errMsg)) {
+            brokenSessionsForTarget.add(session.id);
+            return { status: 'session_dead', reason: errMsg };
+          }
+
+          // Privacy restriction → terminal user-side failure.
+          if (
+            errMsg.includes('USER_PRIVACY_RESTRICT') ||
+            errMsg.includes('PRIVACY_RESTRICTED') ||
+            errMsg.includes('USER_NOT_MUTUAL_CONTACT') ||
+            errMsg.includes('USER_CHANNELS_TOO_MUCH') ||
+            errMsg.includes('Telegram dropped invite (privacy/restricted)')
+          ) {
+            return { status: 'item_failed', reason: 'Privacy settings prevent adding' };
+          }
+
+          // Already participant → success from the operator's POV.
+          if (
+            errMsg.includes('USER_ALREADY_PARTICIPANT') ||
+            errMsg.includes('USERS_TOO_MUCH')
+          ) {
+            return { status: 'ok', reason: 'User already in target' };
+          }
+
+          // CHAT_MEMBER_ADD_FAILED
+          if (
+            errMsg.includes('CHAT_MEMBER_ADD_FAILED') ||
+            errMsg.includes('Telegram refused to add this user')
+          ) {
+            return { status: 'item_retry', reason: errMsg };
+          }
+
+          // User banned / restricted.
+          if (errMsg.includes('USER_BANNED_IN_CHANNEL') || errMsg.includes('USER_RESTRICTED')) {
+            return { status: 'item_failed', reason: 'User is banned or restricted' };
+          }
+
+          // User deactivated / not found.
+          if (
+            errMsg.includes('USER_DEACTIVATED') ||
+            errMsg.includes('INPUT_USER_DEACTIVATED') ||
+            errMsg.includes('USER_NOT_FOUND') ||
+            errMsg.includes('USERNAME_NOT_OCCUPIED') ||
+            errMsg.includes('USER_ID_INVALID') ||
+            errMsg.includes('USERNAME_INVALID') ||
+            errMsg.includes('Could not resolve user') ||
+            /No user has\s+"/i.test(errMsg)
+          ) {
+            return { status: 'item_failed', reason: errMsg };
+          }
+
+          // Resolution error → retry on another session.
+          if (isResolutionError(errMsg)) {
+            return { status: 'item_retry', reason: errMsg };
+          }
+
+          // Generic / unknown failure.
+          return { status: 'item_failed', reason: errMsg };
+        },
+      });
+
+      // Map pool results back into the legacy result format.
+      for (const row of poolResult.results) {
+        if (!row) continue;
+        const prepared = row.item;
+        const userResult = {
+          userId: prepared ? prepared.identifier : 'unknown',
+          targetId,
+          sessionId: row.sessionId,
+          success: row.status === 'ok',
+          error: row.reason || null,
+        };
+
+        if (row.status === 'ok') {
+          addedCount++;
+        } else if (row.reason && (
+          row.reason.includes('Privacy settings') ||
+          row.reason === 'User already in target'
+        )) {
+          userResult.skipped = true;
+          skippedCount++;
+        } else {
+          failedCount++;
+        }
+        results.push(userResult);
+      }
+
+      logger.info(
+        `V2 add-members target ${targetId}: pool stats = ${JSON.stringify(poolResult.stats)}, ` +
+          `resolver stats = ${JSON.stringify(resolverCache.stats)}`,
+        { opId }
+      );
+
+      // Persist progress after each target.
+      const processed = addedCount + failedCount + skippedCount;
+      await persistRunningProgress(
+        { progress: processed, added: addedCount, failed: failedCount, skipped: skippedCount },
+        { force: true }
+      );
+    }
+
+    // Finalize.
+    const finalStatus = await isCancelled(opId) ? 'cancelled' : 'completed';
+    await this._finalizeOperation(opId, finalStatus, addedCount, failedCount, skippedCount, results);
+
+    logger.info(
+      `V2 add members operation ${opId} finished: ${addedCount} added, ${failedCount} failed, ${skippedCount} skipped`,
+      { opId }
+    );
+
+    return {
+      opId,
+      total: userList.length,
+      added: addedCount,
+      failed: failedCount,
+      skipped: skippedCount,
+      results,
+      dedup: {
+        applied: dedupStats.applied,
+        before: dedupStats.before,
+        after: dedupStats.after,
+        dropped: dedupStats.dropped,
+        source: dedupStats.source,
+        listId: dedupStats.listId,
+      },
+      plan: {
+        mode: plan.mode,
+        perSessionBurst: plan.perSessionBurst,
+        maxPerSession: plan.maxPerSessionBurst,
+        rounds: plan.rounds,
+        cooldownSec: [plan.cooldownSecMin, plan.cooldownSecMax],
+        itemDelayMs: [plan.itemDelayMsMin, plan.itemDelayMsMax],
+      },
+      cooldownSkipped: verifiedSessions.cooldownSkipped || [],
+      runner: 'v2',
+    };
   }
 
   // =========================================================================

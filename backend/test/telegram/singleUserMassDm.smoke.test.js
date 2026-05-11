@@ -182,8 +182,16 @@ async function withStubbedSessions(stub, fn) {
 
     const origPoolQuery = pool.query.bind(pool);
     const origSendMessage = telegramService.sendMessage.bind(telegramService);
+    const origPreWarm = telegramService.preWarmSessions.bind(telegramService);
     const origNotify = messageService._notifyProgress.bind(messageService);
     const origFinalize = messageService._finalizeJob.bind(messageService);
+
+    // Stub preWarmSessions so V2 runner doesn't try real MTProto connects.
+    telegramService.preWarmSessions = async (ids) => ({
+      ok: ids.map(String),
+      failed: [],
+      durationMs: 0,
+    });
 
     const queryLog = [];
     const updateRevoked = [];
@@ -249,6 +257,7 @@ async function withStubbedSessions(stub, fn) {
     } finally {
       pool.query = origPoolQuery;
       telegramService.sendMessage = origSendMessage;
+      telegramService.preWarmSessions = origPreWarm;
       messageService._notifyProgress = origNotify;
       messageService._finalizeJob = origFinalize;
     }
@@ -268,8 +277,15 @@ async function withStubbedSessions(stub, fn) {
 
     const origPoolQuery = pool.query.bind(pool);
     const origSendMessage = telegramService.sendMessage.bind(telegramService);
+    const origPreWarm2 = telegramService.preWarmSessions.bind(telegramService);
     const origNotify = messageService._notifyProgress.bind(messageService);
     const origFinalize = messageService._finalizeJob.bind(messageService);
+
+    telegramService.preWarmSessions = async (ids) => ({
+      ok: ids.map(String),
+      failed: [],
+      durationMs: 0,
+    });
 
     pool.query = async (sql) => {
       const text = String(sql).replace(/\s+/g, ' ').trim();
@@ -313,6 +329,7 @@ async function withStubbedSessions(stub, fn) {
     } finally {
       pool.query = origPoolQuery;
       telegramService.sendMessage = origSendMessage;
+      telegramService.preWarmSessions = origPreWarm2;
       messageService._notifyProgress = origNotify;
       messageService._finalizeJob = origFinalize;
     }
@@ -330,8 +347,15 @@ async function withStubbedSessions(stub, fn) {
 
     const origPoolQuery = pool.query.bind(pool);
     const origSendMessage = telegramService.sendMessage.bind(telegramService);
+    const origPreWarm3 = telegramService.preWarmSessions.bind(telegramService);
     const origNotify = messageService._notifyProgress.bind(messageService);
     const origFinalize = messageService._finalizeJob.bind(messageService);
+
+    telegramService.preWarmSessions = async (ids) => ({
+      ok: ids.map(String),
+      failed: [],
+      durationMs: 0,
+    });
 
     const updateRevoked = [];
     pool.query = async (sql, params) => {
@@ -395,6 +419,7 @@ async function withStubbedSessions(stub, fn) {
     } finally {
       pool.query = origPoolQuery;
       telegramService.sendMessage = origSendMessage;
+      telegramService.preWarmSessions = origPreWarm3;
       messageService._notifyProgress = origNotify;
       messageService._finalizeJob = origFinalize;
     }
