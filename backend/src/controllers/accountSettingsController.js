@@ -72,6 +72,52 @@ module.exports = {
   }),
 
   /**
+   * GET /api/account-settings/randomize/pools
+   * Returns the pool data the Randomize Mode samples from.
+   */
+  getRandomizePools: asyncHandler(async (req, res) => {
+    const pools = accountSettingsService.getRandomizePools();
+    return res.status(200).json({ success: true, data: pools });
+  }),
+
+  /**
+   * GET /api/account-settings/randomize/avatars/:id
+   * Streams a bundled avatar JPG so the frontend preview can render it.
+   */
+  getRandomAvatar: asyncHandler(async (req, res) => {
+    const { id } = req.params;
+    const filePath = accountSettingsService.getAvatarFilePath(id);
+    if (!filePath) {
+      return res.status(404).json({
+        success: false,
+        error: { message: 'Avatar not found', code: 'AVATAR_NOT_FOUND' },
+      });
+    }
+    res.setHeader('Cache-Control', 'public, max-age=86400');
+    return res.sendFile(filePath);
+  }),
+
+  /**
+   * POST /api/account-settings/randomize/apply
+   * Applies the per-session assignments produced by Randomize Mode.
+   */
+  applyRandomized: asyncHandler(async (req, res) => {
+    const { assignments } = req.body;
+    const userId = req.user?.id;
+
+    logger.info(`Randomize apply request from user ${userId}`, {
+      sessionCount: Array.isArray(assignments) ? assignments.length : 0,
+    });
+
+    const result = await accountSettingsService.applyRandomizedAssignments(
+      { assignments },
+      userId
+    );
+
+    return res.status(200).json({ success: true, data: result });
+  }),
+
+  /**
    * GET /api/account-settings/:sessionId
    * Get account settings for a session
    */
