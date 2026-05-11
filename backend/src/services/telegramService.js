@@ -3244,9 +3244,13 @@ class TelegramService {
             `Flood wait detected for session ${sessionId}: ${waitSeconds}s (retry ${retries}/${maxRetries})`
           );
 
-          // Long flood waits (≥30s) get pushed to two stores:
-          //   - tg_session_health (legacy anti-revoke risk model)
-          //   - sessions.cooldown_until (new job-eligibility gate)
+          // Long flood waits (≥30s) are pushed to tg_session_health
+          // (anti-revoke risk model). We deliberately DO NOT persist a
+          // panel-side cooldown on the session row — the in-run
+          // sessionWorkerPool already sleeps for `waitSeconds` and
+          // rotates the session back into the pool, and the operator
+          // explicitly asked that future jobs be allowed to retry every
+          // session regardless of past flood history.
           if (waitSeconds >= 30) {
             try {
               const cfg = require('../config/telegram');
@@ -3269,14 +3273,6 @@ class TelegramService {
                 ).catch(() => {});
               }
             } catch { /* best-effort */ }
-            try {
-              const sessionCooldown = require('./sessionCooldown');
-              await sessionCooldown.markFloodCooldown(
-                sessionId,
-                waitSeconds,
-                `FLOOD_WAIT_${waitSeconds}`
-              );
-            } catch { /* best-effort */ }
           }
 
           await sleep(waitSeconds * 1000);
@@ -3284,17 +3280,18 @@ class TelegramService {
         }
 
         // PEER_FLOOD is account-level: Telegram has flagged this
-        // session as spam, and the cooldown is hours / days — not 30s.
-        // Retrying every 30s for 5 attempts just burns 2.5 minutes per
-        // call (and per call site there can be hundreds), without any
-        // chance of recovery in that window. Fail fast AND mark the
-        // session on cooldown so the worker session-pickers stop
-        // handing it more work for a while (privacy/2fa/login pages
-        // don't read the cooldown field, so the operator can still
-        // recover the session manually).
+        // session as spam, and Telegram never returns a duration for
+        // it. Retrying every 30s for 5 attempts just burns 2.5
+        // minutes per call without any chance of recovery in that
+        // window, so we fail fast. We DO NOT persist a panel-side
+        // cooldown — the in-run sessionWorkerPool stops handing more
+        // work to a PEER_FLOODed session for the remainder of this
+        // run, and that's all the per-run isolation needed. Future
+        // jobs (which is when the cooldown row would have mattered)
+        // attempt the session normally per operator request.
         if (errorMessage.includes('PEER_FLOOD')) {
           logger.warn(
-            `Peer flood detected for session ${sessionId}: not retrying (account-level cooldown is hours, not seconds)`
+            `Peer flood detected for session ${sessionId}: not retrying (Telegram returns no duration for PEER_FLOOD)`
           );
           try {
             const cfg = require('../config/telegram');
@@ -3305,10 +3302,6 @@ class TelegramService {
                 fingerprint: { source: 'peer_flood', retries },
               });
             }
-          } catch { /* best-effort */ }
-          try {
-            const sessionCooldown = require('./sessionCooldown');
-            await sessionCooldown.markPeerFlood(sessionId, 'PEER_FLOOD');
           } catch { /* best-effort */ }
           throw this._handleTelegramError(error);
         }

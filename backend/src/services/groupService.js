@@ -10,7 +10,6 @@ const {
   getPrimaryTelegramId,
 } = require('../utils/telegramTargetNormalizer');
 const distributionPlanner = require('./distributionPlanner');
-const sessionCooldown = require('./sessionCooldown');
 const { SessionResolverCache } = require('./sessionResolverCache');
 const { run: runWorkerPool } = require('../utils/sessionWorkerPool');
 
@@ -280,57 +279,29 @@ async function updateProgress(opId, progressData) {
 /**
  * Validate that the given sessions belong to the specified user.
  *
- * By default, sessions whose `cooldown_until` is in the future are
- * filtered out of the returned rows (they're held in flood/peer-flood
- * lockout from `_withFloodRetry`). The dropped sessions are attached
- * to the returned array as a non-enumerable `cooldownSkipped` property
- * so callers can include them in the operation result for UX
- * surfacing without changing the function signature.
- *
- * If every requested session is on cooldown, throws
- * `ALL_SESSIONS_ON_COOLDOWN` (409). Callers that legitimately need to
- * operate on a cooldown session (e.g. privacy / 2FA / login menus)
- * should pass `{ filterCooldown: false }` — but those flows live in
- * sessionController, not here, so the default-on behaviour is what we
- * want for every caller in this file.
+ * Returns the matching `sessions` rows for `(user_id, id IN sessionIds)`.
+ * The legacy per-session cooldown filter (cooldown_until > NOW())
+ * was removed: every job now tries every requested session and the
+ * in-run sessionWorkerPool is the single source of truth for
+ * dropping sessions that hit FLOOD_WAIT / PEER_FLOOD during the
+ * current run.
  *
  * @param {Array<string|number>} sessionIds
  * @param {number|string} userId
- * @param {{ filterCooldown?: boolean }} [opts]
  */
-async function validateSessionsOwnership(sessionIds, userId, opts = {}) {
-  const { filterCooldown = true } = opts;
+async function validateSessionsOwnership(sessionIds, userId) {
   if (!sessionIds || sessionIds.length === 0) {
     throw new AppError('At least one session ID is required', 400, 'NO_SESSIONS');
   }
 
   const placeholders = sessionIds.map((_, i) => `$${i + 2}`).join(',');
-  // SELECT cooldown_* alongside the legacy columns. On a deploy that
-  // hasn't run migration v24 yet the columns won't exist and the
-  // query throws — fall back to the legacy column set in that case
-  // so an upgrading deploy never breaks job submission.
-  let result;
-  try {
-    result = await pool.query(
-      `SELECT id, user_id, status, is_logged_in, phone,
-              cooldown_until, cooldown_reason, cooldown_seconds, cooldown_set_at
-         FROM sessions
-        WHERE id IN (${placeholders})
-          AND user_id = $1`,
-      [userId, ...sessionIds]
-    );
-  } catch (selErr) {
-    logger.warn(
-      `validateSessionsOwnership: cooldown columns missing, falling back: ${selErr.message}`
-    );
-    result = await pool.query(
-      `SELECT id, user_id, status, is_logged_in, phone
-         FROM sessions
-        WHERE id IN (${placeholders})
-          AND user_id = $1`,
-      [userId, ...sessionIds]
-    );
-  }
+  const result = await pool.query(
+    `SELECT id, user_id, status, is_logged_in, phone
+       FROM sessions
+      WHERE id IN (${placeholders})
+        AND user_id = $1`,
+    [userId, ...sessionIds]
+  );
 
   if (result.rows.length === 0) {
     throw new AppError('No valid sessions found for this user', 404, 'SESSION_NOT_FOUND');
@@ -341,52 +312,7 @@ async function validateSessionsOwnership(sessionIds, userId, opts = {}) {
     logger.warn(`Some sessions not found for user ${userId}`, { notFound });
   }
 
-  if (!filterCooldown) {
-    return result.rows;
-  }
-
-  // Filter rows whose cooldown_until is still in the future. Best-
-  // effort — when the column is absent (legacy deploy) every row
-  // passes through unchanged.
-  const now = Date.now();
-  const eligible = [];
-  const skipped = [];
-  for (const row of result.rows) {
-    const cdAt = row.cooldown_until ? new Date(row.cooldown_until).getTime() : 0;
-    if (cdAt > now) {
-      skipped.push({
-        id: row.id,
-        cooldown_until: row.cooldown_until,
-        remaining_seconds: Math.max(0, Math.ceil((cdAt - now) / 1000)),
-        reason: row.cooldown_reason || null,
-      });
-    } else {
-      eligible.push(row);
-    }
-  }
-
-  if (eligible.length === 0 && skipped.length > 0) {
-    const err = new AppError(
-      `All ${skipped.length} requested session(s) are on cooldown`,
-      409,
-      'ALL_SESSIONS_ON_COOLDOWN'
-    );
-    err.cooldownSkipped = skipped;
-    throw err;
-  }
-
-  if (skipped.length > 0) {
-    logger.warn(
-      `validateSessionsOwnership: ${skipped.length} session(s) skipped due to cooldown`,
-      { userId, skipped }
-    );
-    Object.defineProperty(eligible, 'cooldownSkipped', {
-      value: skipped,
-      enumerable: false,
-    });
-  }
-
-  return eligible;
+  return result.rows;
 }
 
 class GroupService {
@@ -813,8 +739,7 @@ class GroupService {
         eligible: preparedUsers.length,
       });
 
-      // Verify session ownership (also drops cooldown sessions; throws
-      // ALL_SESSIONS_ON_COOLDOWN when nothing usable is left).
+      // Verify session ownership.
       verifiedSessions = await validateSessionsOwnership(sessionIds, userId);
     } catch (preflightErr) {
       // Persist a terminal status on the queued op row so the
@@ -1641,7 +1566,6 @@ class GroupService {
           cooldownSec: [plan.cooldownSecMin, plan.cooldownSecMax],
           itemDelayMs: [plan.itemDelayMsMin, plan.itemDelayMsMax],
         },
-        cooldownSkipped: verifiedSessions.cooldownSkipped || [],
       };
     } catch (outerErr) {
       logger.error(`Fatal error in add members operation ${opId}`, { error: outerErr.message });
@@ -2891,7 +2815,6 @@ class GroupService {
         cooldownSec: [plan.cooldownSecMin, plan.cooldownSecMax],
         itemDelayMs: [plan.itemDelayMsMin, plan.itemDelayMsMax],
       },
-      cooldownSkipped: verifiedSessions.cooldownSkipped || [],
       runner: 'v2',
     };
   }

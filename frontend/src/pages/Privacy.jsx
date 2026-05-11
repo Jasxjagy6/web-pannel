@@ -26,6 +26,8 @@ import {
   UserCheck,
   UserX,
   Crown,
+  Hourglass,
+  Power,
 } from 'lucide-react';
 import { useToast } from '../components/common/Toast';
 import { listSessions } from '../api/sessions';
@@ -128,6 +130,16 @@ const RULE_META = {
   nobody:    { label: 'Nobody',    icon: UserX, color: 'rose' },
   premium:   { label: 'Premium',   icon: Crown, color: 'amber' },
 };
+
+// Auto-terminate-inactive-sessions presets. Mirrors Telegram's stock
+// "If away for…" choices under Settings → Devices. Numeric values are
+// the day-counts the backend will hand to account.SetAuthorizationTTL.
+const AUTH_TTL_OPTIONS = [
+  { value: 7,   label: '1 week'   },
+  { value: 90,  label: '3 months' },
+  { value: 180, label: '6 months' },
+  { value: 365, label: '1 year'   },
+];
 
 const RULE_COLOR_CLASSES = {
   emerald: {
@@ -456,6 +468,12 @@ export default function Privacy() {
   const [selectedSessionListId, setSelectedSessionListId] = useState('');
   const [settings, setSettings] = useState({});
   const [submitting, setSubmitting] = useState(false);
+  // Auto-terminate (account.SetAuthorizationTTL) is its own pseudo-job
+  // — it shares the session selector with the privacy bulk-set above
+  // but has a single integer value (days), not a key/rule grid, so it
+  // gets its own Apply button. Default unselected: nothing is picked.
+  const [authTtlDays, setAuthTtlDays] = useState(null);
+  const [authTtlSubmitting, setAuthTtlSubmitting] = useState(false);
 
   const [jobs, setJobs] = useState([]);
   const [drawerJob, setDrawerJob] = useState(null);
@@ -554,6 +572,42 @@ export default function Privacy() {
     }
   };
 
+  const submitAuthTtl = async () => {
+    if (!authTtlDays) {
+      showError('Pick an auto-terminate interval first', 'Nothing to apply');
+      return;
+    }
+    const usingList = sessionPickMode === 'list' && selectedSessionListId;
+    if (!usingList && selectedSessionIds.length === 0) {
+      showError('Pick at least one session (or pick a session list)', 'No targets');
+      return;
+    }
+    if (sessionPickMode === 'list' && !selectedSessionListId) {
+      showError('Pick a session list', 'No targets');
+      return;
+    }
+    setAuthTtlSubmitting(true);
+    try {
+      const payload = { auth_ttl: authTtlDays };
+      const r = usingList
+        ? await createPrivacyJob(payload, { sessionListId: Number(selectedSessionListId) })
+        : await createPrivacyJob(payload, selectedSessionIds);
+      const data = r.data?.data || {};
+      const labelMatch = AUTH_TTL_OPTIONS.find((o) => o.value === authTtlDays);
+      const label = labelMatch ? labelMatch.label : `${authTtlDays} days`;
+      showSuccess(
+        `Auto-terminate (${label}) queued for ${data.sessionCount} session(s)` +
+          (data.skipped ? ` (${data.skipped} skipped)` : ''),
+        `Privacy job #${data.jobId}`
+      );
+      fetchJobs();
+    } catch (err) {
+      showError(parseApiError(err), 'Could not queue auto-terminate');
+    } finally {
+      setAuthTtlSubmitting(false);
+    }
+  };
+
   const cancel = async (id) => {
     if (!confirm(`Cancel privacy job #${id}? Pending sessions will be skipped.`)) return;
     try {
@@ -586,6 +640,75 @@ export default function Privacy() {
           <RefreshCw className="w-3.5 h-3.5" />
           Refresh history
         </button>
+      </div>
+
+      {/* Auto-terminate inactive sessions card.
+          This wraps account.SetAuthorizationTTL — the same Telegram
+          setting as Settings → Devices → "If away for…" on the
+          official client. It re-uses the session picker below so the
+          operator can apply the same TTL to one, many, or a saved list
+          of accounts in a single click. */}
+      <div className="rounded-2xl border border-white/5 bg-dark-800/40 p-5">
+        <div className="flex flex-col lg:flex-row lg:items-center lg:justify-between gap-4">
+          <div className="flex items-start gap-3">
+            <div className="rounded-lg bg-primary-500/10 p-2 text-primary-300 shrink-0">
+              <Hourglass className="h-5 w-5" />
+            </div>
+            <div className="min-w-0">
+              <h3 className="text-sm font-semibold text-white">
+                Auto-terminate inactive sessions
+              </h3>
+              <p className="text-[12px] text-gray-500 mt-0.5 max-w-2xl">
+                Mirrors Telegram’s “If away for…” setting under
+                Settings → Devices. Pick how long an authorization
+                (any device logged into the account) may stay inactive
+                before Telegram auto-terminates it. Applies to every
+                account picked below in one MTProto round-trip per
+                session.
+              </p>
+            </div>
+          </div>
+          <div className="flex flex-wrap gap-2 lg:flex-nowrap lg:items-center">
+            {AUTH_TTL_OPTIONS.map((opt) => {
+              const active = authTtlDays === opt.value;
+              return (
+                <button
+                  key={opt.value}
+                  type="button"
+                  onClick={() => setAuthTtlDays(active ? null : opt.value)}
+                  className={`rounded-lg border px-3 py-2 text-xs font-semibold transition-all ${
+                    active
+                      ? 'bg-primary-500 text-white border-primary-500 shadow-md shadow-primary-500/30'
+                      : 'bg-dark-900/40 border-white/5 text-gray-400 hover:border-primary-500/40 hover:text-primary-300'
+                  }`}
+                >
+                  {opt.label}
+                </button>
+              );
+            })}
+            <button
+              type="button"
+              onClick={submitAuthTtl}
+              disabled={
+                authTtlSubmitting ||
+                !authTtlDays ||
+                (sessionPickMode === 'list'
+                  ? !selectedSessionListId
+                  : selectedSessionIds.length === 0)
+              }
+              className="flex items-center justify-center gap-2 rounded-lg bg-gradient-to-r from-primary-600 to-primary-500 px-4 py-2 text-xs font-semibold text-white shadow-md shadow-primary-500/20 hover:shadow-primary-500/40 disabled:opacity-40 disabled:cursor-not-allowed transition"
+            >
+              {authTtlSubmitting ? (
+                <Loader2 className="w-3.5 h-3.5 animate-spin" />
+              ) : (
+                <Power className="w-3.5 h-3.5" />
+              )}
+              {sessionPickMode === 'list'
+                ? 'Apply to session list'
+                : `Apply to ${selectedSessionIds.length} session${selectedSessionIds.length === 1 ? '' : 's'}`}
+            </button>
+          </div>
+        </div>
       </div>
 
       {/* Settings + Sessions */}

@@ -56,7 +56,6 @@ class GroupQueueManager {
       'EMPTY_USER_LIST',
       'NO_TARGETS',
       'MISSING_USER_ID',
-      'ALL_SESSIONS_ON_COOLDOWN',
       'SESSION_NOT_FOUND',
     ]);
 

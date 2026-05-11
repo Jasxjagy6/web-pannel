@@ -20,15 +20,29 @@
  *                     uses the voice-messages privacy key)
  *   invites           InputPrivacyKeyChatInvite
  *
- * Rule values:
+ * Rule values for the keys above:
  *   everybody  -> InputPrivacyValueAllowAll
  *   nobody     -> InputPrivacyValueDisallowAll
  *   contacts   -> InputPrivacyValueAllowContacts
  *   premium    -> InputPrivacyValueAllowPremium    (messages key only)
  *
+ * One extra synthetic key is also supported, mapping to a *different*
+ * MTProto request:
+ *
+ *   auth_ttl   -> account.SetAuthorizationTTL
+ *     Value is an integer day-count: how long an inactive Telegram
+ *     authorization (any device / session on the account) may live
+ *     before Telegram auto-terminates it. The panel offers Telegram's
+ *     stock presets — 7, 90, 180, 365 — from the Privacy UI's
+ *     "Auto-terminate old sessions" card, applied across one or many
+ *     accounts at once. This is the equivalent of the official mobile
+ *     client's "If away for…" setting under Settings → Devices.
+ *
  * Public API:
  *   PRIVACY_KEYS                    (frozen list of supported keys)
  *   PRIVACY_RULES                   (frozen list of supported rules)
+ *   AUTH_TTL_KEY                    (the synthetic auth-ttl key name)
+ *   AUTH_TTL_DAY_OPTIONS            (frozen list of legal day-count values)
  *   buildKey(name)                  -> Api.InputPrivacyKey*
  *   buildRules(name, ruleValue)     -> [Api.InputPrivacyValue*]
  *   applyToSession(sessionId, settings)  -> per-key result map
@@ -55,6 +69,19 @@ const PRIVACY_KEYS = Object.freeze([
 ]);
 
 const PRIVACY_RULES = Object.freeze(['everybody', 'nobody', 'contacts', 'premium']);
+
+// Synthetic key that re-uses the privacy_jobs queue but invokes
+// `account.SetAuthorizationTTL` instead of `account.SetPrivacy`. The
+// only legal values are Telegram's own preset day-counts.
+const AUTH_TTL_KEY = 'auth_ttl';
+const AUTH_TTL_DAY_OPTIONS = Object.freeze([7, 90, 180, 365]);
+
+function isAuthTtlValueValid(value) {
+  if (typeof value !== 'number' || !Number.isInteger(value) || value <= 0) {
+    return false;
+  }
+  return AUTH_TTL_DAY_OPTIONS.includes(value);
+}
 
 const KEY_FACTORY = {
   phone_number:   () => new Api.InputPrivacyKeyPhoneNumber(),
@@ -132,7 +159,9 @@ async function applyToSession(sessionId, settings, opts = {}) {
   }
   const client = entry.client;
 
-  const keys = Object.keys(settings || {}).filter((k) => PRIVACY_KEYS.includes(k));
+  const keys = Object.keys(settings || {}).filter(
+    (k) => PRIVACY_KEYS.includes(k) || k === AUTH_TTL_KEY
+  );
   if (keys.length === 0) {
     return { results: {}, succeeded: 0, failed: 0 };
   }
@@ -144,6 +173,42 @@ async function applyToSession(sessionId, settings, opts = {}) {
   for (let i = 0; i < keys.length; i++) {
     const keyName = keys[i];
     const ruleValue = settings[keyName];
+
+    // ---------------------------------------------------------------
+    // Synthetic 'auth_ttl' key — routes to account.SetAuthorizationTTL
+    // ---------------------------------------------------------------
+    if (keyName === AUTH_TTL_KEY) {
+      if (!isAuthTtlValueValid(ruleValue)) {
+        results[keyName] = `BAD_AUTH_TTL:${ruleValue}`;
+        failed++;
+        if (i < keys.length - 1) {
+          const sleep = Math.floor(Math.random() * (maxSleep - minSleep + 1)) + minSleep;
+          await new Promise((r) => setTimeout(r, sleep));
+        }
+        continue;
+      }
+      const days = Number(ruleValue);
+      try {
+        await client.invoke(
+          new Api.account.SetAuthorizationTTL({ authorizationTtlDays: days })
+        );
+        results[keyName] = 'ok';
+        succeeded++;
+      } catch (err) {
+        const code = (err && (err.errorMessage || err.message)) || 'ERROR';
+        results[keyName] = code.length > 60 ? code.slice(0, 60) : code;
+        failed++;
+        logger.warn(
+          `account.SetAuthorizationTTL(${days}d) failed for session ${sessionId}: ${code}`
+        );
+      }
+      if (i < keys.length - 1) {
+        const sleep = Math.floor(Math.random() * (maxSleep - minSleep + 1)) + minSleep;
+        await new Promise((r) => setTimeout(r, sleep));
+      }
+      continue;
+    }
+
     if (!PRIVACY_RULES.includes(ruleValue)) {
       results[keyName] = `BAD_RULE:${ruleValue}`;
       failed++;
@@ -186,6 +251,9 @@ async function applyToSession(sessionId, settings, opts = {}) {
 module.exports = {
   PRIVACY_KEYS,
   PRIVACY_RULES,
+  AUTH_TTL_KEY,
+  AUTH_TTL_DAY_OPTIONS,
+  isAuthTtlValueValid,
   buildKey,
   buildRules,
   applyToSession,

@@ -52,7 +52,6 @@ import {
   Download,
   LifeBuoy,
   ShieldAlert,
-  Clock,
 } from 'lucide-react';
 
 // --- Helper: format file size ---
@@ -407,66 +406,6 @@ function SessionDetailModal({ session, isOpen, onClose }) {
                   <span className="text-gray-400">Disabled</span>
                 )}
               </p>
-            </div>
-            {/*
-              Cooldown card — always rendered so the operator can see
-              whether this session is currently locked out by Telegram
-              flood/peer-flood protection. When on cooldown the card
-              shows the remaining time and the reason; otherwise it
-              shows "Eligible" so the field is visibly tracked.
-            */}
-            <div className="rounded-lg border border-white/5 bg-dark-900 p-4 sm:col-span-2">
-              <div className="flex items-center gap-2 text-gray-400 mb-1">
-                <Clock className="w-4 h-4" />
-                <span className="text-xs uppercase tracking-wider">Cooldown</span>
-              </div>
-              {(() => {
-                const onCooldown =
-                  !!session.is_on_cooldown ||
-                  !!(session.cooldown_until && new Date(session.cooldown_until).getTime() > Date.now());
-                const remaining = (() => {
-                  if (typeof session.cooldown_remaining_seconds === 'number') {
-                    return session.cooldown_remaining_seconds;
-                  }
-                  if (session.cooldown_until) {
-                    const ms = new Date(session.cooldown_until).getTime() - Date.now();
-                    return Math.max(0, Math.ceil(ms / 1000));
-                  }
-                  return 0;
-                })();
-                if (!onCooldown || remaining <= 0) {
-                  return (
-                    <p className="text-emerald-400 font-medium flex items-center gap-2">
-                      <span className="inline-block w-2 h-2 rounded-full bg-emerald-400" />
-                      Eligible — no active cooldown
-                    </p>
-                  );
-                }
-                return (
-                  <div>
-                    <p className="text-amber-300 font-medium flex items-center gap-2">
-                      <Clock className="w-4 h-4" />
-                      {formatCooldownLabel(remaining)} remaining
-                    </p>
-                    <p className="text-xs text-gray-500 mt-1">
-                      Reason: <span className="text-gray-400">{session.cooldown_reason || 'flood'}</span>
-                      {session.cooldown_set_at ? (
-                        <>
-                          <span className="mx-1.5">·</span>
-                          Set at <span className="text-gray-400">
-                            {new Date(session.cooldown_set_at).toLocaleString()}
-                          </span>
-                        </>
-                      ) : null}
-                    </p>
-                    <p className="text-xs text-gray-500 mt-2 leading-relaxed">
-                      Group-add and bulk-message jobs will skip this session
-                      until the cooldown expires. Login, 2FA, privacy and
-                      delete actions remain enabled.
-                    </p>
-                  </div>
-                );
-              })()}
             </div>
           </div>
         </div>
@@ -926,100 +865,6 @@ function RiskPill({ session }) {
     >
       {label}
       <span className="ml-1 text-[10px] font-mono opacity-75">{score.toFixed(2)}</span>
-    </span>
-  );
-}
-
-/**
- * Format a remaining-seconds value into a short, human-friendly
- * cooldown label ("12m 03s" / "1h 12m" / "2d 03h"). Used by both the
- * Sessions row badge and the bulk-action banner.
- */
-function formatCooldownLabel(seconds) {
-  const s = Math.max(0, Math.floor(Number(seconds) || 0));
-  if (s < 60) return `${s}s`;
-  if (s < 3600) {
-    const m = Math.floor(s / 60);
-    const rs = s % 60;
-    return `${m}m ${rs.toString().padStart(2, '0')}s`;
-  }
-  if (s < 86400) {
-    const h = Math.floor(s / 3600);
-    const m = Math.floor((s % 3600) / 60);
-    return `${h}h ${m.toString().padStart(2, '0')}m`;
-  }
-  const d = Math.floor(s / 86400);
-  const h = Math.floor((s % 86400) / 3600);
-  return `${d}d ${h.toString().padStart(2, '0')}h`;
-}
-
-/**
- * Render an inline "Cooldown 12m" pill if the session row is currently
- * locked out by `sessionCooldown.markFloodCooldown(...)` (PEER_FLOOD /
- * FLOOD_WAIT). The pill is intentionally distinct from RiskPill /
- * StatusBadge so operators can see at a glance which sessions will be
- * skipped by group-add / bulk-message jobs.
- *
- * Backend-side, `groupService.validateSessionsOwnership` and
- * `messageService._verifyMultipleSessionsOwnership` already filter
- * cooldown rows out of every job — this badge is the user-facing
- * counterpart so the operator knows why a particular session was
- * dropped from the eligible set.
- *
- * Returns null when the session is not on cooldown.
- */
-function CooldownBadge({ session, alwaysShow = true }) {
-  // Prefer the precomputed remaining-seconds the backend ships in the
-  // list payload; fall back to the raw `cooldown_until` timestamp so
-  // older snapshots still render correctly (e.g. cached responses).
-  const onCooldown =
-    !!session?.is_on_cooldown ||
-    !!(session?.cooldown_until && new Date(session.cooldown_until).getTime() > Date.now());
-
-  const remaining = (() => {
-    if (typeof session?.cooldown_remaining_seconds === 'number') {
-      return session.cooldown_remaining_seconds;
-    }
-    if (session?.cooldown_until) {
-      const ms = new Date(session.cooldown_until).getTime() - Date.now();
-      return Math.max(0, Math.ceil(ms / 1000));
-    }
-    return 0;
-  })();
-
-  // Active cooldown — render the prominent amber pill with the
-  // remaining time so operators can see exactly how long the session
-  // will be skipped from group-add / bulk-message jobs.
-  if (onCooldown && remaining > 0) {
-    const reason = session?.cooldown_reason || 'flood';
-    const tooltip =
-      `Telegram rate-limited this session (${reason}). ` +
-      `It will be skipped by group-add / bulk-message jobs for ` +
-      `${formatCooldownLabel(remaining)}. Login / 2FA / privacy / delete actions still work.`;
-    return (
-      <span
-        className="inline-flex items-center rounded-full px-2 py-0.5 text-[11px] font-semibold bg-amber-500/15 text-amber-300 border border-amber-400/30 animate-pulse"
-        title={tooltip}
-      >
-        <Clock className="w-3 h-3 mr-1" />
-        Cooldown {formatCooldownLabel(remaining)}
-      </span>
-    );
-  }
-
-  // Not on cooldown — render a subtle "Cooldown: none" indicator so
-  // the operator can see at a glance that the field is tracked and the
-  // session is currently eligible for jobs. Set `alwaysShow={false}`
-  // for compact layouts that don't have room for the always-on
-  // indicator.
-  if (!alwaysShow) return null;
-  return (
-    <span
-      className="inline-flex items-center rounded-full px-2 py-0.5 text-[11px] font-medium bg-gray-500/10 text-gray-400 border border-gray-500/20"
-      title="No active cooldown. This session is eligible for group-add / bulk-message jobs."
-    >
-      <Clock className="w-3 h-3 mr-1" />
-      Cooldown: none
     </span>
   );
 }
@@ -1675,16 +1520,6 @@ export default function Sessions() {
                             status={session.status || 'inactive'}
                             size="sm"
                           />
-                          {/*
-                            Cooldown badge — surfaces PEER_FLOOD /
-                            FLOOD_WAIT lockouts marked by
-                            sessionCooldown.markFloodCooldown(...). The
-                            backend already filters cooldown rows out
-                            of every job; this is the visual marker so
-                            operators understand why a session was
-                            skipped without opening the detail modal.
-                          */}
-                          <CooldownBadge session={session} />
                         </div>
                       </td>
                       <td className="px-4 py-3 hidden lg:table-cell">
