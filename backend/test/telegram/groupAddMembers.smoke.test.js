@@ -205,6 +205,207 @@ assert.strictEqual(
     if (!err.message.includes('@buyersgc')) throw new Error(`[${c.label}] expected target name in message`);
   }
   console.log('addMemberToGroup.contextualErrors: OK');
+
+// --- addMemberToGroup: silent-drop classification ---
+//
+// `channels.InviteToChannel` returns the same "empty updates + empty
+// users" shape for two distinct cases:
+//   1. The user was silently dropped (Telegram refused to add them
+//      because of their privacy settings). The operator should see
+//      USER_PRIVACY_RESTRICT.
+//   2. The user was ALREADY a participant before this call, so no
+//      state change happened. Operator quote (this is what we're
+//      fixing): "Although both user jashanxjagy and Jagmeet were
+//      successfully added to the groups (I check telegram and they
+//      were in) but still pannel was showing user privacy restrict".
+//
+// The fix probes `channels.GetParticipant` whenever the silent-drop
+// shape fires AND `missingInvitees` is empty — if the user is in,
+// we throw USER_ALREADY_PARTICIPANT instead so the runner records
+// the row as "User already in target" rather than a privacy reject.
+//
+// NOTE: this block is intentionally inside the same IIFE as the
+// contextualErrors block above so the two don't race over the
+// shared `tg.clients` / `tg._resolveEntity` mocks.
+  {
+  const sid = '__silent_drop_test__';
+
+  // ── Case 1: empty response + GetParticipant says user is IN ──
+  //    Expect USER_ALREADY_PARTICIPANT (NOT privacy restrict).
+  {
+    let getParticipantCalled = false;
+    tg._ensureConnected = async () => {};
+    tg.clients = new Map([[sid, {
+      client: {
+        invoke: async (req) => {
+          const t = req && (req.className || req.__type) || '';
+          if (/InviteToChannel/.test(t)) {
+            // Layer 198-style empty wrapper.
+            return {
+              updates: { updates: [], users: [] },
+              missingInvitees: [],
+            };
+          }
+          if (/GetParticipant/.test(t)) {
+            getParticipantCalled = true;
+            return {
+              participant: { className: 'ChannelParticipant' },
+            };
+          }
+          throw new Error(`Unmocked RPC: ${t}`);
+        },
+      },
+    }]]);
+    tg._resolveEntity = async (_s, target) => (typeof target === 'string' && target.startsWith('@')
+      ? { className: 'Channel', id: 1, accessHash: 1 }
+      : { className: 'User', id: 2, accessHash: 2 });
+    tg._withFloodRetry = async (_s, fn) => fn();
+
+    let err = null;
+    try {
+      await tg.addMemberToGroup(sid, '@group', '12345');
+    } catch (e) { err = e; }
+    if (!err) throw new Error('expected throw');
+    if (!err.message.includes('USER_ALREADY_PARTICIPANT')) {
+      throw new Error(
+        `expected USER_ALREADY_PARTICIPANT, got: ${err.message}`
+      );
+    }
+    if (!getParticipantCalled) {
+      throw new Error('expected channels.GetParticipant probe to be called');
+    }
+  }
+
+  // ── Case 2: empty response + GetParticipant says user is LEFT ──
+  //    Expect USER_PRIVACY_RESTRICT (existing behaviour).
+  {
+    tg._ensureConnected = async () => {};
+    tg.clients = new Map([[sid, {
+      client: {
+        invoke: async (req) => {
+          const t = req && (req.className || req.__type) || '';
+          if (/InviteToChannel/.test(t)) {
+            return {
+              updates: { updates: [], users: [] },
+              missingInvitees: [],
+            };
+          }
+          if (/GetParticipant/.test(t)) {
+            return {
+              participant: { className: 'ChannelParticipantLeft' },
+            };
+          }
+          throw new Error(`Unmocked RPC: ${t}`);
+        },
+      },
+    }]]);
+    tg._resolveEntity = async (_s, target) => (typeof target === 'string' && target.startsWith('@')
+      ? { className: 'Channel', id: 1, accessHash: 1 }
+      : { className: 'User', id: 2, accessHash: 2 });
+    tg._withFloodRetry = async (_s, fn) => fn();
+
+    let err = null;
+    try {
+      await tg.addMemberToGroup(sid, '@group', '12345');
+    } catch (e) { err = e; }
+    if (!err) throw new Error('expected throw');
+    if (!err.message.includes('USER_PRIVACY_RESTRICT')) {
+      throw new Error(
+        `expected USER_PRIVACY_RESTRICT when user is not a participant, got: ${err.message}`
+      );
+    }
+  }
+
+  // ── Case 3: missingInvitees populated → DON'T probe ──
+  //    Telegram explicitly populated `missingInvitees` so we already
+  //    know the user was the one dropped. The probe must NOT be
+  //    called (it would be a wasted RPC).
+  {
+    let getParticipantCalled = false;
+    tg._ensureConnected = async () => {};
+    tg.clients = new Map([[sid, {
+      client: {
+        invoke: async (req) => {
+          const t = req && (req.className || req.__type) || '';
+          if (/InviteToChannel/.test(t)) {
+            return {
+              updates: { updates: [], users: [] },
+              missingInvitees: [
+                { userId: 12345, premiumWouldAllowInvite: false },
+              ],
+            };
+          }
+          if (/GetParticipant/.test(t)) {
+            getParticipantCalled = true;
+            return { participant: { className: 'ChannelParticipant' } };
+          }
+          throw new Error(`Unmocked RPC: ${t}`);
+        },
+      },
+    }]]);
+    tg._resolveEntity = async (_s, target) => (typeof target === 'string' && target.startsWith('@')
+      ? { className: 'Channel', id: 1, accessHash: 1 }
+      : { className: 'User', id: 2, accessHash: 2 });
+    tg._withFloodRetry = async (_s, fn) => fn();
+
+    let err = null;
+    try {
+      await tg.addMemberToGroup(sid, '@group', '12345');
+    } catch (e) { err = e; }
+    if (!err) throw new Error('expected throw');
+    if (!err.message.includes('USER_PRIVACY_RESTRICT')) {
+      throw new Error(
+        `expected USER_PRIVACY_RESTRICT when missingInvitees is populated, got: ${err.message}`
+      );
+    }
+    if (getParticipantCalled) {
+      throw new Error(
+        'channels.GetParticipant must NOT be called when missingInvitees is populated'
+      );
+    }
+  }
+
+  // ── Case 4: empty response + GetParticipant throws USER_NOT_PARTICIPANT ──
+  //    Fall back to USER_PRIVACY_RESTRICT. The probe error is the
+  //    canonical "genuinely not in the group" answer.
+  {
+    tg._ensureConnected = async () => {};
+    tg.clients = new Map([[sid, {
+      client: {
+        invoke: async (req) => {
+          const t = req && (req.className || req.__type) || '';
+          if (/InviteToChannel/.test(t)) {
+            return {
+              updates: { updates: [], users: [] },
+              missingInvitees: [],
+            };
+          }
+          if (/GetParticipant/.test(t)) {
+            throw new Error('USER_NOT_PARTICIPANT (caused by channels.GetParticipant)');
+          }
+          throw new Error(`Unmocked RPC: ${t}`);
+        },
+      },
+    }]]);
+    tg._resolveEntity = async (_s, target) => (typeof target === 'string' && target.startsWith('@')
+      ? { className: 'Channel', id: 1, accessHash: 1 }
+      : { className: 'User', id: 2, accessHash: 2 });
+    tg._withFloodRetry = async (_s, fn) => fn();
+
+    let err = null;
+    try {
+      await tg.addMemberToGroup(sid, '@group', '12345');
+    } catch (e) { err = e; }
+    if (!err) throw new Error('expected throw');
+    if (!err.message.includes('USER_PRIVACY_RESTRICT')) {
+      throw new Error(
+        `expected USER_PRIVACY_RESTRICT when probe says USER_NOT_PARTICIPANT, got: ${err.message}`
+      );
+    }
+  }
+
+  console.log('addMemberToGroup.silentDropDisambiguation: OK');
+  }
 })().catch((e) => { console.error(e); process.exit(1); });
 
 console.log('groupAddMembers.smoke.test: OK');
