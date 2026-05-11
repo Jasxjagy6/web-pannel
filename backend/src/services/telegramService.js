@@ -3508,6 +3508,75 @@ class TelegramService {
   }
 
   /**
+   * Pre-warm a fleet of sessions in parallel before a bulk runner
+   * starts dispatching work. The legacy runners pay a sequential
+   * `_ensureConnected` cost on the very first attempt of every
+   * session — for 1000 sessions that's a real wall-clock hit even
+   * before the first MTProto RPC fires. We connect them all in
+   * parallel here (bounded by `concurrency`) so the worker pool can
+   * dispatch as soon as it spins up.
+   *
+   * Connect failures are NOT raised — they're returned in the result
+   * object so the caller can drop those sessions from the live pool
+   * without aborting the whole job. The parallel batch is intentionally
+   * forgiving: a single bad session must never poison the warm-up
+   * for the other 999.
+   *
+   * @param {Array<string|number>} sessionIds
+   * @param {object} [opts]
+   * @param {number} [opts.concurrency=50]  Max parallel connects.
+   * @param {number} [opts.timeoutMs]        Per-session connect timeout
+   *   (defaults to telegramService's TG_CONNECT_TIMEOUT_MS).
+   * @returns {Promise<{
+   *   ok: string[],
+   *   failed: Array<{ sessionId: string, error: string, permanent: boolean }>,
+   *   durationMs: number,
+   * }>}
+   */
+  async preWarmSessions(sessionIds, opts = {}) {
+    const concurrency = Math.max(1, Math.min(
+      Array.isArray(sessionIds) ? sessionIds.length : 1,
+      Number.isFinite(opts.concurrency) && opts.concurrency > 0
+        ? Math.floor(opts.concurrency)
+        : 50
+    ));
+    const ids = Array.isArray(sessionIds) ? sessionIds.map(String) : [];
+    const ok = [];
+    const failed = [];
+    const t0 = Date.now();
+    let idx = 0;
+    const next = async () => {
+      while (idx < ids.length) {
+        const i = idx++;
+        const sid = ids[i];
+        try {
+          await this._ensureConnected(sid, {
+            timeoutMs: opts.timeoutMs,
+          });
+          ok.push(sid);
+        } catch (err) {
+          const message = err && err.message ? err.message : String(err);
+          const permanent = this.isPermanentAuthError(err);
+          failed.push({ sessionId: sid, error: message, permanent });
+          // Don't log full stack — at 1000 sessions that's noise. Just
+          // a concise warning so the operator sees something happened.
+          logger.warn(
+            `preWarmSessions: session ${sid} failed to connect: ${message}${permanent ? ' (permanent)' : ''}`
+          );
+        }
+      }
+    };
+    const workers = [];
+    for (let w = 0; w < concurrency; w++) workers.push(next());
+    await Promise.all(workers);
+    const durationMs = Date.now() - t0;
+    logger.info(
+      `preWarmSessions: ${ok.length} ok, ${failed.length} failed in ${durationMs}ms (concurrency=${concurrency})`
+    );
+    return { ok, failed, durationMs };
+  }
+
+  /**
    * Iterate over all active session IDs (string keys).
    * @returns {string[]}
    */

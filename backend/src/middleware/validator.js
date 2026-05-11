@@ -178,6 +178,19 @@ const schemas = {
     cooldownSecMax: Joi.number().integer().min(0).max(1800).optional(),
     itemDelayMsMin: Joi.number().integer().min(0).max(600000).optional(),
     itemDelayMsMax: Joi.number().integer().min(0).max(600000).optional(),
+    // Hard per-session-per-burst ceiling. The redesigned add-members
+    // runner clamps `perSessionBurst` to this value across all auto
+    // bands. Defaults to 4 server-side; capped at 50 here.
+    maxPerSession: Joi.number().integer().min(1).max(50).optional(),
+    // Source channel identifiers for session-correct access_hash
+    // resolution via channels.GetParticipant. Accepts numeric IDs,
+    // @usernames, or t.me URLs. The V2 runner uses these to resolve
+    // scraped numeric-id rows that would otherwise fail with
+    // "Could not find the input entity" on fresh sessions.
+    sourceChannelIds: Joi.array().items(Joi.string().trim().max(128)).max(10).optional(),
+    sourceChannelId: Joi.string().trim().max(128).optional(),
+    // Optional list_id (for persisting status back into list_items).
+    listId: Joi.alternatives().try(Joi.number().integer().positive(), Joi.string()).optional(),
   })
     .or('sessionIds', 'sessionId', 'sessionListId')
     .or('targetIds', 'targetGroupId'),
