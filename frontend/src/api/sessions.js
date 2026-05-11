@@ -93,3 +93,38 @@ export const downloadSession = async (
   a.remove();
   setTimeout(() => URL.revokeObjectURL(url), 1000);
 };
+
+// ── QR-login clone export ──────────────────────────────────────────
+// The panel uses Telegram's auth.ExportLoginToken /
+// auth.AcceptLoginToken / auth.ImportLoginToken RPCs to mint a
+// brand-new authorization (a fresh auth_key) for each selected
+// session, under a destination api_id/api_hash supplied by the
+// operator. The original session is NOT logged out; both
+// authorizations coexist in Telegram's "Active sessions" UI.
+
+export const startCloneExport = (payload) =>
+  api.post('/sessions/clone-export/start', payload);
+
+export const getCloneExportStatus = (jobId) =>
+  api.get(`/sessions/clone-export/${jobId}/status`);
+
+export const submitCloneExportPassword = (jobId, sessionId, password) =>
+  api.post(`/sessions/clone-export/${jobId}/password`, { sessionId, password });
+
+export const cancelCloneExport = (jobId) =>
+  api.post(`/sessions/clone-export/${jobId}/cancel`);
+
+export const downloadCloneExportZip = async (jobId) => {
+  const response = await api.get(`/sessions/clone-export/${jobId}/download`, {
+    responseType: 'blob',
+  });
+  const blob = response.data;
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `clone-export-${jobId}.zip`;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+};

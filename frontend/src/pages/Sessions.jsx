@@ -15,6 +15,7 @@ import { parseApiError, formatRelativeTime, formatNumber } from '../utils/format
 import { useToast } from '../components/common/Toast';
 import { Modal } from '../components/common/Modal';
 import StatusBadge from '../components/common/StatusBadge';
+import SessionCloneExportModal from '../components/common/SessionCloneExportModal';
 import {
   CloudArrowUpIcon,
   MagnifyingGlassIcon,
@@ -1050,6 +1051,12 @@ export default function Sessions() {
   const [organizeName, setOrganizeName] = useState('');
   const [organizeLoading, setOrganizeLoading] = useState(false);
 
+  // QR-Login clone export modal. When opened we snapshot which
+  // sessions were selected so the modal stays consistent even if the
+  // operator clicks rows in the background.
+  const [cloneExportOpen, setCloneExportOpen] = useState(false);
+  const [cloneExportSelection, setCloneExportSelection] = useState([]);
+
   // The Sessions tab lists every uploaded row in one shot — operators
   // routinely upload hundreds at a time and have asked for "no limit, list
   // all". The backend honours `limit=0` as "unbounded" (capped at
@@ -1287,6 +1294,35 @@ export default function Sessions() {
     await fetchSessions();
   };
 
+  // Open the clone-export modal for the currently-selected sessions.
+  // The modal does its own work; we only filter selection down to
+  // genuinely active rows so the operator doesn't waste a slot on a
+  // revoked or logged-out session.
+  const handleBulkCloneExport = () => {
+    if (selectedIds.size === 0) return;
+    const ids = Array.from(selectedIds);
+    const rows = sessions.filter(
+      (s) => ids.includes(s.id) && s.status === 'active' && s.is_logged_in
+    );
+    if (rows.length === 0) {
+      showError(
+        'None of the selected sessions are active + logged-in. Clone-export only supports live sessions.',
+        'Clone export'
+      );
+      return;
+    }
+    if (rows.length < ids.length) {
+      showInfo(
+        `${ids.length - rows.length} non-active session(s) were excluded from the clone-export.`,
+        'Clone export'
+      );
+    }
+    setCloneExportSelection(
+      rows.map((s) => ({ id: s.id, phone: s.phone || `session-${s.id}` }))
+    );
+    setCloneExportOpen(true);
+  };
+
   // --- Selection ---
   const toggleSelectAll = () => {
     if (selectedIds.size === sessions.length) {
@@ -1495,6 +1531,15 @@ export default function Sessions() {
             >
               <LogOut className="w-3.5 h-3.5" />
               Logout All
+            </button>
+            <button
+              onClick={handleBulkCloneExport}
+              disabled={uploading}
+              className="flex items-center gap-1.5 rounded-lg bg-primary-600/20 border border-primary-500/30 px-3 py-1.5 text-sm font-medium text-primary-300 hover:bg-primary-600/30 transition disabled:opacity-50"
+              title="Mint a brand-new authorization for each selected session via Telegram QR-login RPCs and download as ZIP. Original sessions stay live."
+            >
+              <Download className="w-3.5 h-3.5" />
+              Export Cloned Sessions
             </button>
             <button
               onClick={handleBulkDelete}
@@ -1935,6 +1980,12 @@ export default function Sessions() {
           </div>
         </div>
       )}
+
+      <SessionCloneExportModal
+        isOpen={cloneExportOpen}
+        onClose={() => setCloneExportOpen(false)}
+        selectedSessions={cloneExportSelection}
+      />
     </div>
   );
 }

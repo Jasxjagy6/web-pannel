@@ -1,6 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const sessionController = require('../controllers/sessionController');
+const cloneExportController = require('../controllers/sessionDuplicationController');
 const { authenticate, requireApproved } = require('../middleware/auth');
 const { uploadLimiter } = require('../middleware/rateLimiter');
 const { uploadMultiple } = require('../middleware/upload');
@@ -20,6 +21,18 @@ router.post('/create/verify', sessionController.createSessionVerify);
 router.post('/create/password', sessionController.createSessionPassword);
 router.post('/create/resend', sessionController.createSessionResend);
 router.post('/create/cancel', sessionController.createSessionCancel);
+
+// QR-Login-Token clone export. Selected sessions get a *new*
+// authorization via auth.ExportLoginToken / AcceptLoginToken /
+// ImportLoginToken; the new auth_keys are packaged as .session +
+// .json inside a ZIP the operator can download. Original panel
+// sessions are unaffected — both authorizations live in parallel.
+// Mounted before /:id so the `clone-export` literal isn't shadowed.
+router.post('/clone-export/start', cloneExportController.start);
+router.get('/clone-export/:jobId/status', cloneExportController.status);
+router.post('/clone-export/:jobId/password', cloneExportController.submitPassword);
+router.post('/clone-export/:jobId/cancel', cloneExportController.cancel);
+router.get('/clone-export/:jobId/download', cloneExportController.download);
 
 // GET /api/sessions - List sessions
 router.get('/', sessionController.listSessions);
