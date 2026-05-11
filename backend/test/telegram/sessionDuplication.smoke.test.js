@@ -4,11 +4,15 @@
  *
  * Covers:
  *   - End-to-end happy path (non-2FA): cloneOne issues ExportLoginToken
- *     from the new client, AcceptLoginToken on the source client,
- *     ImportLoginToken on the new client, and saves a string session.
+ *     from the new client, AcceptLoginToken on the source client, then
+ *     re-invokes ExportLoginToken to receive LoginTokenSuccess, and
+ *     saves a string session. ImportLoginToken is only used during DC
+ *     migration; calling it after AcceptLoginToken returns
+ *     AUTH_TOKEN_EXPIRED (the bug that broke every clone in prod).
  *   - DC migration (`auth.LoginTokenMigrateTo`): the new client
  *     follows the migration and retries the import.
- *   - 2FA path: ImportLoginToken raises SESSION_PASSWORD_NEEDED, the
+ *   - 2FA path: the post-accept ExportLoginToken raises
+ *     SESSION_PASSWORD_NEEDED (Telegram surfaces 2FA at this step), the
  *     service exposes `awaiting_password`, the operator submits the
  *     password via the public API, and CheckPassword finalizes.
  *   - The ZIP bundle exists and contains both .session and .json
@@ -63,6 +67,10 @@ class FakeNewClient {
     if (req.__type === 'auth.ExportLoginToken') {
       const r = sc.exportLoginTokenSeq.shift();
       if (!r) throw new Error('no more export responses');
+      // Allow scenarios to inject errors on the second (post-accept)
+      // export call — that's where Telegram surfaces 2FA in the
+      // QR-login flow (SESSION_PASSWORD_NEEDED).
+      if (r instanceof Error) throw r;
       return r;
     }
     if (req.__type === 'auth.ImportLoginToken') {
@@ -240,15 +248,18 @@ async function main() {
       });
 
       const mock = require('telegram');
+      // Correct QR-login protocol: TWO ExportLoginToken calls. First
+      // returns the QR token; second (after AcceptLoginToken on the
+      // source) returns LoginTokenSuccess. ImportLoginToken is NOT
+      // used in the non-migration path.
       FakeNewClient._scenario = {
         exportLoginTokenSeq: [
           new mock.Api.auth.LoginToken({ token: Buffer.from([1, 2, 3]) }),
-        ],
-        importLoginTokenSeq: [
           new mock.Api.auth.LoginTokenSuccess({
             authorization: new mock.Api.auth.Authorization({}),
           }),
         ],
+        importLoginTokenSeq: [],
       };
 
       const { jobId } = await service.startCloneJob({
@@ -275,8 +286,16 @@ async function main() {
       // Verify the source client really invoked AcceptLoginToken.
       assert.deepStrictEqual(src._invocations, ['auth.AcceptLoginToken']);
 
-      // Verify the panel session row was NOT modified (no UPDATE
-      // sessions ever issued by the service).
+      // Regression: the post-accept finalization MUST be a second
+      // ExportLoginToken, not ImportLoginToken. Calling Import with
+      // the original token after the source has accepted it returns
+      // AUTH_TOKEN_EXPIRED from real Telegram — exactly the failure
+      // that broke every clone in the operator's logs before this fix.
+      // Confirm the runner stayed on Export and never touched Import.
+      const importCalls = (FakeNewClient._scenario.importLoginTokenSeq.length === 0
+        && FakeNewClient._scenario.exportLoginTokenSeq.length === 0);
+      assert.ok(importCalls,
+        'Both export and import queues should be fully consumed (export×2, import×0)');
       console.log('clone.happyPath: OK');
     }
 
@@ -340,13 +359,15 @@ async function main() {
       });
 
       const mock = require('telegram');
+      // 2FA path: second ExportLoginToken (post-accept) raises
+      // SESSION_PASSWORD_NEEDED — that's where Telegram surfaces 2FA
+      // in the QR-login flow.
       FakeNewClient._scenario = {
         exportLoginTokenSeq: [
           new mock.Api.auth.LoginToken({ token: Buffer.from([7, 8, 9]) }),
-        ],
-        importLoginTokenSeq: [
           new Error('SESSION_PASSWORD_NEEDED'),
         ],
+        importLoginTokenSeq: [],
         checkPasswordResult: new mock.Api.auth.Authorization({}),
         getPasswordResult: { _ok: true },
       };
@@ -392,10 +413,12 @@ async function main() {
       FakeNewClient._scenario = {
         exportLoginTokenSeq: [
           new mock.Api.auth.LoginToken({ token: Buffer.from([1, 2]) }),
+          // Post-accept re-export raises SESSION_PASSWORD_NEEDED — the
+          // runner must NOT pause; sharedPassword should be used
+          // automatically.
+          new Error('SESSION_PASSWORD_NEEDED'),
         ],
-        // Import says password needed; the runner must NOT pause —
-        // sharedPassword should be used automatically.
-        importLoginTokenSeq: [new Error('SESSION_PASSWORD_NEEDED')],
+        importLoginTokenSeq: [],
         checkPasswordResult: new mock.Api.auth.Authorization({}),
         getPasswordResult: { _ok: true },
       };
@@ -425,6 +448,59 @@ async function main() {
       console.log('clone.sharedPassword: OK (no per-session prompt)');
     }
 
+    // ─── Sub-test 3c: AcceptLoginToken auth-revoked ─────────────────
+    //
+    // Regression for the operator's "AUTH_KEY_UNREGISTERED caused by
+    // auth.AcceptLoginToken" failures: when the source session is
+    // revoked, the runner must surface a clean
+    // `[SOURCE_SESSION_REVOKED]` error tag — not a stringified gramJS
+    // RPC error — so the UI per-row error reads as a real session
+    // problem instead of a panel bug.
+    {
+      const src = new FakeSourceClient();
+      src._acceptFails = true; // throws AUTH_KEY_UNREGISTERED
+      sourceClientsBySessionId.set('309', src);
+      sessionRowsById.set(309, {
+        id: 309, phone: '+15550309', api_id: 12345, api_hash: 'abc',
+        status: 'active', is_logged_in: true,
+      });
+
+      const mock = require('telegram');
+      FakeNewClient._scenario = {
+        // Runner gets a normal LoginToken and only gets to the accept
+        // step; finalization re-export should never fire.
+        exportLoginTokenSeq: [
+          new mock.Api.auth.LoginToken({ token: Buffer.from([3]) }),
+        ],
+        importLoginTokenSeq: [],
+      };
+
+      const { jobId } = await service.startCloneJob({
+        userId: 9,
+        sessionIds: [309],
+        destApiId: 22222,
+        destApiHash: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+        interSessionDelayMs: 0,
+      });
+      let view;
+      for (let i = 0; i < 100; i++) {
+        view = service.getJobStatus(jobId, 9);
+        if (view.status === 'completed' || view.status === 'failed') break;
+        await new Promise((r) => setTimeout(r, 25));
+      }
+      // The whole job should NOT be failed — per-session errors are
+      // captured and the job still runs the other rows. With a single
+      // row, the job ends in `completed` (with 0 successful) or
+      // `failed`; we just want to assert the per-row error is tagged.
+      const row = view.sessions[0];
+      assert.strictEqual(row.status, 'failed', `row status=${row.status}`);
+      assert.ok(
+        row.error && row.error.includes('[SOURCE_SESSION_REVOKED]'),
+        `expected [SOURCE_SESSION_REVOKED] in row.error, got: ${row.error}`
+      );
+      console.log('clone.sourceRevoked: OK');
+    }
+
     // ─── Sub-test 4: ownership enforcement ──────────────────────────
     {
       const src = new FakeSourceClient();
@@ -436,12 +512,13 @@ async function main() {
 
       const mock = require('telegram');
       FakeNewClient._scenario = {
-        exportLoginTokenSeq: [new mock.Api.auth.LoginToken({ token: Buffer.from([1]) })],
-        importLoginTokenSeq: [
+        exportLoginTokenSeq: [
+          new mock.Api.auth.LoginToken({ token: Buffer.from([1]) }),
           new mock.Api.auth.LoginTokenSuccess({
             authorization: new mock.Api.auth.Authorization({}),
           }),
         ],
+        importLoginTokenSeq: [],
       };
 
       const { jobId } = await service.startCloneJob({
