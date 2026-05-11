@@ -127,13 +127,19 @@ function scheduleCleanup(jobId) {
 }
 
 /**
- * Wait for a 2FA password to be submitted via `submitPassword`. Returns
- * the password string or throws if the wait times out / the job is
- * cancelled.
+ * Wait for a 2FA password to be submitted via `submitPassword`. If the
+ * job carries a `sharedPassword` (operator ticked "same password for
+ * all sessions" up-front) we use that and skip the wait entirely.
+ * Otherwise the per-session prompt is exposed and the worker blocks
+ * until `submitPassword` resolves it or the timeout fires.
  *
  * @param {object} sessionState
+ * @param {object} job
  */
-function waitForPassword(sessionState) {
+function waitForPassword(sessionState, job) {
+  if (job && typeof job.sharedPassword === 'string' && job.sharedPassword.length > 0) {
+    return Promise.resolve(job.sharedPassword);
+  }
   return new Promise((resolve, reject) => {
     const timer = setTimeout(() => {
       sessionState._passwordResolver = null;
@@ -283,13 +289,17 @@ async function cloneOne(ctx, sessionRow, sessionState, destApiId, destApiHash) {
       } catch (importErr) {
         const msg = String(importErr && importErr.message || importErr);
         if (msg.includes('SESSION_PASSWORD_NEEDED')) {
-          // 2FA path. Ask the operator for the password and finalize
-          // via auth.CheckPassword.
-          sessionState.status = 'awaiting_password';
-          sessionState.progress = 75;
-          sessionState.passwordHint =
-            'This account has 2FA enabled. Provide the cloud password to finish cloning.';
-          const password = await waitForPassword(sessionState);
+          // 2FA path. If the operator ticked "same password for all
+          // sessions" up-front, waitForPassword resolves immediately
+          // with the shared one — otherwise we expose the per-session
+          // prompt and block until they submit.
+          const hasShared = !!(ctx.job && ctx.job.sharedPassword);
+          sessionState.status = hasShared ? 'verifying_password' : 'awaiting_password';
+          sessionState.progress = hasShared ? 80 : 75;
+          sessionState.passwordHint = hasShared
+            ? 'Applying shared 2FA password…'
+            : 'This account has 2FA enabled. Provide the cloud password to finish cloning.';
+          const password = await waitForPassword(sessionState, ctx.job);
           sessionState.status = 'verifying_password';
           sessionState.progress = 85;
           const pwInfo = await newClient.invoke(new Api.account.GetPassword());
@@ -417,6 +427,7 @@ async function runJob(job) {
     destApiId: job.destApiId,
     destApiHash: job.destApiHash,
     toDisconnect: [],
+    job,
   };
   try {
     for (const sessionState of job.sessions) {
@@ -490,7 +501,7 @@ async function runJob(job) {
  * @param {number} [params.interSessionDelayMs]
  */
 async function startCloneJob(params) {
-  const { userId, sessionIds, destApiId, destApiHash } = params;
+  const { userId, sessionIds, destApiId, destApiHash, sharedPassword } = params;
   if (!userId) throw new Error('userId required');
   if (!Array.isArray(sessionIds) || sessionIds.length === 0) {
     throw new Error('sessionIds required (non-empty array)');
@@ -516,6 +527,13 @@ async function startCloneJob(params) {
     userId,
     destApiId: parsedApiId,
     destApiHash,
+    // Optional "same 2FA password for every session" — operator ticks
+    // this when all accounts in the batch share a cloud password.
+    // When set, sessions that hit SESSION_PASSWORD_NEEDED don't pause
+    // to ask; the runner uses this password directly.
+    sharedPassword: typeof sharedPassword === 'string' && sharedPassword.length > 0
+      ? sharedPassword
+      : null,
     interSessionDelayMs: Number.isFinite(params.interSessionDelayMs)
       ? Math.max(0, params.interSessionDelayMs)
       : DEFAULT_INTER_SESSION_DELAY_MS,

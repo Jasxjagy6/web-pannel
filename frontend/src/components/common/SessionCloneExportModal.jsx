@@ -108,6 +108,12 @@ function PasswordRow({ jobId, sessionState, onSubmitted }) {
 export function SessionCloneExportModal({ isOpen, onClose, selectedSessions }) {
   const [destApiId, setDestApiId] = useState('');
   const [destApiHash, setDestApiHash] = useState('');
+  // "Same 2FA password applies to all selected sessions". When ticked
+  // the password is sent up-front with the start request; the backend
+  // auto-applies it to any session that hits SESSION_PASSWORD_NEEDED,
+  // so the operator never sees the per-session prompt.
+  const [sharedPasswordEnabled, setSharedPasswordEnabled] = useState(false);
+  const [sharedPassword, setSharedPassword] = useState('');
   const [job, setJob] = useState(null);
   const [starting, setStarting] = useState(false);
   const [downloaded, setDownloaded] = useState(false);
@@ -128,6 +134,8 @@ export function SessionCloneExportModal({ isOpen, onClose, selectedSessions }) {
       setJob(null);
       setStarting(false);
       setDownloaded(false);
+      setSharedPasswordEnabled(false);
+      setSharedPassword('');
     } else if (pollRef.current) {
       clearInterval(pollRef.current);
       pollRef.current = null;
@@ -169,12 +177,17 @@ export function SessionCloneExportModal({ isOpen, onClose, selectedSessions }) {
       showError('Destination API ID and API Hash are required.', 'Missing fields');
       return;
     }
+    if (sharedPasswordEnabled && !sharedPassword) {
+      showError('Enter the shared 2FA password or untick the box.', 'Missing fields');
+      return;
+    }
     setStarting(true);
     try {
       const res = await startCloneExport({
         sessionIds: selectedSessions.map((s) => s.id),
         destApiId: Number(destApiId),
         destApiHash: destApiHash.trim(),
+        sharedPassword: sharedPasswordEnabled ? sharedPassword : undefined,
       });
       const data = res.data || res;
       if (!data || !data.jobId) {
@@ -356,6 +369,40 @@ export function SessionCloneExportModal({ isOpen, onClose, selectedSessions }) {
             <code>TelegramClient(stringSession, apiId, apiHash)</code> without
             additional config.
           </p>
+
+          <div className="rounded-lg border border-white/10 bg-dark-900/60 p-3">
+            <label className="flex items-start gap-2 cursor-pointer select-none">
+              <input
+                type="checkbox"
+                checked={sharedPasswordEnabled}
+                onChange={(e) => setSharedPasswordEnabled(e.target.checked)}
+                className="mt-0.5 rounded border-white/20 bg-dark-900 text-primary-600 focus:ring-primary-500/50 focus:ring-offset-0 cursor-pointer"
+              />
+              <div className="flex-1 min-w-0">
+                <p className="text-xs font-semibold text-gray-100">
+                  Same 2FA password for all selected sessions
+                </p>
+                <p className="mt-0.5 text-[11px] text-gray-500">
+                  If every account in this batch uses the same cloud password,
+                  enter it once here. The panel will apply it automatically
+                  whenever a session hits <code>SESSION_PASSWORD_NEEDED</code>,
+                  so you won't be prompted per session.
+                </p>
+              </div>
+            </label>
+            {sharedPasswordEnabled && (
+              <div className="mt-2 flex items-center gap-2 pl-6">
+                <KeyRound className="h-3.5 w-3.5 text-amber-400 shrink-0" />
+                <input
+                  type="password"
+                  placeholder="Shared cloud (2FA) password"
+                  value={sharedPassword}
+                  onChange={(e) => setSharedPassword(e.target.value)}
+                  className="flex-1 rounded border border-amber-500/30 bg-dark-900 px-2 py-1.5 text-xs text-white placeholder-gray-500 focus:border-amber-500 focus:outline-none"
+                />
+              </div>
+            )}
+          </div>
         </div>
       )}
 

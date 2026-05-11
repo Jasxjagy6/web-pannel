@@ -28,7 +28,7 @@ module.exports = {
     if (!userId) {
       throw new AppError('Authentication required', 401, 'NO_AUTH');
     }
-    const { sessionIds, destApiId, destApiHash, interSessionDelayMs } = req.body || {};
+    const { sessionIds, destApiId, destApiHash, interSessionDelayMs, sharedPassword } = req.body || {};
     if (!Array.isArray(sessionIds) || sessionIds.length === 0) {
       throw new AppError(
         'sessionIds must be a non-empty array of panel session IDs',
@@ -57,6 +57,7 @@ module.exports = {
         destApiId,
         destApiHash,
         interSessionDelayMs,
+        sharedPassword,
       });
       res.status(202).json({ jobId });
     } catch (err) {

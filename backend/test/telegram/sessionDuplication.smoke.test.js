@@ -379,6 +379,52 @@ async function main() {
       console.log('clone.twoFactor: OK');
     }
 
+    // ─── Sub-test 3b: 2FA with sharedPassword auto-applies ─────────
+    {
+      const src = new FakeSourceClient();
+      sourceClientsBySessionId.set('305', src);
+      sessionRowsById.set(305, {
+        id: 305, phone: '+15550305', api_id: 12345, api_hash: 'abc',
+        status: 'active', is_logged_in: true,
+      });
+
+      const mock = require('telegram');
+      FakeNewClient._scenario = {
+        exportLoginTokenSeq: [
+          new mock.Api.auth.LoginToken({ token: Buffer.from([1, 2]) }),
+        ],
+        // Import says password needed; the runner must NOT pause —
+        // sharedPassword should be used automatically.
+        importLoginTokenSeq: [new Error('SESSION_PASSWORD_NEEDED')],
+        checkPasswordResult: new mock.Api.auth.Authorization({}),
+        getPasswordResult: { _ok: true },
+      };
+
+      const { jobId } = await service.startCloneJob({
+        userId: 9,
+        sessionIds: [305],
+        destApiId: 22222,
+        destApiHash: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+        interSessionDelayMs: 0,
+        sharedPassword: 'mycloudpw',
+      });
+      let view;
+      let sawAwaiting = false;
+      for (let i = 0; i < 200; i++) {
+        view = service.getJobStatus(jobId, 9);
+        if (view.sessions[0].awaitingPassword) sawAwaiting = true;
+        if (view.status === 'completed' || view.status === 'failed') break;
+        await new Promise((r) => setTimeout(r, 25));
+      }
+      assert.strictEqual(view.status, 'completed', `status=${view.status} err=${view.error}`);
+      assert.strictEqual(view.sessions[0].status, 'cloned');
+      // Most important assertion: the operator was NEVER prompted —
+      // sharedPassword auto-applied.
+      assert.strictEqual(sawAwaiting, false,
+        'sharedPassword should bypass the awaiting_password prompt');
+      console.log('clone.sharedPassword: OK (no per-session prompt)');
+    }
+
     // ─── Sub-test 4: ownership enforcement ──────────────────────────
     {
       const src = new FakeSourceClient();
