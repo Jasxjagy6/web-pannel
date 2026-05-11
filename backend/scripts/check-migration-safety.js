@@ -114,16 +114,27 @@ function check(filePath) {
   // Match statements like `ALTER TABLE sessions DROP COLUMN ...`.
   // Anchored to PROTECTED_TABLES so unrelated migrations can't trigger.
   for (const t of PROTECTED_TABLES) {
-    // 1. ALTER TABLE <t> DROP COLUMN  → forbidden.
+    // 1. ALTER TABLE <t> DROP COLUMN  → forbidden *only* if the column
+    //    being dropped is in PROTECTED_COLUMNS. Feature-specific columns
+    //    (audit fields, deprecated job-state, etc.) can be cleaned up
+    //    in a normal additive-then-drop migration cycle without
+    //    tripping this guard — the guard's intent (see the doc block
+    //    at the top of this file) is to protect the auth-key bytes.
+    const protectedColsForTable = new Set(
+      PROTECTED_COLUMNS.filter(([pt]) => pt === t).map(([, pc]) => pc)
+    );
     const dropColRe = new RegExp(
       String.raw`ALTER\s+TABLE\s+(?:IF\s+EXISTS\s+)?\b${t}\b[\s\S]*?\bDROP\s+COLUMN\b\s+(?:IF\s+EXISTS\s+)?["']?(\w+)`,
       'gi'
     );
     let m;
     while ((m = dropColRe.exec(sql))) {
-      issues.push(
-        `forbidden: ALTER TABLE ${t} DROP COLUMN ${m[1]} — destroys session auth state`
-      );
+      const colName = m[1];
+      if (protectedColsForTable.has(colName)) {
+        issues.push(
+          `forbidden: ALTER TABLE ${t} DROP COLUMN ${colName} — destroys session auth state`
+        );
+      }
     }
     // 2. ALTER TABLE <t> RENAME COLUMN <protected> ...
     for (const [pt, pc] of PROTECTED_COLUMNS) {

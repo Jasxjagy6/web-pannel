@@ -3240,91 +3240,25 @@ class MessageService {
   /**
    * Verify that multiple sessions belong to the specified user.
    *
-   * Sessions that are on cooldown (`cooldown_until` in the future)
-   * are filtered out of the returned set unless the caller passes
-   * `{ filterCooldown: false }`. This mirrors
-   * `groupService.validateSessionsOwnership` so PEER_FLOOD /
-   * FLOOD_WAIT cooldowns observed by the worker propagate to bulk
-   * messaging too.
-   *
-   * The dropped sessions are attached to the returned array as a
-   * non-enumerable `cooldownSkipped` property — callers that want to
-   * surface the skipped count can read it without a signature change.
-   * If every requested session is on cooldown, throws
-   * `ALL_SESSIONS_ON_COOLDOWN` (409).
+   * Returns every matching row. The legacy per-session cooldown
+   * filter (cooldown_until > NOW()) was removed: bulk-message jobs
+   * now attempt every requested session and the in-run rotation
+   * (sessionWorkerPool) is responsible for dropping sessions that
+   * hit FLOOD_WAIT / PEER_FLOOD during the current run.
    *
    * @param {Array<string|number>} sessionIds - Array of session IDs
    * @param {number|string} userId - User ID
-   * @param {{ filterCooldown?: boolean }} [opts]
    * @returns {Promise<Array<{ id: number, user_id: number, status: string }>>}
    * @private
    */
-  async _verifyMultipleSessionsOwnership(sessionIds, userId, opts = {}) {
+  async _verifyMultipleSessionsOwnership(sessionIds, userId) {
     if (!sessionIds || sessionIds.length === 0) return [];
-    const { filterCooldown = true } = opts;
 
-    let result;
-    try {
-      result = await pool.query(
-        `SELECT id, user_id, status,
-                cooldown_until, cooldown_reason, cooldown_seconds, cooldown_set_at
-           FROM sessions
-          WHERE id = ANY($1::int[]) AND user_id = $2`,
-        [sessionIds.map((s) => parseInt(s, 10)), userId]
-      );
-    } catch (selErr) {
-      // Columns absent on an upgrading deploy → fall back so the
-      // bulk-message API doesn't 500 before the migration runs.
-      logger.warn(
-        `_verifyMultipleSessionsOwnership: cooldown columns missing, falling back: ${selErr.message}`
-      );
-      result = await pool.query(
-        'SELECT id, user_id, status FROM sessions WHERE id = ANY($1::int[]) AND user_id = $2',
-        [sessionIds.map((s) => parseInt(s, 10)), userId]
-      );
-    }
-
-    if (!filterCooldown) return result.rows;
-
-    const now = Date.now();
-    const eligible = [];
-    const skipped = [];
-    for (const row of result.rows) {
-      const cdAt = row.cooldown_until ? new Date(row.cooldown_until).getTime() : 0;
-      if (cdAt > now) {
-        skipped.push({
-          id: row.id,
-          cooldown_until: row.cooldown_until,
-          remaining_seconds: Math.max(0, Math.ceil((cdAt - now) / 1000)),
-          reason: row.cooldown_reason || null,
-        });
-      } else {
-        eligible.push(row);
-      }
-    }
-
-    if (eligible.length === 0 && skipped.length > 0) {
-      const err = new AppError(
-        `All ${skipped.length} requested session(s) are on cooldown`,
-        409,
-        'ALL_SESSIONS_ON_COOLDOWN'
-      );
-      err.cooldownSkipped = skipped;
-      throw err;
-    }
-
-    if (skipped.length > 0) {
-      logger.warn(
-        `_verifyMultipleSessionsOwnership: ${skipped.length} session(s) skipped due to cooldown`,
-        { userId, skipped }
-      );
-      Object.defineProperty(eligible, 'cooldownSkipped', {
-        value: skipped,
-        enumerable: false,
-      });
-    }
-
-    return eligible;
+    const result = await pool.query(
+      'SELECT id, user_id, status FROM sessions WHERE id = ANY($1::int[]) AND user_id = $2',
+      [sessionIds.map((s) => parseInt(s, 10)), userId]
+    );
+    return result.rows;
   }
 
   /**

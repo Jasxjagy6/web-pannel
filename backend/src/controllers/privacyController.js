@@ -27,12 +27,28 @@ const RULES_BY_KEY = privacyService.PRIVACY_KEYS.reduce((acc, k) => {
   return acc;
 }, {});
 
+// 'auth_ttl' is a synthetic key whose value is an integer day-count
+// rather than one of the privacy buckets. The /keys endpoint advertises
+// the legal values so the frontend doesn't have to hardcode them.
+RULES_BY_KEY[privacyService.AUTH_TTL_KEY] = privacyService.AUTH_TTL_DAY_OPTIONS.slice();
+
 function _validateSettings(settings) {
   if (!settings || typeof settings !== 'object' || Array.isArray(settings)) {
     throw new AppError('settings must be an object', 400, 'BAD_SETTINGS');
   }
   const cleaned = {};
   for (const [key, value] of Object.entries(settings)) {
+    if (key === privacyService.AUTH_TTL_KEY) {
+      if (!privacyService.isAuthTtlValueValid(value)) {
+        throw new AppError(
+          `Value "${value}" is not a legal auth_ttl day-count (expected one of ${privacyService.AUTH_TTL_DAY_OPTIONS.join(', ')})`,
+          400,
+          'BAD_AUTH_TTL'
+        );
+      }
+      cleaned[key] = Number(value);
+      continue;
+    }
     if (!privacyService.PRIVACY_KEYS.includes(key)) {
       throw new AppError(`Unknown privacy key: ${key}`, 400, 'BAD_KEY');
     }
@@ -60,6 +76,10 @@ const privacyController = {
         keys: privacyService.PRIVACY_KEYS,
         rules: privacyService.PRIVACY_RULES,
         ruleByKey: RULES_BY_KEY,
+        authTtl: {
+          key: privacyService.AUTH_TTL_KEY,
+          dayOptions: privacyService.AUTH_TTL_DAY_OPTIONS,
+        },
       },
     });
   }),
