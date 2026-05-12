@@ -624,14 +624,26 @@ class ScrapeMonitorService {
       values
     );
     const offset = Math.max(0, (page - 1) * limit);
+    // We re-namespace the WHERE clause columns to the `j.` alias for
+    // the joined-style SELECT below.  All other tables in this query
+    // are correlated subqueries so no other column references collide.
+    const whereSqlAliased = whereSql
+      .replace(/\buser_id\b/g, 'j.user_id')
+      .replace(/\bstatus\b/g, 'j.status')
+      .replace(/\btarget_id\b/g, 'j.target_id')
+      .replace(/\btarget_title\b/g, 'j.target_title');
+
     const list = await pool.query(
-      `SELECT * FROM scrape_monitor_jobs ${whereSql}
-       ORDER BY created_at DESC
-       LIMIT $${i} OFFSET $${i + 1}`,
+      `SELECT j.*,
+              (SELECT COUNT(*)::int FROM scrape_monitor_chats c
+                WHERE c.monitor_job_id = j.id) AS chat_count
+         FROM scrape_monitor_jobs j ${whereSqlAliased}
+         ORDER BY j.created_at DESC
+         LIMIT $${i} OFFSET $${i + 1}`,
       [...values, limit, offset]
     );
     return {
-      jobs: list.rows.map(this._toPublic),
+      jobs: list.rows.map((r) => this._toPublic(r)),
       pagination: {
         page, limit,
         total: total.rows[0].n,
@@ -1525,8 +1537,33 @@ class ScrapeMonitorService {
       completedAt: row.completed_at,
       createdAt: row.created_at,
       updatedAt: row.updated_at,
+      schedulerVersion: row.scheduler_version || 'legacy',
+      chatCount: row.chat_count || 1,
     };
   }
 }
 
-module.exports = new ScrapeMonitorService();
+const _singleton = new ScrapeMonitorService();
+
+// V2 monitor (services/monitor/*) reuses the helpers from this module
+// rather than forking them.  Exposed deliberately and explicitly so
+// the coupling shows up in grep.
+_singleton.__internals = {
+  RAW_UPDATE_CLASSNAMES,
+  extractSenderProfile,
+  extractSenderFromRawUpdate,
+  harvestPiggybackedUsers,
+  bigToString,
+  extractUserIdFromPeer,
+  applySenderEntity,
+  blankProfile,
+  isProfileBlank,
+  // Event matching uses an allowlist Set; we expose a static version
+  // so the V2 listenerWorker can reuse it without an instance method.
+  eventChatCandidates: (eventOrUpdate) =>
+    _singleton._eventChatCandidates(eventOrUpdate),
+  eventMatchesTarget: (eventOrUpdate, allowedChatIds) =>
+    _singleton._eventMatchesTarget(eventOrUpdate, allowedChatIds),
+};
+
+module.exports = _singleton;
