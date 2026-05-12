@@ -1,6 +1,7 @@
 const scrapeService = require('../services/scrapeService');
 const reportService = require('../services/reportService');
 const monitorService = require('../services/scrapeMonitorService');
+const monitorOrchestrator = require('../services/monitor/monitorOrchestrator');
 const telegramService = require('../services/telegramService');
 const sessionListService = require('../services/sessionListService');
 const { pool } = require('../config/database');
@@ -28,6 +29,24 @@ async function _resolveSessions(req, fallbackSessionIds = []) {
     return ids;
   }
   return fallbackSessionIds;
+}
+
+/**
+ * Peek at the scheduler version on a monitor job row so we can route
+ * read/control endpoints to the right service.  Cached per-call only;
+ * one extra SELECT-per-id is fine for this code path.
+ */
+async function _isV2Job(jobId) {
+  if (!Number.isFinite(jobId)) return false;
+  try {
+    const r = await pool.query(
+      `SELECT scheduler_version FROM scrape_monitor_jobs WHERE id = $1`,
+      [jobId]
+    );
+    return r.rows[0]?.scheduler_version === 'v2';
+  } catch {
+    return false;
+  }
 }
 
 const scrapeController = {
@@ -564,6 +583,10 @@ const scrapeController = {
       durationSeconds, durationDays, durationHours, durationMinutes,
       targetTitle, reason, options, autoStart,
       dedupEnabled, allowDuplicates,
+      // V2 (multi-chat / cohort scheduler) — see services/monitor/.
+      chats, targetIds,
+      cohortSizeDefault, shiftMinSeconds, shiftMaxSeconds,
+      overlapSeconds, autoFastScrape,
     } = req.body || {};
 
     const explicitSessions = Array.isArray(sessionIds) && sessionIds.length
@@ -589,21 +612,63 @@ const scrapeController = {
     if (dedupEnabled !== undefined) resolvedDedup = !!dedupEnabled;
     else if (allowDuplicates !== undefined) resolvedDedup = !allowDuplicates;
 
-    const job = await monitorService.createJob({
-      userId,
-      sessionIds: sessions,
-      targetId,
-      targetType: targetType || 'group',
-      targetTitle: targetTitle || null,
-      durationSeconds: duration,
-      reason: reason || null,
-      options: options || {},
-      autoStart: autoStart !== false,
-      dedupEnabled: resolvedDedup,
-    });
+    // V2 routing: any caller that provides a multi-chat shape OR an
+    // explicit v2-only knob (cohort size, shift bounds, overlap) gets
+    // routed to the cohort scheduler.  Single-chat / single-session
+    // legacy calls stay on monitorService for compatibility.
+    const hasMultiChat = Array.isArray(chats) && chats.length > 1
+      || Array.isArray(targetIds) && targetIds.length > 1;
+    const hasV2Knob = (
+      cohortSizeDefault != null
+      || shiftMinSeconds != null
+      || shiftMaxSeconds != null
+      || overlapSeconds != null
+      || autoFastScrape != null
+    );
+    const v2 = hasMultiChat || hasV2Knob;
+
+    let job;
+    if (v2) {
+      job = await monitorOrchestrator.createJob({
+        userId,
+        sessionIds: sessions,
+        chats,
+        targetIds,
+        targetId,
+        targetType: targetType || 'group',
+        targetTitle: targetTitle || null,
+        durationSeconds: duration,
+        reason: reason || null,
+        options: options || {},
+        autoStart: autoStart !== false,
+        dedupEnabled: resolvedDedup !== false,
+        cohortSizeDefault,
+        shiftMinSeconds,
+        shiftMaxSeconds,
+        overlapSeconds,
+        autoFastScrape,
+      });
+    } else {
+      job = await monitorService.createJob({
+        userId,
+        sessionIds: sessions,
+        targetId,
+        targetType: targetType || 'group',
+        targetTitle: targetTitle || null,
+        durationSeconds: duration,
+        reason: reason || null,
+        options: options || {},
+        autoStart: autoStart !== false,
+        dedupEnabled: resolvedDedup,
+      });
+    }
 
     await reportService.logActivity(userId, 'monitor_start', 'scrape_monitor', job.id, {
-      sessionCount: sessions.length, targetId, durationSeconds: duration,
+      sessionCount: sessions.length,
+      targetId: job.targetId || targetId,
+      durationSeconds: duration,
+      scheduler: v2 ? 'v2' : 'legacy',
+      chatCount: v2 ? (job.chatCount || (Array.isArray(chats) ? chats.length : 1)) : 1,
     });
 
     res.status(202).json({ success: true, data: job });
@@ -621,32 +686,55 @@ const scrapeController = {
 
   getMonitor: asyncHandler(async (req, res) => {
     const userId = req.user.id;
-    const data = await monitorService.getJob(parseInt(req.params.id, 10), userId);
+    const jobId = parseInt(req.params.id, 10);
+    const isV2 = await _isV2Job(jobId);
+    const data = isV2
+      ? await monitorOrchestrator.getJob(jobId, userId)
+      : await monitorService.getJob(jobId, userId);
     res.json({ success: true, data });
   }),
 
   pauseMonitor: asyncHandler(async (req, res) => {
     const userId = req.user.id;
-    const data = await monitorService.pauseJob(parseInt(req.params.id, 10), userId);
+    const jobId = parseInt(req.params.id, 10);
+    const isV2 = await _isV2Job(jobId);
+    const data = isV2
+      ? await monitorOrchestrator.pauseJob(jobId, userId)
+      : await monitorService.pauseJob(jobId, userId);
     res.json({ success: true, data });
   }),
 
   resumeMonitor: asyncHandler(async (req, res) => {
     const userId = req.user.id;
-    const data = await monitorService.resumeJob(parseInt(req.params.id, 10), userId);
+    const jobId = parseInt(req.params.id, 10);
+    const isV2 = await _isV2Job(jobId);
+    const data = isV2
+      ? await monitorOrchestrator.resumeJob(jobId, userId)
+      : await monitorService.resumeJob(jobId, userId);
     res.json({ success: true, data });
   }),
 
   stopMonitor: asyncHandler(async (req, res) => {
     const userId = req.user.id;
-    const data = await monitorService.stopJob(parseInt(req.params.id, 10), userId, 'cancelled');
+    const jobId = parseInt(req.params.id, 10);
+    const isV2 = await _isV2Job(jobId);
+    const data = isV2
+      ? await monitorOrchestrator.stopJob(jobId, userId, 'cancelled')
+      : await monitorService.stopJob(jobId, userId, 'cancelled');
     res.json({ success: true, data });
   }),
 
   cancelAllMonitors: asyncHandler(async (req, res) => {
     const userId = req.user.id;
-    const data = await monitorService.cancelAll(userId);
-    res.json({ success: true, data });
+    // Cancel V2 jobs through the orchestrator (so the in-process
+    // listeners are torn down) and legacy jobs through the legacy
+    // service in one pass.
+    const v2Out = await monitorOrchestrator.cancelAll(userId);
+    const legacyOut = await monitorService.cancelAll(userId);
+    res.json({
+      success: true,
+      data: { cancelled: (v2Out.cancelled || 0) + (legacyOut.cancelled || 0) },
+    });
   }),
 
   monitorUsers: asyncHandler(async (req, res) => {

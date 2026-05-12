@@ -62,6 +62,7 @@ const MIGRATION_ORDER = [
   'migration_v25_list_items_access_hash.sql',
   'migration_v26_backfill_list_items_access_hash.sql',
   'migration_v27_drop_session_cooldown.sql',
+  'migration_v28_monitor_v2.sql',
 ];
 
 function listMigrationFiles() {

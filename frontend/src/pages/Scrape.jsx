@@ -125,6 +125,11 @@ export default function Scrape() {
   // its own row, so a chatty user appears N times. The state lives on
   // the period prompt modal but is sent up the API as `dedupEnabled`.
   const [monitorDedupEnabled, setMonitorDedupEnabled] = useState(true);
+  // v28: when ON, batch ALL admin-only targets into one V2 monitor job
+  // (multi-chat). Each chat gets its own cohort and rotation schedule,
+  // but they share the session pool and the job-level fatigue budget.
+  // When OFF, fall back to v6 behaviour (one job per chat).
+  const [multiChatMonitor, setMultiChatMonitor] = useState(true);
   const [, forceTickRender] = useState(0);
 
   const { showSuccess, showError } = useToast();
@@ -409,6 +414,12 @@ export default function Scrape() {
   };
 
   // Launch period-bounded monitor jobs for the prompted admin-only targets.
+  //
+  // v28: when `multiChatMonitor` is ON we send ALL admin targets as one
+  // V2 job (`chats: [...]`).  V2's cohort scheduler then distributes
+  // sessions across chats and rotates them to keep behavioural
+  // fingerprints under the per-account threshold.  When OFF, fall back
+  // to v6 behaviour: one monitor job per chat.
   const handleStartMonitors = async () => {
     if (!periodPrompt || !periodPrompt.adminTargets?.length) return;
     const usingList = sessionPickMode === 'list' && selectedSessionListId;
@@ -419,32 +430,70 @@ export default function Scrape() {
     setCreatingMonitors(true);
     let started = 0;
     let failed = 0;
-    for (const t of periodPrompt.adminTargets) {
+
+    const useV2 = multiChatMonitor && periodPrompt.adminTargets.length > 0;
+    if (useV2) {
       try {
-        const monitorPayload = {
+        const chats = periodPrompt.adminTargets.map((t) => ({
           targetId: t.target,
           targetType: t.targetType || scrapeType,
           targetTitle: t.info?.title || null,
+        }));
+        const payload = {
+          chats,
+          targetType: scrapeType,
           durationSeconds: periodSeconds,
-          reason: t.reason || 'admin_only',
+          reason: 'admin_only',
           autoStart: true,
           dedupEnabled: monitorDedupEnabled,
+          // Auto-sized cohort by default; UI knob coming in a follow-up.
+          cohortSizeDefault: 1,
+          shiftMinSeconds: 1800,
+          shiftMaxSeconds: 5400,
+          overlapSeconds: 60,
+          autoFastScrape: true,
         };
-        if (usingList) {
-          monitorPayload.sessionListId = Number(selectedSessionListId);
-        } else {
-          monitorPayload.sessionIds = selectedSessions;
-        }
-        await createMonitorJob(monitorPayload);
-        started++;
+        if (usingList) payload.sessionListId = Number(selectedSessionListId);
+        else payload.sessionIds = selectedSessions;
+        await createMonitorJob(payload);
+        started = chats.length;
       } catch (err) {
-        console.error('failed to create monitor', err);
-        failed++;
+        console.error('failed to create v2 multi-chat monitor', err);
+        failed = periodPrompt.adminTargets.length;
+      }
+    } else {
+      for (const t of periodPrompt.adminTargets) {
+        try {
+          const monitorPayload = {
+            targetId: t.target,
+            targetType: t.targetType || scrapeType,
+            targetTitle: t.info?.title || null,
+            durationSeconds: periodSeconds,
+            reason: t.reason || 'admin_only',
+            autoStart: true,
+            dedupEnabled: monitorDedupEnabled,
+          };
+          if (usingList) {
+            monitorPayload.sessionListId = Number(selectedSessionListId);
+          } else {
+            monitorPayload.sessionIds = selectedSessions;
+          }
+          await createMonitorJob(monitorPayload);
+          started++;
+        } catch (err) {
+          console.error('failed to create monitor', err);
+          failed++;
+        }
       }
     }
     setCreatingMonitors(false);
     setPeriodPrompt(null);
-    if (started > 0) showSuccess(`${started} monitor job(s) started`, 'Monitor');
+    if (started > 0) {
+      const label = useV2
+        ? `1 multi-chat monitor (${started} chat${started === 1 ? '' : 's'})`
+        : `${started} monitor job(s)`;
+      showSuccess(`${label} started`, 'Monitor');
+    }
     if (failed > 0) showError(`${failed} monitor(s) failed`, 'Monitor Error');
     setActiveTab('history');
     await fetchMonitors();
@@ -1054,6 +1103,22 @@ export default function Scrape() {
                           <td className="py-2 px-3">
                             <p className="text-white truncate max-w-40" title={m.targetId}>
                               {m.targetTitle || m.targetId}
+                              {(m.chatCount && m.chatCount > 1) && (
+                                <span
+                                  className="ml-1.5 inline-block px-1.5 py-0.5 rounded text-[10px] font-medium bg-primary-500/20 text-primary-200 align-middle"
+                                  title={`Multi-chat monitor: ${m.chatCount} chats sharing one session pool.`}
+                                >
+                                  +{m.chatCount - 1} more
+                                </span>
+                              )}
+                              {m.schedulerVersion === 'v2' && (
+                                <span
+                                  className="ml-1.5 inline-block px-1.5 py-0.5 rounded text-[10px] font-medium bg-emerald-500/20 text-emerald-200 align-middle"
+                                  title="V2 cohort scheduler: small rotating session cohort per chat."
+                                >
+                                  v2
+                                </span>
+                              )}
                             </p>
                             <p className="text-gray-500">{m.targetType}</p>
                           </td>
@@ -1505,6 +1570,38 @@ export default function Scrape() {
                 </button>
               </div>
             </div>
+
+            {/* v28: Multi-chat cohort scheduler.  ON batches all
+                admin-only targets into a single V2 job and rotates
+                a small cohort (1–3 sessions) per chat to hit
+                800–1500 unique users / day / chat without parking
+                every session on every chat. */}
+            {periodPrompt.adminTargets.length > 1 && (
+              <div className="rounded-lg border border-primary-500/30 bg-primary-500/5 p-3">
+                <div className="flex items-start justify-between gap-3">
+                  <div className="flex-1">
+                    <p className="text-sm font-medium text-primary-300">
+                      Multi-chat cohort scheduler
+                    </p>
+                    <p className="mt-1 text-xs text-gray-400">
+                      {multiChatMonitor
+                        ? 'On — all chats run inside one job. A small cohort of sessions rotates per chat (auto-sized by traffic, 30–90 min shifts with 60 s overlap) so no single account ever parks on a single chat. Recommended for production.'
+                        : 'Off — fall back to one monitor job per chat. Every selected session listens to every chat for the full window. Higher PEER_FLOOD risk.'}
+                    </p>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => setMultiChatMonitor((v) => !v)}
+                    className={`relative h-6 w-11 shrink-0 rounded-full transition-colors ${multiChatMonitor ? 'bg-primary-500' : 'bg-white/10'}`}
+                    role="switch"
+                    aria-checked={multiChatMonitor}
+                    aria-label="Multi-chat cohort scheduler"
+                  >
+                    <span className={`absolute top-0.5 left-0.5 h-5 w-5 rounded-full bg-white shadow-sm transition-transform ${multiChatMonitor ? 'translate-x-5' : 'translate-x-0'}`} />
+                  </button>
+                </div>
+              </div>
+            )}
 
             <div className="flex gap-2 justify-end pt-2">
               <button

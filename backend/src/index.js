@@ -552,6 +552,18 @@ async function start() {
       logger.warn(`monitor sweep init failed: ${err.message}`);
     }
 
+    // 7a. Boot the V2 cohort-scheduler orchestrator (monitor V2).
+    //     This is the long-running scheduler that fan-outs one job
+    //     across multiple chats and rotates a cohort of sessions on
+    //     each chat to keep behavioural fingerprints under threshold.
+    //     Legacy v6 jobs continue through scrapeMonitorService above.
+    try {
+      const monitorOrchestrator = require('./services/monitor/monitorOrchestrator');
+      await monitorOrchestrator.start();
+    } catch (err) {
+      logger.warn(`monitorOrchestrator.start failed: ${err.message}`);
+    }
+
     // 7b. Boot the message-schedule tick loop. Polls
     //     `message_schedules` for rows that are due for another run
     //     (last dispatched job is in a terminal state AND
