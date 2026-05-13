@@ -645,6 +645,116 @@ class AccountSettingsService {
   }
 
   /**
+   * Remove every profile photo from a list of sessions. Used by the
+   * "Remove all profile photos" destructive bulk action in the
+   * AccountSettings page — leaves each account with no visible avatar
+   * (Telegram renders the default monogram).
+   *
+   * Walks each session sequentially (same pattern as
+   * {@link applyRandomizedAssignments}). Failures on individual sessions
+   * are recorded in the result but do not abort the rest of the batch,
+   * so a single revoked auth-key doesn't poison a 40-session run.
+   *
+   * @param {{ sessionIds: Array<number|string> }} params
+   * @param {number} userId
+   * @returns {Promise<{total:number, success:number, failed:number, results:object[]}>}
+   */
+  async removeAllProfilePhotos({ sessionIds }, userId) {
+    if (!userId) {
+      throw new AppError('User ID is required', 400, 'MISSING_USER_ID');
+    }
+    if (!Array.isArray(sessionIds) || sessionIds.length === 0) {
+      throw new AppError(
+        'At least one session is required',
+        400,
+        'NO_SESSIONS'
+      );
+    }
+
+    const numericIds = sessionIds
+      .map((s) => Number(s))
+      .filter((n) => Number.isFinite(n) && n > 0);
+    if (numericIds.length === 0) {
+      throw new AppError('No valid session IDs', 400, 'NO_VALID_SESSIONS');
+    }
+
+    // Ownership check — only touch rows that belong to the caller.
+    const ownedRows = await pool.query(
+      `SELECT id, phone, status FROM sessions WHERE id = ANY($1::int[]) AND user_id = $2`,
+      [numericIds, userId]
+    );
+    const ownedById = new Map(ownedRows.rows.map((r) => [r.id, r]));
+    if (ownedById.size === 0) {
+      throw new AppError('No valid sessions found', 404, 'NO_VALID_SESSIONS');
+    }
+
+    logger.info(
+      `Starting bulk profile-photo removal for ${ownedById.size} sessions`,
+      { userId, sessionCount: ownedById.size }
+    );
+
+    const results = [];
+    for (const sid of numericIds) {
+      const owned = ownedById.get(sid);
+      const sessionResult = {
+        sessionId: sid,
+        phone: owned ? owned.phone : null,
+        success: false,
+        deletedCount: 0,
+        errors: [],
+      };
+
+      if (!owned) {
+        sessionResult.errors.push('Session not found or not owned by user');
+        results.push(sessionResult);
+        continue;
+      }
+
+      try {
+        const ret = await callWithRevocationTracking(
+          sid,
+          'accountSettings.removeAllProfilePhotos',
+          () => telegramService.removeAllProfilePhotos(String(sid))
+        );
+        sessionResult.deletedCount = (ret && ret.deletedCount) || 0;
+        sessionResult.success = true;
+      } catch (err) {
+        sessionResult.errors.push(`Photo removal failed: ${err.message}`);
+      }
+
+      results.push(sessionResult);
+    }
+
+    const successCount = results.filter((r) => r.success).length;
+    const totalDeleted = results.reduce((sum, r) => sum + (r.deletedCount || 0), 0);
+    await pool.query(
+      `INSERT INTO activity_logs (user_id, action, details, created_at)
+       VALUES ($1, 'remove_all_profile_photos', $2, NOW())`,
+      [
+        userId,
+        JSON.stringify({
+          sessionCount: numericIds.length,
+          successCount,
+          totalDeleted,
+        }),
+      ]
+    );
+
+    logger.info(
+      `Bulk profile-photo removal completed: ${successCount}/${numericIds.length} sessions, ${totalDeleted} photos deleted`,
+      { userId }
+    );
+
+    return {
+      total: numericIds.length,
+      success: successCount,
+      failed: numericIds.length - successCount,
+      totalDeleted,
+      results,
+    };
+  }
+
+  /**
    * Get account settings for a session.
    * 
    * @param {string} sessionId - Session ID

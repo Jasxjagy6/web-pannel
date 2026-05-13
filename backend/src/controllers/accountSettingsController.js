@@ -165,6 +165,29 @@ module.exports = {
   }),
 
   /**
+   * POST /api/account-settings/remove-photos
+   * Wipe every profile photo (visible avatar + history) for each of the
+   * given sessions. Destructive — there is no undo. Returns a per-session
+   * report so the frontend can surface failures.
+   */
+  removeAllProfilePhotos: asyncHandler(async (req, res) => {
+    const { sessionIds: rawSessionIds } = req.body;
+    const userId = req.user?.id;
+    const sessionIds = await resolveSessionIdsFromRequest(req, rawSessionIds || []);
+
+    logger.info(`Bulk profile-photo removal request from user ${userId}`, {
+      sessionCount: sessionIds?.length || 0,
+    });
+
+    const result = await accountSettingsService.removeAllProfilePhotos(
+      { sessionIds },
+      userId
+    );
+
+    return res.status(200).json({ success: true, data: result });
+  }),
+
+  /**
    * GET /api/account-settings/:sessionId
    * Get account settings for a session
    */

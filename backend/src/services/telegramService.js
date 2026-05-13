@@ -2344,6 +2344,44 @@ class TelegramService {
   }
 
   /**
+   * Wipe EVERY profile photo on the active session — visible avatar +
+   * history. Used by the "Remove all profile photos" bulk action so the
+   * account ends up with no avatar at all (Telegram renders the default
+   * monogram).
+   *
+   * Implementation re-uses {@link _deletePriorProfilePhotos} with
+   * `newPhotoId=null` so nothing is preserved. Returns a summary of how
+   * many photos were removed.
+   *
+   * @param {string} sessionId
+   * @returns {Promise<{success:boolean, updatedField:string, deletedCount:number}>}
+   */
+  async removeAllProfilePhotos(sessionId) {
+    await this._ensureConnected(sessionId);
+    try {
+      const deletedCount = await this._deletePriorProfilePhotos(
+        sessionId,
+        null
+      );
+      logger.info(
+        `Removed ${deletedCount} profile photo(s) from session ${sessionId}`,
+        { sessionId, deletedCount }
+      );
+      return {
+        success: true,
+        updatedField: 'profile_photo',
+        deletedCount,
+      };
+    } catch (error) {
+      logger.error(
+        `Failed to remove profile photos for session ${sessionId}`,
+        { error: error && error.message }
+      );
+      throw this._handleTelegramError(error);
+    }
+  }
+
+  /**
    * Get the contact list of the current user.
    *
    * @param {string} sessionId - Active session identifier
