@@ -201,6 +201,16 @@ async function withStubbedSessions(stub, fn) {
       if (text.startsWith('SELECT status FROM messaging_jobs')) {
         return { rows: [{ status: 'running' }] };
       }
+      // sessionService.flagSessionRevoked first reads the row to
+      // build the account_info JSONB; return a minimal row so it
+      // proceeds to the UPDATE branch.
+      if (text.startsWith('SELECT id, user_id, status, is_logged_in, account_info FROM sessions')) {
+        return {
+          rows: [
+            { id: params[0], user_id: 1, status: 'active', is_logged_in: true, account_info: {} },
+          ],
+        };
+      }
       if (text.startsWith('UPDATE sessions') && text.includes("status = 'revoked'")) {
         updateRevoked.push(params);
         return { rows: [] };
@@ -363,6 +373,13 @@ async function withStubbedSessions(stub, fn) {
       if (text.startsWith('SELECT status FROM messaging_jobs')) {
         return { rows: [{ status: 'running' }] };
       }
+      if (text.startsWith('SELECT id, user_id, status, is_logged_in, account_info FROM sessions')) {
+        return {
+          rows: [
+            { id: params[0], user_id: 1, status: 'active', is_logged_in: true, account_info: {} },
+          ],
+        };
+      }
       if (text.startsWith('UPDATE sessions') && text.includes("status = 'revoked'")) {
         updateRevoked.push(params);
         return { rows: [] };
@@ -415,7 +432,17 @@ async function withStubbedSessions(stub, fn) {
         1,
         `expected sessions table flagged once; got ${updateRevoked.length}`
       );
-      assert.deepStrictEqual(updateRevoked[0], [300, 1]);
+      // sessionService.flagSessionRevoked now does the write — its
+      // UPDATE takes [sessionId, account_info_json], so we just check
+      // the session id (first arg) and that the account_info payload
+      // carries the original AUTH_KEY_UNREGISTERED message.
+      assert.strictEqual(updateRevoked[0][0], 300, 'session 300 flagged revoked');
+      const accountInfo = JSON.parse(updateRevoked[0][1]);
+      assert.ok(
+        /AUTH_KEY_UNREGISTERED/.test(accountInfo.lastError || ''),
+        `account_info.lastError carries the auth error: ${accountInfo.lastError}`
+      );
+      assert.strictEqual(accountInfo.revocationReason, 'AUTH_KEY_UNREGISTERED');
     } finally {
       pool.query = origPoolQuery;
       telegramService.sendMessage = origSendMessage;

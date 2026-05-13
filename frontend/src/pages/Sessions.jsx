@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { usePolling } from '../hooks/usePolling';
+import { useWebSocket } from '../hooks/useWebSocket';
 import {
   listSessions,
   uploadSessions,
@@ -945,6 +946,37 @@ export default function Sessions() {
 
   // Poll every 10 seconds for live updates
   usePolling(fetchSessions, 10000, true);
+
+  // ----------------------------------------------------------
+  // Live revocation pings: whenever any job hits a Telegram
+  // permanent-auth error (AUTH_KEY_UNREGISTERED, SESSION_REVOKED,
+  // etc.), sessionService.flagSessionRevoked emits `sessions:revoked`
+  // to the user's room. We refresh + apply a fast local patch so the
+  // UI flips to "Revoked" without waiting for the next poll cycle.
+  // ----------------------------------------------------------
+  const { connect, on } = useWebSocket();
+  useEffect(() => {
+    const token = typeof localStorage !== 'undefined' ? localStorage.getItem('token') : null;
+    if (token) connect(token);
+  }, [connect]);
+
+  useEffect(() => {
+    const cleanup = on('sessions:revoked', (payload) => {
+      const revokedId = Number(payload?.sessionId);
+      if (!Number.isFinite(revokedId)) return;
+      // Eager local patch so the badge flips instantly.
+      setSessions((prev) =>
+        prev.map((s) =>
+          Number(s.id) === revokedId
+            ? { ...s, status: 'revoked', is_logged_in: false, isLoggedIn: false }
+            : s
+        )
+      );
+      // Then refetch in case other fields (account_info / last_error) changed.
+      fetchSessions();
+    });
+    return cleanup;
+  }, [on, fetchSessions]);
 
   // --- Actions ---
   const handleUploadComplete = async (count, error, meta) => {

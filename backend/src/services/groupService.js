@@ -1,5 +1,6 @@
 const { pool } = require('../config/database');
 const telegramService = require('./telegramService');
+const sessionService = require('./sessionService');
 const logger = require('../utils/logger');
 const { AppError } = require('../utils/errorHandler');
 const { redisClient } = require('../config/redis');
@@ -2636,6 +2637,11 @@ class GroupService {
             inputUser = await resolverCache.resolve(session, prepared);
           } catch (resolveErr) {
             if (tgService.isPermanentAuthError(resolveErr)) {
+              // Flip the session row to status='revoked' before bailing
+              // — otherwise this same session would be tried again on
+              // the next job. Fire-and-forget; the per-target loop
+              // already gracefully drops the session for this run.
+              sessionService.maybeFlagRevoked(session.id, resolveErr, 'groupService.resolve').catch(() => {});
               return { status: 'session_dead', reason: resolveErr.message };
             }
             // Resolution failure — try the candidate chain directly.
@@ -2693,8 +2699,11 @@ class GroupService {
 
           const errMsg = addErr.message || String(addErr);
 
-          // Permanent auth error → kill the session.
+          // Permanent auth error → kill the session AND flag it as
+          // revoked in the DB so the Sessions UI / future jobs no
+          // longer surface it as active.
           if (tgService.isPermanentAuthError(addErr)) {
+            sessionService.maybeFlagRevoked(session.id, addErr, 'groupService.invite').catch(() => {});
             return { status: 'session_dead', reason: errMsg };
           }
 

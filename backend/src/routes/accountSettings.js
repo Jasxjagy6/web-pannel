@@ -26,6 +26,14 @@ router.post('/upload-photo', fileUpload, accountSettingsController.uploadProfile
 router.get('/randomize/pools', accountSettingsController.getRandomizePools);
 router.post('/randomize/apply', accountSettingsController.applyRandomized);
 
+// POST /api/account-settings/profile-list/preview  - Build a per-session
+//   preview from an uploaded profile list (cycles names + bios, suffixes
+//   duplicate usernames, picks a random avatar per session).
+// POST /api/account-settings/profile-list/apply    - Apply the chosen
+//   assignments via the existing Randomize Mode pipeline.
+router.post('/profile-list/preview', accountSettingsController.previewProfileList);
+router.post('/profile-list/apply', accountSettingsController.applyProfileList);
+
 // GET /api/account-settings/:sessionId - Get account settings for a session
 router.get('/:sessionId', accountSettingsController.getAccountSettings);
 

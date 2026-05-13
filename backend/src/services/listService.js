@@ -22,7 +22,7 @@ const MAX_ITEMS_PER_LIST = 10000;
 /**
  * Valid list types.
  */
-const VALID_LIST_TYPES = ['users', 'groups', 'channels', 'scraped', 'manual', 'imported', 'merged'];
+const VALID_LIST_TYPES = ['users', 'groups', 'channels', 'scraped', 'manual', 'imported', 'merged', 'profile'];
 
 /**
  * Valid export formats.
@@ -715,6 +715,148 @@ function parseTxtContent(content) {
 }
 
 /**
+ * Parse a numbered-block profile list (used by the Account Settings →
+ * Randomize-from-Profile-List flow).
+ *
+ * The format is what operators commonly paste from spreadsheets / notes
+ * apps. Each entry starts with `N.` (the index) on its own line, followed
+ * by one or more `Key: value` lines until the next blank line or next
+ * `N.` marker.
+ *
+ * Recognised keys (case-insensitive, with sane aliases):
+ *   - Name             → split into first_name + last_name
+ *   - Username         → username (any leading `@` is stripped)
+ *   - Bio / About      → bio (truncated to 70 chars at insert time)
+ *   - PFP / Picture    → IGNORED — operators routinely write English
+ *                        descriptions ("Yellow default letter icon")
+ *                        rather than actual URLs, so we never attempt to
+ *                        fetch from this field. Profile-pic selection
+ *                        happens randomly from the bundled avatar
+ *                        catalog regardless of what the list says.
+ *
+ * Entries with no `Name` AND no `Username` are dropped.
+ *
+ * @param {string} content - Raw file content
+ * @returns {Array<{ telegram_id: null, username: string|null, first_name: string|null, last_name: string|null, phone: null, access_hash: null, bio: string|null }>}
+ */
+function parseProfileListContent(content) {
+  if (!content || typeof content !== 'string') return [];
+  // Normalise line endings before block splitting so a CRLF-encoded
+  // export from Notepad doesn't break the parser.
+  const text = content.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+
+  // Split on any line that *starts* with `<index>.` so each block can be
+  // processed independently. The first split entry will usually be empty
+  // (anything before the first `1.` header). We also accept blank-line
+  // separation as a fallback so a list without numeric markers still
+  // imports as long as each profile is its own paragraph.
+  const blocks = [];
+  if (/^\s*\d+\.\s*$/m.test(text)) {
+    // Numbered format — split on each `N.` line.
+    const parts = text.split(/^\s*\d+\.\s*$/m);
+    for (const p of parts) {
+      const t = p.trim();
+      if (t) blocks.push(t);
+    }
+  } else {
+    // No numbered headers — fall back to blank-line paragraph separation.
+    const parts = text.split(/\n\s*\n+/);
+    for (const p of parts) {
+      const t = p.trim();
+      if (t) blocks.push(t);
+    }
+  }
+
+  const KEY_ALIASES = {
+    name: 'name',
+    fullname: 'name',
+    'full name': 'name',
+    displayname: 'name',
+    'display name': 'name',
+    handle: 'username',
+    username: 'username',
+    user: 'username',
+    tg: 'username',
+    telegram: 'username',
+    bio: 'bio',
+    about: 'bio',
+    description: 'bio',
+    status: 'bio',
+    // PFP fields are recognised so we can deliberately ignore the value
+    // (rather than mis-interpreting a "Pic" line as something else).
+    pfp: 'pfp',
+    pic: 'pfp',
+    picture: 'pfp',
+    photo: 'pfp',
+    avatar: 'pfp',
+    profilepic: 'pfp',
+    'profile pic': 'pfp',
+    'profile picture': 'pfp',
+    'profile photo': 'pfp',
+  };
+
+  const entries = [];
+  for (const block of blocks) {
+    const lines = block.split('\n');
+    const fields = {};
+    for (const rawLine of lines) {
+      const line = rawLine.trim();
+      if (!line) continue;
+      // Skip residual numeric markers in case a block somehow retained
+      // its `N.` prefix.
+      if (/^\d+\.$/.test(line)) continue;
+      const colonIdx = line.indexOf(':');
+      if (colonIdx <= 0) continue;
+      const keyRaw = line.slice(0, colonIdx).trim().toLowerCase();
+      const value = line.slice(colonIdx + 1).trim();
+      if (!value) continue;
+      const canonical = KEY_ALIASES[keyRaw];
+      if (!canonical) continue;
+      if (canonical === 'pfp') continue; // Deliberately ignored.
+      // Take the FIRST occurrence of each key per block (operators
+      // sometimes paste duplicate Username lines from spreadsheet
+      // exports — keep the topmost).
+      if (!(canonical in fields)) {
+        fields[canonical] = value;
+      }
+    }
+
+    if (!fields.name && !fields.username) continue;
+
+    let first_name = null;
+    let last_name = null;
+    if (fields.name) {
+      const parts = fields.name.split(/\s+/).filter(Boolean);
+      first_name = parts[0] || null;
+      last_name = parts.length > 1 ? parts.slice(1).join(' ') : null;
+    }
+
+    let username = null;
+    if (fields.username) {
+      username = fields.username.replace(/^@+/, '').trim();
+      // Skip numeric-only "usernames" — that's just an id-shaped string
+      // that Telegram won't resolve as a handle, and downstream
+      // `account.updateUsername` would reject it anyway.
+      if (!username || /^\d+$/.test(username)) username = null;
+    }
+
+    if (!first_name && !username) continue;
+
+    entries.push({
+      telegram_id: null,
+      username,
+      first_name,
+      last_name,
+      phone: null,
+      access_hash: null,
+      bio: fields.bio || null,
+    });
+  }
+
+  return entries;
+}
+
+/**
  * Escape a value for safe CSV output.
  *
  * @param {*} value - The value to escape
@@ -815,7 +957,7 @@ async function insertListItemsBatch(client, listId, items) {
 
     for (const item of batch) {
       placeholders.push(
-        `($${paramIndex}, $${paramIndex + 1}, $${paramIndex + 2}, $${paramIndex + 3}, $${paramIndex + 4}, $${paramIndex + 5}, $${paramIndex + 6}, NOW())`
+        `($${paramIndex}, $${paramIndex + 1}, $${paramIndex + 2}, $${paramIndex + 3}, $${paramIndex + 4}, $${paramIndex + 5}, $${paramIndex + 6}, $${paramIndex + 7}, NOW())`
       );
 
       // Coerce here as a final safety net even though parseCsvContent /
@@ -826,6 +968,12 @@ async function insertListItemsBatch(client, listId, items) {
       // access_hash is only meaningful when paired with a telegram_id —
       // a hash without an id is unusable for InputUser construction.
       const accessHash = telegramId ? coerceAccessHash(item.access_hash) : null;
+      // `bio` is profile-list-only (Telegram About blurb). Non-profile
+      // imports leave this null and the column is ignored by every
+      // messaging/group-add/scraping path.
+      const bio = typeof item.bio === 'string' && item.bio.length > 0
+        ? item.bio.slice(0, 70) // Telegram caps "about" at 70 chars
+        : null;
       values.push(
         listId,
         telegramId,
@@ -833,13 +981,14 @@ async function insertListItemsBatch(client, listId, items) {
         item.first_name || null,
         item.last_name || null,
         item.phone || null,
-        accessHash
+        accessHash,
+        bio
       );
-      paramIndex += 7;
+      paramIndex += 8;
     }
 
     const insertQuery = `
-      INSERT INTO list_items (list_id, telegram_id, username, first_name, last_name, phone, access_hash, added_at)
+      INSERT INTO list_items (list_id, telegram_id, username, first_name, last_name, phone, access_hash, bio, added_at)
       VALUES ${placeholders.join(', ')}
       ON CONFLICT DO NOTHING
     `;
@@ -887,8 +1036,9 @@ class ListService {
       throw new AppError('File is required for import', 400, 'MISSING_FILE');
     }
 
-    const validTypes = ['users', 'groups', 'channels'];
+    const validTypes = ['users', 'groups', 'channels', 'profile'];
     const listType = validTypes.includes(type) ? type : 'users';
+    const isProfileList = listType === 'profile';
 
     logger.info(`Importing list "${listName}" for user ${userId} from ${file.originalname}`, {
       userId,
@@ -918,13 +1068,49 @@ class ListService {
     let entries = [];
 
     try {
-      const detected = detectContentFormat(content, ext, mimeType);
-      if (detected === 'json') {
-        entries = parseJsonContent(content);
-      } else if (detected === 'csv') {
-        entries = parseCsvContent(content);
+      if (isProfileList) {
+        // Profile lists never use the username/id-centric parsers.
+        // The format is numbered `Key: value` blocks (name / username
+        // / bio / pfp) — see `parseProfileListContent`. JSON arrays
+        // of `{ name, username, bio }` are also accepted so operators
+        // can paste structured data.
+        const trimmed = content.trim();
+        if (trimmed.startsWith('[') || trimmed.startsWith('{')) {
+          try {
+            const parsed = JSON.parse(trimmed);
+            const arr = Array.isArray(parsed) ? parsed : (parsed.entries || parsed.items || parsed.users || []);
+            entries = arr.map((it) => {
+              const nameRaw = it.name || it.fullName || it.full_name || it.displayName || it.display_name || '';
+              const nameParts = String(nameRaw).split(/\s+/).filter(Boolean);
+              const first = it.first_name || it.firstName || nameParts[0] || null;
+              const last = it.last_name || it.lastName || (nameParts.length > 1 ? nameParts.slice(1).join(' ') : null);
+              let uname = it.username ? String(it.username).replace(/^@+/, '').trim() : null;
+              if (uname && /^\d+$/.test(uname)) uname = null;
+              return {
+                telegram_id: null,
+                username: uname,
+                first_name: first ? String(first).trim() : null,
+                last_name: last ? String(last).trim() : null,
+                phone: null,
+                access_hash: null,
+                bio: it.bio || it.about || null,
+              };
+            }).filter((e) => e.first_name || e.username);
+          } catch (jsonErr) {
+            entries = parseProfileListContent(content);
+          }
+        } else {
+          entries = parseProfileListContent(content);
+        }
       } else {
-        entries = parseTxtContent(content);
+        const detected = detectContentFormat(content, ext, mimeType);
+        if (detected === 'json') {
+          entries = parseJsonContent(content);
+        } else if (detected === 'csv') {
+          entries = parseCsvContent(content);
+        } else {
+          entries = parseTxtContent(content);
+        }
       }
     } catch (parseError) {
       // If this is an AppError, re-throw it
@@ -979,6 +1165,12 @@ class ListService {
           continue;
         }
         seenUsernames.add(key);
+      } else if (isProfileList) {
+        // Profile-list rows without a username are still valid (name +
+        // bio only) — many entries in the sample format have no `@`
+        // handle at all. They represent independent list slots so we
+        // must NOT collapse them just because their names happen to
+        // match. Fall through and keep them all.
       }
       deduplicatedEntries.push(entry);
     }
@@ -988,12 +1180,17 @@ class ListService {
     try {
       await client.query('BEGIN');
 
-      // Create the list
+      // Create the list. Use a `profile_import_*` source tag for profile
+      // lists so downstream features (normalize-all, scraping audience
+      // filter, etc.) can quickly tell them apart from contact lists.
+      const sourceTag = isProfileList
+        ? `profile_import_${ext.replace('.', '') || 'raw'}`
+        : `import_${ext.replace('.', '')}`;
       const listResult = await client.query(
         `INSERT INTO lists (user_id, name, type, items_count, source, created_at)
          VALUES ($1, $2, $3, $4, $5, NOW())
          RETURNING id`,
-        [userId, listName.trim(), listType, deduplicatedEntries.length, `import_${ext.replace('.', '')}`]
+        [userId, listName.trim(), listType, deduplicatedEntries.length, sourceTag]
       );
 
       const listId = listResult.rows[0].id;
@@ -2022,7 +2219,7 @@ class ListService {
 
     // Get paginated items
     const itemsResult = await pool.query(
-      `SELECT id, telegram_id, username, first_name, last_name, phone, access_hash, added_at
+      `SELECT id, telegram_id, username, first_name, last_name, phone, access_hash, bio, added_at
        FROM list_items
        WHERE ${whereClause}
        ORDER BY id ASC
@@ -2040,12 +2237,58 @@ class ListService {
       accessHash: row.access_hash !== null && row.access_hash !== undefined
         ? String(row.access_hash)
         : null,
+      // `bio` only surfaces for profile lists, but harmless to include
+      // for every type — null otherwise.
+      bio: row.bio || null,
       addedAt: row.added_at,
     }));
 
     const pagination = buildPagination(page, limit, total);
 
     return { items, pagination };
+  }
+
+  /**
+   * Load every row of a profile list, in insertion order. Profile lists
+   * are bounded by MAX_ITEMS_PER_LIST (10 000) so loading the whole list
+   * in one pass is safe.
+   *
+   * @param {number|string} userId
+   * @param {number|string} listId
+   * @returns {Promise<{ list: object, items: Array<{ firstName: string|null, lastName: string|null, username: string|null, bio: string|null }> }>}
+   */
+  async loadProfileListItems(userId, listId) {
+    const list = await validateListOwnership(listId, userId);
+    if (list.type !== 'profile') {
+      throw new AppError(
+        `List ${listId} is type '${list.type}', expected 'profile'`,
+        400,
+        'NOT_PROFILE_LIST'
+      );
+    }
+    const result = await pool.query(
+      `SELECT first_name, last_name, username, bio
+         FROM list_items
+        WHERE list_id = $1
+        ORDER BY id ASC`,
+      [listId]
+    );
+    const items = result.rows.map((r) => ({
+      firstName: r.first_name || null,
+      lastName: r.last_name || null,
+      username: r.username || null,
+      bio: r.bio || null,
+    }));
+    return {
+      list: {
+        id: list.id,
+        name: list.name,
+        type: list.type,
+        itemsCount: list.items_count,
+        source: list.source,
+      },
+      items,
+    };
   }
 
   /**
@@ -2388,6 +2631,7 @@ module.exports.__internal = {
   parseCsvContent,
   parseJsonContent,
   parseTxtContent,
+  parseProfileListContent,
   coerceTelegramId,
   coerceUsername,
   detectContentFormat,

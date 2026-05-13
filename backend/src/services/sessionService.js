@@ -3593,6 +3593,206 @@ class SessionService {
       reason: (lastError && (lastError.errorMessage || lastError.message)) || 'no_valid_backup',
     };
   }
+
+  /**
+   * Centralised "session has been revoked by Telegram" handler. Any
+   * task/job that catches an AUTH_KEY_UNREGISTERED / AUTH_KEY_INVALID /
+   * SESSION_REVOKED / USER_DEACTIVATED error against a known session
+   * should call this so the session row is reliably flipped to
+   * `status='revoked'`, `is_logged_in=FALSE` in the DB and the in-memory
+   * client is torn down. Idempotent — calling twice on an already-revoked
+   * row is a fast no-op.
+   *
+   * Best-effort: never throws. Returns a structured result for the
+   * caller to log if useful.
+   *
+   * @param {number|string} sessionId
+   * @param {object} [context]
+   * @param {Error|string} [context.error]    The raw Telegram error
+   * @param {string} [context.reason]         Short stable code (e.g. 'AUTH_KEY_UNREGISTERED')
+   * @param {string} [context.source]         Subsystem that detected it ('messageService', 'groupService', ...)
+   * @param {number|string} [context.userId]  Owner of the session, used to scope socket events
+   * @returns {Promise<{ flagged: boolean, alreadyRevoked?: boolean, reason: string, message?: string }>}
+   */
+  async flagSessionRevoked(sessionId, context = {}) {
+    if (!sessionId) return { flagged: false, reason: 'missing_session_id' };
+    const id = parseInt(sessionId, 10);
+    if (!Number.isFinite(id) || id <= 0) {
+      return { flagged: false, reason: 'invalid_session_id' };
+    }
+
+    const err = context.error;
+    const errMessage = err ? (err.errorMessage || err.message || String(err)) : (context.reason || 'auth_revoked');
+    const reasonCode = context.reason || this._inferRevokeReasonCode(errMessage) || 'AUTH_REVOKED';
+    const source = context.source || 'unknown';
+
+    try {
+      const existing = await pool.query(
+        `SELECT id, user_id, status, is_logged_in, account_info
+           FROM sessions
+          WHERE id = $1`,
+        [id]
+      );
+      if (existing.rows.length === 0) {
+        return { flagged: false, reason: 'session_not_found' };
+      }
+      const row = existing.rows[0];
+
+      // Idempotent guard — if both status and is_logged_in already
+      // reflect the revoked state, skip the write and the disconnect
+      // teardown.
+      const alreadyRevoked =
+        String(row.status).toLowerCase() === 'revoked' && row.is_logged_in === false;
+
+      let accountInfo;
+      if (row.account_info && typeof row.account_info === 'object') {
+        accountInfo = { ...row.account_info };
+      } else if (typeof row.account_info === 'string') {
+        try { accountInfo = JSON.parse(row.account_info); } catch (_) { accountInfo = {}; }
+      } else {
+        accountInfo = {};
+      }
+      const nowIso = new Date().toISOString();
+      accountInfo.lastError = errMessage;
+      accountInfo.lastErrorAt = nowIso;
+      accountInfo.revokedAt = accountInfo.revokedAt || nowIso;
+      accountInfo.revocationReason = reasonCode;
+      accountInfo.revocationSource = source;
+
+      if (!alreadyRevoked) {
+        await pool.query(
+          `UPDATE sessions
+              SET status       = 'revoked',
+                  is_logged_in = FALSE,
+                  account_info = $2,
+                  updated_at   = NOW()
+            WHERE id = $1`,
+          [id, JSON.stringify(accountInfo)]
+        );
+        logger.warn(
+          `[auth-revoked] session ${id} flagged revoked from ${source}: ${reasonCode} (${errMessage})`,
+          { sessionId: id, source, reasonCode }
+        );
+      } else {
+        // Still refresh `lastError`/`lastErrorAt` so the operator sees
+        // the most recent occurrence on the Sessions page.
+        await pool.query(
+          `UPDATE sessions
+              SET account_info = $2,
+                  updated_at   = NOW()
+            WHERE id = $1`,
+          [id, JSON.stringify(accountInfo)]
+        );
+      }
+
+      // Best-effort: disconnect the in-memory GramJS client so the
+      // next job doesn't try to use a dead handle. Lazy require to
+      // avoid circular dependency at module-load time.
+      try {
+        const telegramService = require('./telegramService');
+        if (telegramService && typeof telegramService.disconnect === 'function') {
+          await telegramService.disconnect(String(id)).catch(() => {});
+        }
+      } catch (_) {
+        // ignore — telegramService not loaded in this process is fine
+      }
+
+      // Live-push to the owning user's room so the Sessions tab
+      // updates without waiting for the 10-second poll.
+      try {
+        const io = global.io;
+        if (io && row.user_id != null) {
+          const room = `user:${row.user_id}`;
+          io.to(room).emit('sessions:revoked', {
+            sessionId: id,
+            status: 'revoked',
+            reason: reasonCode,
+            message: errMessage,
+            source,
+            at: nowIso,
+          });
+        }
+      } catch (_) {
+        // Socket emit is best-effort; the DB row is the source of truth.
+      }
+
+      return {
+        flagged: true,
+        alreadyRevoked,
+        reason: reasonCode,
+        message: errMessage,
+      };
+    } catch (markErr) {
+      logger.warn(
+        `[auth-revoked] failed to flag session ${id} revoked from ${source}: ${markErr.message}`
+      );
+      return {
+        flagged: false,
+        reason: 'db_error',
+        message: markErr.message,
+      };
+    }
+  }
+
+  /**
+   * Map an error message to a stable reason code. The patterns mirror
+   * `telegramService.isPermanentAuthError`. Used only for diagnostic
+   * logging on the revoked row.
+   *
+   * @param {string} msg
+   * @returns {string|null}
+   * @private
+   */
+  _inferRevokeReasonCode(msg) {
+    if (!msg) return null;
+    const h = String(msg).toUpperCase();
+    if (h.includes('AUTH_KEY_UNREGISTERED')) return 'AUTH_KEY_UNREGISTERED';
+    if (h.includes('AUTH_KEY_INVALID')) return 'AUTH_KEY_INVALID';
+    if (h.includes('AUTH_KEY_DUPLICATED')) return 'AUTH_KEY_DUPLICATED';
+    if (h.includes('SESSION_REVOKED')) return 'SESSION_REVOKED';
+    if (h.includes('SESSION_EXPIRED')) return 'SESSION_EXPIRED';
+    if (h.includes('USER_DEACTIVATED')) return 'USER_DEACTIVATED';
+    return null;
+  }
+
+  /**
+   * Convenience wrapper around {@link flagSessionRevoked}: only flags
+   * when the supplied error matches Telegram's permanent-auth-error
+   * family (so a generic FLOOD_WAIT or PEER_FLOOD never trips it).
+   *
+   * Designed for use inside per-session catch blocks across the codebase:
+   *
+   *     try { await client.invoke(...) }
+   *     catch (err) {
+   *       await sessionService.maybeFlagRevoked(sessionId, err, 'groupService');
+   *       throw err;
+   *     }
+   *
+   * @param {number|string} sessionId
+   * @param {Error} error
+   * @param {string} [source]
+   * @returns {Promise<boolean>} true if the session was flagged revoked
+   */
+  async maybeFlagRevoked(sessionId, error, source) {
+    if (!sessionId || !error) return false;
+    // Lazy require to dodge the require-cycle that telegramService
+    // would otherwise create.
+    let telegramService;
+    try {
+      telegramService = require('./telegramService');
+    } catch (_) {
+      return false;
+    }
+    if (!telegramService || typeof telegramService.isPermanentAuthError !== 'function') {
+      return false;
+    }
+    if (!telegramService.isPermanentAuthError(error)) return false;
+    const result = await this.flagSessionRevoked(sessionId, {
+      error,
+      source: source || 'unknown',
+    });
+    return Boolean(result.flagged);
+  }
 }
 
 module.exports = new SessionService();

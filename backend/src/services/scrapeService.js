@@ -496,6 +496,15 @@ class ScrapeService {
             // Wait out the flood wait
             await this._delayWithCancellation(jobId, waitSeconds * 1000);
           } else {
+            // If Telegram returned a permanent auth error, flag the
+            // session as revoked so future jobs skip it and the
+            // Sessions UI updates immediately.
+            try {
+              const sessionService = require('./sessionService');
+              sessionService
+                .maybeFlagRevoked(sessionId, error, 'scrapeService.group')
+                .catch(() => {});
+            } catch (_) { /* defensive — should never fire */ }
             throw error;
           }
         }
@@ -554,6 +563,12 @@ class ScrapeService {
             delay = Math.min(MAX_BATCH_DELAY_MS, waitSeconds * 1000 * FLOOD_WAIT_MULTIPLIER);
             await this._delayWithCancellation(jobId, waitSeconds * 1000);
           } else {
+            try {
+              const sessionService = require('./sessionService');
+              sessionService
+                .maybeFlagRevoked(sessionId, error, 'scrapeService.channel')
+                .catch(() => {});
+            } catch (_) { /* defensive */ }
             throw error;
           }
         }

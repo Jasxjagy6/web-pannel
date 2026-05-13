@@ -118,6 +118,53 @@ module.exports = {
   }),
 
   /**
+   * POST /api/account-settings/profile-list/preview
+   * Build the per-session assignments for "Apply Profile List" without
+   * touching Telegram. Returns the cycled name / username (with
+   * random-suffix repeats) / bio / avatar choice for each session so
+   * the frontend can render a preview table the operator can re-roll.
+   */
+  previewProfileList: asyncHandler(async (req, res) => {
+    const { listId, sessionIds: rawSessionIds, updateUsernames, updatePhotos, updateBios } = req.body;
+    const userId = req.user?.id;
+    const sessionIds = await resolveSessionIdsFromRequest(req, rawSessionIds || []);
+    const result = await accountSettingsService.previewProfileListAssignments(
+      { listId, sessionIds, updateUsernames, updatePhotos, updateBios },
+      userId
+    );
+    return res.status(200).json({ success: true, data: result });
+  }),
+
+  /**
+   * POST /api/account-settings/profile-list/apply
+   * Apply a profile list across the given sessions. Accepts either a
+   * `listId` (re-builds assignments server-side) or an explicit
+   * `assignments` array (the preview the operator already re-rolled).
+   */
+  applyProfileList: asyncHandler(async (req, res) => {
+    const {
+      listId,
+      sessionIds: rawSessionIds,
+      assignments,
+      updateUsernames,
+      updatePhotos,
+      updateBios,
+    } = req.body;
+    const userId = req.user?.id;
+    const sessionIds = await resolveSessionIdsFromRequest(req, rawSessionIds || []);
+    logger.info(`Profile-list apply request from user ${userId}`, {
+      listId,
+      sessionCount: sessionIds?.length || 0,
+      withAssignments: Array.isArray(assignments),
+    });
+    const result = await accountSettingsService.applyProfileListToSessions(
+      { listId, sessionIds, assignments, updateUsernames, updatePhotos, updateBios },
+      userId
+    );
+    return res.status(200).json({ success: true, data: result });
+  }),
+
+  /**
    * GET /api/account-settings/:sessionId
    * Get account settings for a session
    */

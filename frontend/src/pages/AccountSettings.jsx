@@ -15,6 +15,7 @@ import {
   Shield,
   Sparkles,
   Pencil,
+  ListChecks,
 } from 'lucide-react';
 import { useToast } from '../components/common/Toast';
 import { listSessions } from '../api/sessions';
@@ -22,6 +23,7 @@ import { updateAccountSettings, uploadProfilePhoto } from '../api/accountSetting
 import { parseApiError } from '../utils/formatters';
 import SessionListSwitcher from '../components/common/SessionListSwitcher';
 import AccountRandomizePanel from '../components/settings/AccountRandomizePanel';
+import AccountProfileListPanel from '../components/settings/AccountProfileListPanel';
 
 export default function AccountSettings() {
   const { showSuccess, showError } = useToast();
@@ -354,9 +356,33 @@ export default function AccountSettings() {
           <Sparkles className="w-4 h-4" />
           Randomize
         </button>
+        <button
+          type="button"
+          onClick={() => setMode('profileList')}
+          className={`inline-flex items-center gap-2 rounded-lg px-4 py-2 text-sm font-medium transition ${
+            mode === 'profileList'
+              ? 'bg-primary-500/20 text-primary-200 border border-primary-500/30'
+              : 'text-gray-400 hover:text-gray-200'
+          }`}
+        >
+          <ListChecks className="w-4 h-4" />
+          Profile List
+        </button>
       </div>
 
-      {mode === 'randomize' ? (
+      {mode === 'profileList' ? (
+        <div className="grid grid-cols-1 xl:grid-cols-2 gap-6">
+          <div className="space-y-6">
+            <AccountProfileListPanel
+              selectedSessions={selectedSessionObjects}
+              showSuccess={showSuccess}
+              showError={showError}
+              onApplied={() => fetchSessions()}
+            />
+          </div>
+          <div className="space-y-6">{renderSessionPicker()}</div>
+        </div>
+      ) : mode === 'randomize' ? (
         <div className="grid grid-cols-1 xl:grid-cols-2 gap-6">
           <div className="space-y-6">
             <AccountRandomizePanel

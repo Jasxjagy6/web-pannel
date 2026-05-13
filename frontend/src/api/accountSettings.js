@@ -28,3 +28,22 @@ export const randomAvatarUrl = (avatarId) => {
 
 export const applyRandomizedAccountSettings = (assignments) =>
   api.post('/account-settings/randomize/apply', { assignments });
+
+// Profile List Mode --------------------------------------------------------
+
+/**
+ * Build the per-session preview for "Apply Profile List". Returns
+ * `{ list, assignments, listSize, sessionCount, repeatsRequired }`.
+ * The frontend renders the assignments table and lets the operator
+ * re-roll by calling this endpoint again before the final apply.
+ */
+export const previewProfileList = (payload) =>
+  api.post('/account-settings/profile-list/preview', payload);
+
+/**
+ * Apply a profile list across the given sessions. Accepts either
+ * `{ listId, sessionIds, ...flags }` (server rebuilds assignments) or
+ * `{ assignments }` (use the previewed assignments verbatim).
+ */
+export const applyProfileList = (payload) =>
+  api.post('/account-settings/profile-list/apply', payload);
