@@ -16,10 +16,15 @@ import {
   Sparkles,
   Pencil,
   ListChecks,
+  Trash2,
 } from 'lucide-react';
 import { useToast } from '../components/common/Toast';
 import { listSessions } from '../api/sessions';
-import { updateAccountSettings, uploadProfilePhoto } from '../api/accountSettings';
+import {
+  updateAccountSettings,
+  uploadProfilePhoto,
+  removeAllProfilePhotos,
+} from '../api/accountSettings';
 import { parseApiError } from '../utils/formatters';
 import SessionListSwitcher from '../components/common/SessionListSwitcher';
 import AccountRandomizePanel from '../components/settings/AccountRandomizePanel';
@@ -59,6 +64,12 @@ export default function AccountSettings() {
 
   const [submitting, setSubmitting] = useState(false);
   const [uploadingPhoto, setUploadingPhoto] = useState(false);
+
+  // "Remove all profile photos" destructive bulk action.
+  // Two-step confirm so an accidental click can't nuke everyone.
+  const [removingPhotos, setRemovingPhotos] = useState(false);
+  const [showRemovePhotosConfirm, setShowRemovePhotosConfirm] = useState(false);
+  const [removePhotosResult, setRemovePhotosResult] = useState(null);
 
   // Fetch sessions
   const fetchSessions = useCallback(async () => {
@@ -204,6 +215,58 @@ export default function AccountSettings() {
     setUpdateFlags(prev => ({ ...prev, [field]: !prev[field] }));
   };
 
+  // ---- "Remove all profile photos" destructive bulk action ----
+  //
+  // Builds the same { sessionIds | sessionListId } shape the other
+  // bulk endpoints accept, then POSTs to /account-settings/remove-photos.
+  // Failures on individual sessions are reported per-session in the
+  // result payload so we surface them in a follow-up toast.
+  const handleRemoveAllPhotos = async () => {
+    const usingList = sessionPickMode === 'list';
+
+    // Validate selection before showing destructive UI.
+    if (usingList && !selectedSessionListId) {
+      showError('Please pick a session list first.');
+      return;
+    }
+    if (!usingList && selectedSessionIds.length === 0) {
+      showError('Please select at least one session.');
+      return;
+    }
+
+    setRemovingPhotos(true);
+    setRemovePhotosResult(null);
+    try {
+      const payload = usingList
+        ? { sessionListId: selectedSessionListId }
+        : { sessionIds: selectedSessionIds };
+      const resp = await removeAllProfilePhotos(payload);
+      const data = resp.data?.data || {};
+      setRemovePhotosResult(data);
+      const { total = 0, success = 0, failed = 0, totalDeleted = 0 } = data;
+      if (failed === 0) {
+        showSuccess(
+          `Removed ${totalDeleted} profile photo(s) across ${success}/${total} session(s).`
+        );
+      } else {
+        showError(
+          `Removed photos on ${success}/${total} session(s); ${failed} failed. See details below.`
+        );
+      }
+    } catch (err) {
+      showError(parseApiError(err));
+    } finally {
+      setRemovingPhotos(false);
+      setShowRemovePhotosConfirm(false);
+    }
+  };
+
+  // Sessions targeted by the destructive action, for the confirm dialog copy.
+  const removePhotosTargetCount =
+    sessionPickMode === 'list'
+      ? (selectedSessionListId ? '(session list)' : '0')
+      : selectedSessionIds.length;
+
   const inputBase = 'w-full rounded-lg border bg-dark-900 py-2.5 px-3 text-sm text-white placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-primary-500/50 focus:border-primary-500 transition';
 
   // Full session objects (with phone) for the currently-selected IDs.
@@ -329,6 +392,146 @@ export default function AccountSettings() {
           </span>
         </div>
       </Link>
+
+      {/* Destructive: remove all profile photos for the selected sessions.
+          Visible in every mode so it's reachable without switching tabs.
+          Uses the same selection (sessionIds OR sessionListId) as the
+          other bulk actions on this page. */}
+      <div className="rounded-xl border border-red-500/30 bg-gradient-to-br from-red-500/10 via-dark-800 to-dark-800 p-5">
+        <div className="flex flex-col md:flex-row md:items-center md:justify-between gap-4">
+          <div className="flex items-start gap-4">
+            <div className="rounded-xl bg-red-500/15 p-3 text-red-300 flex-shrink-0">
+              <Trash2 className="w-5 h-5" />
+            </div>
+            <div>
+              <h3 className="text-sm font-semibold text-white flex items-center gap-2">
+                Remove all profile photos
+                <span className="text-[10px] uppercase tracking-wider px-1.5 py-0.5 rounded bg-red-500/20 text-red-300 border border-red-500/30">
+                  Destructive
+                </span>
+              </h3>
+              <p className="mt-1 text-xs text-gray-400 max-w-xl">
+                Wipes <strong>every</strong> profile photo (visible avatar
+                + full history) on each selected session. Telegram will
+                render the default monogram afterwards. There is no undo.
+              </p>
+            </div>
+          </div>
+          <button
+            type="button"
+            onClick={() => setShowRemovePhotosConfirm(true)}
+            disabled={removingPhotos}
+            className="inline-flex items-center gap-2 rounded-lg border border-red-500/40 bg-red-500/20 px-4 py-2 text-sm font-medium text-red-200 hover:bg-red-500/30 hover:border-red-500/60 transition disabled:opacity-50 disabled:cursor-not-allowed flex-shrink-0"
+          >
+            {removingPhotos ? (
+              <>
+                <Loader2 className="w-4 h-4 animate-spin" />
+                Removing&hellip;
+              </>
+            ) : (
+              <>
+                <Trash2 className="w-4 h-4" />
+                Remove all photos
+              </>
+            )}
+          </button>
+        </div>
+
+        {/* Per-session report after the bulk run.
+            Only renders if the operator ran the action at least once. */}
+        {removePhotosResult && (
+          <div className="mt-4 rounded-lg border border-white/10 bg-dark-900/60 p-3 text-xs text-gray-300">
+            <div className="flex items-center gap-2 mb-2 text-gray-200">
+              <Check className="w-3.5 h-3.5 text-emerald-400" />
+              <span>
+                {removePhotosResult.success}/{removePhotosResult.total}{' '}
+                session(s) cleaned&nbsp;&middot;&nbsp;
+                {removePhotosResult.totalDeleted} photo(s) deleted
+                {removePhotosResult.failed > 0 && (
+                  <span className="text-red-300">
+                    {' '}&middot; {removePhotosResult.failed} failed
+                  </span>
+                )}
+              </span>
+            </div>
+            {Array.isArray(removePhotosResult.results) &&
+              removePhotosResult.results.some((r) => !r.success) && (
+                <div className="space-y-1 max-h-40 overflow-y-auto">
+                  {removePhotosResult.results
+                    .filter((r) => !r.success)
+                    .map((r) => (
+                      <div
+                        key={r.sessionId}
+                        className="flex items-start gap-2 text-red-300"
+                      >
+                        <X className="w-3 h-3 mt-0.5 flex-shrink-0" />
+                        <span className="break-words">
+                          {r.phone || `Session ${r.sessionId}`}:{' '}
+                          {(r.errors || []).join('; ') || 'Failed'}
+                        </span>
+                      </div>
+                    ))}
+                </div>
+              )}
+          </div>
+        )}
+      </div>
+
+      {/* Confirm dialog: explicit count + double-confirm so an accidental
+          click can't nuke every photo across 40 sessions. */}
+      {showRemovePhotosConfirm && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-sm p-4">
+          <div className="w-full max-w-md rounded-xl border border-red-500/40 bg-dark-800 p-6 shadow-2xl">
+            <div className="flex items-start gap-3 mb-4">
+              <div className="rounded-lg bg-red-500/15 p-2 text-red-300">
+                <AlertTriangle className="w-5 h-5" />
+              </div>
+              <div>
+                <h3 className="text-base font-semibold text-white">
+                  Remove all profile photos?
+                </h3>
+                <p className="mt-1 text-sm text-gray-400">
+                  This will wipe every profile photo on{' '}
+                  <strong className="text-white">
+                    {removePhotosTargetCount}
+                  </strong>{' '}
+                  session(s) (visible avatar plus the entire photo
+                  history). The accounts will show the default Telegram
+                  monogram afterwards. <strong>This cannot be undone.</strong>
+                </p>
+              </div>
+            </div>
+            <div className="flex items-center justify-end gap-2">
+              <button
+                type="button"
+                onClick={() => setShowRemovePhotosConfirm(false)}
+                disabled={removingPhotos}
+                className="rounded-lg border border-white/10 bg-dark-900 px-4 py-2 text-sm text-gray-300 hover:bg-dark-700 transition disabled:opacity-50"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={handleRemoveAllPhotos}
+                disabled={removingPhotos}
+                className="inline-flex items-center gap-2 rounded-lg border border-red-500/50 bg-red-500/30 px-4 py-2 text-sm font-medium text-red-100 hover:bg-red-500/50 transition disabled:opacity-50"
+              >
+                {removingPhotos ? (
+                  <>
+                    <Loader2 className="w-4 h-4 animate-spin" />
+                    Removing&hellip;
+                  </>
+                ) : (
+                  <>
+                    <Trash2 className="w-4 h-4" />
+                    Yes, remove all photos
+                  </>
+                )}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Mode tabs */}
       <div className="inline-flex rounded-xl border border-white/10 bg-dark-800 p-1">

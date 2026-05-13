@@ -34,6 +34,11 @@ router.post('/randomize/apply', accountSettingsController.applyRandomized);
 router.post('/profile-list/preview', accountSettingsController.previewProfileList);
 router.post('/profile-list/apply', accountSettingsController.applyProfileList);
 
+// POST /api/account-settings/remove-photos - Bulk-delete every profile
+// photo (visible avatar + history) on the selected sessions. Destructive.
+// Registered BEFORE the `/:sessionId` catch-all so the literal path wins.
+router.post('/remove-photos', accountSettingsController.removeAllProfilePhotos);
+
 // GET /api/account-settings/:sessionId - Get account settings for a session
 router.get('/:sessionId', accountSettingsController.getAccountSettings);
 

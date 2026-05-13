@@ -63,3 +63,19 @@ export const applyProfileList = (payload) =>
   api.post('/account-settings/profile-list/apply', payload, {
     timeout: LONG_RUNNING_TIMEOUT_MS,
   });
+
+// Destructive bulk action --------------------------------------------------
+
+/**
+ * Wipe EVERY profile photo (visible avatar + history) on each selected
+ * session so the account ends up with no avatar at all. Destructive —
+ * there is no undo. Accepts either `{ sessionIds: [...] }` or
+ * `{ sessionListId }` so the existing list-based selector works.
+ *
+ * Uses the same long timeout as the other bulk actions because the
+ * backend hits Telegram MTProto sequentially per session.
+ */
+export const removeAllProfilePhotos = (payload) =>
+  api.post('/account-settings/remove-photos', payload, {
+    timeout: LONG_RUNNING_TIMEOUT_MS,
+  });
