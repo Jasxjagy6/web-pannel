@@ -102,6 +102,22 @@ export default function AccountSettings() {
   const [photoQueueApplying, setPhotoQueueApplying] = useState(false);
   const [photoQueueResult, setPhotoQueueResult] = useState(null);
 
+  // ---- Random photo distribution (Manual mode) ----
+  //
+  // Operator drops N photos + selects M sessions. Each session gets a
+  // UNIQUE random photo from the pool (no duplicates across sessions).
+  // Internally this just builds [{photoPath, sessionIds:[sid]}] pairs
+  // and dispatches via the existing /photo-assignments/apply endpoint.
+  // Each pool entry: { id, fileName, photoPath, previewUrl, size }
+  const [randomPool, setRandomPool] = useState([]);
+  const [randomPoolUploading, setRandomPoolUploading] = useState(false);
+  const [randomPoolUploadProgress, setRandomPoolUploadProgress] = useState({
+    done: 0,
+    total: 0,
+  });
+  const [randomDistApplying, setRandomDistApplying] = useState(false);
+  const [randomDistResult, setRandomDistResult] = useState(null);
+
   // Fetch sessions
   const fetchSessions = useCallback(async () => {
     try {
@@ -571,6 +587,173 @@ export default function AccountSettings() {
   };
   const photoQueueOverlaps = computePhotoQueueOverlaps();
 
+  // ---- Random photo distribution handlers ----
+  //
+  // Upload all selected files sequentially via the existing
+  // /upload-photo endpoint, accumulating { photoPath, fileName }
+  // entries. We upload sequentially (not parallel) to keep the
+  // multipart endpoint happy and to get a deterministic progress
+  // counter for the UI.
+  const handleRandomPoolFilesSelect = async (e) => {
+    const files = Array.from(e.target.files || []);
+    if (files.length === 0) return;
+    // Per-file validation: image type + 5MB cap (same as the single
+    // uploadProfilePhoto guard).
+    for (const f of files) {
+      if (!f.type.startsWith('image/')) {
+        showError(`'${f.name}' is not an image`, 'Invalid File');
+        if (e.target) e.target.value = '';
+        return;
+      }
+      if (f.size > 5 * 1024 * 1024) {
+        showError(`'${f.name}' is over 5MB`, 'File Too Large');
+        if (e.target) e.target.value = '';
+        return;
+      }
+    }
+
+    setRandomPoolUploading(true);
+    setRandomPoolUploadProgress({ done: 0, total: files.length });
+    setRandomDistResult(null);
+
+    const newlyAdded = [];
+    try {
+      for (let i = 0; i < files.length; i++) {
+        const f = files[i];
+        try {
+          const fd = new FormData();
+          fd.append('photo', f);
+          const resp = await uploadProfilePhoto(fd);
+          const filePath = resp.data?.data?.filePath;
+          if (!filePath) throw new Error('Upload returned no path');
+          newlyAdded.push({
+            id:
+              typeof crypto !== 'undefined' && crypto.randomUUID
+                ? crypto.randomUUID()
+                : `rp-${Date.now()}-${i}`,
+            fileName: f.name,
+            photoPath: filePath,
+            previewUrl: URL.createObjectURL(f),
+            size: f.size,
+          });
+        } catch (err) {
+          showError(
+            `'${f.name}': ${parseApiError(err)}`,
+            'Upload Failed'
+          );
+        }
+        setRandomPoolUploadProgress({ done: i + 1, total: files.length });
+      }
+      if (newlyAdded.length > 0) {
+        setRandomPool((prev) => [...prev, ...newlyAdded]);
+      }
+    } finally {
+      setRandomPoolUploading(false);
+      if (e.target) e.target.value = '';
+    }
+  };
+
+  // Remove a single photo from the pool (revoke its object URL).
+  const handleRemoveRandomPoolEntry = (entryId) => {
+    setRandomPool((prev) => {
+      const dropped = prev.find((e) => e.id === entryId);
+      if (dropped?.previewUrl) {
+        try { URL.revokeObjectURL(dropped.previewUrl); } catch (_) {}
+      }
+      return prev.filter((e) => e.id !== entryId);
+    });
+  };
+
+  // Wipe the entire pool.
+  const handleClearRandomPool = () => {
+    randomPool.forEach((e) => {
+      if (e.previewUrl) {
+        try { URL.revokeObjectURL(e.previewUrl); } catch (_) {}
+      }
+    });
+    setRandomPool([]);
+    setRandomDistResult(null);
+  };
+
+  // Shuffle + dispatch. Each session gets exactly one photo from the
+  // pool, no duplicates. If pool > sessions, extras are unused. If
+  // pool < sessions we hard-stop (user's spec was 'not same').
+  const handleApplyRandomDist = async () => {
+    if (randomPool.length === 0) {
+      showError('Upload at least one photo first.', 'Validation Error');
+      return;
+    }
+    if (sessionPickMode === 'list') {
+      showError(
+        'Session lists are not supported here. Pick individual sessions in the right column.',
+        'Validation Error'
+      );
+      return;
+    }
+    if (selectedSessionIds.length === 0) {
+      showError(
+        'Pick at least one session in the right column.',
+        'Validation Error'
+      );
+      return;
+    }
+    if (randomPool.length < selectedSessionIds.length) {
+      showError(
+        `Only ${randomPool.length} photo(s) but ${selectedSessionIds.length} session(s) selected. ` +
+          `Upload more photos so every session can get a unique image.`,
+        'Not Enough Photos'
+      );
+      return;
+    }
+
+    // Fisher–Yates shuffle on a copy of the pool so the order is truly
+    // random and unique-per-session.
+    const shuffled = randomPool.slice();
+    for (let i = shuffled.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
+    }
+    const assignments = selectedSessionIds.map((sid, idx) => ({
+      photoPath: shuffled[idx].photoPath,
+      sessionIds: [sid],
+    }));
+
+    setRandomDistApplying(true);
+    setRandomDistResult(null);
+    try {
+      const resp = await applyPhotoAssignments(assignments);
+      const data = resp.data?.data || {};
+      // Augment each row with the originating filename so the result
+      // panel can show what photo each session ended up with.
+      const enriched = (data.results || []).map((r) => {
+        const a = assignments[r.assignmentIndex];
+        const matched = randomPool.find(
+          (p) => p.photoPath === (a && a.photoPath)
+        );
+        return { ...r, fileName: matched?.fileName };
+      });
+      setRandomDistResult({ ...data, results: enriched });
+      const {
+        totalSessions = 0,
+        success = 0,
+        failed = 0,
+      } = data;
+      if (failed === 0) {
+        showSuccess(
+          `Distributed ${success}/${totalSessions} unique photo(s) across selected sessions.`
+        );
+      } else {
+        showError(
+          `Distributed photos to ${success}/${totalSessions} session(s); ${failed} failed. See details below.`
+        );
+      }
+    } catch (err) {
+      showError(parseApiError(err), 'Distribution Failed');
+    } finally {
+      setRandomDistApplying(false);
+    }
+  };
+
   // Sessions targeted by the destructive action, for the confirm dialog copy.
   const removePhotosTargetCount =
     sessionPickMode === 'list'
@@ -1036,6 +1219,233 @@ export default function AccountSettings() {
                           </span>
                         </div>
                       ))}
+                  </div>
+                )}
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Random photo distribution — Manual-mode bulk action that takes
+          N uploaded photos and assigns one unique photo to each of M
+          selected sessions (M <= N). No two sessions share a photo. */}
+      {mode === 'manual' && (
+        <div className="rounded-xl border border-emerald-500/20 bg-gradient-to-br from-emerald-500/5 via-dark-800 to-dark-800 p-5">
+          <div className="flex flex-col md:flex-row md:items-start md:justify-between gap-4 mb-4">
+            <div className="flex items-start gap-4">
+              <div className="rounded-xl bg-emerald-500/15 p-3 text-emerald-300 flex-shrink-0">
+                <Sparkles className="w-5 h-5" />
+              </div>
+              <div>
+                <h3 className="text-sm font-semibold text-white flex items-center gap-2">
+                  Random photo distribution
+                  <span className="text-[10px] uppercase tracking-wider px-1.5 py-0.5 rounded bg-emerald-500/20 text-emerald-200 border border-emerald-500/30">
+                    Unique per session
+                  </span>
+                </h3>
+                <p className="mt-1 text-xs text-gray-400 max-w-2xl leading-relaxed">
+                  Upload a pool of photos (e.g. 30) and pick the same number
+                  of sessions in the right column. Each session gets a
+                  random photo from the pool — <strong>no two sessions
+                  share the same image</strong>. Pool size must be ≥ session
+                  count.
+                </p>
+              </div>
+            </div>
+            {randomPool.length > 0 && !randomPoolUploading && (
+              <button
+                type="button"
+                onClick={handleClearRandomPool}
+                className="text-xs text-gray-400 hover:text-red-300 transition flex-shrink-0 underline-offset-2 hover:underline"
+              >
+                Clear pool
+              </button>
+            )}
+          </div>
+
+          {/* Upload zone (accepts multiple files) */}
+          <label className="flex cursor-pointer flex-col items-center justify-center rounded-lg border-2 border-dashed border-white/10 bg-dark-900 p-4 text-center transition-colors hover:border-emerald-500/50 mb-4">
+            <input
+              type="file"
+              accept="image/*"
+              multiple
+              onChange={handleRandomPoolFilesSelect}
+              disabled={randomPoolUploading || randomDistApplying}
+              className="hidden"
+            />
+            {randomPoolUploading ? (
+              <>
+                <Loader2 className="w-6 h-6 text-emerald-500 animate-spin mb-1" />
+                <p className="text-xs text-gray-300">
+                  Uploading {randomPoolUploadProgress.done}/
+                  {randomPoolUploadProgress.total}&hellip;
+                </p>
+              </>
+            ) : (
+              <>
+                <Upload className="w-6 h-6 text-gray-500 mb-1" />
+                <p className="text-xs text-gray-300">
+                  Click to select photos (you can pick many at once)
+                </p>
+                <p className="text-[11px] text-gray-500 mt-0.5">
+                  PNG / JPG / WEBP up to 5MB each
+                </p>
+              </>
+            )}
+          </label>
+
+          {/* Pool thumbnails grid */}
+          {randomPool.length > 0 ? (
+            <div className="mb-4">
+              <div className="flex items-center justify-between mb-2">
+                <p className="text-xs text-gray-300">
+                  Pool:{' '}
+                  <span className="text-white">{randomPool.length} photo(s)</span>
+                </p>
+                <p className="text-xs text-gray-400">
+                  Selected sessions:{' '}
+                  <span className="text-white">
+                    {sessionPickMode === 'list'
+                      ? '(session list — not supported)'
+                      : `${selectedSessionIds.length}`}
+                  </span>
+                </p>
+              </div>
+              <div className="grid grid-cols-4 sm:grid-cols-6 md:grid-cols-8 gap-2 max-h-56 overflow-y-auto p-1">
+                {randomPool.map((entry) => (
+                  <div
+                    key={entry.id}
+                    className="relative group rounded-lg overflow-hidden border border-white/10 bg-dark-900"
+                  >
+                    <img
+                      src={entry.previewUrl}
+                      alt={entry.fileName}
+                      className="w-full aspect-square object-cover"
+                      title={entry.fileName}
+                    />
+                    <button
+                      type="button"
+                      onClick={() => handleRemoveRandomPoolEntry(entry.id)}
+                      disabled={randomDistApplying}
+                      className="absolute top-0.5 right-0.5 rounded-full bg-black/70 text-white p-1 opacity-0 group-hover:opacity-100 transition hover:bg-red-500/80 disabled:opacity-50"
+                      title="Remove from pool"
+                    >
+                      <X className="w-3 h-3" />
+                    </button>
+                  </div>
+                ))}
+              </div>
+            </div>
+          ) : (
+            <div className="text-center text-xs text-gray-500 italic mb-4 py-2 border border-dashed border-white/5 rounded-lg">
+              Pool is empty. Upload photos above.
+            </div>
+          )}
+
+          {/* Count-mismatch warnings */}
+          {randomPool.length > 0 &&
+            sessionPickMode !== 'list' &&
+            selectedSessionIds.length > randomPool.length && (
+              <div className="rounded-lg border border-red-500/30 bg-red-500/5 p-3 text-xs text-red-200 leading-relaxed mb-4">
+                <div className="flex items-start gap-2">
+                  <AlertTriangle className="w-4 h-4 mt-0.5 flex-shrink-0" />
+                  <div>
+                    <strong>Not enough photos.</strong>{' '}
+                    {selectedSessionIds.length} session(s) selected but only{' '}
+                    {randomPool.length} photo(s) in the pool. Upload{' '}
+                    {selectedSessionIds.length - randomPool.length} more
+                    photo(s) — every session needs a unique image.
+                  </div>
+                </div>
+              </div>
+            )}
+          {randomPool.length > 0 &&
+            sessionPickMode !== 'list' &&
+            selectedSessionIds.length > 0 &&
+            randomPool.length > selectedSessionIds.length && (
+              <div className="rounded-lg border border-yellow-500/30 bg-yellow-500/5 p-3 text-xs text-yellow-200 leading-relaxed mb-4">
+                <div className="flex items-start gap-2">
+                  <AlertCircle className="w-4 h-4 mt-0.5 flex-shrink-0" />
+                  <div>
+                    {randomPool.length - selectedSessionIds.length} photo(s)
+                    in the pool won't be used (more photos than sessions).
+                    The {selectedSessionIds.length} selected session(s) will
+                    each still get a unique random photo.
+                  </div>
+                </div>
+              </div>
+            )}
+
+          <div className="flex items-center justify-end gap-2">
+            <button
+              type="button"
+              onClick={handleApplyRandomDist}
+              disabled={
+                randomDistApplying ||
+                randomPoolUploading ||
+                randomPool.length === 0 ||
+                sessionPickMode === 'list' ||
+                selectedSessionIds.length === 0 ||
+                selectedSessionIds.length > randomPool.length
+              }
+              className="inline-flex items-center gap-2 rounded-lg bg-gradient-to-r from-emerald-600 to-green-600 px-5 py-2 text-sm font-semibold text-white shadow-lg shadow-emerald-600/25 transition hover:from-emerald-500 hover:to-green-500 disabled:cursor-not-allowed disabled:opacity-60"
+            >
+              {randomDistApplying ? (
+                <>
+                  <Loader2 className="w-4 h-4 animate-spin" />
+                  Distributing&hellip;
+                </>
+              ) : (
+                <>
+                  <Sparkles className="w-4 h-4" />
+                  Distribute (
+                  {sessionPickMode === 'list' ? 0 : selectedSessionIds.length}{' '}
+                  session(s))
+                </>
+              )}
+            </button>
+          </div>
+
+          {/* Per-session result panel after the run. */}
+          {randomDistResult && (
+            <div className="mt-4 rounded-lg border border-white/10 bg-dark-900/60 p-3 text-xs text-gray-300">
+              <div className="flex items-center gap-2 mb-2 text-gray-200">
+                <Check className="w-3.5 h-3.5 text-emerald-400" />
+                <span>
+                  {randomDistResult.success}/{randomDistResult.totalSessions}{' '}
+                  session(s) received their photo
+                  {randomDistResult.failed > 0 && (
+                    <span className="text-red-300">
+                      {' '}&middot; {randomDistResult.failed} failed
+                    </span>
+                  )}
+                </span>
+              </div>
+              {Array.isArray(randomDistResult.results) &&
+                randomDistResult.results.length > 0 && (
+                  <div className="space-y-1 max-h-44 overflow-y-auto">
+                    {randomDistResult.results.map((r, i) => (
+                      <div
+                        key={`${r.sessionId}-${i}`}
+                        className={
+                          r.success
+                            ? 'flex items-start gap-2 text-gray-300'
+                            : 'flex items-start gap-2 text-red-300'
+                        }
+                      >
+                        {r.success ? (
+                          <Check className="w-3 h-3 mt-0.5 flex-shrink-0 text-emerald-400" />
+                        ) : (
+                          <X className="w-3 h-3 mt-0.5 flex-shrink-0" />
+                        )}
+                        <span className="break-words">
+                          {r.phone || `Session ${r.sessionId}`}
+                          {r.fileName ? ` ← ${r.fileName}` : ''}
+                          {!r.success &&
+                            `: ${(r.errors || []).join('; ') || 'Failed'}`}
+                        </span>
+                      </div>
+                    ))}
                   </div>
                 )}
             </div>
