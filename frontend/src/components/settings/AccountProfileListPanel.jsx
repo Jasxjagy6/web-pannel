@@ -19,6 +19,13 @@ import {
 } from '../../api/accountSettings';
 import { parseApiError } from '../../utils/formatters';
 
+function formatElapsed(seconds) {
+  const s = Math.max(0, Math.floor(seconds || 0));
+  const mm = Math.floor(s / 60);
+  const ss = s % 60;
+  return `${String(mm).padStart(2, '0')}:${String(ss).padStart(2, '0')}`;
+}
+
 /**
  * Account Settings → "Profile List" mode.
  *
@@ -58,6 +65,24 @@ export default function AccountProfileListPanel({
   const [applying, setApplying] = useState(false);
   const [applyError, setApplyError] = useState(null);
   const [lastApplyResult, setLastApplyResult] = useState(null);
+  // Elapsed time (seconds) since the operator clicked Apply. Drives the
+  // visible progress text + "this takes a while" hint, so users don't
+  // think the request has hung when it's actually still chewing through
+  // sessions on the backend.
+  const [applyElapsed, setApplyElapsed] = useState(0);
+
+  // Tick the elapsed counter once per second while applying.
+  useEffect(() => {
+    if (!applying) {
+      setApplyElapsed(0);
+      return undefined;
+    }
+    const startedAt = Date.now();
+    const id = setInterval(() => {
+      setApplyElapsed(Math.floor((Date.now() - startedAt) / 1000));
+    }, 1000);
+    return () => clearInterval(id);
+  }, [applying]);
 
   const sessionIds = useMemo(
     () =>
@@ -152,6 +177,10 @@ export default function AccountProfileListPanel({
           firstName: flags.firstName ? a.firstName : undefined,
           lastName: flags.lastName ? a.lastName : undefined,
           username: flags.username ? a.username : undefined,
+          // When the matching list row had no username, the backend
+          // sets clearUsername=true so the apply path explicitly
+          // wipes the session's current handle. Pass it through.
+          clearUsername: flags.username ? a.clearUsername === true : undefined,
           bio: flags.bio ? a.bio : undefined,
           avatarId: flags.profilePhoto ? a.avatarId : undefined,
         })),
@@ -184,8 +213,10 @@ export default function AccountProfileListPanel({
             Apply a <span className="font-semibold text-emerald-200">profile list</span> across the
             selected sessions. Each session gets one row from the list — names and bios cycle
             when the list is shorter than the session count, duplicate usernames get a random
-            suffix appended, and every session is assigned a random real profile picture from
-            a 150+ image catalog (the list's "PFP" text is ignored).
+            suffix appended, list rows without a username will <strong>clear</strong> that
+            session's handle, and every session is assigned a random{' '}
+            <strong>real human photo</strong> (actors, portrait photography, live-action
+            superheroes) from the bundled catalog (the list's "PFP" text is ignored).
           </div>
         </div>
       </div>
@@ -344,7 +375,17 @@ export default function AccountProfileListPanel({
                         <td className="px-3 py-2 text-gray-100">
                           {[a.firstName, a.lastName].filter(Boolean).join(' ') || '—'}
                         </td>
-                        <td className="px-3 py-2 text-blue-400">{a.username ? `@${a.username}` : '—'}</td>
+                        <td className="px-3 py-2 text-blue-400">
+                          {a.username ? (
+                            `@${a.username}`
+                          ) : a.clearUsername ? (
+                            <span className="inline-flex items-center rounded bg-amber-500/10 px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide text-amber-300">
+                              will be cleared
+                            </span>
+                          ) : (
+                            '—'
+                          )}
+                        </td>
                         <td className="px-3 py-2 text-gray-400 hidden md:table-cell max-w-xs truncate" title={a.bio || ''}>
                           {a.bio || '—'}
                         </td>
@@ -365,6 +406,26 @@ export default function AccountProfileListPanel({
           </div>
         )}
       </div>
+
+      {applying && (
+        <div className="flex items-start gap-3 rounded-lg border border-primary-500/30 bg-primary-500/10 p-3 text-sm text-primary-100">
+          <Loader2 className="h-4 w-4 mt-0.5 animate-spin text-primary-300" />
+          <div className="flex-1">
+            <div className="font-medium">
+              Applying profile list to {sessionIds.length} session
+              {sessionIds.length === 1 ? '' : 's'}…
+            </div>
+            <div className="mt-1 text-xs text-primary-200/70">
+              Elapsed: {formatElapsed(applyElapsed)}. Each session takes a few seconds — this can
+              run for several minutes. Please keep this tab open; the operation is still in
+              progress.
+            </div>
+            <div className="mt-2 h-1 w-full overflow-hidden rounded bg-primary-900/30">
+              <div className="h-full animate-pulse rounded bg-primary-400/70" style={{ width: '100%' }} />
+            </div>
+          </div>
+        </div>
+      )}
 
       {applyError && (
         <div className="flex items-start gap-2 rounded-lg border border-red-500/30 bg-red-500/10 p-3 text-sm text-red-300">
@@ -403,7 +464,9 @@ export default function AccountProfileListPanel({
           className="inline-flex items-center gap-2 rounded-lg bg-primary-600 px-4 py-2 text-sm font-medium text-white shadow-lg shadow-primary-900/30 transition hover:bg-primary-500 disabled:cursor-not-allowed disabled:opacity-50"
         >
           {applying ? <Loader2 className="h-4 w-4 animate-spin" /> : <ListChecks className="h-4 w-4" />}
-          {applying ? 'Applying...' : `Apply to ${sessionIds.length || 0} session(s)`}
+          {applying
+            ? `Applying… (${formatElapsed(applyElapsed)})`
+            : `Apply to ${sessionIds.length || 0} session(s)`}
         </button>
       </div>
     </div>
