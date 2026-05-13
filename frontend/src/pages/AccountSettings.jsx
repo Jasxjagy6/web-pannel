@@ -62,6 +62,17 @@ export default function AccountSettings() {
     profilePhoto: false,
   });
 
+  // Per-field action mode in Manual mode: 'set' applies the typed value,
+  // 'remove' clears the field on Telegram. firstName is always 'set'
+  // because Telegram rejects an empty first name (FIRSTNAME_INVALID).
+  const [fieldModes, setFieldModes] = useState({
+    firstName: 'set',
+    lastName: 'set',
+    username: 'set',
+    bio: 'set',
+    profilePhoto: 'set',
+  });
+
   const [submitting, setSubmitting] = useState(false);
   const [uploadingPhoto, setUploadingPhoto] = useState(false);
 
@@ -160,6 +171,37 @@ export default function AccountSettings() {
       return;
     }
 
+    // Block the obvious mistake before hitting the backend: any field
+    // checked in 'set' mode must have a value (except photo which has
+    // its own upload flow).
+    if (updateFlags.firstName && fieldModes.firstName === 'set' && !firstName.trim()) {
+      showError('Enter a first name or uncheck "First Name"', 'Validation Error');
+      return;
+    }
+    if (updateFlags.lastName && fieldModes.lastName === 'set' && !lastName.trim()) {
+      showError('Enter a last name or switch the toggle to Remove', 'Validation Error');
+      return;
+    }
+    if (updateFlags.username && fieldModes.username === 'set' && !username.trim()) {
+      showError('Enter a username or switch the toggle to Remove', 'Validation Error');
+      return;
+    }
+    if (updateFlags.bio && fieldModes.bio === 'set' && !bio.trim()) {
+      showError('Enter a bio or switch the toggle to Remove', 'Validation Error');
+      return;
+    }
+    if (
+      updateFlags.profilePhoto &&
+      fieldModes.profilePhoto === 'set' &&
+      !profilePhoto
+    ) {
+      showError(
+        'Upload a photo first or switch the toggle to Remove',
+        'Validation Error'
+      );
+      return;
+    }
+
     setSubmitting(true);
     try {
       const updatePayload = {
@@ -167,8 +209,16 @@ export default function AccountSettings() {
         lastName: updateFlags.lastName ? lastName : undefined,
         username: updateFlags.username ? username : undefined,
         bio: updateFlags.bio ? bio : undefined,
-        profilePhotoPath: updateFlags.profilePhoto && profilePhoto ? profilePhoto.path : undefined,
+        // In Remove mode the backend ignores profilePhotoPath and calls
+        // removeAllProfilePhotos instead.
+        profilePhotoPath:
+          updateFlags.profilePhoto &&
+          fieldModes.profilePhoto === 'set' &&
+          profilePhoto
+            ? profilePhoto.path
+            : undefined,
         updateFlags,
+        fieldModes,
       };
       if (usingList) {
         updatePayload.sessionListId = Number(selectedSessionListId);
@@ -208,11 +258,81 @@ export default function AccountSettings() {
       bio: false,
       profilePhoto: false,
     });
+    setFieldModes({
+      firstName: 'set',
+      lastName: 'set',
+      username: 'set',
+      bio: 'set',
+      profilePhoto: 'set',
+    });
     setSelectedSessionIds([]);
   };
 
   const toggleUpdateFlag = (field) => {
     setUpdateFlags(prev => ({ ...prev, [field]: !prev[field] }));
+  };
+
+  // Flip a single field between 'set' and 'remove'. firstName is locked
+  // to 'set' because Telegram requires a non-empty first name.
+  const setFieldMode = (field, mode) => {
+    if (field === 'firstName') return;
+    setFieldModes((prev) => ({ ...prev, [field]: mode }));
+  };
+
+  // Compact Set ↔ Remove pill toggle rendered next to each field's
+  // checkbox. Disabled when the field's checkbox itself is unchecked
+  // so the operator has to opt in to the field first. firstName always
+  // renders a single, locked "Set" pill because Telegram rejects an
+  // empty first name (FIRSTNAME_INVALID).
+  const renderModeToggle = (field) => {
+    const enabled = !!updateFlags[field];
+    const mode = fieldModes[field];
+    const isFirstName = field === 'firstName';
+
+    const baseBtn =
+      'px-2 py-0.5 text-[10px] font-semibold rounded-md transition border';
+    const activeSet = 'bg-primary-500/30 text-primary-100 border-primary-500/50';
+    const activeRemove = 'bg-red-500/30 text-red-100 border-red-500/50';
+    const inactive =
+      'bg-transparent text-gray-400 border-white/10 hover:bg-white/5';
+
+    if (isFirstName) {
+      return (
+        <span
+          className="ml-auto inline-flex items-center gap-1 text-[10px] text-gray-500 italic"
+          title="Telegram requires a non-empty first name on every account, so it can't be cleared from the panel."
+        >
+          (Set only)
+        </span>
+      );
+    }
+
+    return (
+      <span className="ml-auto inline-flex items-center gap-1 rounded-md border border-white/10 bg-dark-900 p-0.5">
+        <button
+          type="button"
+          disabled={!enabled}
+          onClick={() => setFieldMode(field, 'set')}
+          className={`${baseBtn} ${
+            mode === 'set' ? activeSet : inactive
+          } ${!enabled ? 'opacity-40 cursor-not-allowed' : ''}`}
+          title="Apply the value below to every selected session"
+        >
+          Set
+        </button>
+        <button
+          type="button"
+          disabled={!enabled}
+          onClick={() => setFieldMode(field, 'remove')}
+          className={`${baseBtn} ${
+            mode === 'remove' ? activeRemove : inactive
+          } ${!enabled ? 'opacity-40 cursor-not-allowed' : ''}`}
+          title="Clear this field on every selected session — for profile photo this removes every photo (avatar + history)"
+        >
+          Remove
+        </button>
+      </span>
+    );
   };
 
   // ---- "Remove all profile photos" destructive bulk action ----
@@ -627,6 +747,7 @@ export default function AccountSettings() {
                     <label className="text-sm font-medium text-gray-300">
                       First Name
                     </label>
+                    {renderModeToggle('firstName')}
                   </div>
                   <input
                     type="text"
@@ -650,14 +771,27 @@ export default function AccountSettings() {
                     <label className="text-sm font-medium text-gray-300">
                       Last Name
                     </label>
+                    {renderModeToggle('lastName')}
                   </div>
                   <input
                     type="text"
                     value={lastName}
                     onChange={(e) => setLastName(e.target.value)}
-                    placeholder="Enter last name"
-                    disabled={!updateFlags.lastName}
-                    className={`${inputBase} ${!updateFlags.lastName ? 'opacity-50 cursor-not-allowed' : ''}`}
+                    placeholder={
+                      updateFlags.lastName && fieldModes.lastName === 'remove'
+                        ? 'Last name will be cleared on every selected session'
+                        : 'Enter last name'
+                    }
+                    disabled={
+                      !updateFlags.lastName ||
+                      fieldModes.lastName === 'remove'
+                    }
+                    className={`${inputBase} ${
+                      !updateFlags.lastName ||
+                      fieldModes.lastName === 'remove'
+                        ? 'opacity-50 cursor-not-allowed'
+                        : ''
+                    }`}
                   />
                 </div>
               </div>
@@ -678,14 +812,26 @@ export default function AccountSettings() {
                     <AtSign className="w-4 h-4" />
                     Username
                   </label>
+                  {renderModeToggle('username')}
                 </div>
                 <input
                   type="text"
                   value={username}
                   onChange={(e) => setUsername(e.target.value.replace(/^@/, ''))}
-                  placeholder="username (without @)"
-                  disabled={!updateFlags.username}
-                  className={`${inputBase} ${!updateFlags.username ? 'opacity-50 cursor-not-allowed' : ''}`}
+                  placeholder={
+                    updateFlags.username && fieldModes.username === 'remove'
+                      ? 'Username will be cleared on every selected session'
+                      : 'username (without @)'
+                  }
+                  disabled={
+                    !updateFlags.username ||
+                    fieldModes.username === 'remove'
+                  }
+                  className={`${inputBase} ${
+                    !updateFlags.username || fieldModes.username === 'remove'
+                      ? 'opacity-50 cursor-not-allowed'
+                      : ''
+                  }`}
                 />
               </div>
 
@@ -702,15 +848,26 @@ export default function AccountSettings() {
                     <FileText className="w-4 h-4" />
                     Bio / About
                   </label>
-                  <span className="text-xs text-gray-500 ml-auto">{bio.length} / 70</span>
+                  <span className="text-xs text-gray-500">{bio.length} / 70</span>
+                  {renderModeToggle('bio')}
                 </div>
                 <textarea
                   value={bio}
                   onChange={(e) => setBio(e.target.value.slice(0, 70))}
-                  placeholder="Write a short bio (max 70 characters)"
-                  disabled={!updateFlags.bio}
+                  placeholder={
+                    updateFlags.bio && fieldModes.bio === 'remove'
+                      ? 'Bio will be cleared on every selected session'
+                      : 'Write a short bio (max 70 characters)'
+                  }
+                  disabled={
+                    !updateFlags.bio || fieldModes.bio === 'remove'
+                  }
                   rows={3}
-                  className={`${inputBase} ${!updateFlags.bio ? 'opacity-50 cursor-not-allowed' : ''} resize-none`}
+                  className={`${inputBase} ${
+                    !updateFlags.bio || fieldModes.bio === 'remove'
+                      ? 'opacity-50 cursor-not-allowed'
+                      : ''
+                  } resize-none`}
                 />
               </div>
             </div>
@@ -728,52 +885,73 @@ export default function AccountSettings() {
                   <Upload className="w-4 h-4" />
                   Profile Photo
                 </label>
+                {renderModeToggle('profilePhoto')}
               </div>
 
-              <div className={`space-y-3 ${!updateFlags.profilePhoto ? 'opacity-50' : ''}`}>
-                {profilePhotoPreview && (
-                  <div className="flex items-center gap-3 mb-3">
-                    <img
-                      src={profilePhotoPreview}
-                      alt="Preview"
-                      className="w-16 h-16 rounded-full object-cover border-2 border-primary-500"
-                    />
-                    <div className="flex-1">
-                      <p className="text-sm text-white">{profilePhoto?.name}</p>
-                      <button
-                        type="button"
-                        onClick={() => {
-                          setProfilePhoto(null);
-                          setProfilePhotoPreview(null);
-                          setUpdateFlags(prev => ({ ...prev, profilePhoto: false }));
-                        }}
-                        className="text-xs text-red-400 hover:text-red-300"
-                      >
-                        Remove
-                      </button>
+              {/* In Remove mode the upload UI is hidden and we show a
+                  destructive notice instead. The Apply button at the
+                  bottom of the form routes this to the same
+                  removeAllProfilePhotos backend the standalone card uses. */}
+              {updateFlags.profilePhoto && fieldModes.profilePhoto === 'remove' ? (
+                <div className="rounded-lg border border-red-500/30 bg-red-500/5 p-4 text-xs text-red-200 leading-relaxed">
+                  <div className="flex items-start gap-2">
+                    <AlertTriangle className="w-4 h-4 mt-0.5 flex-shrink-0" />
+                    <div>
+                      <strong>Remove mode active.</strong> When you click
+                      <em> Apply Settings</em>, every profile photo
+                      (visible avatar + full history) will be deleted
+                      from each selected session. Telegram will render
+                      the default monogram afterwards. This cannot be
+                      undone.
                     </div>
                   </div>
-                )}
-
-                <label className="flex cursor-pointer flex-col items-center justify-center rounded-lg border-2 border-dashed border-white/10 bg-dark-900 p-6 text-center transition-colors hover:border-primary-500/50">
-                  <input
-                    type="file"
-                    accept="image/*"
-                    onChange={handlePhotoUpload}
-                    disabled={!updateFlags.profilePhoto}
-                    className="hidden"
-                  />
-                  {uploadingPhoto ? (
-                    <Loader2 className="w-8 h-8 text-primary-500 animate-spin mb-2" />
-                  ) : (
-                    <Upload className="w-8 h-8 text-gray-500 mb-2" />
+                </div>
+              ) : (
+                <div className={`space-y-3 ${!updateFlags.profilePhoto ? 'opacity-50' : ''}`}>
+                  {profilePhotoPreview && (
+                    <div className="flex items-center gap-3 mb-3">
+                      <img
+                        src={profilePhotoPreview}
+                        alt="Preview"
+                        className="w-16 h-16 rounded-full object-cover border-2 border-primary-500"
+                      />
+                      <div className="flex-1">
+                        <p className="text-sm text-white">{profilePhoto?.name}</p>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setProfilePhoto(null);
+                            setProfilePhotoPreview(null);
+                            setUpdateFlags(prev => ({ ...prev, profilePhoto: false }));
+                          }}
+                          className="text-xs text-red-400 hover:text-red-300"
+                        >
+                          Remove
+                        </button>
+                      </div>
+                    </div>
                   )}
-                  <p className="text-sm text-gray-300">
-                    {uploadingPhoto ? 'Uploading...' : 'Click to upload photo'}
-                  </p>
-                  <p className="text-xs text-gray-500 mt-1">PNG, JPG or GIF (max 5MB)</p>
-                </label>
-              </div>
+
+                  <label className="flex cursor-pointer flex-col items-center justify-center rounded-lg border-2 border-dashed border-white/10 bg-dark-900 p-6 text-center transition-colors hover:border-primary-500/50">
+                    <input
+                      type="file"
+                      accept="image/*"
+                      onChange={handlePhotoUpload}
+                      disabled={!updateFlags.profilePhoto}
+                      className="hidden"
+                    />
+                    {uploadingPhoto ? (
+                      <Loader2 className="w-8 h-8 text-primary-500 animate-spin mb-2" />
+                    ) : (
+                      <Upload className="w-8 h-8 text-gray-500 mb-2" />
+                    )}
+                    <p className="text-sm text-gray-300">
+                      {uploadingPhoto ? 'Uploading...' : 'Click to upload photo'}
+                    </p>
+                    <p className="text-xs text-gray-500 mt-1">PNG, JPG or GIF (max 5MB)</p>
+                  </label>
+                </div>
+              )}
             </div>
           </div>
 
@@ -808,7 +986,8 @@ export default function AccountSettings() {
                 </div>
               </div>
 
-              {/* Selected fields list */}
+              {/* Selected fields list. Remove-mode rows show in red so
+                  the operator can spot a destructive change at a glance. */}
               <div className="mt-3 space-y-1">
                 {updateFlags.firstName && (
                   <div className="flex items-center gap-2 text-xs text-green-400">
@@ -817,29 +996,83 @@ export default function AccountSettings() {
                   </div>
                 )}
                 {updateFlags.lastName && (
-                  <div className="flex items-center gap-2 text-xs text-green-400">
-                    <Check className="w-3 h-3" />
-                    <span>Last Name: {lastName || '(empty)'}</span>
+                  <div
+                    className={`flex items-center gap-2 text-xs ${
+                      fieldModes.lastName === 'remove'
+                        ? 'text-red-300'
+                        : 'text-green-400'
+                    }`}
+                  >
+                    {fieldModes.lastName === 'remove' ? (
+                      <Trash2 className="w-3 h-3" />
+                    ) : (
+                      <Check className="w-3 h-3" />
+                    )}
+                    <span>
+                      Last Name:{' '}
+                      {fieldModes.lastName === 'remove'
+                        ? '(will be cleared)'
+                        : lastName || '(empty)'}
+                    </span>
                   </div>
                 )}
                 {updateFlags.username && (
-                  <div className="flex items-center gap-2 text-xs text-green-400">
-                    <Check className="w-3 h-3" />
-                    <span>Username: @{username || '(empty)'}</span>
+                  <div
+                    className={`flex items-center gap-2 text-xs ${
+                      fieldModes.username === 'remove'
+                        ? 'text-red-300'
+                        : 'text-green-400'
+                    }`}
+                  >
+                    {fieldModes.username === 'remove' ? (
+                      <Trash2 className="w-3 h-3" />
+                    ) : (
+                      <Check className="w-3 h-3" />
+                    )}
+                    <span>
+                      Username:{' '}
+                      {fieldModes.username === 'remove'
+                        ? '(will be cleared)'
+                        : `@${username || '(empty)'}`}
+                    </span>
                   </div>
                 )}
                 {updateFlags.bio && (
-                  <div className="flex items-center gap-2 text-xs text-green-400">
-                    <Check className="w-3 h-3" />
-                    <span>Bio: {bio || '(empty)'}</span>
+                  <div
+                    className={`flex items-center gap-2 text-xs ${
+                      fieldModes.bio === 'remove'
+                        ? 'text-red-300'
+                        : 'text-green-400'
+                    }`}
+                  >
+                    {fieldModes.bio === 'remove' ? (
+                      <Trash2 className="w-3 h-3" />
+                    ) : (
+                      <Check className="w-3 h-3" />
+                    )}
+                    <span>
+                      Bio:{' '}
+                      {fieldModes.bio === 'remove'
+                        ? '(will be cleared)'
+                        : bio || '(empty)'}
+                    </span>
                   </div>
                 )}
-                {updateFlags.profilePhoto && profilePhoto && (
-                  <div className="flex items-center gap-2 text-xs text-green-400">
-                    <Check className="w-3 h-3" />
-                    <span>Profile Photo: {profilePhoto.name}</span>
-                  </div>
-                )}
+                {updateFlags.profilePhoto &&
+                  fieldModes.profilePhoto === 'remove' && (
+                    <div className="flex items-center gap-2 text-xs text-red-300">
+                      <Trash2 className="w-3 h-3" />
+                      <span>Profile Photo: (all photos will be removed)</span>
+                    </div>
+                  )}
+                {updateFlags.profilePhoto &&
+                  fieldModes.profilePhoto === 'set' &&
+                  profilePhoto && (
+                    <div className="flex items-center gap-2 text-xs text-green-400">
+                      <Check className="w-3 h-3" />
+                      <span>Profile Photo: {profilePhoto.name}</span>
+                    </div>
+                  )}
               </div>
             </div>
           </div>

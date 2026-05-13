@@ -189,6 +189,10 @@ class AccountSettingsService {
       bio,
       profilePhotoPath,
       updateFlags = {},
+      // Per-field action mode. Each value is either 'set' (apply the
+      // provided value) or 'remove' (clear the field on Telegram). When
+      // missing, defaults to 'set' so old clients keep working.
+      fieldModes = {},
     } = params;
 
     if (!userId) {
@@ -207,6 +211,18 @@ class AccountSettingsService {
       throw new AppError('At least one field must be selected for update', 400, 'NO_UPDATES_SELECTED');
     }
 
+    // Per-field "is this a clear request?" booleans. Telegram doesn't
+    // let us clear first name (FIRSTNAME_INVALID), so the firstName
+    // 'remove' mode is silently coerced to 'set' here — the UI also
+    // disables that toggle. Defence in depth.
+    const wantsRemove = {
+      firstName: false, // first name cannot be cleared on Telegram.
+      lastName: fieldModes.lastName === 'remove',
+      username: fieldModes.username === 'remove',
+      bio: fieldModes.bio === 'remove',
+      profilePhoto: fieldModes.profilePhoto === 'remove',
+    };
+
     // Verify session ownership
     const sessionRecords = await pool.query(
       `SELECT id, phone, status FROM sessions WHERE id = ANY($1::int[]) AND user_id = $2`,
@@ -221,6 +237,7 @@ class AccountSettingsService {
       userId,
       sessionCount: sessionRecords.rows.length,
       updates: updateFlags,
+      wantsRemove,
     });
 
     const results = [];
@@ -236,59 +253,178 @@ class AccountSettingsService {
       };
 
       try {
-        // Update first name and last name
+        // ─── First name (set only) + last name (set OR remove) ──────────
+        //
+        // Telegram requires first_name to be non-empty, so we never
+        // attempt to clear it. Last name clearing is handled by the
+        // dedicated clearProfileFields helper so the flag bit is set
+        // correctly.
         if (updateFlags.firstName || updateFlags.lastName) {
           try {
-            await callWithRevocationTracking(session.id, 'accountSettings.bulkName', () =>
-              telegramService.updateProfile(
-                String(session.id),
-                updateFlags.firstName ? (firstName || '') : undefined,
-                updateFlags.lastName ? (lastName || '') : ''
-              )
-            );
-            if (updateFlags.firstName) sessionResult.updatedFields.push('firstName');
-            if (updateFlags.lastName) sessionResult.updatedFields.push('lastName');
+            const lastNameWantsRemove =
+              updateFlags.lastName && wantsRemove.lastName;
+            const lastNameSetValue = updateFlags.lastName
+              ? (lastNameWantsRemove ? '' : (lastName || ''))
+              : '';
+
+            if (updateFlags.firstName) {
+              // Setting first name (and optionally last name in the same RPC).
+              await callWithRevocationTracking(
+                session.id,
+                'accountSettings.bulkName',
+                () =>
+                  telegramService.updateProfile(
+                    String(session.id),
+                    firstName || '',
+                    lastNameSetValue
+                  )
+              );
+              sessionResult.updatedFields.push('firstName');
+              if (updateFlags.lastName) {
+                sessionResult.updatedFields.push(
+                  lastNameWantsRemove ? 'lastName:cleared' : 'lastName'
+                );
+              }
+            } else if (updateFlags.lastName) {
+              // Last-name-only path.
+              if (lastNameWantsRemove) {
+                await callWithRevocationTracking(
+                  session.id,
+                  'accountSettings.bulkLastNameClear',
+                  () =>
+                    telegramService.clearProfileFields(String(session.id), {
+                      lastName: true,
+                    })
+                );
+                sessionResult.updatedFields.push('lastName:cleared');
+              } else {
+                // Set last name only — pass any non-empty firstName so
+                // updateProfile's internal guard doesn't skip the RPC.
+                await callWithRevocationTracking(
+                  session.id,
+                  'accountSettings.bulkLastName',
+                  () =>
+                    telegramService.updateProfile(
+                      String(session.id),
+                      undefined, // leave first name alone — but updateProfile
+                      // requires firstName truthy OR lastName non-empty;
+                      // lastName non-empty here so the guard passes.
+                      lastNameSetValue
+                    )
+                );
+                sessionResult.updatedFields.push('lastName');
+              }
+            }
           } catch (err) {
             sessionResult.errors.push(`Name update failed: ${err.message}`);
           }
         }
 
-        // Update username
-        if (updateFlags.username && username) {
+        // ─── Username (set or clear) ────────────────────────────────────
+        if (updateFlags.username) {
           try {
-            await callWithRevocationTracking(session.id, 'accountSettings.bulkUsername', () =>
-              telegramService.updateUsername(String(session.id), username)
-            );
-            sessionResult.updatedFields.push('username');
+            if (wantsRemove.username) {
+              await callWithRevocationTracking(
+                session.id,
+                'accountSettings.bulkUsernameClear',
+                () => telegramService.updateUsername(String(session.id), '')
+              );
+              sessionResult.updatedFields.push('username:cleared');
+            } else if (username) {
+              await callWithRevocationTracking(
+                session.id,
+                'accountSettings.bulkUsername',
+                () =>
+                  telegramService.updateUsername(String(session.id), username)
+              );
+              sessionResult.updatedFields.push('username');
+            } else {
+              sessionResult.errors.push(
+                'Username update failed: empty value (use Remove mode to clear)'
+              );
+            }
           } catch (err) {
             sessionResult.errors.push(`Username update failed: ${err.message}`);
           }
         }
 
-        // Update bio
-        if (updateFlags.bio && bio !== undefined) {
+        // ─── Bio (set or clear) ─────────────────────────────────────────
+        if (updateFlags.bio) {
           try {
-            await callWithRevocationTracking(session.id, 'accountSettings.bulkBio', () =>
-              telegramService.updateProfile(
-                String(session.id),
-                undefined,
-                '',
-                updateFlags.bio ? bio : ''
-              )
-            );
-            sessionResult.updatedFields.push('bio');
+            if (wantsRemove.bio) {
+              await callWithRevocationTracking(
+                session.id,
+                'accountSettings.bulkBioClear',
+                () =>
+                  telegramService.clearProfileFields(String(session.id), {
+                    bio: true,
+                  })
+              );
+              sessionResult.updatedFields.push('bio:cleared');
+            } else if (bio !== undefined && bio !== null) {
+              // bio === '' would be treated as a clear by updateProfile's
+              // internal guard — route it through clearProfileFields for
+              // explicit semantics instead.
+              if (bio === '') {
+                await callWithRevocationTracking(
+                  session.id,
+                  'accountSettings.bulkBioClear',
+                  () =>
+                    telegramService.clearProfileFields(String(session.id), {
+                      bio: true,
+                    })
+                );
+                sessionResult.updatedFields.push('bio:cleared');
+              } else {
+                await callWithRevocationTracking(
+                  session.id,
+                  'accountSettings.bulkBio',
+                  () =>
+                    telegramService.updateProfile(
+                      String(session.id),
+                      undefined,
+                      '',
+                      bio
+                    )
+                );
+                sessionResult.updatedFields.push('bio');
+              }
+            }
           } catch (err) {
             sessionResult.errors.push(`Bio update failed: ${err.message}`);
           }
         }
 
-        // Update profile photo
-        if (updateFlags.profilePhoto && profilePhotoPath) {
+        // ─── Profile photo (set or remove all) ──────────────────────────
+        if (updateFlags.profilePhoto) {
           try {
-            await callWithRevocationTracking(session.id, 'accountSettings.bulkPhoto', () =>
-              telegramService.updateProfilePhoto(String(session.id), profilePhotoPath)
-            );
-            sessionResult.updatedFields.push('profilePhoto');
+            if (wantsRemove.profilePhoto) {
+              const ret = await callWithRevocationTracking(
+                session.id,
+                'accountSettings.bulkPhotoRemove',
+                () =>
+                  telegramService.removeAllProfilePhotos(String(session.id))
+              );
+              const deleted = (ret && ret.deletedCount) || 0;
+              sessionResult.updatedFields.push(
+                `profilePhoto:cleared(${deleted})`
+              );
+            } else if (profilePhotoPath) {
+              await callWithRevocationTracking(
+                session.id,
+                'accountSettings.bulkPhoto',
+                () =>
+                  telegramService.updateProfilePhoto(
+                    String(session.id),
+                    profilePhotoPath
+                  )
+              );
+              sessionResult.updatedFields.push('profilePhoto');
+            } else {
+              sessionResult.errors.push(
+                'Profile photo update failed: no file provided (use Remove mode to clear)'
+              );
+            }
           } catch (err) {
             sessionResult.errors.push(`Profile photo update failed: ${err.message}`);
           }
