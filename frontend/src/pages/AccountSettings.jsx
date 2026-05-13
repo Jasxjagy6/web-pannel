@@ -17,6 +17,9 @@ import {
   Pencil,
   ListChecks,
   Trash2,
+  Image as ImageIcon,
+  Plus,
+  AlertCircle,
 } from 'lucide-react';
 import { useToast } from '../components/common/Toast';
 import { listSessions } from '../api/sessions';
@@ -24,6 +27,7 @@ import {
   updateAccountSettings,
   uploadProfilePhoto,
   removeAllProfilePhotos,
+  applyPhotoAssignments,
 } from '../api/accountSettings';
 import { parseApiError } from '../utils/formatters';
 import SessionListSwitcher from '../components/common/SessionListSwitcher';
@@ -81,6 +85,22 @@ export default function AccountSettings() {
   const [removingPhotos, setRemovingPhotos] = useState(false);
   const [showRemovePhotosConfirm, setShowRemovePhotosConfirm] = useState(false);
   const [removePhotosResult, setRemovePhotosResult] = useState(null);
+
+  // ---- Per-session Photo Queue (Manual mode) ----
+  //
+  // Operator builds a list of {photo, sessionIds} pairs and clicks Apply
+  // Queue. Each entry stores the on-disk path returned by /upload-photo
+  // plus a snapshot of which sessions should receive that photo.
+  // photoQueueDraftFile is the photo currently being staged for the
+  // "Add to queue" button — once added, it's cleared so the operator can
+  // upload the next one.
+  const [photoQueueDraftFile, setPhotoQueueDraftFile] = useState(null);
+  const [photoQueueDraftPreview, setPhotoQueueDraftPreview] = useState(null);
+  const [photoQueueUploading, setPhotoQueueUploading] = useState(false);
+  // Each entry: { id, fileName, photoPath, previewUrl, sessionIds, sessionPhones }
+  const [photoQueue, setPhotoQueue] = useState([]);
+  const [photoQueueApplying, setPhotoQueueApplying] = useState(false);
+  const [photoQueueResult, setPhotoQueueResult] = useState(null);
 
   // Fetch sessions
   const fetchSessions = useCallback(async () => {
@@ -381,6 +401,176 @@ export default function AccountSettings() {
     }
   };
 
+  // ---- Per-session Photo Queue handlers ----
+  //
+  // Upload a new draft photo without touching the rest of the form. The
+  // file is saved to the panel's upload dir; we hold on to the returned
+  // path so the Apply Queue request can reference it later. We also keep
+  // a local object URL for the live preview.
+  const handlePhotoQueueDraftUpload = async (e) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    if (!file.type.startsWith('image/')) {
+      showError('Please select an image file', 'Invalid File');
+      return;
+    }
+    if (file.size > 5 * 1024 * 1024) {
+      showError('Image must be less than 5MB', 'File Too Large');
+      return;
+    }
+    setPhotoQueueUploading(true);
+    try {
+      const formData = new FormData();
+      formData.append('photo', file);
+      const resp = await uploadProfilePhoto(formData);
+      const filePath = resp.data?.data?.filePath;
+      if (!filePath) throw new Error('Upload returned no path');
+      setPhotoQueueDraftFile({ name: file.name, path: filePath });
+      setPhotoQueueDraftPreview(URL.createObjectURL(file));
+    } catch (err) {
+      showError(parseApiError(err), 'Upload Failed');
+    } finally {
+      setPhotoQueueUploading(false);
+      // Clear the input so the same file can be re-selected if needed.
+      if (e.target) e.target.value = '';
+    }
+  };
+
+  // Capture the current selection + draft photo as a new queue entry.
+  // Snapshots the session IDs so subsequent picker changes don't affect
+  // an already-queued assignment.
+  const handleAddPhotoQueueEntry = () => {
+    if (!photoQueueDraftFile) {
+      showError('Upload a photo first.', 'Validation Error');
+      return;
+    }
+    if (sessionPickMode === 'list') {
+      showError(
+        'Session lists are not supported in the photo queue. Pick individual sessions instead.',
+        'Validation Error'
+      );
+      return;
+    }
+    if (selectedSessionIds.length === 0) {
+      showError(
+        'Pick at least one session in the right column before adding.',
+        'Validation Error'
+      );
+      return;
+    }
+    const sessionPhones = selectedSessionIds
+      .map((id) => sessions.find((s) => s.id === id)?.phone || `#${id}`)
+      .slice(0, 6);
+    setPhotoQueue((prev) => [
+      ...prev,
+      {
+        id:
+          typeof crypto !== 'undefined' && crypto.randomUUID
+            ? crypto.randomUUID()
+            : `q-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+        fileName: photoQueueDraftFile.name,
+        photoPath: photoQueueDraftFile.path,
+        previewUrl: photoQueueDraftPreview,
+        sessionIds: selectedSessionIds.slice(),
+        sessionPhones,
+      },
+    ]);
+    // Clear the draft so the operator can upload the next photo. We
+    // intentionally keep the session selection so they can deselect /
+    // tweak before the next add — quicker than re-selecting from scratch.
+    setPhotoQueueDraftFile(null);
+    setPhotoQueueDraftPreview(null);
+    setPhotoQueueResult(null);
+  };
+
+  // Drop a row from the queue. Revokes the object URL to avoid a small
+  // memory leak when many photos are queued.
+  const handleRemovePhotoQueueEntry = (entryId) => {
+    setPhotoQueue((prev) => {
+      const out = prev.filter((e) => e.id !== entryId);
+      const dropped = prev.find((e) => e.id === entryId);
+      if (dropped?.previewUrl) {
+        try { URL.revokeObjectURL(dropped.previewUrl); } catch (_) {}
+      }
+      return out;
+    });
+  };
+
+  // Wipe the entire queue and the draft. Used by the "Clear queue" button.
+  const handleClearPhotoQueue = () => {
+    photoQueue.forEach((e) => {
+      if (e.previewUrl) {
+        try { URL.revokeObjectURL(e.previewUrl); } catch (_) {}
+      }
+    });
+    setPhotoQueue([]);
+    setPhotoQueueDraftFile(null);
+    if (photoQueueDraftPreview) {
+      try { URL.revokeObjectURL(photoQueueDraftPreview); } catch (_) {}
+    }
+    setPhotoQueueDraftPreview(null);
+    setPhotoQueueResult(null);
+  };
+
+  // POST the queue to the backend. Server applies each assignment in
+  // order; the last one wins for any session that appears more than once.
+  const handleApplyPhotoQueue = async () => {
+    if (photoQueue.length === 0) {
+      showError('Add at least one assignment first.', 'Validation Error');
+      return;
+    }
+    setPhotoQueueApplying(true);
+    setPhotoQueueResult(null);
+    try {
+      const assignments = photoQueue.map((e) => ({
+        photoPath: e.photoPath,
+        sessionIds: e.sessionIds,
+      }));
+      const resp = await applyPhotoAssignments(assignments);
+      const data = resp.data?.data || {};
+      setPhotoQueueResult(data);
+      const {
+        totalAssignments = 0,
+        totalSessions = 0,
+        success = 0,
+        failed = 0,
+      } = data;
+      if (failed === 0) {
+        showSuccess(
+          `Applied ${totalAssignments} photo assignment(s) across ${success}/${totalSessions} session(s).`
+        );
+      } else {
+        showError(
+          `Applied ${success}/${totalSessions} session(s) across ${totalAssignments} assignment(s); ${failed} failed. See details below.`
+        );
+      }
+    } catch (err) {
+      showError(parseApiError(err), 'Apply Failed');
+    } finally {
+      setPhotoQueueApplying(false);
+    }
+  };
+
+  // Compute overlap warning: sessions that appear in more than one queue
+  // entry will only receive the LAST assignment's photo (because Telegram
+  // only renders the most recent UploadProfilePhoto).
+  const computePhotoQueueOverlaps = () => {
+    const seen = new Map(); // sessionId -> [entryIndex]
+    photoQueue.forEach((entry, idx) => {
+      entry.sessionIds.forEach((sid) => {
+        const arr = seen.get(sid) || [];
+        arr.push(idx);
+        seen.set(sid, arr);
+      });
+    });
+    const overlaps = [];
+    seen.forEach((indices, sid) => {
+      if (indices.length > 1) overlaps.push({ sessionId: sid, indices });
+    });
+    return overlaps;
+  };
+  const photoQueueOverlaps = computePhotoQueueOverlaps();
+
   // Sessions targeted by the destructive action, for the confirm dialog copy.
   const removePhotosTargetCount =
     sessionPickMode === 'list'
@@ -596,6 +786,262 @@ export default function AccountSettings() {
           </div>
         )}
       </div>
+
+      {/* Per-session Photo Queue — Manual-mode bulk action that lets the
+          operator stage MULTIPLE {photo, sessionIds} pairs before hitting
+          Apply. Different from the single-photo flow above on the Manual
+          form, which sends one photo to every selected session. */}
+      {mode === 'manual' && (
+        <div className="rounded-xl border border-primary-500/20 bg-gradient-to-br from-primary-500/5 via-dark-800 to-dark-800 p-5">
+          <div className="flex flex-col md:flex-row md:items-start md:justify-between gap-4 mb-4">
+            <div className="flex items-start gap-4">
+              <div className="rounded-xl bg-primary-500/15 p-3 text-primary-300 flex-shrink-0">
+                <ImageIcon className="w-5 h-5" />
+              </div>
+              <div>
+                <h3 className="text-sm font-semibold text-white flex items-center gap-2">
+                  Per-session photo queue
+                  <span className="text-[10px] uppercase tracking-wider px-1.5 py-0.5 rounded bg-primary-500/20 text-primary-200 border border-primary-500/30">
+                    Manual mode
+                  </span>
+                </h3>
+                <p className="mt-1 text-xs text-gray-400 max-w-2xl leading-relaxed">
+                  Want different photos on different sessions? Upload a photo, pick
+                  the sessions in the right column, click <strong>Add to queue</strong>.
+                  Repeat with new photos / new sessions. When you're done, hit
+                  <strong> Apply queue</strong> and each photo is uploaded to its
+                  specific sessions. Session lists aren't supported here — only
+                  the individual-session picker.
+                </p>
+              </div>
+            </div>
+            {photoQueue.length > 0 && (
+              <button
+                type="button"
+                onClick={handleClearPhotoQueue}
+                className="text-xs text-gray-400 hover:text-red-300 transition flex-shrink-0 underline-offset-2 hover:underline"
+              >
+                Clear queue
+              </button>
+            )}
+          </div>
+
+          {/* Draft builder: upload photo + Add to queue */}
+          <div className="grid grid-cols-1 md:grid-cols-[180px_1fr_auto] items-stretch gap-3 mb-4">
+            {/* Upload dropzone */}
+            <label className="flex cursor-pointer flex-col items-center justify-center rounded-lg border-2 border-dashed border-white/10 bg-dark-900 p-3 text-center transition-colors hover:border-primary-500/50 min-h-[100px]">
+              <input
+                type="file"
+                accept="image/*"
+                onChange={handlePhotoQueueDraftUpload}
+                disabled={photoQueueUploading || photoQueueApplying}
+                className="hidden"
+              />
+              {photoQueueUploading ? (
+                <Loader2 className="w-6 h-6 text-primary-500 animate-spin mb-1" />
+              ) : photoQueueDraftPreview ? (
+                <img
+                  src={photoQueueDraftPreview}
+                  alt="draft"
+                  className="w-16 h-16 rounded-full object-cover border-2 border-primary-500 mb-1"
+                />
+              ) : (
+                <Upload className="w-6 h-6 text-gray-500 mb-1" />
+              )}
+              <p className="text-xs text-gray-300 truncate max-w-full">
+                {photoQueueUploading
+                  ? 'Uploading…'
+                  : photoQueueDraftFile
+                  ? photoQueueDraftFile.name
+                  : 'Upload photo'}
+              </p>
+            </label>
+
+            {/* Status line + selection summary */}
+            <div className="flex flex-col justify-center text-xs text-gray-400 px-1">
+              <p className="text-gray-300 mb-1">
+                {photoQueueDraftFile ? (
+                  <>
+                    <span className="text-primary-300">Photo ready.</span>{' '}
+                    Now pick sessions on the right.
+                  </>
+                ) : (
+                  <>Upload a photo to start the next queue entry.</>
+                )}
+              </p>
+              <p>
+                Current selection:{' '}
+                <span className="text-white">
+                  {sessionPickMode === 'list'
+                    ? '(session list — not supported here)'
+                    : `${selectedSessionIds.length} session(s)`}
+                </span>
+              </p>
+              {photoQueue.length > 0 && (
+                <p className="mt-1">
+                  Queue:{' '}
+                  <span className="text-white">
+                    {photoQueue.length} assignment(s) covering{' '}
+                    {
+                      new Set(
+                        photoQueue.flatMap((e) => e.sessionIds)
+                      ).size
+                    }{' '}
+                    unique session(s)
+                  </span>
+                </p>
+              )}
+            </div>
+
+            <button
+              type="button"
+              onClick={handleAddPhotoQueueEntry}
+              disabled={
+                !photoQueueDraftFile ||
+                photoQueueUploading ||
+                photoQueueApplying ||
+                sessionPickMode === 'list' ||
+                selectedSessionIds.length === 0
+              }
+              className="inline-flex items-center justify-center gap-2 rounded-lg border border-primary-500/40 bg-primary-500/20 px-4 py-2 text-sm font-medium text-primary-100 hover:bg-primary-500/30 hover:border-primary-500/60 transition disabled:opacity-50 disabled:cursor-not-allowed self-stretch"
+              title="Capture the current photo + selected sessions as a queue entry"
+            >
+              <Plus className="w-4 h-4" />
+              Add to queue
+            </button>
+          </div>
+
+          {/* Queue table */}
+          {photoQueue.length > 0 ? (
+            <div className="space-y-2 mb-4">
+              {photoQueue.map((entry, idx) => (
+                <div
+                  key={entry.id}
+                  className="flex items-start gap-3 rounded-lg border border-white/10 bg-dark-900/60 p-2.5"
+                >
+                  <div className="flex flex-col items-center flex-shrink-0">
+                    <img
+                      src={entry.previewUrl}
+                      alt={entry.fileName}
+                      className="w-12 h-12 rounded-full object-cover border border-white/10"
+                    />
+                    <span className="text-[10px] text-gray-500 mt-1">
+                      #{idx + 1}
+                    </span>
+                  </div>
+                  <div className="flex-1 min-w-0">
+                    <p className="text-xs text-white truncate" title={entry.fileName}>
+                      {entry.fileName}
+                    </p>
+                    <p className="text-[11px] text-gray-400 mt-0.5">
+                      {entry.sessionIds.length} session(s):{' '}
+                      {entry.sessionPhones.join(', ')}
+                      {entry.sessionIds.length > entry.sessionPhones.length &&
+                        ` … +${
+                          entry.sessionIds.length - entry.sessionPhones.length
+                        } more`}
+                    </p>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => handleRemovePhotoQueueEntry(entry.id)}
+                    disabled={photoQueueApplying}
+                    className="text-gray-400 hover:text-red-300 transition p-1 disabled:opacity-50"
+                    title="Remove from queue"
+                  >
+                    <X className="w-4 h-4" />
+                  </button>
+                </div>
+              ))}
+            </div>
+          ) : (
+            <div className="text-center text-xs text-gray-500 italic mb-4 py-2 border border-dashed border-white/5 rounded-lg">
+              Queue is empty. Build entries above, then click Apply queue.
+            </div>
+          )}
+
+          {/* Overlap warning — when the same session is in multiple
+              entries, only the LAST entry's photo will end up visible
+              because Telegram only renders the most recent upload. */}
+          {photoQueueOverlaps.length > 0 && (
+            <div className="rounded-lg border border-yellow-500/30 bg-yellow-500/5 p-3 text-xs text-yellow-200 leading-relaxed mb-4">
+              <div className="flex items-start gap-2">
+                <AlertCircle className="w-4 h-4 mt-0.5 flex-shrink-0" />
+                <div>
+                  <strong>
+                    {photoQueueOverlaps.length} session(s) appear in multiple
+                    queue entries.
+                  </strong>{' '}
+                  Telegram only renders the most recent photo, so for those
+                  sessions only the LAST matching assignment's photo will end
+                  up visible. (Earlier assignments still upload but get
+                  immediately overwritten.)
+                </div>
+              </div>
+            </div>
+          )}
+
+          <div className="flex items-center justify-end gap-2">
+            <button
+              type="button"
+              onClick={handleApplyPhotoQueue}
+              disabled={photoQueueApplying || photoQueue.length === 0}
+              className="inline-flex items-center gap-2 rounded-lg bg-gradient-to-r from-primary-600 to-blue-600 px-5 py-2 text-sm font-semibold text-white shadow-lg shadow-primary-600/25 transition hover:from-primary-500 hover:to-blue-500 disabled:cursor-not-allowed disabled:opacity-60"
+            >
+              {photoQueueApplying ? (
+                <>
+                  <Loader2 className="w-4 h-4 animate-spin" />
+                  Applying queue&hellip;
+                </>
+              ) : (
+                <>
+                  <Save className="w-4 h-4" />
+                  Apply queue ({photoQueue.length})
+                </>
+              )}
+            </button>
+          </div>
+
+          {/* Per-(assignment, session) report after the queue run. */}
+          {photoQueueResult && (
+            <div className="mt-4 rounded-lg border border-white/10 bg-dark-900/60 p-3 text-xs text-gray-300">
+              <div className="flex items-center gap-2 mb-2 text-gray-200">
+                <Check className="w-3.5 h-3.5 text-emerald-400" />
+                <span>
+                  {photoQueueResult.success}/{photoQueueResult.totalSessions}{' '}
+                  session-photo apply(s) succeeded across{' '}
+                  {photoQueueResult.totalAssignments} assignment(s)
+                  {photoQueueResult.failed > 0 && (
+                    <span className="text-red-300">
+                      {' '}&middot; {photoQueueResult.failed} failed
+                    </span>
+                  )}
+                </span>
+              </div>
+              {Array.isArray(photoQueueResult.results) &&
+                photoQueueResult.results.some((r) => !r.success) && (
+                  <div className="space-y-1 max-h-40 overflow-y-auto">
+                    {photoQueueResult.results
+                      .filter((r) => !r.success)
+                      .map((r, i) => (
+                        <div
+                          key={`${r.assignmentIndex}-${r.sessionId}-${i}`}
+                          className="flex items-start gap-2 text-red-300"
+                        >
+                          <X className="w-3 h-3 mt-0.5 flex-shrink-0" />
+                          <span className="break-words">
+                            Assignment #{r.assignmentIndex + 1} →{' '}
+                            {r.phone || `Session ${r.sessionId}`}:{' '}
+                            {(r.errors || []).join('; ') || 'Failed'}
+                          </span>
+                        </div>
+                      ))}
+                  </div>
+                )}
+            </div>
+          )}
+        </div>
+      )}
 
       {/* Confirm dialog: explicit count + double-confirm so an accidental
           click can't nuke every photo across 40 sessions. */}

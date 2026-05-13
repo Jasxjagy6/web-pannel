@@ -39,6 +39,15 @@ router.post('/profile-list/apply', accountSettingsController.applyProfileList);
 // Registered BEFORE the `/:sessionId` catch-all so the literal path wins.
 router.post('/remove-photos', accountSettingsController.removeAllProfilePhotos);
 
+// POST /api/account-settings/photo-assignments/apply - Apply a queue of
+// per-session photo assignments built in the Manual-mode "Photo Queue"
+// card. Each assignment maps one uploaded photo to a specific list of
+// sessionIds. Registered BEFORE the `/:sessionId` catch-all.
+router.post(
+  '/photo-assignments/apply',
+  accountSettingsController.applyPhotoAssignments
+);
+
 // GET /api/account-settings/:sessionId - Get account settings for a session
 router.get('/:sessionId', accountSettingsController.getAccountSettings);
 
