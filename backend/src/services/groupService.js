@@ -1843,7 +1843,9 @@ class GroupService {
 
     const result = await pool.query(
       `SELECT id, user_id, session_id, target_group_id, operation, operation_type, status,
-              total_users, total_count, success_count, failed_count, options, user_list,
+              total_users, total_count, success_count, failed_count,
+              COALESCE(requested_count, 0) AS requested_count,
+              options, user_list,
               created_at, completed_at
        FROM group_operations
        WHERE id = $1 AND user_id = $2`,
@@ -1911,6 +1913,7 @@ class GroupService {
       totalUsers: row.total_users || row.total_count || 0,
       successCount: row.success_count || 0,
       failedCount: row.failed_count || 0,
+      requestedCount: row.requested_count || 0,
       options,
       createdAt: row.created_at,
       completedAt: row.completed_at,
@@ -1955,7 +1958,9 @@ class GroupService {
 
     const opsResult = await pool.query(
       `SELECT id, user_id, session_id, target_group_id, operation, operation_type, status,
-              total_users, total_count, success_count, failed_count, options,
+              total_users, total_count, success_count, failed_count,
+              COALESCE(requested_count, 0) AS requested_count,
+              options,
               created_at, completed_at
        FROM group_operations
        WHERE ${whereClause}
@@ -1980,6 +1985,7 @@ class GroupService {
         totalUsers: row.total_users || row.total_count || 0,
         successCount: row.success_count || 0,
         failedCount: row.failed_count || 0,
+        requestedCount: row.requested_count || 0,
         options,
         createdAt: row.created_at,
         completedAt: row.completed_at,
@@ -2149,16 +2155,22 @@ class GroupService {
     let successCount = 0;
     let failedCount = 0;
     let skippedCount = 0;
+    // Approval-pending join requests. Tracked separately from
+    // success/skipped so the operator-facing toast and Operation
+    // History can distinguish a session that's actually a member from
+    // one that's stuck in `request_pending` waiting on an admin.
+    let requestedCount = 0;
     const results = [];
 
     const emitProgress = async () => {
-      const processed = successCount + failedCount + skippedCount;
+      const processed = successCount + failedCount + skippedCount + requestedCount;
       await updateProgress(opId, {
         operation_id: opId,
         progress: processed,
         success: successCount,
         failed: failedCount,
         skipped: skippedCount,
+        requested: requestedCount,
         total: totalPairs,
         status: 'running',
       });
@@ -2173,6 +2185,7 @@ class GroupService {
               success: successCount,
               failed: failedCount,
               skipped: skippedCount,
+              requested: requestedCount,
             },
           });
         }
@@ -2206,9 +2219,19 @@ class GroupService {
               : await tgService.joinChannel(session.id, targetId);
             result.success = opResult.success;
             if (opResult.targetName) result.targetName = opResult.targetName;
-            if (opResult.skipped) {
+            // `status` is only populated by `joinChannel`. For leaves
+            // we keep the historical success / skipped bucketing.
+            if (opResult.status) result.status = opResult.status;
+            if (opResult.status === 'requested') {
+              // Join request queued, awaiting admin approval. Don't
+              // count as success (session isn't in the chat yet) and
+              // don't count as skipped (action was taken).
+              requestedCount++;
+            } else if (opResult.status === 'already_member' || opResult.skipped) {
               result.skipped = true;
-              result.reason = opResult.reason;
+              result.reason = opResult.reason || (opResult.status === 'already_member'
+                ? 'Already a member'
+                : undefined);
               skippedCount++;
             } else {
               successCount++;
@@ -2243,14 +2266,23 @@ class GroupService {
 
     await updateProgress(opId, {
       operation_id: opId,
-      progress: successCount + failedCount + skippedCount,
+      progress: successCount + failedCount + skippedCount + requestedCount,
       success: successCount,
       failed: failedCount,
       skipped: skippedCount,
+      requested: requestedCount,
       total: totalPairs,
       status: finalStatus,
     });
-    await this._finalizeOperation(opId, finalStatus, successCount, failedCount, skippedCount, results);
+    await this._finalizeOperation(
+      opId,
+      finalStatus,
+      successCount,
+      failedCount,
+      skippedCount,
+      results,
+      { requestedCount }
+    );
 
     return {
       opId,
@@ -2258,6 +2290,7 @@ class GroupService {
       success: successCount,
       failed: failedCount,
       skipped: skippedCount,
+      requested: requestedCount,
       results,
     };
   }
@@ -2823,7 +2856,8 @@ class GroupService {
   // Internal Helpers
   // =========================================================================
 
-  async _finalizeOperation(opId, status, successCount, failedCount, skippedCount, results) {
+  async _finalizeOperation(opId, status, successCount, failedCount, skippedCount, results, extra = {}) {
+    const requestedCount = Number(extra && extra.requestedCount) || 0;
     try {
       // Store detailed results in Redis
       try {
@@ -2836,15 +2870,41 @@ class GroupService {
         // Skip
       }
 
-      await pool.query(
-        `UPDATE group_operations SET
-          status = $1,
-          success_count = $2,
-          failed_count = $3,
-          completed_at = NOW()
-         WHERE id = $4`,
-        [status, successCount, failedCount, opId]
-      );
+      // `requested_count` was added in migration v30. We write it
+      // unconditionally here -- in deployments where the migration
+      // hasn't been applied yet the UPDATE will throw and the catch
+      // below re-tries without the column so the operation row still
+      // closes out cleanly.
+      try {
+        await pool.query(
+          `UPDATE group_operations SET
+            status = $1,
+            success_count = $2,
+            failed_count = $3,
+            requested_count = $4,
+            completed_at = NOW()
+           WHERE id = $5`,
+          [status, successCount, failedCount, requestedCount, opId]
+        );
+      } catch (colErr) {
+        if (colErr && /requested_count/i.test(colErr.message || '')) {
+          logger.warn(
+            `requested_count column missing on group_operations; ` +
+              `falling back to legacy UPDATE for op=${opId}. Apply migration v30.`
+          );
+          await pool.query(
+            `UPDATE group_operations SET
+              status = $1,
+              success_count = $2,
+              failed_count = $3,
+              completed_at = NOW()
+             WHERE id = $4`,
+            [status, successCount, failedCount, opId]
+          );
+        } else {
+          throw colErr;
+        }
+      }
     } catch (err) {
       logger.error(`Failed to finalise operation ${opId}`, { error: err.message });
     }
