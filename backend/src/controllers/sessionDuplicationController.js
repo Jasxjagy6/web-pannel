@@ -133,9 +133,17 @@ module.exports = {
         'ZIP_GONE'
       );
     }
-    const filename = path.basename(zipPath);
+    // Express's `res.sendFile` mandates an absolute path. The service
+    // already resolves `uploadsRoot` to an absolute path, but harden
+    // here too so a future regression (or an unusual deployment that
+    // sets UPLOAD_DIR via a different code path) cannot turn this
+    // endpoint into a 500.
+    const absoluteZipPath = path.isAbsolute(zipPath)
+      ? zipPath
+      : path.resolve(zipPath);
+    const filename = path.basename(absoluteZipPath);
     res.setHeader('Content-Type', 'application/zip');
     res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
-    return res.sendFile(zipPath);
+    return res.sendFile(absoluteZipPath);
   }),
 };

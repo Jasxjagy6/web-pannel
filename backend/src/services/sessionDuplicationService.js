@@ -107,7 +107,17 @@ const jobs = new Map();
 // the existing uploads dir so it shares the same persistence
 // guarantees the rest of the panel relies on (Telethon session
 // downloads already live here).
-const uploadsRoot = process.env.UPLOAD_DIR || path.join(process.cwd(), 'uploads');
+//
+// IMPORTANT: resolve to an absolute path. UPLOAD_DIR is typically set
+// to a *relative* path in deployments (e.g. `./uploads` in
+// .env.example), which means every derived path — stageRoot,
+// stageDir, zipPath — is also relative. Express's `res.sendFile`
+// rejects relative paths with `TypeError: path must be absolute or
+// specify root to res.sendFile`, which crashed every clone-export
+// download in production.
+const uploadsRoot = path.resolve(
+  process.env.UPLOAD_DIR || path.join(process.cwd(), 'uploads')
+);
 const stageRoot = path.join(uploadsRoot, '_clone_export');
 
 const DEFAULT_INTER_SESSION_DELAY_MS = 800;
@@ -164,6 +174,64 @@ function newJobId() {
 
 function sanitizeFilename(s) {
   return String(s || '').replace(/[^A-Za-z0-9+_.-]/g, '_').slice(0, 80) || 'session';
+}
+
+/**
+ * Flip the panel's local row for `sourceId` to `is_logged_in=false`,
+ * `status='revoked'` so the UI matches Telegram's actual state after
+ * AcceptLoginToken returned AUTH_KEY_UNREGISTERED / SESSION_REVOKED.
+ *
+ * Best-effort: caller awaits with `.catch(() => {})`. We do NOT
+ * disturb the rest of the session row (api_id, encrypted session
+ * data, account_info except for two diagnostic timestamps) so a
+ * subsequent re-login can recover it.
+ *
+ * @param {number|string} sourceId
+ * @param {object} ctx          job-scope context (carries job.userId for the WHERE clause)
+ * @param {string} reasonMsg    raw error text from Telegram, used for diagnostics
+ */
+async function _markSourceRevoked(sourceId, ctx, reasonMsg) {
+  const userId = ctx && ctx.job && ctx.job.userId;
+  if (!userId) return;
+  try {
+    // Merge into existing account_info JSON rather than overwriting.
+    // The shape mirrors telegramClientService.js where the same flip
+    // happens on getMe-time AUTH_KEY_UNREGISTERED.
+    const r = await pool.query(
+      `SELECT account_info FROM sessions WHERE id = $1 AND user_id = $2`,
+      [sourceId, userId]
+    );
+    let info = {};
+    if (r.rows[0] && r.rows[0].account_info) {
+      const raw = r.rows[0].account_info;
+      if (typeof raw === 'string') {
+        try { info = JSON.parse(raw); } catch (_) { info = {}; }
+      } else {
+        info = raw || {};
+      }
+    }
+    info.lastError = `clone-export AcceptLoginToken: ${reasonMsg}`;
+    info.lastErrorAt = new Date().toISOString();
+    info.revokedAt = info.revokedAt || new Date().toISOString();
+    await pool.query(
+      `UPDATE sessions
+          SET is_logged_in = FALSE,
+              status       = 'revoked',
+              account_info = $3,
+              updated_at   = NOW()
+        WHERE id = $1 AND user_id = $2`,
+      [sourceId, userId, JSON.stringify(info)]
+    );
+    logger.warn(
+      `sessionDuplication: flagged source session ${sourceId} revoked after AcceptLoginToken (${reasonMsg})`,
+      { userId }
+    );
+  } catch (err) {
+    logger.warn(
+      `sessionDuplication: could not flag source session ${sourceId} revoked: ${err.message}`,
+      { userId }
+    );
+  }
 }
 
 /**
@@ -370,6 +438,13 @@ async function cloneOne(ctx, sessionRow, sessionState, destApiId, destApiHash) {
       } catch (acceptErr) {
         const m = String(acceptErr && acceptErr.message || acceptErr);
         if (m.includes('AUTH_KEY_UNREGISTERED') || m.includes('SESSION_REVOKED')) {
+          // Panel's local DB still thought this session was active (the
+          // operator's exact symptom was "the sessions are active on
+          // the pannel"). Sync the truth back so the next page refresh
+          // shows it as revoked, and so the next clone-export attempt
+          // is short-circuited at the `is_logged_in` check instead of
+          // wasting another QR-login round-trip.
+          await _markSourceRevoked(sourceId, ctx, m).catch(() => {});
           throw new Error(
             `[SOURCE_SESSION_REVOKED] Source session ${sourceId} was revoked by Telegram — re-login it from the Sessions tab and re-run the export.`
           );
@@ -683,6 +758,30 @@ async function startCloneJob(params) {
   }
   if (typeof destApiHash !== 'string' || destApiHash.length < 16) {
     throw new Error('destApiHash looks invalid (expected 32-hex-char string)');
+  }
+
+  // Cancel any of this user's previous in-flight clone-export jobs.
+  //
+  // Production logs (2026-05-13) showed the operator click "Start" four
+  // times in a row while the first job (wrong destApiId) was still
+  // grinding through 200+ sessions. The jobs ran concurrently and
+  // shared the same panel-side `_ensureConnected` source clients, so
+  // each new job alternated failures with the previous one in the
+  // logs and the user couldn't tell which job's status they were
+  // looking at. A new job from the same user supersedes the older
+  // ones — the panel UI only ever shows the most recent job.
+  for (const existing of jobs.values()) {
+    if (existing.userId === userId && existing.status === 'running') {
+      existing.status = 'cancelled';
+      for (const s of existing.sessions) {
+        if (s._passwordRejecter) {
+          try { s._passwordRejecter(new Error('Superseded by a newer clone-export job')); } catch (_) { /* best-effort */ }
+        }
+      }
+      logger.info(
+        `sessionDuplication: superseding running job ${existing.id} because user ${userId} started a new clone-export`
+      );
+    }
   }
 
   await fs.ensureDir(stageRoot);
