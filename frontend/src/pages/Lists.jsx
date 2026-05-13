@@ -34,6 +34,7 @@ function TypeBadge({ type }) {
     users: { bg: 'bg-blue-500/15', text: 'text-blue-400', label: 'Users' },
     groups: { bg: 'bg-purple-500/15', text: 'text-purple-400', label: 'Groups' },
     channels: { bg: 'bg-amber-500/15', text: 'text-amber-400', label: 'Channels' },
+    profile: { bg: 'bg-emerald-500/15', text: 'text-emerald-400', label: 'Profile' },
   };
   const c = config[type] || config.users;
   return (
@@ -91,6 +92,10 @@ export default function Lists() {
   const [importFileName, setImportFileName] = useState('');
   const [createName, setCreateName] = useState('');
   const [createScrapeJob, setCreateScrapeJob] = useState('');
+  // 'users' is the default; 'profile' creates a new account-settings
+  // source list (Name / Username / Bio). The other two share the same
+  // backend parser so we don't need a separate radio for them yet.
+  const [createListType, setCreateListType] = useState('users');
   const [importing, setImporting] = useState(false);
 
   const [detailList, setDetailList] = useState(null);
@@ -188,9 +193,10 @@ export default function Lists() {
         const formData = new FormData();
         formData.append('file', importFile);
         formData.append('name', createName.trim());
-        formData.append('type', 'users');
+        formData.append('type', createListType || 'users');
         await listsAPI.importList(formData);
-        showSuccess(`List "${createName}" imported successfully.`, 'Import Complete');
+        const label = createListType === 'profile' ? 'Profile list' : 'List';
+        showSuccess(`${label} "${createName}" imported successfully.`, 'Import Complete');
         setShowCreateModal(false);
         resetCreateForm();
         fetchLists();
@@ -225,6 +231,7 @@ export default function Lists() {
     setImportFile(null);
     setImportFileName('');
     setCreateMode('import');
+    setCreateListType('users');
   };
 
   const handleDelete = async (list) => {
@@ -629,24 +636,71 @@ export default function Lists() {
           </div>
 
           {createMode === 'import' && (
-            <div>
-              <label className="mb-1.5 block text-sm font-medium text-gray-300">File (CSV / JSON / TXT)</label>
-              <label className="flex cursor-pointer flex-col items-center justify-center rounded-lg border-2 border-dashed border-white/10 bg-dark-900 p-8 text-center transition-colors hover:border-primary-500/50 hover:bg-dark-900/80">
-                <input type="file" accept=".csv,.json,.txt" onChange={handleFileSelect} className="hidden" />
-                <Upload className="mb-3 h-8 w-8 text-gray-500" />
-                {importFileName ? (
-                  <div className="flex items-center gap-2">
-                    <Check className="h-4 w-4 text-green-400" />
-                    <span className="text-sm font-medium text-white">{importFileName}</span>
-                  </div>
-                ) : (
-                  <>
-                    <p className="text-sm font-medium text-gray-300">Click to upload or drag and drop</p>
-                    <p className="mt-1 text-xs text-gray-500">CSV, JSON, or TXT files</p>
-                  </>
+            <>
+              <div>
+                <label className="mb-1.5 block text-sm font-medium text-gray-300">List Type</label>
+                <div className="grid grid-cols-2 gap-2">
+                  {[
+                    { value: 'users', label: 'Users / Contacts', hint: 'IDs + usernames for messaging / group-add' },
+                    { value: 'profile', label: 'Profile List', hint: 'Names + bios for Account Settings' },
+                  ].map((opt) => (
+                    <button
+                      key={opt.value}
+                      type="button"
+                      onClick={() => setCreateListType(opt.value)}
+                      className={`rounded-lg border px-3 py-2 text-left transition-colors ${
+                        createListType === opt.value
+                          ? 'border-primary-500 bg-primary-500/10 text-white'
+                          : 'border-white/10 bg-dark-900 text-gray-300 hover:border-white/20'
+                      }`}
+                    >
+                      <div className="text-sm font-medium">{opt.label}</div>
+                      <div className="mt-0.5 text-[11px] text-gray-500">{opt.hint}</div>
+                    </button>
+                  ))}
+                </div>
+                {createListType === 'profile' && (
+                  <p className="mt-2 rounded-md border border-emerald-500/20 bg-emerald-500/5 px-3 py-2 text-[11px] leading-snug text-emerald-300">
+                    Profile lists are used by Account Settings → <span className="font-semibold">Apply Profile List</span>.
+                    Each entry should follow the numbered-block format below.
+                    The "PFP" field is ignored — the panel picks a random
+                    real profile picture from a 150+ image catalog for
+                    every session.
+                    <br />
+                    <br />
+                    <span className="font-mono text-emerald-200/80">
+                      1.<br />
+                      Name: Marc Williams<br />
+                      Username: @marcw88<br />
+                      Bio: Crypto enthusiast, building the future<br />
+                      PFP: anime portrait, blue background
+                    </span>
+                  </p>
                 )}
-              </label>
-            </div>
+              </div>
+              <div>
+                <label className="mb-1.5 block text-sm font-medium text-gray-300">File (CSV / JSON / TXT)</label>
+                <label className="flex cursor-pointer flex-col items-center justify-center rounded-lg border-2 border-dashed border-white/10 bg-dark-900 p-8 text-center transition-colors hover:border-primary-500/50 hover:bg-dark-900/80">
+                  <input type="file" accept=".csv,.json,.txt" onChange={handleFileSelect} className="hidden" />
+                  <Upload className="mb-3 h-8 w-8 text-gray-500" />
+                  {importFileName ? (
+                    <div className="flex items-center gap-2">
+                      <Check className="h-4 w-4 text-green-400" />
+                      <span className="text-sm font-medium text-white">{importFileName}</span>
+                    </div>
+                  ) : (
+                    <>
+                      <p className="text-sm font-medium text-gray-300">Click to upload or drag and drop</p>
+                      <p className="mt-1 text-xs text-gray-500">
+                        {createListType === 'profile'
+                          ? 'Numbered-block TXT, JSON array, or CSV'
+                          : 'CSV, JSON, or TXT files'}
+                      </p>
+                    </>
+                  )}
+                </label>
+              </div>
+            </>
           )}
 
           {createMode === 'scrape' && (
@@ -706,10 +760,21 @@ export default function Lists() {
                 <table className="w-full">
                   <thead>
                     <tr className="border-b border-white/5">
-                      <th className="px-4 py-2.5 text-left text-xs font-semibold uppercase tracking-wider text-gray-400">User ID</th>
-                      <th className="px-4 py-2.5 text-left text-xs font-semibold uppercase tracking-wider text-gray-400">Username</th>
-                      <th className="px-4 py-2.5 text-left text-xs font-semibold uppercase tracking-wider text-gray-400 hidden sm:table-cell">Name</th>
-                      <th className="px-4 py-2.5 text-left text-xs font-semibold uppercase tracking-wider text-gray-400 hidden md:table-cell">Phone</th>
+                      {detailList?.type === 'profile' ? (
+                        <>
+                          <th className="px-4 py-2.5 text-left text-xs font-semibold uppercase tracking-wider text-gray-400">#</th>
+                          <th className="px-4 py-2.5 text-left text-xs font-semibold uppercase tracking-wider text-gray-400">Name</th>
+                          <th className="px-4 py-2.5 text-left text-xs font-semibold uppercase tracking-wider text-gray-400">Username</th>
+                          <th className="px-4 py-2.5 text-left text-xs font-semibold uppercase tracking-wider text-gray-400 hidden md:table-cell">Bio</th>
+                        </>
+                      ) : (
+                        <>
+                          <th className="px-4 py-2.5 text-left text-xs font-semibold uppercase tracking-wider text-gray-400">User ID</th>
+                          <th className="px-4 py-2.5 text-left text-xs font-semibold uppercase tracking-wider text-gray-400">Username</th>
+                          <th className="px-4 py-2.5 text-left text-xs font-semibold uppercase tracking-wider text-gray-400 hidden sm:table-cell">Name</th>
+                          <th className="px-4 py-2.5 text-left text-xs font-semibold uppercase tracking-wider text-gray-400 hidden md:table-cell">Phone</th>
+                        </>
+                      )}
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-white/5">
@@ -720,12 +785,27 @@ export default function Lists() {
                         </td>
                       </tr>
                     ) : (
-                      pagedDetailItems.map((item) => (
+                      pagedDetailItems.map((item, idx) => (
                         <tr key={item.id} className="transition-colors hover:bg-white/[0.02]">
-                          <td className="px-4 py-2.5 text-sm font-mono text-gray-300">{item.telegram_id || item.userId}</td>
-                          <td className="px-4 py-2.5 text-sm text-blue-400">{item.username ? `@${item.username}` : '—'}</td>
-                          <td className="px-4 py-2.5 text-sm text-gray-300 hidden sm:table-cell">{item.first_name || item.firstName} {item.last_name || item.lastName}</td>
-                          <td className="px-4 py-2.5 text-sm text-gray-400 hidden md:table-cell">{item.phone || '—'}</td>
+                          {detailList?.type === 'profile' ? (
+                            <>
+                              <td className="px-4 py-2.5 text-sm font-mono text-gray-500">{(detailPage - 1) * detailPageSize + idx + 1}</td>
+                              <td className="px-4 py-2.5 text-sm text-gray-100">
+                                {[item.first_name || item.firstName, item.last_name || item.lastName].filter(Boolean).join(' ') || '—'}
+                              </td>
+                              <td className="px-4 py-2.5 text-sm text-blue-400">{item.username ? `@${item.username}` : '—'}</td>
+                              <td className="px-4 py-2.5 text-sm text-gray-400 hidden md:table-cell max-w-md truncate" title={item.bio || ''}>
+                                {item.bio || '—'}
+                              </td>
+                            </>
+                          ) : (
+                            <>
+                              <td className="px-4 py-2.5 text-sm font-mono text-gray-300">{item.telegram_id || item.userId}</td>
+                              <td className="px-4 py-2.5 text-sm text-blue-400">{item.username ? `@${item.username}` : '—'}</td>
+                              <td className="px-4 py-2.5 text-sm text-gray-300 hidden sm:table-cell">{item.first_name || item.firstName} {item.last_name || item.lastName}</td>
+                              <td className="px-4 py-2.5 text-sm text-gray-400 hidden md:table-cell">{item.phone || '—'}</td>
+                            </>
+                          )}
                         </tr>
                       ))
                     )}

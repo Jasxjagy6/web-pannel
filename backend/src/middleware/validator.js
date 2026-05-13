@@ -225,7 +225,7 @@ const schemas = {
     // (and the merge/from-scrape flows) keep working.
     name: Joi.string().max(255),
     listName: Joi.string().max(255),
-    type: Joi.string().valid('users', 'groups', 'channels').default('users'),
+    type: Joi.string().valid('users', 'groups', 'channels', 'profile').default('users'),
   })
     .or('name', 'listName')
     .unknown(true),

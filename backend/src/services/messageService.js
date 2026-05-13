@@ -9,6 +9,7 @@
 
 const { pool } = require('../config/database');
 const telegramService = require('./telegramService');
+const sessionService = require('./sessionService');
 const logger = require('../utils/logger');
 const { AppError } = require('../utils/errorHandler');
 const { buildPagination, applyPagination, applySorting } = require('../utils/pagination');
@@ -2262,6 +2263,11 @@ class MessageService {
             );
 
             logger.warn(`Failed to send message to group ${groupId} from session ${session.id}: ${err.message}`);
+
+            // Auth-revoked detection.
+            sessionService
+              .maybeFlagRevoked(session.id, err, 'messageService.bulkGroups')
+              .catch(() => {});
           }
 
           results.push(result);
@@ -2528,6 +2534,14 @@ class MessageService {
               );
 
               logger.warn(`Failed to send message to user ${userId_target} from session ${session.id}: ${err.message}`);
+
+              // Detect AUTH_KEY_UNREGISTERED / SESSION_REVOKED /
+              // USER_DEACTIVATED on this send and flag the session
+              // immediately so the rest of the job + the Sessions UI
+              // both see the revocation.
+              sessionService
+                .maybeFlagRevoked(session.id, err, 'messageService.bulk')
+                .catch(() => {});
             }
 
             results.push(result);
@@ -2873,26 +2887,40 @@ class MessageService {
             const sessionLooksRevoked = isRevokedSessionError(err.message);
             if (sessionLooksRevoked) {
               revokedSessionIds.add(session.id);
-              // Mark the session row revoked so future jobs skip it
-              // entirely — best-effort, don't fail the job if the
-              // update can't run.
+              // Use sessionService.flagSessionRevoked so the Sessions
+              // UI gets a live `sessions:revoked` socket event, the
+              // in-memory GramJS client is torn down, and the
+              // `account_info` JSONB records the original Telegram
+              // error. The legacy raw-SQL fallback below is kept as a
+              // safety net in case the helper itself fails.
               try {
-                await pool.query(
-                  `UPDATE sessions
-                      SET status = 'revoked', is_logged_in = FALSE, updated_at = NOW()
-                    WHERE id = $1 AND user_id = $2`,
-                  [session.id, userId]
-                );
+                await sessionService.flagSessionRevoked(session.id, {
+                  error: err,
+                  source: 'messageService.singleUserMassDm',
+                });
+              } catch (flagErr) {
                 logger.warn(
-                  `Single-user mass DM job ${jobId}: session ${session.id} revoked (AUTH_KEY_UNREGISTERED); flagged in DB`,
+                  `flagSessionRevoked failed for session ${session.id}: ${flagErr.message}; falling back to inline UPDATE`,
                   { jobId }
                 );
-              } catch (markErr) {
-                logger.warn(
-                  `Failed to flag revoked session ${session.id}: ${markErr.message}`,
-                  { jobId }
-                );
+                try {
+                  await pool.query(
+                    `UPDATE sessions
+                        SET status = 'revoked', is_logged_in = FALSE, updated_at = NOW()
+                      WHERE id = $1 AND user_id = $2`,
+                    [session.id, userId]
+                  );
+                } catch (markErr) {
+                  logger.warn(
+                    `Failed to flag revoked session ${session.id}: ${markErr.message}`,
+                    { jobId }
+                  );
+                }
               }
+              logger.warn(
+                `Single-user mass DM job ${jobId}: session ${session.id} revoked (${err.message}); flagged in DB`,
+                { jobId }
+              );
             }
           }
 
@@ -3131,15 +3159,25 @@ class MessageService {
               );
 
               if (isRevokedSessionError(errMsg)) {
-                // Mark session as revoked in DB.
+                // Mark session as revoked via sessionService so the
+                // Sessions UI receives a live socket event in addition
+                // to the DB write. Raw-SQL fallback retained for
+                // robustness if the helper itself can't be reached.
                 try {
-                  await pool.query(
-                    `UPDATE sessions
-                        SET status = 'revoked', is_logged_in = FALSE, updated_at = NOW()
-                      WHERE id = $1 AND user_id = $2`,
-                    [session.id, userId]
-                  );
-                } catch (_) { /* best-effort */ }
+                  await sessionService.flagSessionRevoked(session.id, {
+                    error: err,
+                    source: 'messageService.singleUserMassDm.target',
+                  });
+                } catch (_) {
+                  try {
+                    await pool.query(
+                      `UPDATE sessions
+                          SET status = 'revoked', is_logged_in = FALSE, updated_at = NOW()
+                        WHERE id = $1 AND user_id = $2`,
+                      [session.id, userId]
+                    );
+                  } catch (_inner) { /* best-effort */ }
+                }
                 return { status: 'session_dead', reason: errMsg };
               }
 
