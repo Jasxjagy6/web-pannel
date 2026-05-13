@@ -2127,10 +2127,14 @@ class TelegramService {
   async updateUsername(sessionId, username) {
     await this._ensureConnected(sessionId);
 
-    try {
-      // Remove @ if present
-      const cleanUsername = username.startsWith('@') ? username.substring(1) : username;
+    // Strip leading @ if present and normalise null/undefined to '' so
+    // the "clear username" path is unambiguous.
+    const cleanUsername =
+      typeof username === 'string' && username.startsWith('@')
+        ? username.substring(1)
+        : (username || '');
 
+    try {
       await this._withFloodRetry(sessionId, async () => {
         return await this.clients.get(String(sessionId)).client.invoke(
           new Api.account.UpdateUsername({
@@ -2149,7 +2153,33 @@ class TelegramService {
         updatedField: 'username',
       };
     } catch (error) {
-      logger.error(`Failed to update username for session ${sessionId}`, { error: error.message });
+      // Telegram raises USERNAME_NOT_MODIFIED when the desired username
+      // is already the current one (and, crucially, when you ask to clear
+      // a username that's already empty). The end state matches what the
+      // caller asked for, so treat it as success instead of bubbling up
+      // a failure that aborts the whole bulk-randomize batch.
+      const message = (error && error.message) || '';
+      if (/USERNAME_NOT_MODIFIED/i.test(message)) {
+        logger.info(
+          `Username already set to '${cleanUsername}'\u2014treating USERNAME_NOT_MODIFIED as no-op success`,
+          { sessionId }
+        );
+        try {
+          const current = await this.getMe(sessionId);
+          return {
+            ...current,
+            updatedField: 'username',
+            unchanged: true,
+          };
+        } catch (_) {
+          return {
+            username: cleanUsername,
+            updatedField: 'username',
+            unchanged: true,
+          };
+        }
+      }
+      logger.error(`Failed to update username for session ${sessionId}`, { error: message });
       throw this._handleTelegramError(error);
     }
   }
@@ -2178,12 +2208,12 @@ class TelegramService {
       // logs (2026-05-13). Wrap the on-disk file in a `CustomFile`
       // so GramJS streams it correctly. Do NOT unlink `filePath`
       // after upload — the Randomize feature reuses the bundled
-      // `avatar01.jpg … avatar12.jpg` assets across sessions.
+      // `avatar*.jpg` assets across sessions.
       const { CustomFile } = require('telegram/client/uploads');
       const stat = fs.statSync(filePath);
       const client = this.clients.get(String(sessionId)).client;
 
-      await this._withFloodRetry(sessionId, async () => {
+      const uploadResult = await this._withFloodRetry(sessionId, async () => {
         const inputFile = await client.uploadFile({
           file: new CustomFile(
             path.basename(filePath) || `photo-${Date.now()}.jpg`,
@@ -2199,14 +2229,118 @@ class TelegramService {
 
       logger.info(`Updated profile photo`, { sessionId });
 
+      // photos.UploadProfilePhoto sets the new photo as the visible avatar
+      // BUT older photos remain in the profile-photo history. On bought
+      // sessions whose seller already uploaded a photo, operators reported
+      // the old picture still being visible in some Telegram clients
+      // because of client-side caching of the legacy history entries.
+      // Delete every prior photo so the freshly uploaded one is unambiguously
+      // the only photo on the account. The cleanup is best-effort — if it
+      // fails we still consider the primary update successful.
+      const newPhotoId = this._extractPhotoId(uploadResult);
+      let deletedPriorCount = 0;
+      try {
+        deletedPriorCount = await this._deletePriorProfilePhotos(
+          sessionId,
+          newPhotoId
+        );
+        if (deletedPriorCount > 0) {
+          logger.info(
+            `Deleted ${deletedPriorCount} prior profile photo(s) so the new upload is the only avatar`,
+            { sessionId }
+          );
+        }
+      } catch (cleanupErr) {
+        logger.warn(
+          `Failed to clean up prior profile photos for session ${sessionId} (new photo is still set as the avatar)`,
+          { error: (cleanupErr && cleanupErr.message) || String(cleanupErr) }
+        );
+      }
+
       return {
         success: true,
         updatedField: 'profile_photo',
+        deletedPriorPhotos: deletedPriorCount,
       };
     } catch (error) {
       logger.error(`Failed to update profile photo for session ${sessionId}`, { error: error.message });
       throw this._handleTelegramError(error);
     }
+  }
+
+  /**
+   * Pull the `photo.id` (as a BigInt) out of a `photos.UploadProfilePhoto`
+   * MTProto response. Returns null if the shape is unexpected.
+   *
+   * @param {any} uploadResult
+   * @returns {bigint|null}
+   */
+  _extractPhotoId(uploadResult) {
+    try {
+      const photo = uploadResult && uploadResult.photo;
+      if (!photo) return null;
+      if (photo.id === null || photo.id === undefined) return null;
+      // GramJS returns id as a BigInteger-like object; coerce safely.
+      return BigInt(photo.id.toString());
+    } catch (_) {
+      return null;
+    }
+  }
+
+  /**
+   * Delete every photo on the active session's profile EXCEPT the one
+   * just uploaded. Returns the count of photos deleted.
+   *
+   * @param {string} sessionId
+   * @param {bigint|null} newPhotoId  ID of the freshly uploaded photo (kept)
+   * @returns {Promise<number>}
+   */
+  async _deletePriorProfilePhotos(sessionId, newPhotoId) {
+    const client = this.clients.get(String(sessionId)).client;
+
+    const photosResp = await this._withFloodRetry(sessionId, async () => {
+      return await client.invoke(
+        new Api.photos.GetUserPhotos({
+          userId: new Api.InputUserSelf(),
+          offset: 0,
+          maxId: BigInt(0),
+          limit: 100,
+        })
+      );
+    });
+
+    const photos = (photosResp && photosResp.photos) || [];
+    const toDelete = [];
+    for (const ph of photos) {
+      if (!ph || ph.className !== 'Photo') continue;
+      if (ph.id === undefined || ph.id === null) continue;
+      let phIdBig;
+      try {
+        phIdBig = BigInt(ph.id.toString());
+      } catch (_) {
+        continue;
+      }
+      if (newPhotoId !== null && phIdBig === newPhotoId) {
+        // This is the photo we just uploaded — keep it.
+        continue;
+      }
+      toDelete.push(
+        new Api.InputPhoto({
+          id: ph.id,
+          accessHash: ph.accessHash,
+          fileReference: ph.fileReference,
+        })
+      );
+    }
+
+    if (toDelete.length === 0) return 0;
+
+    await this._withFloodRetry(sessionId, async () => {
+      return await client.invoke(
+        new Api.photos.DeletePhotos({ id: toDelete })
+      );
+    });
+    return toDelete.length;
   }
 
   /**
