@@ -2166,18 +2166,34 @@ class TelegramService {
 
     try {
       const fs = require('fs');
+      const path = require('path');
       if (!fs.existsSync(filePath)) {
         throw new Error(`Image file not found: ${filePath}`);
       }
 
+      // GramJS's `uploadFile` does NOT accept a raw string path —
+      // when it tries to coerce the string into a buffer it throws
+      // "Could not create buffer from file <path>". That was the bug
+      // behind every Randomize avatar upload failing in production
+      // logs (2026-05-13). Wrap the on-disk file in a `CustomFile`
+      // so GramJS streams it correctly. Do NOT unlink `filePath`
+      // after upload — the Randomize feature reuses the bundled
+      // `avatar01.jpg … avatar12.jpg` assets across sessions.
+      const { CustomFile } = require('telegram/client/uploads');
+      const stat = fs.statSync(filePath);
+      const client = this.clients.get(String(sessionId)).client;
+
       await this._withFloodRetry(sessionId, async () => {
-        return await this.clients.get(String(sessionId)).client.invoke(
-          new Api.photos.UploadProfilePhoto({
-            file: await this.clients.get(String(sessionId)).client.uploadFile({
-              file: filePath,
-              workers: 1,
-            }),
-          })
+        const inputFile = await client.uploadFile({
+          file: new CustomFile(
+            path.basename(filePath) || `photo-${Date.now()}.jpg`,
+            stat.size,
+            filePath,
+          ),
+          workers: 1,
+        });
+        return await client.invoke(
+          new Api.photos.UploadProfilePhoto({ file: inputFile })
         );
       });
 

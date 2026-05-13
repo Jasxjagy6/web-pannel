@@ -201,16 +201,23 @@ function mockTelegramService() {
 // Stub the pool so DB lookups during the run come back deterministic.
 // ─────────────────────────────────────────────────────────────────────
 let sessionRowsById = new Map();
+let dbQueries = [];
 function mockDB() {
   require.cache[require.resolve('../../src/config/database.js')] = {
     exports: {
       pool: {
         query: async (sql, params) => {
           const text = String(sql).replace(/\s+/g, ' ').trim();
+          dbQueries.push({ text, params });
           if (text.startsWith('SELECT id, phone, api_id, api_hash')) {
             const id = Number(params[0]);
             const row = sessionRowsById.get(id);
             return { rows: row ? [row] : [] };
+          }
+          if (text.startsWith('SELECT account_info FROM sessions')) {
+            const id = Number(params[0]);
+            const row = sessionRowsById.get(id);
+            return { rows: row ? [{ account_info: row.account_info || null }] : [] };
           }
           return { rows: [] };
         },
@@ -560,7 +567,91 @@ async function main() {
         row.error && row.error.includes('[SOURCE_SESSION_REVOKED]'),
         `expected [SOURCE_SESSION_REVOKED] in row.error, got: ${row.error}`
       );
-      console.log('clone.sourceRevoked: OK');
+
+      // Regression: when AcceptLoginToken returns AUTH_KEY_UNREGISTERED
+      // the service must update the panel's local DB row to match
+      // Telegram's truth, so the operator's "sessions are active on
+      // the pannel" symptom (panel UI lying about session liveness)
+      // is fixed automatically on the next refresh.
+      const updates = dbQueries.filter((q) =>
+        /UPDATE sessions[\s\S]+SET is_logged_in = FALSE/i.test(q.text)
+        && /status\s*=\s*'revoked'/i.test(q.text)
+        && Array.isArray(q.params)
+        && Number(q.params[0]) === 309
+      );
+      assert.ok(
+        updates.length >= 1,
+        `expected an UPDATE sessions ... SET is_logged_in=FALSE, status='revoked' for source session 309 after AcceptLoginToken returned AUTH_KEY_UNREGISTERED. dbQueries.text=\n${dbQueries.map(q => q.text).join('\n---\n')}`
+      );
+      console.log('clone.sourceRevoked: OK (DB also flipped to revoked)');
+    }
+
+    // ─── Sub-test: superseding job cancels previous in-flight one ──
+    {
+      // Two jobs from the same user, started back-to-back. The second
+      // must cause the first to flip to `cancelled`. Mirrors the
+      // production log signature where the operator clicked Start
+      // four times in a row and the panel ran them concurrently,
+      // alternating per-row failures across both job IDs.
+      const srcA = new FakeSourceClient();
+      const srcB = new FakeSourceClient();
+      sourceClientsBySessionId.set('501', srcA);
+      sourceClientsBySessionId.set('502', srcB);
+      sessionRowsById.set(501, { id: 501, phone: '+15550501', api_id: 1, api_hash: 'a', status: 'active', is_logged_in: true });
+      sessionRowsById.set(502, { id: 502, phone: '+15550502', api_id: 1, api_hash: 'a', status: 'active', is_logged_in: true });
+
+      const mock = require('telegram');
+      FakeNewClient._scenario = {
+        exportLoginTokenSeq: [
+          new mock.Api.auth.LoginToken({ token: Buffer.from([1]) }),
+          new mock.Api.auth.LoginTokenSuccess({
+            authorization: new mock.Api.auth.Authorization({}),
+          }),
+        ],
+        importLoginTokenSeq: [],
+      };
+      const { jobId: idA } = await service.startCloneJob({
+        userId: 11,
+        sessionIds: [501],
+        destApiId: 22222,
+        destApiHash: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+        interSessionDelayMs: 30,
+      });
+      FakeNewClient._scenario = {
+        exportLoginTokenSeq: [
+          new mock.Api.auth.LoginToken({ token: Buffer.from([1]) }),
+          new mock.Api.auth.LoginTokenSuccess({
+            authorization: new mock.Api.auth.Authorization({}),
+          }),
+        ],
+        importLoginTokenSeq: [],
+      };
+      const { jobId: idB } = await service.startCloneJob({
+        userId: 11,
+        sessionIds: [502],
+        destApiId: 22222,
+        destApiHash: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+        interSessionDelayMs: 0,
+      });
+      // Wait for job A to react to the supersede.
+      for (let i = 0; i < 80; i++) {
+        const a = service.getJobStatus(idA, 11);
+        if (a && a.status === 'cancelled') break;
+        await new Promise((r) => setTimeout(r, 25));
+      }
+      const a = service.getJobStatus(idA, 11);
+      assert.ok(a, 'job A should still be retrievable');
+      assert.strictEqual(
+        a.status, 'cancelled',
+        `expected job A to be cancelled when job B started for same user, got status=${a.status}`
+      );
+      // Second job is allowed to complete normally.
+      for (let i = 0; i < 80; i++) {
+        const b = service.getJobStatus(idB, 11);
+        if (b.status === 'completed' || b.status === 'failed') break;
+        await new Promise((r) => setTimeout(r, 25));
+      }
+      console.log('clone.supersede: OK (previous job cancelled when new one starts for same user)');
     }
 
     // ─── Sub-test 4: ownership enforcement ──────────────────────────
