@@ -16,6 +16,9 @@ module.exports = {
       username,
       bio,
       updateFlags,
+      // Per-field 'set' vs 'remove' mode. Frontend sends this when the
+      // operator toggles a field's action button in Manual mode.
+      fieldModes,
     } = req.body;
 
     const userId = req.user?.id;
@@ -24,6 +27,7 @@ module.exports = {
     logger.info(`Account settings update request from user ${userId}`, {
       sessionCount: sessionIds?.length || 0,
       flags: updateFlags,
+      fieldModes,
     });
 
     const result = await accountSettingsService.updateMultipleSessions({
@@ -34,6 +38,7 @@ module.exports = {
       bio,
       profilePhotoPath: req.body.profilePhotoPath,
       updateFlags,
+      fieldModes,
     }, userId);
 
     return res.status(200).json({

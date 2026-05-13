@@ -2118,6 +2118,63 @@ class TelegramService {
   }
 
   /**
+   * Clear one or more profile fields for the active session by issuing
+   * `account.UpdateProfile` with the appropriate empty-string slot. Each
+   * argument is independent; pass `true` to clear that field.
+   *
+   *   - lastName=true → sets last_name = '' (Telegram allows empty last name)
+   *   - bio=true      → sets about = ''     (Telegram allows empty bio)
+   *
+   * NOTE: Telegram REQUIRES a non-empty `first_name` on every account —
+   * `account.UpdateProfile({ firstName: '' })` returns FIRSTNAME_INVALID.
+   * That's why first name has no "clear" path here; the frontend disables
+   * the toggle accordingly.
+   *
+   * Username + profile-photo clearing have their own dedicated methods
+   * ({@link updateUsername}('') and {@link removeAllProfilePhotos}).
+   *
+   * @param {string} sessionId
+   * @param {{ lastName?: boolean, bio?: boolean }} fields
+   * @returns {Promise<{success:boolean, cleared:string[]}>}
+   */
+  async clearProfileFields(sessionId, fields = {}) {
+    await this._ensureConnected(sessionId);
+    const cleared = [];
+    try {
+      // Telegram's UpdateProfile uses flag bits so we can clear one
+      // field without touching the others. Sending only the slot we
+      // want to clear leaves the rest alone.
+      if (fields.lastName) {
+        await this._withFloodRetry(sessionId, async () =>
+          this.clients
+            .get(String(sessionId))
+            .client.invoke(new Api.account.UpdateProfile({ lastName: '' }))
+        );
+        cleared.push('lastName');
+      }
+      if (fields.bio) {
+        await this._withFloodRetry(sessionId, async () =>
+          this.clients
+            .get(String(sessionId))
+            .client.invoke(new Api.account.UpdateProfile({ about: '' }))
+        );
+        cleared.push('bio');
+      }
+      logger.info(
+        `Cleared profile fields: ${cleared.join(', ') || '(none)'}`,
+        { sessionId }
+      );
+      return { success: true, cleared };
+    } catch (error) {
+      logger.error(
+        `Failed to clear profile fields for session ${sessionId}`,
+        { error: error && error.message }
+      );
+      throw this._handleTelegramError(error);
+    }
+  }
+
+  /**
    * Update username for a session.
    *
    * @param {string} sessionId - Active session identifier
