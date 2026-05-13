@@ -193,6 +193,29 @@ module.exports = {
   }),
 
   /**
+   * POST /api/account-settings/photo-assignments/apply
+   * Apply a queue of per-session photo assignments built in the
+   * AccountSettings Manual mode "Photo Queue" card. Body shape:
+   *   { assignments: [{ photoPath: string, sessionIds: number[] }, ...] }
+   * Returns a per-(assignment, session) report.
+   */
+  applyPhotoAssignments: asyncHandler(async (req, res) => {
+    const { assignments } = req.body;
+    const userId = req.user?.id;
+
+    logger.info(`Photo-queue apply request from user ${userId}`, {
+      assignmentCount: Array.isArray(assignments) ? assignments.length : 0,
+    });
+
+    const result = await accountSettingsService.applyPhotoAssignments(
+      { assignments },
+      userId
+    );
+
+    return res.status(200).json({ success: true, data: result });
+  }),
+
+  /**
    * GET /api/account-settings/:sessionId
    * Get account settings for a session
    */

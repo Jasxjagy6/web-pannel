@@ -79,3 +79,18 @@ export const removeAllProfilePhotos = (payload) =>
   api.post('/account-settings/remove-photos', payload, {
     timeout: LONG_RUNNING_TIMEOUT_MS,
   });
+
+/**
+ * Apply a queue of per-session photo assignments built in the Manual-mode
+ * "Photo Queue" card. Each assignment is `{ photoPath, sessionIds }` where
+ * `photoPath` is the value returned by /upload-photo for that file.
+ *
+ * Uses the same long timeout as the other bulk actions because the
+ * backend hits Telegram MTProto sequentially per session.
+ */
+export const applyPhotoAssignments = (assignments) =>
+  api.post(
+    '/account-settings/photo-assignments/apply',
+    { assignments },
+    { timeout: LONG_RUNNING_TIMEOUT_MS }
+  );

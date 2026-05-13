@@ -781,15 +781,197 @@ class AccountSettingsService {
   }
 
   /**
+   * Apply a queue of per-session photo assignments. Each assignment carries
+   * its own `photoPath` (the on-disk path returned by /upload-photo) and a
+   * list of `sessionIds` that should receive that photo.
+   *
+   * Semantics:
+   *   - Assignments are processed in order. Within an assignment, every
+   *     session is processed sequentially with revocation tracking.
+   *   - If the same sessionId appears in two assignments the LATER one
+   *     wins (Telegram only renders the most recently uploaded avatar).
+   *     The frontend warns the operator about overlaps; the backend just
+   *     applies them in order.
+   *   - Per-session failures are isolated — one AUTH_KEY_UNREGISTERED
+   *     does not abort the rest of the queue.
+   *   - Ownership is enforced: any sessionId not owned by the caller is
+   *     dropped from the assignment and recorded as an error result.
+   *   - Photo paths are validated to live under the uploads tmp dir to
+   *     prevent reading arbitrary files off disk.
+   *
+   * @param {{ assignments: Array<{ photoPath: string, sessionIds: Array<number|string> }> }} params
+   * @param {number} userId
+   * @returns {Promise<{
+   *   totalAssignments: number,
+   *   totalSessions: number,
+   *   success: number,
+   *   failed: number,
+   *   results: Array<{ assignmentIndex:number, sessionId:number, phone:string|null, success:boolean, errors:string[] }>
+   * }>}
+   */
+  async applyPhotoAssignments({ assignments }, userId) {
+    if (!userId) {
+      throw new AppError('User ID is required', 400, 'MISSING_USER_ID');
+    }
+    if (!Array.isArray(assignments) || assignments.length === 0) {
+      throw new AppError(
+        'At least one photo assignment is required',
+        400,
+        'NO_ASSIGNMENTS'
+      );
+    }
+
+    // Photo paths must live under the same tmp uploads directory that
+    // /upload-photo writes to — otherwise we'd be giving the operator a
+    // way to instruct the panel to read arbitrary files.
+    const uploadDir = path.join(os.tmpdir(), 'telegram-panel', 'uploads');
+    const isUnderUploadDir = (p) => {
+      if (typeof p !== 'string' || !p.length) return false;
+      const resolved = path.resolve(p);
+      const root = path.resolve(uploadDir);
+      return resolved === root || resolved.startsWith(root + path.sep);
+    };
+
+    // First-pass validation: every assignment must have a valid photoPath
+    // and at least one numeric sessionId. Bad entries are rejected early
+    // before we hit Telegram.
+    const cleanAssignments = [];
+    for (let i = 0; i < assignments.length; i++) {
+      const a = assignments[i] || {};
+      const photoPath = typeof a.photoPath === 'string' ? a.photoPath : '';
+      const sids = Array.isArray(a.sessionIds)
+        ? a.sessionIds
+            .map((s) => Number(s))
+            .filter((n) => Number.isFinite(n) && n > 0)
+        : [];
+      if (!photoPath) {
+        throw new AppError(
+          `Assignment #${i + 1} is missing a photo path`,
+          400,
+          'INVALID_ASSIGNMENT'
+        );
+      }
+      if (!isUnderUploadDir(photoPath)) {
+        throw new AppError(
+          `Assignment #${i + 1} has an invalid photo path`,
+          400,
+          'INVALID_PHOTO_PATH'
+        );
+      }
+      if (!fs.existsSync(photoPath)) {
+        throw new AppError(
+          `Assignment #${i + 1} photo no longer exists on disk — re-upload it`,
+          400,
+          'PHOTO_NOT_FOUND'
+        );
+      }
+      if (sids.length === 0) {
+        throw new AppError(
+          `Assignment #${i + 1} has no sessions`,
+          400,
+          'NO_SESSIONS_IN_ASSIGNMENT'
+        );
+      }
+      cleanAssignments.push({ photoPath, sessionIds: sids, index: i });
+    }
+
+    // Ownership check across the union of all session IDs in the queue.
+    const allSessionIds = Array.from(
+      new Set(cleanAssignments.flatMap((a) => a.sessionIds))
+    );
+    const ownedRows = await pool.query(
+      `SELECT id, phone, status FROM sessions WHERE id = ANY($1::int[]) AND user_id = $2`,
+      [allSessionIds, userId]
+    );
+    const ownedById = new Map(ownedRows.rows.map((r) => [r.id, r]));
+    if (ownedById.size === 0) {
+      throw new AppError('No valid sessions found', 404, 'NO_VALID_SESSIONS');
+    }
+
+    logger.info(
+      `Starting per-session photo-queue apply: ${cleanAssignments.length} assignments, ` +
+        `${allSessionIds.length} unique sessions (${ownedById.size} owned)`,
+      { userId }
+    );
+
+    const results = [];
+    let totalSessions = 0;
+
+    for (const a of cleanAssignments) {
+      for (const sid of a.sessionIds) {
+        totalSessions += 1;
+        const owned = ownedById.get(sid);
+        const sessionResult = {
+          assignmentIndex: a.index,
+          sessionId: sid,
+          phone: owned ? owned.phone : null,
+          success: false,
+          errors: [],
+        };
+
+        if (!owned) {
+          sessionResult.errors.push(
+            'Session not found or not owned by user'
+          );
+          results.push(sessionResult);
+          continue;
+        }
+
+        try {
+          await callWithRevocationTracking(
+            sid,
+            'accountSettings.photoQueueApply',
+            () =>
+              telegramService.updateProfilePhoto(String(sid), a.photoPath)
+          );
+          sessionResult.success = true;
+        } catch (err) {
+          sessionResult.errors.push(
+            `Profile photo update failed: ${err.message}`
+          );
+        }
+
+        results.push(sessionResult);
+      }
+    }
+
+    const successCount = results.filter((r) => r.success).length;
+    await pool.query(
+      `INSERT INTO activity_logs (user_id, action, details, created_at)
+       VALUES ($1, 'apply_photo_assignments', $2, NOW())`,
+      [
+        userId,
+        JSON.stringify({
+          assignments: cleanAssignments.length,
+          totalSessions,
+          successCount,
+        }),
+      ]
+    );
+
+    logger.info(
+      `Per-session photo-queue apply completed: ${successCount}/${totalSessions} sessions across ${cleanAssignments.length} assignments`,
+      { userId }
+    );
+
+    return {
+      totalAssignments: cleanAssignments.length,
+      totalSessions,
+      success: successCount,
+      failed: totalSessions - successCount,
+      results,
+    };
+  }
+
+  /**
    * Remove every profile photo from a list of sessions. Used by the
    * "Remove all profile photos" destructive bulk action in the
    * AccountSettings page — leaves each account with no visible avatar
    * (Telegram renders the default monogram).
    *
-   * Walks each session sequentially (same pattern as
-   * {@link applyRandomizedAssignments}). Failures on individual sessions
-   * are recorded in the result but do not abort the rest of the batch,
-   * so a single revoked auth-key doesn't poison a 40-session run.
+   * Walks each session sequentially. Failures on individual sessions are
+   * recorded in the result but do not abort the rest of the batch, so a
+   * single revoked auth-key doesn't poison a 40-session run.
    *
    * @param {{ sessionIds: Array<number|string> }} params
    * @param {number} userId
