@@ -126,6 +126,48 @@ for (const a of assignments) {
   seen.add(k);
 }
 
+// ──────────────────────────────────────────────────────────────────
+// 3b. buildProfileListAssignments — list row with NO username should
+//      produce clearUsername=true so the apply path calls
+//      account.UpdateUsername('') and wipes the session's handle.
+// ──────────────────────────────────────────────────────────────────
+const mixedItems = [
+  { firstName: 'Marc', lastName: 'W', username: 'marcw88', bio: 'A' },
+  { firstName: 'Anonymous', username: null, bio: 'no handle' },
+];
+// 4 sessions, 2 items → indices [0:marc, 1:anon, 2:marc_repeat, 3:anon_repeat]
+const mixedAssignments = buildProfileListAssignments(
+  mixedItems,
+  [201, 202, 203, 204],
+  avatarIds
+);
+assert.strictEqual(mixedAssignments[0].username, 'marcw88');
+assert.strictEqual(mixedAssignments[0].clearUsername, undefined);
+
+// Row 1 has no username → must be flagged clearUsername=true with
+// an empty username string the apply path can pass through.
+assert.strictEqual(
+  mixedAssignments[1].clearUsername,
+  true,
+  'row without username sets clearUsername=true'
+);
+assert.strictEqual(
+  mixedAssignments[1].username,
+  '',
+  'username is empty string when clearing'
+);
+
+// Row 2 is a repeat of the named row → suffixed username, NOT clearing.
+assert.ok(
+  /^marcw88_[a-z0-9]{4}$/.test(mixedAssignments[2].username),
+  `row 2 should be a suffixed marcw88, got ${mixedAssignments[2].username}`
+);
+assert.strictEqual(mixedAssignments[2].clearUsername, undefined);
+
+// Row 3 is the second occurrence of the no-username item → also clear.
+assert.strictEqual(mixedAssignments[3].clearUsername, true);
+assert.strictEqual(mixedAssignments[3].username, '');
+
 // Name + bio are allowed to repeat (operator explicitly asked).
 assert.strictEqual(
   assignments[0].firstName,

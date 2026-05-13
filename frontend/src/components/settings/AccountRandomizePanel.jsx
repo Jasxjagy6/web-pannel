@@ -65,6 +65,13 @@ function fmtSelectedCount(n) {
   return `${n} sessions`;
 }
 
+function fmtElapsed(seconds) {
+  const s = Math.max(0, Math.floor(seconds || 0));
+  const mm = Math.floor(s / 60);
+  const ss = s % 60;
+  return `${String(mm).padStart(2, '0')}:${String(ss).padStart(2, '0')}`;
+}
+
 export default function AccountRandomizePanel({
   selectedSessions, // [{ id, phone, username? }]
   onApplied,
@@ -87,6 +94,21 @@ export default function AccountRandomizePanel({
   const [usernameBase, setUsernameBase] = useState('');
   const [assignments, setAssignments] = useState([]); // generated rows
   const [submitting, setSubmitting] = useState(false);
+  // Elapsed seconds since Apply was clicked — drives the long-running
+  // progress hint so users don't think the request has hung.
+  const [submitElapsed, setSubmitElapsed] = useState(0);
+
+  useEffect(() => {
+    if (!submitting) {
+      setSubmitElapsed(0);
+      return undefined;
+    }
+    const startedAt = Date.now();
+    const id = setInterval(() => {
+      setSubmitElapsed(Math.floor((Date.now() - startedAt) / 1000));
+    }, 1000);
+    return () => clearInterval(id);
+  }, [submitting]);
 
   // ---- Load pools once on mount.
   useEffect(() => {
@@ -389,6 +411,25 @@ export default function AccountRandomizePanel({
               />
             ))}
           </ul>
+          {submitting && (
+            <div className="px-5 py-3 border-t border-white/10 bg-emerald-500/[0.04]">
+              <div className="flex items-center gap-3 text-sm text-emerald-100">
+                <Loader2 className="w-4 h-4 animate-spin text-emerald-300" />
+                <div className="flex-1">
+                  <div className="font-medium">
+                    Applying to {assignments.length} session{assignments.length === 1 ? '' : 's'}…
+                  </div>
+                  <div className="mt-1 text-xs text-emerald-200/70">
+                    Elapsed: {fmtElapsed(submitElapsed)}. Each session takes a few seconds — please
+                    keep this tab open until completion.
+                  </div>
+                  <div className="mt-2 h-1 w-full overflow-hidden rounded bg-emerald-900/30">
+                    <div className="h-full animate-pulse rounded bg-emerald-400/70" style={{ width: '100%' }} />
+                  </div>
+                </div>
+              </div>
+            </div>
+          )}
           <div className="px-5 py-4 border-t border-white/10 flex justify-end">
             <button
               type="button"
@@ -399,7 +440,7 @@ export default function AccountRandomizePanel({
               {submitting ? (
                 <>
                   <Loader2 className="w-4 h-4 animate-spin" />
-                  Applying…
+                  Applying… ({fmtElapsed(submitElapsed)})
                 </>
               ) : (
                 <>

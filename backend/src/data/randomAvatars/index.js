@@ -6,12 +6,18 @@
  * time so dropping additional `avatar*.{png,jpg,jpeg}` files automatically
  * extends the pool with no code change.
  *
- * The pool today contains:
- *   - 158 stylised real-looking avatars (anime portraits, illustrated
- *     heroes, robots, cartoons, pixel art, etc.) seeded via DiceBear and
- *     committed as `avatar001.png … avatar158.png`.
- *   - 12 legacy `avatarNN.jpg` placeholders kept for backward
- *     compatibility with any URL the frontend may have cached.
+ * The pool today contains 200+ REAL human photographs seeded by
+ * `backend/scripts/seedRealAvatars.js`:
+ *   - 200 portrait photographs of real people (men + women) sourced
+ *     from randomuser.me's Creative-Commons / Flickr-derived collection.
+ *   - 30+ headshots of live-action superhero actors (MCU / DC / X-Men)
+ *     sourced from Wikimedia Commons via the MediaWiki pageimages API
+ *     (Iron Man, Spider-Man, Captain America, Thor, Wonder Woman,
+ *     Batman, Superman, Wolverine, Deadpool, etc.).
+ *
+ * The 170-image synthetic DiceBear catalog that used to live here was
+ * replaced with this real-photo pool per operator request — the
+ * synthetic avatars looked unrealistic on production sessions.
  *
  * Avatars are sorted alphabetically (so iteration order is stable) and
  * the helpers below resolve an avatar ID to its on-disk path regardless

@@ -120,29 +120,39 @@ function buildProfileListAssignments(profileItems, sessionIds, avatarIds, opts =
       assignment.bio = src.bio;
     }
 
-    if (updateUsernames && src.username) {
-      let candidate;
-      const baseUses = usernameUseCount.get(src.username) || 0;
-      if (baseUses === 0 && !claimedUsernames.has(src.username.toLowerCase())) {
-        candidate = src.username;
-      } else {
-        // Repeat: add a random suffix until we get something unused.
-        for (let tries = 0; tries < 8; tries++) {
-          const candidateAttempt = `${src.username}${randomUsernameSuffix()}`.slice(0, 32);
-          if (!claimedUsernames.has(candidateAttempt.toLowerCase())) {
-            candidate = candidateAttempt;
-            break;
+    if (updateUsernames) {
+      if (src.username) {
+        let candidate;
+        const baseUses = usernameUseCount.get(src.username) || 0;
+        if (baseUses === 0 && !claimedUsernames.has(src.username.toLowerCase())) {
+          candidate = src.username;
+        } else {
+          // Repeat: add a random suffix until we get something unused.
+          for (let tries = 0; tries < 8; tries++) {
+            const candidateAttempt = `${src.username}${randomUsernameSuffix()}`.slice(0, 32);
+            if (!claimedUsernames.has(candidateAttempt.toLowerCase())) {
+              candidate = candidateAttempt;
+              break;
+            }
+          }
+          if (!candidate) {
+            // Extremely unlikely after 8 attempts; let the runtime
+            // collision detection (USERNAME_OCCUPIED) handle it.
+            candidate = `${src.username}${randomUsernameSuffix()}`.slice(0, 32);
           }
         }
-        if (!candidate) {
-          // Extremely unlikely after 8 attempts; let the runtime
-          // collision detection (USERNAME_OCCUPIED) handle it.
-          candidate = `${src.username}${randomUsernameSuffix()}`.slice(0, 32);
-        }
+        usernameUseCount.set(src.username, baseUses + 1);
+        claimedUsernames.add(candidate.toLowerCase());
+        assignment.username = candidate;
+      } else {
+        // Source row has no username — operator explicitly asked that
+        // we CLEAR the session's current handle in this case (call
+        // account.UpdateUsername with an empty string), regardless of
+        // what the session had before. The apply path keys off this
+        // flag and treats it differently from "username field absent".
+        assignment.username = '';
+        assignment.clearUsername = true;
       }
-      usernameUseCount.set(src.username, baseUses + 1);
-      claimedUsernames.add(candidate.toLowerCase());
-      assignment.username = candidate;
     }
 
     if (updatePhotos && Array.isArray(avatarIds) && avatarIds.length > 0) {
@@ -455,6 +465,11 @@ class AccountSettingsService {
           }
         }
 
+        // Username has three states:
+        //   - non-empty string  → set to that handle
+        //   - clearUsername=true → call UpdateUsername("") to wipe the
+        //     session's current handle (profile-list row had no username)
+        //   - absent / undefined → leave the session's username alone
         if (typeof a.username === 'string' && a.username.length > 0) {
           try {
             await callWithRevocationTracking(id, 'accountSettings.randomizeUsername', () =>
@@ -463,6 +478,15 @@ class AccountSettingsService {
             sessionResult.updatedFields.push('username');
           } catch (err) {
             sessionResult.errors.push(`Username update failed: ${err.message}`);
+          }
+        } else if (a.clearUsername === true) {
+          try {
+            await callWithRevocationTracking(id, 'accountSettings.clearUsername', () =>
+              telegramService.updateUsername(String(id), '')
+            );
+            sessionResult.updatedFields.push('username:cleared');
+          } catch (err) {
+            sessionResult.errors.push(`Username clear failed: ${err.message}`);
           }
         }
 
