@@ -806,13 +806,18 @@ class MonitorOrchestrator {
     if (!sessionIds || sessionIds.length === 0) return new Map();
     const meta = new Map();
     // One query for sessions + tg_session_health + last-shift info.
+    //
+    // The proxy join uses `sessions.bound_proxy_id` (v3) → `proxies.id`
+    // (v2 base + v14 per-user fields). `country_code` is the ISO-3166
+    // alpha-2 added in v14; older shared rows can have it NULL which
+    // the planner already treats as "unknown country".
     const r = await pool.query(
-      `SELECT s.id, s.user_id, s.is_logged_in, s.dc_id, s.proxy_id,
-              p.country AS proxy_country,
+      `SELECT s.id, s.user_id, s.is_logged_in, s.dc_id, s.bound_proxy_id,
+              p.country_code AS proxy_country,
               h.risk_score
          FROM sessions s
          LEFT JOIN tg_session_health h ON h.session_id = s.id
-         LEFT JOIN user_proxies p ON p.id = s.proxy_id
+         LEFT JOIN proxies p ON p.id = s.bound_proxy_id
         WHERE s.id = ANY($1::int[])`,
       [sessionIds]
     );

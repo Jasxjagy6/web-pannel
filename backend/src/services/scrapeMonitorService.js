@@ -718,6 +718,17 @@ class ScrapeMonitorService {
         await this._finishJob(job.id, job.user_id);
         continue;
       }
+      // This method runs at boot AND on the 60 s sweep timer (index.js).
+      // At boot _active is empty so every running job needs a fresh
+      // _attach. On the sweep, only act on jobs that aren't already
+      // attached in-process — otherwise we tear down healthy listeners
+      // every minute, wipe the in-memory profileCache/participantCache,
+      // and re-run _resolveEntity / iterParticipants against
+      // admin-only chats that we know will fail. The sweep's real job
+      // is to roll *expired* jobs to completed and to re-attach jobs
+      // whose in-memory state was lost (e.g. after a hot reload that
+      // skipped the boot path).
+      if (this._active.has(job.id)) continue;
       try {
         await this._attach(
           job.id, job.user_id, job.session_ids, remaining, job.target_id,
@@ -788,6 +799,24 @@ class ScrapeMonitorService {
         resolved = await telegramService._resolveEntity(String(sid), rawTarget);
       } catch (err) {
         logger.debug(`Monitor job ${jobId} session ${sid} could not pre-resolve target: ${err.message}`);
+      }
+      // For private / invite-only chats with no public @username,
+      // `_resolveEntity` keeps trying `resolveUsername` against the
+      // URL slug and fails with USERNAME_NOT_OCCUPIED. Those chats
+      // are still in the session's dialog list (you joined via an
+      // invite link). Scan the dialog cache and match by username,
+      // numeric id, invite hash, or title so we can populate the
+      // allow-list with the real chat id and stop relying purely on
+      // `_chat.username` (which is empty for private chats).
+      if (!resolved) {
+        try {
+          resolved = await this._resolveFromDialogs(String(sid), rawTarget);
+          if (resolved) {
+            logger.debug(`Monitor job ${jobId} session ${sid} resolved target via dialog cache`);
+          }
+        } catch (err) {
+          logger.debug(`Monitor job ${jobId} session ${sid} dialog-cache fallback failed: ${err.message}`);
+        }
       }
       if (resolved && resolved.id !== undefined && resolved.id !== null) {
         const idStr = bigToString(resolved.id);
@@ -922,6 +951,83 @@ class ScrapeMonitorService {
   }
 
   /**
+   * Resolve `rawTarget` against a session's dialog cache. Used when
+   * `_resolveEntity` fails — typically for private / invite-only chats
+   * whose URL slug isn't a real `@username`. We match across all forms
+   * the operator might paste (numeric id, `@username`, `t.me/<slug>`,
+   * `t.me/+<invite>`, raw invite hash, and a normalized title).
+   *
+   * Returns the GramJS entity (`Chat` / `Channel`) or `null`.
+   */
+  async _resolveFromDialogs(sessionId, rawTarget) {
+    const client = telegramService.clients.get(String(sessionId))?.client;
+    if (!client) return null;
+
+    const raw = String(rawTarget).trim();
+    const candidates = new Set();
+    candidates.add(raw);
+    candidates.add(raw.toLowerCase());
+    if (raw.startsWith('@')) candidates.add(raw.slice(1).toLowerCase());
+
+    // Pull every form we can think of out of the target string so we
+    // can match it against `dialog.entity.username` / `dialog.title`
+    // / numeric id / invite hash regardless of how the operator typed it.
+    const urlMatch = raw.match(/(?:t\.me|telegram\.me)\/(?:s\/)?(@?[+\w_]+)/i);
+    if (urlMatch && urlMatch[1]) {
+      const slug = urlMatch[1].replace(/^@/, '').toLowerCase();
+      candidates.add(slug);
+      if (slug.startsWith('+')) candidates.add(slug.slice(1));
+    }
+    const inviteMatch = raw.match(/(?:joinchat\/|t\.me\/\+)([\w-]+)/i);
+    const inviteHash = inviteMatch ? inviteMatch[1] : null;
+    const numericId = /^-?\d+$/.test(raw) ? raw : null;
+
+    const dialogs = await client.getDialogs({ limit: 500 });
+    for (const dialog of dialogs || []) {
+      const entity = dialog.entity;
+      if (!entity || (entity.className !== 'Chat' && entity.className !== 'Channel')) {
+        continue;
+      }
+
+      // Exact id match (numeric or "-100…" supergroup form).
+      const idStr = bigToString(entity.id);
+      if (idStr) {
+        if (numericId === idStr) return entity;
+        if (numericId === `-100${idStr}`) return entity;
+        if (numericId === `-${idStr}`) return entity;
+      }
+
+      // Public username match.
+      if (entity.username) {
+        const u = String(entity.username).toLowerCase();
+        if (candidates.has(u)) return entity;
+      }
+
+      // Invite-link hash match: a Channel's `usernames` field doesn't
+      // include the invite hash, but the chat title is often unique
+      // enough to match as a last resort. Try title equality with
+      // basic normalisation (lowercase, alphanumeric only).
+      if (entity.title) {
+        const t = String(entity.title).toLowerCase().replace(/[^a-z0-9]/g, '');
+        for (const cand of candidates) {
+          const c = cand.toLowerCase().replace(/[^a-z0-9]/g, '');
+          if (c && c === t) return entity;
+        }
+      }
+
+      // For invite-link targets we also try the cached
+      // `entity.accessHash`-derived form — but GramJS doesn't expose the
+      // invite hash directly on the dialog, so we settle for whatever
+      // match the title / username pass produced above.
+      if (inviteHash) {
+        // No-op; left here so future improvements have a place to slot
+        // a proper invite-hash → dialog match if GramJS adds support.
+      }
+    }
+    return null;
+  }
+
+  /**
    * Best-effort prefetch of the target chat's participants — populates
    * `ctx.enrich.participantCache` so blank profiles surfaced from
    * typing / reactions / membership updates can be enriched without a
@@ -933,7 +1039,19 @@ class ScrapeMonitorService {
     for (const sid of sessionIds) {
       try {
         const sidStr = String(sid);
-        const entity = await telegramService._resolveEntity(sidStr, rawTarget);
+        let entity = null;
+        try {
+          entity = await telegramService._resolveEntity(sidStr, rawTarget);
+        } catch (resolveErr) {
+          logger.debug(`Monitor job ${jobId} session ${sid} prefetch _resolveEntity failed: ${resolveErr.message}`);
+        }
+        if (!entity) {
+          try {
+            entity = await this._resolveFromDialogs(sidStr, rawTarget);
+          } catch (dialogErr) {
+            logger.debug(`Monitor job ${jobId} session ${sid} prefetch dialog fallback failed: ${dialogErr.message}`);
+          }
+        }
         if (!entity) continue;
         const client = telegramService.clients.get(sidStr)?.client;
         if (!client) continue;
@@ -1263,87 +1381,75 @@ class ScrapeMonitorService {
 
     let inserted = false;
     if (dedupEnabled) {
-      const existing = await pool.query(
-        `SELECT id FROM scrape_monitor_users
-          WHERE monitor_job_id = $1 AND telegram_id = $2
-          LIMIT 1`,
-        [jobId, profile.telegramId]
+      // Atomic upsert against the v29 partial UNIQUE
+      // (monitor_job_id, telegram_id) WHERE dedup_locked AND
+      // monitor_chat_id IS NULL. This replaces the previous
+      // SELECT-then-INSERT path which races with N parallel
+      // NewMessage handlers (one per attached session) on the same
+      // chat, producing ~N rows per real message.
+      //
+      // RETURNING (xmax = 0) AS inserted lets us distinguish "first
+      // sighting" (INSERT) from "Nth sighting" (UPDATE) without an
+      // extra round-trip — see https://stackoverflow.com/q/34708509.
+      const res = await pool.query(
+        `INSERT INTO scrape_monitor_users
+           (monitor_job_id, telegram_id, username, first_name, last_name,
+            phone, is_bot, is_premium, message_count,
+            first_seen_at, last_seen_at, via_session_id,
+            is_verified, is_scam, is_fake, is_restricted, is_deleted,
+            is_support, is_contact, is_mutual_contact, is_close_friend,
+            lang_code, status, access_hash, has_profile_photo, dc_id,
+            restriction_reason, dedup_locked)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 1, NOW(), NOW(), $9,
+                 $10, $11, $12, $13, $14, $15, $16, $17, $18,
+                 $19, $20, $21, $22, $23, $24, TRUE)
+         ON CONFLICT (monitor_job_id, telegram_id)
+           WHERE dedup_locked = TRUE AND monitor_chat_id IS NULL
+         DO UPDATE SET
+           message_count     = scrape_monitor_users.message_count + 1,
+           last_seen_at      = NOW(),
+           username          = COALESCE(EXCLUDED.username,    scrape_monitor_users.username),
+           first_name        = COALESCE(EXCLUDED.first_name,  scrape_monitor_users.first_name),
+           last_name         = COALESCE(EXCLUDED.last_name,   scrape_monitor_users.last_name),
+           phone             = COALESCE(EXCLUDED.phone,       scrape_monitor_users.phone),
+           is_premium        = scrape_monitor_users.is_premium    OR EXCLUDED.is_premium,
+           is_bot            = scrape_monitor_users.is_bot        OR EXCLUDED.is_bot,
+           is_verified       = scrape_monitor_users.is_verified   OR EXCLUDED.is_verified,
+           is_scam           = scrape_monitor_users.is_scam       OR EXCLUDED.is_scam,
+           is_fake           = scrape_monitor_users.is_fake       OR EXCLUDED.is_fake,
+           is_restricted     = scrape_monitor_users.is_restricted OR EXCLUDED.is_restricted,
+           is_deleted        = scrape_monitor_users.is_deleted    OR EXCLUDED.is_deleted,
+           is_support        = scrape_monitor_users.is_support    OR EXCLUDED.is_support,
+           is_contact        = scrape_monitor_users.is_contact    OR EXCLUDED.is_contact,
+           is_mutual_contact = scrape_monitor_users.is_mutual_contact OR EXCLUDED.is_mutual_contact,
+           is_close_friend   = scrape_monitor_users.is_close_friend   OR EXCLUDED.is_close_friend,
+           lang_code         = COALESCE(EXCLUDED.lang_code,    scrape_monitor_users.lang_code),
+           status            = COALESCE(EXCLUDED.status,       scrape_monitor_users.status),
+           access_hash       = COALESCE(EXCLUDED.access_hash,  scrape_monitor_users.access_hash),
+           has_profile_photo = scrape_monitor_users.has_profile_photo OR EXCLUDED.has_profile_photo,
+           dc_id             = COALESCE(EXCLUDED.dc_id,        scrape_monitor_users.dc_id),
+           restriction_reason = COALESCE(EXCLUDED.restriction_reason, scrape_monitor_users.restriction_reason)
+         RETURNING (xmax = 0) AS inserted`,
+        [
+          jobId, profile.telegramId, profile.username,
+          profile.firstName, profile.lastName, profile.phone,
+          !!profile.isBot, !!profile.isPremium, sessionId,
+          !!profile.isVerified, !!profile.isScam, !!profile.isFake,
+          !!profile.isRestricted, !!profile.isDeleted, !!profile.isSupport,
+          !!profile.isContact, !!profile.isMutualContact, !!profile.isCloseFriend,
+          profile.langCode, profile.status,
+          profile.accessHash != null ? String(profile.accessHash) : null,
+          !!profile.hasProfilePhoto,
+          profile.dcId != null ? Number(profile.dcId) : null,
+          profile.restrictionReason || null,
+        ]
       );
-      if (existing.rows[0]) {
-        await pool.query(
-          `UPDATE scrape_monitor_users
-              SET message_count    = message_count + 1,
-                  last_seen_at     = NOW(),
-                  username         = COALESCE($3, username),
-                  first_name       = COALESCE($4, first_name),
-                  last_name        = COALESCE($5, last_name),
-                  phone            = COALESCE($6, phone),
-                  is_premium       = is_premium OR $7,
-                  is_bot           = is_bot OR $8,
-                  is_verified      = is_verified OR $9,
-                  is_scam          = is_scam OR $10,
-                  is_fake          = is_fake OR $11,
-                  is_restricted    = is_restricted OR $12,
-                  is_deleted       = is_deleted OR $13,
-                  is_support       = is_support OR $14,
-                  is_contact       = is_contact OR $15,
-                  is_mutual_contact = is_mutual_contact OR $16,
-                  is_close_friend  = is_close_friend OR $17,
-                  lang_code        = COALESCE($18, lang_code),
-                  status           = COALESCE($19, status),
-                  access_hash      = COALESCE($20, access_hash),
-                  has_profile_photo = has_profile_photo OR $21,
-                  dc_id            = COALESCE($22, dc_id),
-                  restriction_reason = COALESCE($23, restriction_reason)
-            WHERE id = $1 AND monitor_job_id = $2`,
-          [
-            existing.rows[0].id, jobId, profile.username,
-            profile.firstName, profile.lastName, profile.phone,
-            !!profile.isPremium, !!profile.isBot,
-            !!profile.isVerified, !!profile.isScam, !!profile.isFake,
-            !!profile.isRestricted, !!profile.isDeleted, !!profile.isSupport,
-            !!profile.isContact, !!profile.isMutualContact, !!profile.isCloseFriend,
-            profile.langCode, profile.status,
-            profile.accessHash != null ? String(profile.accessHash) : null,
-            !!profile.hasProfilePhoto,
-            profile.dcId != null ? Number(profile.dcId) : null,
-            profile.restrictionReason || null,
-          ]
-        );
-        inserted = false;
-      } else {
-        await pool.query(
-          `INSERT INTO scrape_monitor_users
-             (monitor_job_id, telegram_id, username, first_name, last_name,
-              phone, is_bot, is_premium, message_count,
-              first_seen_at, last_seen_at, via_session_id,
-              is_verified, is_scam, is_fake, is_restricted, is_deleted,
-              is_support, is_contact, is_mutual_contact, is_close_friend,
-              lang_code, status, access_hash, has_profile_photo, dc_id,
-              restriction_reason)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 1, NOW(), NOW(), $9,
-                   $10, $11, $12, $13, $14, $15, $16, $17, $18,
-                   $19, $20, $21, $22, $23, $24)`,
-          [
-            jobId, profile.telegramId, profile.username,
-            profile.firstName, profile.lastName, profile.phone,
-            !!profile.isBot, !!profile.isPremium, sessionId,
-            !!profile.isVerified, !!profile.isScam, !!profile.isFake,
-            !!profile.isRestricted, !!profile.isDeleted, !!profile.isSupport,
-            !!profile.isContact, !!profile.isMutualContact, !!profile.isCloseFriend,
-            profile.langCode, profile.status,
-            profile.accessHash != null ? String(profile.accessHash) : null,
-            !!profile.hasProfilePhoto,
-            profile.dcId != null ? Number(profile.dcId) : null,
-            profile.restrictionReason || null,
-          ]
-        );
-        inserted = true;
-      }
+      inserted = !!res.rows[0]?.inserted;
     } else {
       // dedup OFF: every observation is its own row, even from the same
       // user. The user explicitly opted in to a raw activity log, so
-      // we MUST NOT skip anything here.
+      // we MUST NOT skip anything here. `dedup_locked = FALSE` keeps
+      // these rows outside the partial UNIQUE.
       await pool.query(
         `INSERT INTO scrape_monitor_users
            (monitor_job_id, telegram_id, username, first_name, last_name,
@@ -1352,10 +1458,10 @@ class ScrapeMonitorService {
             is_verified, is_scam, is_fake, is_restricted, is_deleted,
             is_support, is_contact, is_mutual_contact, is_close_friend,
             lang_code, status, access_hash, has_profile_photo, dc_id,
-            restriction_reason)
+            restriction_reason, dedup_locked)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 1, NOW(), NOW(), $9,
                  $10, $11, $12, $13, $14, $15, $16, $17, $18,
-                 $19, $20, $21, $22, $23, $24)`,
+                 $19, $20, $21, $22, $23, $24, FALSE)`,
         [
           jobId, profile.telegramId, profile.username,
           profile.firstName, profile.lastName, profile.phone,
