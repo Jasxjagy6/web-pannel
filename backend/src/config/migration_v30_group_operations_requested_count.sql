@@ -1,0 +1,34 @@
+-- Migration v30: track join-request (approval-pending) outcomes on group_operations
+--
+-- Context
+-- =======
+-- `group_operations` historically tracked three terminal outcomes per
+-- (session, target) pair: success, failed, skipped. With the join/leave
+-- upgrade that lands alongside this migration, joining a private chat
+-- whose owner has "approve new members" enabled — or a public channel
+-- with "request to join" enabled — is *not* a success and *not* a
+-- failure: the panel successfully queued an approval request, the
+-- session is now in `request_pending` state, and the join will resolve
+-- when (and if) an admin approves it.
+--
+-- Without a dedicated counter the panel was forced to either
+-- mis-classify these as "failed" (operator panics — looks like the bulk
+-- run broke) or "succeeded" (operator panics differently — thinks the
+-- chats are ready to use, then bulk-sends to chats they aren't in yet).
+-- Both regressed the operator's mental model of what their fleet is
+-- actually a member of.
+--
+-- This migration adds the column. The bulk-join runner writes
+-- `requested_count` alongside the existing counters; `getOperationDetails`
+-- and `listOperations` surface it; the frontend's completion toast and
+-- Operation History split it out from "failed".
+--
+-- Safety
+-- ======
+-- Pure additive `ADD COLUMN ... DEFAULT 0`. Existing reads that don't
+-- know about the new column are unaffected. Existing writes that don't
+-- set it leave it at the default. Runs in <1ms on any practical size of
+-- `group_operations` (the table is bounded by jobs, not by per-pair
+-- rows). Idempotent via `IF NOT EXISTS`.
+ALTER TABLE group_operations
+  ADD COLUMN IF NOT EXISTS requested_count INTEGER NOT NULL DEFAULT 0;

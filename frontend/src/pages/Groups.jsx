@@ -167,14 +167,19 @@ function JoinLeaveForm({ sessions, onSubmit, submitting }) {
           onChange={(e) => setTargetIds(e.target.value)}
           placeholder="https://t.me/example_group
 or @example_channel
+or https://t.me/+abcDEF1234567890XYZ   (private invite link)
 or -1001234567890
 (one per line, multiple supported)"
-          rows={4}
+          rows={5}
           className={`${inputBase} ${errors.targetIds ? inputError : inputNormal} resize-none`}
         />
         {errors.targetIds && <p className="mt-1 text-xs text-red-400">{errors.targetIds}</p>}
         <p className="mt-1 text-xs text-gray-500">
-          Enter one group/channel link or ID per line. You can join/leave multiple at once.
+          Enter one group/channel link or ID per line. Private invite links
+          (<code className="text-gray-400">t.me/+…</code> /
+          <code className="text-gray-400">t.me/joinchat/…</code>) are supported —
+          chats that require admin approval will be marked as <em>Requested</em>
+          in the completion summary.
         </p>
       </div>
 
@@ -1319,17 +1324,34 @@ export default function Groups() {
 
       const success = finalOp.successCount || 0;
       const failed = finalOp.failedCount || 0;
-      const skipped = Math.max(0, (finalOp.totalUsers || total) - success - failed);
+      const requested = finalOp.requestedCount || 0;
       const totalRun = finalOp.totalUsers || total;
+      const skipped = Math.max(0, totalRun - success - failed - requested);
+      const requestedSuffix = requested > 0
+        ? `, ${requested} awaiting admin approval`
+        : '';
 
       if (finalOp.status === 'cancelled') {
-        showError(`Operation cancelled. ${success} ${actionWord} so far, ${failed} failed.`, 'Cancelled');
-      } else if (failed === 0 && skipped === 0) {
+        showError(
+          `Operation cancelled. ${success} ${actionWord} so far, ${failed} failed${requestedSuffix}.`,
+          'Cancelled',
+        );
+      } else if (failed === 0 && skipped === 0 && requested === 0) {
         showSuccess(`All ${success} session(s) ${actionWord} successfully.`, 'Complete');
-      } else if (success > 0) {
+      } else if (data.mode === 'join' && requested > 0 && failed === 0 && success === 0 && skipped === 0) {
         showSuccess(
-          `${success} ${actionWord}, ${failed} failed, ${skipped} skipped out of ${totalRun}.`,
-          'Partial Success',
+          `All ${requested} session(s) sent a join request. The chat owner ` +
+            `must approve before the sessions become members.`,
+          'Awaiting Approval',
+        );
+      } else if (success + requested > 0) {
+        const parts = [`${success} ${actionWord}`];
+        if (requested > 0) parts.push(`${requested} awaiting approval`);
+        if (failed > 0) parts.push(`${failed} failed`);
+        if (skipped > 0) parts.push(`${skipped} skipped`);
+        showSuccess(
+          `${parts.join(', ')} out of ${totalRun}.`,
+          requested > 0 ? 'Partial — Approvals Pending' : 'Partial Success',
         );
       } else {
         showError(`All ${failed} operation(s) failed. Open Operation History for details.`, 'Failed');
@@ -1476,7 +1498,12 @@ export default function Groups() {
                   <th className="text-left py-3 px-4 text-xs font-medium text-gray-400">ID</th>
                   <th className="text-left py-3 px-4 text-xs font-medium text-gray-400">Target</th>
                   <th className="text-left py-3 px-4 text-xs font-medium text-gray-400">Status</th>
-                  <th className="text-left py-3 px-4 text-xs font-medium text-gray-400">Added / Failed / Total</th>
+                  <th
+                    className="text-left py-3 px-4 text-xs font-medium text-gray-400"
+                    title="Success / Awaiting admin approval / Failed / Total"
+                  >
+                    Added / Requested / Failed / Total
+                  </th>
                   <th className="text-left py-3 px-4 text-xs font-medium text-gray-400">Date</th>
                   <th className="text-right py-3 px-4 text-xs font-medium text-gray-400">Actions</th>
                 </tr>
@@ -1496,6 +1523,13 @@ export default function Groups() {
                     </td>
                     <td className="py-3 px-4">
                       <span className="text-green-400">{op.successCount || 0}</span>
+                      <span className="text-gray-600 mx-1">/</span>
+                      <span
+                        className="text-amber-400"
+                        title="Sessions awaiting admin approval to join"
+                      >
+                        {op.requestedCount || 0}
+                      </span>
                       <span className="text-gray-600 mx-1">/</span>
                       <span className="text-red-400">{op.failedCount || 0}</span>
                       <span className="text-gray-600 mx-1">/</span>

@@ -2704,24 +2704,55 @@ class TelegramService {
         }
       }
 
-      // Handle invite links
-      if (idStr.startsWith('https://t.me/joinchat/') || idStr.startsWith('https://t.me/+')) {
+      // Handle invite links. Accepts every form Telegram clients emit
+      // — `https://t.me/+abc`, `https://t.me/joinchat/abc`, the
+      // bare-host `t.me/+abc`, the `telegram.me/...` mirror, the
+      // `tg://join?invite=abc` deep link, and a bare hash on its own
+      // line — via the shared `_parseInviteHash` helper. The previous
+      // implementation only matched the `https://t.me/joinchat/` and
+      // `https://t.me/+` prefixes, so paste-from-clipboard hashes and
+      // every desktop client share format that omits the scheme fell
+      // through to the username branch and were rejected as
+      // "Could not resolve target".
+      const inviteHash = this._parseInviteHash(idStr);
+      if (inviteHash) {
         try {
           const result = await this._withFloodRetry(sessionId, async () => {
             return await client.invoke(
-              new Api.messages.CheckChatInvite({
-                hash: idStr.split('/').pop(),
-              })
+              new Api.messages.CheckChatInvite({ hash: inviteHash })
             );
           });
 
-          if (result.className === 'ChatInvite') {
-            // Import the invite to get the channel/chat
+          // Already a member: CheckChatInvite returns ChatInviteAlready
+          // with `chat` populated. Before this branch was added, the
+          // sessions that were already in the chat from a previous run
+          // walked off the end of the resolver, returned null, and the
+          // bulk job counted them as failed ("Could not resolve
+          // target"). Surface the chat directly — caller decides what
+          // to do next.
+          if (result && result.className === 'ChatInviteAlready' && result.chat) {
+            return result.chat;
+          }
+          if (result && result.className === 'ChatInvitePeek' && result.chat) {
+            // Peek-only invites grant a temporary view. Joining still
+            // requires a separate ImportChatInvite, which the join
+            // flow handles explicitly. For other callers (monitor /
+            // add-members) returning the chat is correct — they want
+            // the entity, not the membership state.
+            return result.chat;
+          }
+
+          if (result && result.className === 'ChatInvite') {
+            // Import the invite to actually join the chat. This is the
+            // historical side-effect behaviour every other caller of
+            // `_resolveEntity` relies on (monitor, add-members, …) so
+            // we keep it. The join flow detects invite-link targets
+            // up-front and runs its own ImportChatInvite path with the
+            // approval-pending semantics it needs, so it never hits
+            // this branch.
             const imported = await this._withFloodRetry(sessionId, async () => {
               return await client.invoke(
-                new Api.messages.ImportChatInvite({
-                  hash: idStr.split('/').pop(),
-                })
+                new Api.messages.ImportChatInvite({ hash: inviteHash })
               );
             });
 
@@ -2886,6 +2917,64 @@ class TelegramService {
    * @returns {bigint|null}
    * @private
    */
+  /**
+   * Extract the invite hash from any of the forms a Telegram invite
+   * link can take. Returns the hash string (the characters after
+   * `joinchat/`, `+`, or `?invite=`) or `null` if `target` is not an
+   * invite link.
+   *
+   * Supported forms (case-insensitive on the host / scheme):
+   *   - https://t.me/joinchat/<hash>
+   *   - https://t.me/+<hash>
+   *   - http://t.me/joinchat/<hash>
+   *   - t.me/+<hash>
+   *   - www.t.me/+<hash>
+   *   - https://telegram.me/joinchat/<hash>
+   *   - tg://join?invite=<hash>
+   *   - bare <hash> (16-64 base64url characters, no scheme / no slash)
+   *
+   * Trailing query strings, fragments and path slashes are tolerated
+   * (e.g. `https://t.me/+abc?single`, `t.me/joinchat/abc/`).
+   *
+   * @param {*} target
+   * @returns {string|null}
+   * @private
+   */
+  _parseInviteHash(target) {
+    if (target == null) return null;
+    const raw = String(target).trim();
+    if (!raw) return null;
+
+    // tg:// deep link. The query string can be in any order — handle
+    // ?invite=X explicitly so future params don't break the match.
+    const tgMatch = raw.match(/^tg:\/\/join\?(?:[^#]*&)*invite=([A-Za-z0-9_-]+)/i);
+    if (tgMatch) return tgMatch[1];
+
+    // Strip http(s):// and any leading slashes / `www.` so the rest of
+    // the matcher only has to know about the host + path.
+    const noScheme = raw
+      .replace(/^https?:\/\//i, '')
+      .replace(/^\/+/, '')
+      .replace(/^www\./i, '');
+
+    // (t|telegram).me/(joinchat/|+)<hash>
+    const linkMatch = noScheme.match(
+      /^(?:t|telegram)\.me\/(?:joinchat\/|\+)([A-Za-z0-9_-]+)/i
+    );
+    if (linkMatch) return linkMatch[1];
+
+    // Bare hash (operator pasted just the hash). Base64url alphabet,
+    // generous length range so we accept new (longer) and legacy
+    // (shorter) hashes. Excludes anything containing `/`, `@`, `:`, or
+    // dots so we don't mis-classify usernames or URLs that failed the
+    // earlier match.
+    if (!/[\\\/@.:?&=#]/.test(raw) && /^[A-Za-z0-9_-]{16,64}$/.test(raw)) {
+      return raw;
+    }
+
+    return null;
+  }
+
   _normalizeAccessHashHint(hint) {
     try {
       if (hint === null || hint === undefined) return null;
@@ -3114,6 +3203,45 @@ class TelegramService {
         retryable: false,
         statusCode: 403,
       },
+      // Note: INVITE_REQUEST_SENT and USER_ALREADY_PARTICIPANT are
+      // intentionally NOT mapped here. The join flow catches them
+      // inline via message matching on the raw error and produces a
+      // structured result (status='requested' / 'already_member')
+      // instead of throwing. Other callers (add-members,
+      // addMemberToGroup) rely on the raw token remaining in the
+      // surfaced error message so their own regex-based fallbacks
+      // (USER_ALREADY_PARTICIPANT probes in addMemberToGroup, etc.)
+      // keep working.
+      INVITE_HASH_EXPIRED: {
+        pattern: /INVITE_HASH_EXPIRED/i,
+        message: 'The invite link has expired and is no longer valid.',
+        code: 'INVITE_HASH_EXPIRED',
+        retryable: false,
+        statusCode: 410,
+      },
+      INVITE_HASH_INVALID: {
+        pattern: /INVITE_HASH_INVALID/i,
+        message: 'The invite link is malformed or has been revoked.',
+        code: 'INVITE_HASH_INVALID',
+        retryable: false,
+        statusCode: 400,
+      },
+      INVITE_HASH_EMPTY: {
+        pattern: /INVITE_HASH_EMPTY/i,
+        message: 'The invite link is empty.',
+        code: 'INVITE_HASH_EMPTY',
+        retryable: false,
+        statusCode: 400,
+      },
+      CHANNELS_TOO_MUCH: {
+        pattern: /CHANNELS_TOO_MUCH/i,
+        message:
+          'This session has joined the maximum number of channels and ' +
+          'supergroups Telegram allows. Leave a few channels first.',
+        code: 'CHANNELS_TOO_MUCH',
+        retryable: false,
+        statusCode: 403,
+      },
       SLOWMODE_WAIT: {
         pattern: /SLOWMODE_WAIT_(\d+)/i,
         message: (seconds) => `Slowmode is enabled. Please wait ${seconds} seconds.`,
@@ -3329,40 +3457,223 @@ class TelegramService {
   /**
    * Join a group or channel using a session.
    *
+   * Returns one of three terminal outcomes via a `status` field so the
+   * caller (`groupService._runJoinLeaveBulk`) can split the per-pair
+   * results into operator-facing buckets:
+   *
+   *   - `joined`         -> session is now a member.
+   *   - `already_member` -> session was already in the chat; nothing
+   *                          to do. Counted as a skip on the operation
+   *                          row so the existing "All N joined" toast
+   *                          stays accurate.
+   *   - `requested`      -> the chat / channel requires admin approval,
+   *                          a join request has been queued by
+   *                          Telegram. The session will land in the
+   *                          chat only when an admin approves; surface
+   *                          this separately so operators know the
+   *                          fleet is not yet ready to use that target.
+   *
+   * Two flow paths share this method:
+   *
+   *   1. **Invite-link path** -- any target that `_parseInviteHash`
+   *      recognises (every `t.me/+...`, `t.me/joinchat/...`,
+   *      `telegram.me/...`, `tg://join?invite=...`, or bare-hash form).
+   *      We talk to `messages.CheckChatInvite` first so the
+   *      `requestNeeded` flag is observable up-front, then issue
+   *      `messages.ImportChatInvite` and translate its errors
+   *      (`USER_ALREADY_PARTICIPANT`, `INVITE_REQUEST_SENT`) into the
+   *      three-state outcome. The previous implementation routed these
+   *      targets through `_resolveEntity` and then *also* called
+   *      `channels.JoinChannel`, which double-billed the rate limit and
+   *      surfaced "already a member" as a hard failure.
+   *
+   *   2. **Public/username/numeric path** -- everything else.
+   *      `_resolveEntity` first, then `channels.JoinChannel`. The same
+   *      two error mappings apply: a channel with "request to join"
+   *      enabled raises `INVITE_REQUEST_SENT`, a session that's already
+   *      in the channel raises `USER_ALREADY_PARTICIPANT`. Both used to
+   *      be counted as failures; now they map to `requested` /
+   *      `already_member` respectively.
+   *
    * @param {string} sessionId - Active session identifier
-   * @param {string} targetId - Group/channel username or ID
-   * @returns {Promise<{ success: boolean, targetId: string, targetName?: string }>}
+   * @param {string} targetId  - Group/channel username, ID, or invite link
+   * @returns {Promise<{
+   *   success: true,
+   *   targetId: string,
+   *   targetName?: string,
+   *   status: 'joined'|'already_member'|'requested',
+   *   skipped?: boolean,
+   *   reason?: string
+   * }>}
    */
   async joinChannel(sessionId, targetId) {
     await this._ensureConnected(sessionId);
+    const { Api } = require('telegram/tl');
+    const client = this.clients.get(String(sessionId)).client;
+
+    const targetStr = String(targetId);
+    const inviteHash = this._parseInviteHash(targetStr);
 
     try {
-      const entity = await this._resolveEntity(sessionId, targetId);
-      if (!entity) {
-        throw new Error(`Could not resolve target: ${targetId}`);
+      if (inviteHash) {
+        return await this._joinViaInviteHash(sessionId, client, Api, targetStr, inviteHash);
       }
-
-      const inputPeer = getInputPeer(entity);
-
-      await this._withFloodRetry(sessionId, async () => {
-        const { Api } = require('telegram/tl');
-        return await this.clients.get(String(sessionId)).client.invoke(
-          new Api.channels.JoinChannel({
-            channel: inputPeer,
-          })
-        );
-      });
-
-      logger.info(`Session ${sessionId} joined ${targetId}`, { sessionId, targetId });
-
-      return {
-        success: true,
-        targetId: String(targetId),
-        targetName: entity.title || entity.username || targetId,
-      };
+      return await this._joinViaUsernameOrId(sessionId, client, Api, targetStr);
     } catch (error) {
       logger.error(`Failed to join ${targetId}`, { sessionId, error: error.message });
       throw this._handleTelegramError(error);
+    }
+  }
+
+  /**
+   * Join via `messages.ImportChatInvite`. Used for every invite-link
+   * form. Returns the same three-state outcome documented on
+   * `joinChannel`.
+   *
+   * @private
+   */
+  async _joinViaInviteHash(sessionId, client, Api, targetStr, inviteHash) {
+    // CheckChatInvite is read-only -- it lets us see whether the session
+    // is already in the chat (ChatInviteAlready) and, when it isn't,
+    // whether ImportChatInvite is going to queue a join request
+    // (`requestNeeded`) instead of joining immediately. We use that
+    // flag to set expectations for the operator-facing toast even
+    // before we issue the import. Failures here fall through to the
+    // ImportChatInvite call below -- a transient CheckChatInvite error
+    // shouldn't prevent the join attempt.
+    let preCheck = null;
+    try {
+      preCheck = await this._withFloodRetry(sessionId, async () => {
+        return await client.invoke(new Api.messages.CheckChatInvite({ hash: inviteHash }));
+      });
+    } catch (checkError) {
+      if (this.isPermanentAuthError(checkError)) throw checkError;
+      logger.debug(`CheckChatInvite failed for ${targetStr}`, {
+        sessionId,
+        error: checkError.message,
+      });
+    }
+
+    if (preCheck && preCheck.className === 'ChatInviteAlready' && preCheck.chat) {
+      logger.info(`Session ${sessionId} already member of ${targetStr}`, { sessionId });
+      return {
+        success: true,
+        targetId: targetStr,
+        targetName: preCheck.chat.title || preCheck.chat.username || targetStr,
+        status: 'already_member',
+        skipped: true,
+        reason: 'Already a member',
+      };
+    }
+
+    try {
+      const imported = await this._withFloodRetry(sessionId, async () => {
+        return await client.invoke(new Api.messages.ImportChatInvite({ hash: inviteHash }));
+      });
+
+      const chat = imported && imported.chats && imported.chats[0];
+      logger.info(`Session ${sessionId} joined ${targetStr} via invite link`, { sessionId });
+      return {
+        success: true,
+        targetId: targetStr,
+        targetName: (chat && (chat.title || chat.username)) || targetStr,
+        status: 'joined',
+      };
+    } catch (importError) {
+      const message = importError.message || String(importError);
+
+      if (/INVITE_REQUEST_SENT/i.test(message)) {
+        // Telegram's signal that the import queued an approval request
+        // rather than completing a join. The session is now in
+        // `request_pending` state; an admin must approve before the
+        // session actually becomes a member.
+        const chat = preCheck && preCheck.className === 'ChatInvite' ? preCheck : null;
+        const name = (chat && chat.title) || targetStr;
+        logger.info(`Session ${sessionId} sent join request to ${targetStr}`, { sessionId });
+        return {
+          success: true,
+          targetId: targetStr,
+          targetName: name,
+          status: 'requested',
+        };
+      }
+
+      if (/USER_ALREADY_PARTICIPANT/i.test(message)) {
+        // Race / pre-check missed it. Same outcome as ChatInviteAlready.
+        logger.info(`Session ${sessionId} already member of ${targetStr} (per ImportChatInvite)`, {
+          sessionId,
+        });
+        return {
+          success: true,
+          targetId: targetStr,
+          targetName: targetStr,
+          status: 'already_member',
+          skipped: true,
+          reason: 'Already a member',
+        };
+      }
+
+      throw importError;
+    }
+  }
+
+  /**
+   * Join via `channels.JoinChannel` after resolving an `@username` or
+   * numeric id. Returns the same three-state outcome documented on
+   * `joinChannel`.
+   *
+   * @private
+   */
+  async _joinViaUsernameOrId(sessionId, client, Api, targetStr) {
+    const entity = await this._resolveEntity(sessionId, targetStr);
+    if (!entity) {
+      throw new Error(`Could not resolve target: ${targetStr}`);
+    }
+
+    const inputPeer = getInputPeer(entity);
+    const entityName = entity.title || entity.username || targetStr;
+
+    try {
+      await this._withFloodRetry(sessionId, async () => {
+        return await client.invoke(new Api.channels.JoinChannel({ channel: inputPeer }));
+      });
+
+      logger.info(`Session ${sessionId} joined ${targetStr}`, { sessionId });
+      return {
+        success: true,
+        targetId: targetStr,
+        targetName: entityName,
+        status: 'joined',
+      };
+    } catch (error) {
+      const message = error.message || String(error);
+
+      if (/INVITE_REQUEST_SENT/i.test(message)) {
+        // Public channel with "request to join" enabled. Same semantics
+        // as the invite-link approval path: the request is queued and
+        // an admin must approve.
+        logger.info(`Session ${sessionId} sent join request to ${targetStr}`, { sessionId });
+        return {
+          success: true,
+          targetId: targetStr,
+          targetName: entityName,
+          status: 'requested',
+        };
+      }
+
+      if (/USER_ALREADY_PARTICIPANT/i.test(message)) {
+        logger.info(`Session ${sessionId} already member of ${targetStr}`, { sessionId });
+        return {
+          success: true,
+          targetId: targetStr,
+          targetName: entityName,
+          status: 'already_member',
+          skipped: true,
+          reason: 'Already a member',
+        };
+      }
+
+      throw error;
     }
   }
 

@@ -64,6 +64,7 @@ const MIGRATION_ORDER = [
   'migration_v27_drop_session_cooldown.sql',
   'migration_v28_monitor_v2.sql',
   'migration_v29_monitor_dedup_unique.sql',
+  'migration_v30_group_operations_requested_count.sql',
 ];
 
 function listMigrationFiles() {
