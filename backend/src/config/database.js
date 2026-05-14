@@ -74,34 +74,169 @@ const initDB = async () => {
   }
 };
 
+/**
+ * Bootstrap / reconcile the env-managed admin user.
+ *
+ * The legacy implementation used `INSERT ... ON CONFLICT (email) DO UPDATE`,
+ * which keyed the conflict on the *current* email — so rotating ADMIN_EMAIL
+ * in backend/.env inserted a brand-new admin row each time and left the old
+ * one (e.g. admin@example.com) sitting in the database with its old
+ * password still valid. See migration_v32_env_admin_marker.sql for the
+ * column / backfill that powers this rewrite.
+ *
+ * The contract this function honors:
+ *   - At most one user row has is_env_admin = TRUE. That row's email and
+ *     password_hash always reflect ADMIN_EMAIL / ADMIN_PASSWORD from .env.
+ *   - When the env values change, the SAME row is updated in place, so its
+ *     id and all foreign-key-referencing data (sessions, jobs, lists,
+ *     billing rows, etc.) survive, and any JWT issued before the rotation
+ *     keeps working (auth middleware re-loads the row by userId, not email).
+ *   - The old credentials (old email and/or password) stop working
+ *     immediately after the next boot. If the legacy buggy path already
+ *     inserted a phantom row at the new env email, it gets quarantined
+ *     here so it can't be used to log in either.
+ */
 const ensureAdminUser = async () => {
   const adminEmail = (process.env.ADMIN_EMAIL || 'admin@example.com').trim().toLowerCase();
   const adminPassword = process.env.ADMIN_PASSWORD || 'admin123';
   const passwordHash = await bcrypt.hash(adminPassword, 10);
 
-  // Insert if missing, then re-hash the password and force admin/approved
-  // status on every boot (so changing ADMIN_PASSWORD in .env actually
-  // takes effect, and so an accidental DB UPDATE can't lock the admin
-  // out of their own panel).
-  await pool.query(
-    `INSERT INTO users (email, password_hash, role, status, is_approved,
-                        approved_at, subscription_status, subscription_plan,
-                        subscription_features, created_at, updated_at)
-     VALUES ($1, $2, 'admin', 'approved', TRUE, NOW(),
-             'active', 'admin', '{"all":true}'::jsonb, NOW(), NOW())
-     ON CONFLICT (email) DO UPDATE SET
-       password_hash = EXCLUDED.password_hash,
-       role = 'admin',
-       status = 'approved',
-       is_approved = TRUE,
-       approved_at = COALESCE(users.approved_at, NOW()),
-       subscription_status = 'active',
-       subscription_plan = COALESCE(users.subscription_plan, 'admin'),
-       subscription_features = COALESCE(users.subscription_features, '{}'::jsonb) || '{"all":true}'::jsonb,
-       updated_at = NOW()`,
-    [adminEmail, passwordHash]
-  );
-  console.log(`Admin user ensured: ${adminEmail}`);
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    const envAdminRes = await client.query(
+      `SELECT id, LOWER(email) AS email
+         FROM users
+        WHERE is_env_admin = TRUE
+        LIMIT 1`
+    );
+    const envAdmin = envAdminRes.rows[0];
+
+    if (envAdmin) {
+      if (envAdmin.email !== adminEmail) {
+        // Email rotation requested. Resolve any collision on UNIQUE(email)
+        // before renaming the env-admin row. The only path that could put
+        // another row at this email is the legacy buggy seed (no other
+        // code path creates admin rows from the env email). Quarantine the
+        // duplicate so its credentials stop working, but keep the row so
+        // any data referencing it remains recoverable.
+        const dupRes = await client.query(
+          `SELECT id FROM users
+            WHERE LOWER(email) = $1 AND id <> $2
+            LIMIT 1`,
+          [adminEmail, envAdmin.id]
+        );
+        const dup = dupRes.rows[0];
+        if (dup) {
+          await client.query(
+            `UPDATE users
+                SET email = 'legacy-admin-' || id || '@invalid.local',
+                    role = 'user',
+                    status = 'pending',
+                    is_approved = FALSE,
+                    approved_at = NULL,
+                    is_env_admin = FALSE,
+                    updated_at = NOW()
+              WHERE id = $1`,
+            [dup.id]
+          );
+          console.warn(
+            `Admin bootstrap: quarantined duplicate user id=${dup.id} that ` +
+            `collided with new ADMIN_EMAIL=${adminEmail}. The original env-admin ` +
+            `row (id=${envAdmin.id}) is being renamed to ${adminEmail}; its ` +
+            `data and sessions are preserved.`
+          );
+        }
+      }
+
+      // Update the existing env-admin row in place. Email change (if any)
+      // and password are applied to the SAME row id, so foreign-key data
+      // (sessions, jobs, lists, etc.) and any active JWTs continue to
+      // resolve to this user.
+      await client.query(
+        `UPDATE users
+            SET email = $1,
+                password_hash = $2,
+                role = 'admin',
+                status = 'approved',
+                is_approved = TRUE,
+                approved_at = COALESCE(approved_at, NOW()),
+                subscription_status = 'active',
+                subscription_plan = COALESCE(subscription_plan, 'admin'),
+                subscription_features = COALESCE(subscription_features, '{}'::jsonb)
+                                       || '{"all":true}'::jsonb,
+                banned_at = NULL,
+                banned_reason = NULL,
+                updated_at = NOW()
+          WHERE id = $3`,
+        [adminEmail, passwordHash, envAdmin.id]
+      );
+      if (envAdmin.email !== adminEmail) {
+        console.log(
+          `Admin user ensured (id=${envAdmin.id}): renamed ${envAdmin.email} -> ${adminEmail}`
+        );
+      } else {
+        console.log(`Admin user ensured (id=${envAdmin.id}): ${adminEmail}`);
+      }
+    } else {
+      // No env-managed admin yet. Either the database is fresh, or the v32
+      // migration's backfill found no existing admin rows. Promote any
+      // existing user that happens to already use the env email, otherwise
+      // insert a new admin row.
+      const existingRes = await client.query(
+        `SELECT id FROM users WHERE LOWER(email) = $1 LIMIT 1`,
+        [adminEmail]
+      );
+      const existing = existingRes.rows[0];
+      if (existing) {
+        await client.query(
+          `UPDATE users
+              SET password_hash = $1,
+                  role = 'admin',
+                  status = 'approved',
+                  is_approved = TRUE,
+                  approved_at = COALESCE(approved_at, NOW()),
+                  subscription_status = 'active',
+                  subscription_plan = COALESCE(subscription_plan, 'admin'),
+                  subscription_features = COALESCE(subscription_features, '{}'::jsonb)
+                                         || '{"all":true}'::jsonb,
+                  is_env_admin = TRUE,
+                  banned_at = NULL,
+                  banned_reason = NULL,
+                  updated_at = NOW()
+            WHERE id = $2`,
+          [passwordHash, existing.id]
+        );
+        console.log(
+          `Admin user ensured (id=${existing.id}): ${adminEmail} ` +
+          `(promoted existing user to env-admin)`
+        );
+      } else {
+        const insertRes = await client.query(
+          `INSERT INTO users (email, password_hash, role, status, is_approved,
+                              approved_at, subscription_status, subscription_plan,
+                              subscription_features, is_env_admin,
+                              created_at, updated_at)
+           VALUES ($1, $2, 'admin', 'approved', TRUE, NOW(),
+                   'active', 'admin', '{"all":true}'::jsonb, TRUE,
+                   NOW(), NOW())
+           RETURNING id`,
+          [adminEmail, passwordHash]
+        );
+        console.log(
+          `Admin user ensured (id=${insertRes.rows[0].id}): ${adminEmail} (created)`
+        );
+      }
+    }
+
+    await client.query('COMMIT');
+  } catch (err) {
+    await client.query('ROLLBACK');
+    throw err;
+  } finally {
+    client.release();
+  }
 };
 
 const ensureGroupOperationsSchema = async () => {
