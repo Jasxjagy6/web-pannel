@@ -4,6 +4,7 @@ import {
   register as apiRegister,
   getProfile as apiGetProfile,
   updateProfile as apiUpdateProfile,
+  logout as apiLogout,
 } from '@/api/auth';
 
 export const AuthContext = createContext(null);
@@ -50,7 +51,17 @@ export function AuthProvider({ children }) {
     return userData;
   }, [persist]);
 
-  const logout = useCallback(() => {
+  const logout = useCallback(async () => {
+    // Best-effort: revoke the server-side auth_sessions row so the
+    // session disappears from the admin "Active logins" view
+    // immediately. We catch & ignore errors — if the request fails
+    // (offline, server down, token already revoked) we still want
+    // to clear local storage so the user lands on /login.
+    try {
+      await apiLogout();
+    } catch (_) {
+      // ignore — local logout is the authoritative UX action.
+    }
     persist(null, null);
   }, [persist]);
 

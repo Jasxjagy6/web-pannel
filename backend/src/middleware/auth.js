@@ -1,12 +1,27 @@
 const jwt = require('jsonwebtoken');
 const { pool } = require('../config/database');
 const { AppError, asyncHandler } = require('../utils/errorHandler');
+const authSessionService = require('../services/authSessionService');
 
 /**
  * Verify the JWT, hydrate req.user from the live `users` row.
  *
  * We always re-read the database so a banned / un-approved user can't
  * keep using a JWT that was issued before the admin's action.
+ *
+ * Two extra revocation gates run on every authenticated request:
+ *
+ *   1. users.tokens_invalidated_at — set whenever ADMIN_EMAIL /
+ *      ADMIN_PASSWORD rotates in backend/.env, OR when an admin force-
+ *      logs-out a user from the UI. Any JWT with `iat` strictly older
+ *      than this timestamp is rejected. Catches pre-existing JWTs that
+ *      were issued before this PR (they have no jti).
+ *
+ *   2. auth_sessions.revoked_at — looked up by the JWT's `jti` claim.
+ *      If the row is missing or revoked, the JWT is rejected even
+ *      though it's still cryptographically valid. Used by /logout,
+ *      the admin "revoke session" button, and ensureAdminUser's mass
+ *      revocation on env rotation.
  */
 const authenticate = asyncHandler(async (req, _res, next) => {
   const authHeader = req.headers.authorization;
@@ -29,7 +44,8 @@ const authenticate = asyncHandler(async (req, _res, next) => {
     `SELECT id, email, role, status, is_approved,
             subscription_plan, subscription_status, subscription_expires_at,
             subscription_features,
-            trial_started_at, trial_expires_at, trial_used
+            trial_started_at, trial_expires_at, trial_used,
+            tokens_invalidated_at
        FROM users
       WHERE id = $1`,
     [decoded.userId]
@@ -38,6 +54,39 @@ const authenticate = asyncHandler(async (req, _res, next) => {
   if (!row) {
     throw new AppError('User not found', 401, 'USER_NOT_FOUND');
   }
+
+  // Gate 1: blanket invalidation. Issued-at is in seconds, the column
+  // is a TIMESTAMPTZ. Compare epoch seconds on both sides so the cmp
+  // is timezone-safe. Also defensive against pre-v33 tokens that have
+  // no iat (jwt.sign always sets iat, but be safe).
+  if (row.tokens_invalidated_at && typeof decoded.iat === 'number') {
+    const invalidatedAtSec = Math.floor(
+      new Date(row.tokens_invalidated_at).getTime() / 1000
+    );
+    if (decoded.iat < invalidatedAtSec) {
+      throw new AppError('Token revoked', 401, 'TOKEN_REVOKED');
+    }
+  }
+
+  // Gate 2: per-session revocation. Tokens issued before v33 don't have
+  // a jti — they only fall under Gate 1. After v33 every issued token
+  // has a jti and MUST resolve to a non-revoked auth_sessions row.
+  let authSession = null;
+  if (decoded.jti) {
+    authSession = await authSessionService.getActiveByJti(decoded.jti);
+    if (!authSession) {
+      throw new AppError('Session revoked', 401, 'TOKEN_REVOKED');
+    }
+    if (authSession.user_id !== row.id) {
+      // jti is bound to a specific user — refuse if someone tries to
+      // forge a token by mixing-and-matching claims.
+      throw new AppError('Invalid token', 401, 'INVALID_TOKEN');
+    }
+    // Best-effort: bump last_seen_at + refresh IP/UA. Fire-and-forget
+    // so a DB blip can't 500 an otherwise-valid request.
+    authSessionService.touchSession(authSession.id, req).catch(() => {});
+  }
+  req.authSession = authSession;
 
   req.user = {
     id: row.id,

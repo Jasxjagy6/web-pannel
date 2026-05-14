@@ -14,6 +14,9 @@ router.post('/login', authLimiter, validate(schemas.login), authController.login
 // POST /api/auth/refresh - Refresh token
 router.post('/refresh', authenticate, authController.refreshToken);
 
+// POST /api/auth/logout - Revoke the current JWT's auth_sessions row.
+router.post('/logout', authenticate, authController.logout);
+
 // GET /api/auth/profile - Get profile
 router.get('/profile', authenticate, authController.getProfile);
 

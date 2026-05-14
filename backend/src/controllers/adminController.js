@@ -2,6 +2,7 @@ const { pool } = require('../config/database');
 const { AppError, asyncHandler } = require('../utils/errorHandler');
 const logger = require('../utils/logger');
 const { publicUser, SAFE_USER_COLUMNS } = require('./authController');
+const authSessionService = require('../services/authSessionService');
 
 const VALID_PLANS = new Set(['trial', 'basic', 'pro', 'enterprise', 'admin']);
 
@@ -691,6 +692,111 @@ const adminController = {
     });
     logger.info('admin: proxy settings updated', { admin: req.user.id, patch, cleanup });
     res.json({ success: true, data: updated, cleanup });
+  }),
+
+  // ---------------------------------------------------------------------
+  // Active logins — list / revoke per-user JWT sessions.
+  //
+  // GET    /api/admin/users/:id/sessions           — list active sessions
+  // POST   /api/admin/users/:id/sessions/revoke-all — kill them all at once
+  //                                                 (except the admin's own
+  //                                                 current session, to avoid
+  //                                                 the admin logging
+  //                                                 themselves out)
+  // DELETE /api/admin/sessions/:sessionId          — revoke one by id
+  //
+  // The "Active logins" view in the admin panel is the user-facing surface
+  // for this — see frontend/src/pages/Admin.jsx.
+  // ---------------------------------------------------------------------
+
+  listUserSessions: asyncHandler(async (req, res) => {
+    const userId = parseInt(req.params.id, 10);
+    if (!userId) {
+      throw new AppError('Invalid user id', 400, 'BAD_REQUEST');
+    }
+    const userRes = await pool.query(
+      `SELECT id, email, role, is_env_admin FROM users WHERE id = $1`,
+      [userId]
+    );
+    if (!userRes.rows[0]) {
+      throw new AppError('User not found', 404, 'USER_NOT_FOUND');
+    }
+    const sessions = await authSessionService.listActiveForUser(userId);
+    res.json({
+      success: true,
+      data: {
+        user: userRes.rows[0],
+        // Surface the admin's *own* current session id so the UI can mark
+        // it with a "This device" badge and disable the revoke button on
+        // that row (revoking it would log the admin out mid-action).
+        currentSessionId: req.authSession?.id || null,
+        sessions: sessions.map((s) => ({
+          id: s.id,
+          ipAddress: s.ip_address,
+          userAgent: s.user_agent,
+          issuedAt: s.issued_at,
+          lastSeenAt: s.last_seen_at,
+          expiresAt: s.expires_at,
+        })),
+      },
+    });
+  }),
+
+  revokeUserSession: asyncHandler(async (req, res) => {
+    const sessionId = parseInt(req.params.sessionId, 10);
+    if (!sessionId) {
+      throw new AppError('Invalid session id', 400, 'BAD_REQUEST');
+    }
+    // Don't let an admin accidentally kill the very session they're
+    // currently using.
+    if (req.authSession?.id === sessionId) {
+      throw new AppError(
+        'Refusing to revoke your own current session. Log out instead.',
+        400,
+        'REFUSE_SELF_REVOKE'
+      );
+    }
+    const revoked = await authSessionService.revokeById(sessionId, 'admin_revoked');
+    if (!revoked) {
+      throw new AppError('Session not found or already revoked', 404, 'SESSION_NOT_FOUND');
+    }
+    await recordAdminAction(req.user.id, revoked.user_id, 'auth_session_revoke', {
+      sessionId,
+      jti: revoked.jti,
+    });
+    logger.info('admin: revoked auth session', {
+      admin: req.user.id,
+      targetUser: revoked.user_id,
+      sessionId,
+    });
+    res.json({ success: true, data: { id: revoked.id, revokedAt: revoked.revoked_at } });
+  }),
+
+  revokeAllUserSessions: asyncHandler(async (req, res) => {
+    const userId = parseInt(req.params.id, 10);
+    if (!userId) {
+      throw new AppError('Invalid user id', 400, 'BAD_REQUEST');
+    }
+    const exceptId = req.user.id === userId ? (req.authSession?.id || null) : null;
+    const n = await authSessionService.revokeAllForUser(userId, 'admin_mass_revoked', {
+      exceptSessionId: exceptId,
+    });
+    // Also bump the user's tokens_invalidated_at so any pre-v33 JWT
+    // (no jti) for this user is rejected at the next request.
+    await pool.query(
+      `UPDATE users SET tokens_invalidated_at = NOW() WHERE id = $1`,
+      [userId]
+    );
+    await recordAdminAction(req.user.id, userId, 'auth_session_revoke_all', {
+      revoked: n,
+      keptOwnSessionId: exceptId,
+    });
+    logger.info('admin: revoked all auth sessions for user', {
+      admin: req.user.id,
+      targetUser: userId,
+      revoked: n,
+    });
+    res.json({ success: true, data: { revoked: n, keptOwnSessionId: exceptId } });
   }),
 };
 
