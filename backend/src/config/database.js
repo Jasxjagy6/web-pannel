@@ -106,7 +106,7 @@ const ensureAdminUser = async () => {
     await client.query('BEGIN');
 
     const envAdminRes = await client.query(
-      `SELECT id, LOWER(email) AS email
+      `SELECT id, LOWER(email) AS email, password_hash
          FROM users
         WHERE is_env_admin = TRUE
         LIMIT 1`
@@ -114,7 +114,16 @@ const ensureAdminUser = async () => {
     const envAdmin = envAdminRes.rows[0];
 
     if (envAdmin) {
-      if (envAdmin.email !== adminEmail) {
+      // Detect whether the env email or password actually changed so we
+      // can blanket-revoke every currently-open admin browser session.
+      // Comparing the NEW password against the STORED bcrypt hash tells
+      // us whether the operator rotated ADMIN_PASSWORD without us having
+      // to keep the old plaintext around.
+      const emailChanged = envAdmin.email !== adminEmail;
+      const passwordChanged = !(await bcrypt.compare(adminPassword, envAdmin.password_hash));
+      const credsRotated = emailChanged || passwordChanged;
+
+      if (emailChanged) {
         // Email rotation requested. Resolve any collision on UNIQUE(email)
         // before renaming the env-admin row. The only path that could put
         // another row at this email is the legacy buggy seed (no other
@@ -172,7 +181,41 @@ const ensureAdminUser = async () => {
           WHERE id = $3`,
         [adminEmail, passwordHash, envAdmin.id]
       );
-      if (envAdmin.email !== adminEmail) {
+      if (credsRotated) {
+        // Force-logout every currently-open admin session. Two
+        // independent mechanisms, used together so the kill is total:
+        //   - users.tokens_invalidated_at catches any pre-v33 JWT (no
+        //     jti claim) plus any JWT whose auth_sessions row has been
+        //     pruned;
+        //   - auth_sessions.revoked_at catches every still-open jti so
+        //     the row also shows up as "revoked by env rotation" in the
+        //     admin "Active logins" history.
+        // Both surfaces are added by v33 and v33 runs in initDB before
+        // ensureAdminUser, so the column + table are always present
+        // when we get here. Either one alone is sufficient to lock out
+        // every existing JWT; we set both so pre-v33 tokens (no jti)
+        // are caught by tokens_invalidated_at AND the revocation also
+        // shows up in the admin "Active logins" history.
+        await client.query(
+          `UPDATE users SET tokens_invalidated_at = NOW() WHERE id = $1`,
+          [envAdmin.id]
+        );
+        const revoked = await client.query(
+          `UPDATE auth_sessions
+              SET revoked_at = NOW(),
+                  revoked_reason = 'admin_env_rotated'
+            WHERE user_id = $1
+              AND revoked_at IS NULL`,
+          [envAdmin.id]
+        );
+        console.warn(
+          `Admin bootstrap: ADMIN_${emailChanged && passwordChanged ? 'EMAIL+PASSWORD' : (emailChanged ? 'EMAIL' : 'PASSWORD')} ` +
+          `rotated; tokens_invalidated_at set + revoked ${revoked.rowCount} ` +
+          `active admin session row(s) for user id=${envAdmin.id}.`
+        );
+      }
+
+      if (emailChanged) {
         console.log(
           `Admin user ensured (id=${envAdmin.id}): renamed ${envAdmin.email} -> ${adminEmail}`
         );

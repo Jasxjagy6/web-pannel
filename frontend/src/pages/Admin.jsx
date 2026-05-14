@@ -3,7 +3,7 @@ import {
   Users, Search, Loader2, ShieldCheck, Ban, RefreshCcw, Settings2, Trash2,
   CheckCircle2, X, ChevronDown, Filter,
   CreditCard, Sparkles, Wallet, DollarSign, Save, AlertCircle, ListChecks,
-  ShieldAlert, Activity,
+  ShieldAlert, Activity, LogOut, Monitor, Globe,
 } from 'lucide-react';
 import {
   listUsers, approveUser, banUser, unbanUser, deleteUser,
@@ -12,6 +12,7 @@ import {
   grantUserSubscription, expireUserSubscription,
   listUserPlatformSubscriptions, setUserPlatformSubscription,
   listTgDetectionEvents, getTgRiskOverview,
+  listUserAuthSessions, revokeAuthSession, revokeAllUserAuthSessions,
 } from '../api/admin';
 import { useToast } from '../components/common/Toast';
 import { parseApiError, formatDateTime, formatRelativeTime } from '../utils/formatters';
@@ -56,6 +57,7 @@ export default function Admin() {
       {tab === 'users'    && <UsersTab />}
       {tab === 'billing'  && <BillingAdminTab />}
       {tab === 'antirevoke' && <AntiRevokeTab />}
+      {tab === 'logins'   && <ActiveLoginsTab />}
     </div>
   );
 }
@@ -65,6 +67,7 @@ function AdminTabs({ tab, onChange }) {
     { key: 'users',       label: 'Users',           icon: Users },
     { key: 'billing',     label: 'Billing & Trial', icon: CreditCard },
     { key: 'antirevoke',  label: 'Anti-revoke (TG)', icon: ShieldAlert },
+    { key: 'logins',      label: 'Active logins',   icon: LogOut },
   ];
   return (
     <div className="inline-flex rounded-xl border border-dark-700 bg-dark-900/60 p-1">
@@ -1226,4 +1229,307 @@ function AntiRevokeTab() {
       </div>
     </div>
   );
+}
+
+// ---------------------------------------------------------------------
+// Active logins tab.
+//
+// Surfaces the per-user JWT session tracking (auth_sessions). Default
+// view is "logins on this admin email" — i.e. the admin's own user_id
+// — so the operator can immediately see every browser still holding a
+// valid JWT for their account. A search box lets them pull any other
+// user's active sessions by email.
+//
+// Two revocation actions are exposed:
+//   - "Revoke this session" on a row: kills one device.
+//   - "Revoke all other sessions": kills every session for the user
+//     EXCEPT the admin's own current session (so the admin doesn't
+//     accidentally log themselves out mid-action).
+//
+// The boot path already mass-revokes admin sessions when ADMIN_EMAIL /
+// ADMIN_PASSWORD rotate in backend/.env — this tab is the runtime
+// equivalent for ad-hoc force-logouts and for monitoring who is
+// currently signed in.
+function ActiveLoginsTab() {
+  const toast = useToast();
+  const [searchEmail, setSearchEmail] = useState('');
+  const [activeUserId, setActiveUserId] = useState(null);
+  const [resolving, setResolving] = useState(false);
+  const [data, setData] = useState(null);
+  const [loading, setLoading] = useState(false);
+  const [actingId, setActingId] = useState(null);
+  const [bulkActing, setBulkActing] = useState(false);
+
+  // On mount: resolve "me" so the default view shows the admin's own
+  // active logins. We piggy-back on getProfile via the AuthContext
+  // hydration in App.jsx, but to avoid threading that down we just hit
+  // /auth/profile here once (already cached by the browser).
+  useEffect(() => {
+    let aborted = false;
+    (async () => {
+      setResolving(true);
+      try {
+        const stored = JSON.parse(localStorage.getItem('user') || 'null');
+        if (!aborted && stored?.id) setActiveUserId(stored.id);
+      } catch {
+        // ignore — fallback to empty state
+      } finally {
+        if (!aborted) setResolving(false);
+      }
+    })();
+    return () => { aborted = true; };
+  }, []);
+
+  const load = useCallback(async (uid) => {
+    if (!uid) return;
+    setLoading(true);
+    try {
+      const r = await listUserAuthSessions(uid);
+      setData(r.data?.data || null);
+    } catch (e) {
+      toast.error(parseApiError(e), 'Failed to load sessions');
+    } finally {
+      setLoading(false);
+    }
+  }, [toast]);
+
+  useEffect(() => {
+    if (activeUserId) load(activeUserId);
+  }, [activeUserId, load]);
+
+  const onSearch = async (e) => {
+    e?.preventDefault?.();
+    const q = searchEmail.trim().toLowerCase();
+    if (!q) return;
+    try {
+      const r = await listUsers({ search: q, limit: 1 });
+      const u = (r.data?.data?.users || [])[0];
+      if (!u) {
+        toast.error(`No user matched "${searchEmail}"`);
+        return;
+      }
+      setActiveUserId(u.id);
+    } catch (err) {
+      toast.error(parseApiError(err), 'Search failed');
+    }
+  };
+
+  const revokeOne = async (sessionId) => {
+    if (!sessionId) return;
+    if (!confirm('Revoke this session? The browser will be logged out at its next request.')) return;
+    setActingId(sessionId);
+    try {
+      await revokeAuthSession(sessionId);
+      toast.success('Session revoked');
+      await load(activeUserId);
+    } catch (e) {
+      toast.error(parseApiError(e), 'Revoke failed');
+    } finally {
+      setActingId(null);
+    }
+  };
+
+  const revokeAll = async () => {
+    if (!activeUserId) return;
+    const u = data?.user;
+    const msg = u
+      ? `Revoke ALL active logins for ${u.email}? Your own current session will be kept.`
+      : 'Revoke all active logins for this user? Your own current session will be kept.';
+    if (!confirm(msg)) return;
+    setBulkActing(true);
+    try {
+      const r = await revokeAllUserAuthSessions(activeUserId);
+      const n = r.data?.data?.revoked ?? 0;
+      toast.success(`Revoked ${n} session${n === 1 ? '' : 's'}`);
+      await load(activeUserId);
+    } catch (e) {
+      toast.error(parseApiError(e), 'Bulk revoke failed');
+    } finally {
+      setBulkActing(false);
+    }
+  };
+
+  const sessions = data?.sessions || [];
+  const currentSessionId = data?.currentSessionId || null;
+  const targetUser = data?.user || null;
+
+  return (
+    <div className="space-y-4">
+      <div className="rounded-xl border border-dark-700 bg-dark-900/60 p-4">
+        <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
+          <div>
+            <h2 className="text-lg font-semibold text-white flex items-center gap-2">
+              <LogOut className="h-5 w-5 text-primary-400" />
+              Active logins
+            </h2>
+            <p className="mt-1 text-sm text-dark-400">
+              One row per browser holding a valid JWT for this account. Revoke a row to
+              force that device back to the login screen at its next request.
+              ADMIN_EMAIL / ADMIN_PASSWORD rotation in <code className="text-dark-200">backend/.env</code>{' '}
+              automatically revokes every admin session here.
+            </p>
+          </div>
+          <form onSubmit={onSearch} className="flex items-center gap-2">
+            <div className="relative">
+              <Search className="pointer-events-none absolute left-2 top-1/2 h-4 w-4 -translate-y-1/2 text-dark-400" />
+              <input
+                value={searchEmail}
+                onChange={(e) => setSearchEmail(e.target.value)}
+                placeholder="user email"
+                className="rounded-lg border border-dark-700 bg-dark-800 py-1.5 pl-8 pr-3 text-sm text-white placeholder:text-dark-500 focus:border-primary-600 focus:outline-none"
+              />
+            </div>
+            <button
+              type="submit"
+              className="rounded-lg border border-dark-700 bg-dark-800 px-3 py-1.5 text-sm font-medium text-dark-200 hover:bg-dark-700 hover:text-white"
+            >
+              Look up
+            </button>
+            {activeUserId && (
+              <button
+                type="button"
+                onClick={() => load(activeUserId)}
+                className="inline-flex items-center gap-1 rounded-lg border border-dark-700 bg-dark-800 px-3 py-1.5 text-sm font-medium text-dark-200 hover:bg-dark-700 hover:text-white"
+              >
+                <RefreshCcw className="h-3.5 w-3.5" /> Refresh
+              </button>
+            )}
+          </form>
+        </div>
+
+        {(resolving || (loading && !data)) ? (
+          <div className="mt-4 flex items-center text-sm text-dark-300">
+            <Loader2 className="mr-2 h-4 w-4 animate-spin" /> Loading sessions…
+          </div>
+        ) : !activeUserId ? (
+          <div className="mt-4 rounded-lg border border-dashed border-dark-700 bg-dark-900/40 p-4 text-sm text-dark-300">
+            Search for a user by email to view their active logins.
+          </div>
+        ) : (
+          <>
+            <div className="mt-4 flex flex-wrap items-center gap-3">
+              <div className="rounded-lg border border-dark-700 bg-dark-800/60 px-3 py-2 text-sm">
+                <span className="text-dark-400">User:</span>{' '}
+                <span className="font-medium text-white">{targetUser?.email || `#${activeUserId}`}</span>
+                {targetUser?.role === 'admin' && (
+                  <span className="ml-2 rounded border border-primary-500/30 bg-primary-500/10 px-1.5 py-0.5 text-xs font-medium text-primary-300">
+                    admin
+                  </span>
+                )}
+                {targetUser?.is_env_admin && (
+                  <span className="ml-2 rounded border border-emerald-500/30 bg-emerald-500/10 px-1.5 py-0.5 text-xs font-medium text-emerald-300">
+                    env-managed
+                  </span>
+                )}
+              </div>
+              <div className="rounded-lg border border-dark-700 bg-dark-800/60 px-3 py-2 text-sm">
+                <span className="text-dark-400">Active sessions:</span>{' '}
+                <span className="font-semibold text-white">{sessions.length}</span>
+              </div>
+              <button
+                onClick={revokeAll}
+                disabled={bulkActing || sessions.length === 0}
+                className="ml-auto inline-flex items-center gap-1.5 rounded-lg border border-error-500/40 bg-error-500/10 px-3 py-1.5 text-sm font-medium text-error-300 hover:bg-error-500/20 disabled:cursor-not-allowed disabled:opacity-50"
+                title="Revokes every session except the one you're using right now"
+              >
+                {bulkActing ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Ban className="h-3.5 w-3.5" />}
+                Revoke all other sessions
+              </button>
+            </div>
+
+            <div className="mt-4 overflow-x-auto rounded-lg border border-dark-700">
+              <table className="min-w-full divide-y divide-dark-700 text-sm">
+                <thead className="bg-dark-800/80 text-left text-xs uppercase tracking-wide text-dark-400">
+                  <tr>
+                    <th className="px-4 py-2">IP</th>
+                    <th className="px-4 py-2">Device</th>
+                    <th className="px-4 py-2">Signed in</th>
+                    <th className="px-4 py-2">Last seen</th>
+                    <th className="px-4 py-2">Expires</th>
+                    <th className="px-4 py-2 text-right">Actions</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-dark-800 bg-dark-900/40">
+                  {sessions.length === 0 && !loading && (
+                    <tr>
+                      <td colSpan={6} className="px-4 py-6 text-center text-sm text-dark-400">
+                        No active logins for this user.
+                      </td>
+                    </tr>
+                  )}
+                  {sessions.map((s) => {
+                    const isCurrent = s.id === currentSessionId;
+                    return (
+                      <tr key={s.id} className="hover:bg-white/[0.02]">
+                        <td className="px-4 py-2 font-mono text-xs text-dark-200">
+                          <span className="inline-flex items-center gap-1">
+                            <Globe className="h-3.5 w-3.5 text-dark-400" /> {s.ipAddress || '—'}
+                          </span>
+                        </td>
+                        <td className="px-4 py-2 max-w-[320px] truncate text-dark-200" title={s.userAgent || ''}>
+                          <span className="inline-flex items-center gap-1">
+                            <Monitor className="h-3.5 w-3.5 text-dark-400" />
+                            {s.userAgent ? shortUserAgent(s.userAgent) : '—'}
+                          </span>
+                        </td>
+                        <td className="px-4 py-2 text-dark-300" title={formatDateTime(s.issuedAt)}>
+                          {formatRelativeTime(s.issuedAt)}
+                        </td>
+                        <td className="px-4 py-2 text-dark-300" title={formatDateTime(s.lastSeenAt)}>
+                          {formatRelativeTime(s.lastSeenAt)}
+                        </td>
+                        <td className="px-4 py-2 text-dark-400 text-xs">
+                          {s.expiresAt ? formatRelativeTime(s.expiresAt) : '—'}
+                        </td>
+                        <td className="px-4 py-2 text-right">
+                          {isCurrent ? (
+                            <span className="inline-flex items-center gap-1 rounded border border-emerald-500/30 bg-emerald-500/10 px-2 py-0.5 text-xs font-medium text-emerald-300">
+                              <CheckCircle2 className="h-3 w-3" /> This device
+                            </span>
+                          ) : (
+                            <button
+                              onClick={() => revokeOne(s.id)}
+                              disabled={actingId === s.id}
+                              className="inline-flex items-center gap-1 rounded border border-error-500/30 bg-error-500/10 px-2 py-1 text-xs font-medium text-error-300 hover:bg-error-500/20 disabled:cursor-not-allowed disabled:opacity-50"
+                            >
+                              {actingId === s.id
+                                ? <Loader2 className="h-3 w-3 animate-spin" />
+                                : <LogOut className="h-3 w-3" />}
+                              Revoke
+                            </button>
+                          )}
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// Strip the verbose Chrome-on-Linux/Mozilla preamble from a user-agent
+// string so the admin table can render a useful "device" cell without
+// blowing up the row. Falls back to the raw string if no known pattern
+// matches.
+function shortUserAgent(ua) {
+  if (!ua) return '—';
+  const m =
+    /(Edg|Chrome|Firefox|Safari|OPR|Brave)\/([\d.]+)/.exec(ua) ||
+    /(curl|wget|python|node)\/([\w.\-]+)/i.exec(ua);
+  const os =
+    /Windows NT/.test(ua) ? 'Windows' :
+    /Mac OS X/.test(ua)   ? 'macOS' :
+    /Android/.test(ua)    ? 'Android' :
+    /iPhone|iPad|iOS/.test(ua) ? 'iOS' :
+    /Linux/.test(ua)      ? 'Linux' :
+    '';
+  if (m) {
+    return `${m[1]} ${m[2].split('.')[0]}${os ? ` · ${os}` : ''}`;
+  }
+  return ua.slice(0, 60);
 }

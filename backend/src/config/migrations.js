@@ -67,6 +67,7 @@ const MIGRATION_ORDER = [
   'migration_v30_group_operations_requested_count.sql',
   'migration_v31_profile_lists_and_revocation.sql',
   'migration_v32_env_admin_marker.sql',
+  'migration_v33_auth_sessions.sql',
 ];
 
 function listMigrationFiles() {

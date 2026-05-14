@@ -4,6 +4,7 @@ const { pool } = require('../config/database');
 const { AppError, asyncHandler } = require('../utils/errorHandler');
 const logger = require('../utils/logger');
 const subscriptionService = require('../services/subscriptionService');
+const authSessionService = require('../services/authSessionService');
 
 const SAFE_USER_COLUMNS = `
   id, email, role, status, is_approved, approved_at,
@@ -69,9 +70,19 @@ async function countApiCredentials(userId) {
   }
 }
 
-function generateToken(user) {
+/**
+ * Issue a fresh JWT for `user` and record the matching auth_sessions row
+ * so it can be revoked later (logout, env rotation, admin force-logout).
+ *
+ * The jti claim embedded in the JWT is the auth_sessions.jti UUID; the
+ * middleware looks it up on every authenticated request. Sessions whose
+ * row has been revoked stop authenticating immediately even though the
+ * JWT itself is still cryptographically valid.
+ */
+async function generateToken(user, req) {
+  const session = await authSessionService.createSession(user.id, req);
   return jwt.sign(
-    { userId: user.id, email: user.email, role: user.role },
+    { userId: user.id, email: user.email, role: user.role, jti: session.jti },
     process.env.JWT_SECRET,
     { expiresIn: process.env.JWT_EXPIRE || '7d' }
   );
@@ -118,7 +129,7 @@ const authController = {
 
     logger.info('User registered', { userId: user.id, email });
 
-    const token = generateToken(user);
+    const token = await generateToken(user, req);
     // Brand-new user has 0 credentials by definition; skip the count
     // query and ship the response immediately. No subscriptions yet either.
     const subsByPlatform = await subscriptionService.loadSubscriptions(user.id);
@@ -170,7 +181,7 @@ const authController = {
     );
     const user = fullResult.rows[0];
 
-    const token = generateToken(user);
+    const token = await generateToken(user, req);
     const apiCredentialsCount = await countApiCredentials(user.id);
     const subsByPlatform = await subscriptionService.loadSubscriptions(user.id);
     logger.info('User logged in', { userId: user.id, email: user.email, role: user.role });
@@ -197,7 +208,12 @@ const authController = {
     if (user.status === 'banned') {
       throw new AppError('Account is banned', 403, 'ACCOUNT_BANNED');
     }
-    const token = generateToken(user);
+    // Revoke the previous session row before issuing the refreshed one
+    // so refresh isn't a vector for stockpiling active sessions.
+    if (req.authSession?.jti) {
+      await authSessionService.revokeByJti(req.authSession.jti, 'refresh');
+    }
+    const token = await generateToken(user, req);
     const apiCredentialsCount = await countApiCredentials(user.id);
     const subsByPlatform = await subscriptionService.loadSubscriptions(user.id);
     return res.status(200).json({
@@ -205,6 +221,19 @@ const authController = {
       token,
       user: publicUser(user, { apiCredentialsCount, subsByPlatform }),
     });
+  }),
+
+  /**
+   * Revoke the current JWT's auth_sessions row. After this call the
+   * same JWT will fail authentication on subsequent requests with
+   * INVALID_TOKEN, which is what the frontend's response interceptor
+   * uses to redirect the user to /login.
+   */
+  logout: asyncHandler(async (req, res) => {
+    if (req.authSession?.jti) {
+      await authSessionService.revokeByJti(req.authSession.jti, 'logout');
+    }
+    return res.status(200).json({ success: true });
   }),
 
   /**

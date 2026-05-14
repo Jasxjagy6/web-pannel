@@ -76,3 +76,18 @@ export const adminProxyUsage = () =>
 export const getProxySettings = () => api.get('/admin/proxy/settings');
 export const updateProxySettings = (data) =>
   api.put('/admin/proxy/settings', data);
+
+// ---------------------------------------------------------------------
+// Active logins — per-user JWT session tracking. Used by the
+// "Active logins" tab in the admin panel to see, count, and revoke
+// every still-open browser session belonging to a given user (admin
+// or otherwise). The boot path already mass-revokes admin sessions
+// when ADMIN_EMAIL / ADMIN_PASSWORD rotate in backend/.env; these
+// endpoints expose the same primitives to the operator at runtime.
+// ---------------------------------------------------------------------
+export const listUserAuthSessions = (userId) =>
+  api.get(`/admin/users/${userId}/sessions`);
+export const revokeAllUserAuthSessions = (userId) =>
+  api.post(`/admin/users/${userId}/sessions/revoke-all`);
+export const revokeAuthSession = (sessionId) =>
+  api.delete(`/admin/sessions/${sessionId}`);
