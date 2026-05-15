@@ -226,6 +226,18 @@ app.use(
   instagramIdentityRoutes
 );
 
+// Instagram-only identity-lookup module — multi-method OSINT against
+// a public IG username (profile info, recovery masks, cross-platform
+// probes, geo from public posts, google dorks). Independent surface
+// from /scrape because the workload, rate-limit profile, and audit
+// model are all different. See instagram_upgrade.txt §4.3 and §6.4.
+const instagramLookupRoutes = require('./routes/instagramLookup');
+app.use(
+  `${apiPrefix}/instagram/lookup`,
+  parsePlatform('instagram'),
+  instagramLookupRoutes
+);
+
 // 404 handler
 app.use((req, res) => {
   res.status(404).json({ success: false, error: { message: 'Route not found', code: 'NOT_FOUND' } });

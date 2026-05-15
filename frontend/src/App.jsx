@@ -52,6 +52,7 @@ const InstagramSessions        = lazy(() => import('./pages/instagram/Sessions')
 const InstagramCreateSession   = lazy(() => import('./pages/instagram/CreateSession'));
 const InstagramUploadSession   = lazy(() => import('./pages/instagram/UploadSession'));
 const InstagramScrape          = lazy(() => import('./pages/instagram/Scrape'));
+const InstagramLookup          = lazy(() => import('./pages/instagram/Lookup'));
 // IG-native pages shipped in PR #42. Each is a first-class implementation
 // (not a wrapper around the Telegram page) backed by IG-only API routes.
 const InstagramLists           = lazy(() => import('./pages/instagram/Lists'));
@@ -263,6 +264,10 @@ function PlatformRoutes() {
           "switch to Telegram" notice when the active platform isn't TG. */}
       <Route path="login-sessions" element={<ProtectedRoute title="Login"><TelegramLoginSessions /></ProtectedRoute>} />
       <Route path="scrape" element={<ProtectedRoute title="Scrape"><PlatformPage tg={Scrape} ig={InstagramScrape} /></ProtectedRoute>} />
+      {/* Instagram-only identity-lookup module. Hidden from the TG
+          sidebar; TG side falls back to the legacy Scrape page so
+          /telegram/lookup at least renders something. */}
+      <Route path="lookup" element={<ProtectedRoute title="Identity Lookup"><PlatformPage tg={Scrape} ig={InstagramLookup} /></ProtectedRoute>} />
       {/* Messaging / Groups / Threads are Telegram-only features. They
           stay routable under /telegram/* but are hidden from the IG
           panel sidebar (and IG-side use of these URLs falls back to

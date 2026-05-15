@@ -81,6 +81,27 @@ const capabilities = {
   behavior_simulate:      true,
 
   // ---------------------------------------------------------------------
+  // Identity-lookup module (instagram_upgrade.txt — IG-only).
+  // Each fine-grained capability gates a single probe surface; the
+  // `lookup_any` rollup is what the sidebar reads to decide whether
+  // the "Identity lookup" nav entry should render at all.
+  // ---------------------------------------------------------------------
+  lookup_any:                  true,
+  lookup_public_profile:       true,   // §2.1 web_profile_info
+  lookup_recovery:             true,   // §2.9 oracles 1+2+3 (single-pass)
+  lookup_recovery_deep:        false,  // §2.9 oracle 4 (PR #5.5)
+  lookup_recovery_watch:       false,  // §2.9 oracle 5 longitudinal (PR #7)
+  lookup_breach_correlation:   false,  // §2.9 oracle 6 (PR #5.5)
+  lookup_email_enumerate:      false,  // §2.2 stage 3 (PR #4 — needs burners)
+  lookup_phone_enumerate:      false,  // §2.2 stage 4 (PR #4 — needs burners)
+  lookup_breach:               false,  // §2.3 (PR #5 — needs paid API keys)
+  lookup_link_expand:          false,  // §2.4 (PR #5)
+  lookup_cross_platform:       true,   // §2.5 Sherlock probe
+  lookup_reverse_image:        false,  // §2.6 (PR #6 — needs PimEyes/SerpAPI)
+  lookup_dork:                 true,   // §2.7 (no-op when SERPAPI_KEY unset)
+  lookup_geo:                  true,   // §2.8 city-from-posts (never IP)
+
+  // ---------------------------------------------------------------------
   // Coarse rollups consumed by the sidebar / nav (mirror of
   // telegram/index.js). Same key on both providers so the React
   // Sidebar gate can stay simple.
@@ -185,6 +206,16 @@ const behavior = new Proxy({}, {
   get(_t, prop) { return _lazy('behavior')[prop]; },
 });
 
+// Identity-lookup module. Lazily loaded — the lookup subsystem pulls
+// undici / domain dictionaries that we don't want on the cold-start
+// path of a panel running pure-Telegram traffic.
+const lookup = new Proxy({}, {
+  get(_t, prop) {
+    // eslint-disable-next-line global-require
+    return require('./lookup')[prop];
+  },
+});
+
 // IG doesn't use per-user app credentials (the user authenticates with the
 // Instagram username + password during session create), so the credentials
 // gate always passes.
@@ -219,5 +250,6 @@ module.exports = {
   proxies,
   identity,
   behavior,
+  lookup,
   userCredentials,
 };

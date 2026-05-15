@@ -3,6 +3,7 @@ const messageQueue = require('./messageQueue');
 const groupQueue = require('./groupQueue');
 const instagramScrapeQueue = require('./instagramScrapeQueue');
 const instagramMessageQueue = require('./instagramMessageQueue');
+const instagramLookupQueue = require('./instagramLookupQueue');
 const logger = require('../utils/logger');
 
 async function initializeQueues() {
@@ -16,11 +17,14 @@ async function initializeQueues() {
     if (process.env.IG_QUEUES_ENABLED !== 'false') {
       await instagramScrapeQueue.initialize();
       await instagramMessageQueue.initialize();
+      await instagramLookupQueue.initialize();
       try {
         const igScrape = require('../providers/instagram/scrape');
         const igMessaging = require('../providers/instagram/messaging');
+        const igLookup = require('../providers/instagram/lookup');
         instagramScrapeQueue.setJobExecutor((jobId) => igScrape._executeScrapeJob(jobId));
         instagramMessageQueue.setJobExecutor((jobId) => igMessaging._executeMessagingJob(jobId));
+        instagramLookupQueue.setJobExecutor((jobId) => igLookup.runJob(jobId));
       } catch (err) {
         logger.warn(`IG queue executors not registered: ${err.message}`);
       }
@@ -38,6 +42,7 @@ async function closeQueues() {
   await groupQueue.close();
   if (instagramScrapeQueue.initialized) await instagramScrapeQueue.close();
   if (instagramMessageQueue.initialized) await instagramMessageQueue.close();
+  if (instagramLookupQueue.initialized) await instagramLookupQueue.close();
   logger.info('All queues closed');
 }
 
@@ -48,6 +53,7 @@ module.exports = {
   groupQueue,
   instagramScrapeQueue,
   instagramMessageQueue,
+  instagramLookupQueue,
   initializeQueues,
   closeQueues,
 };

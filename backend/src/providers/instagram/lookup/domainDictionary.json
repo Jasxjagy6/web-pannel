@@ -1,0 +1,20 @@
+{
+  "domains": [
+    "gmail.com", "googlemail.com",
+    "outlook.com", "hotmail.com", "live.com", "msn.com",
+    "yahoo.com", "yahoo.co.uk", "yahoo.co.in", "ymail.com", "rocketmail.com",
+    "icloud.com", "me.com", "mac.com",
+    "aol.com", "aim.com",
+    "protonmail.com", "proton.me", "pm.me",
+    "tutanota.com", "tutanota.de", "tuta.io",
+    "fastmail.com", "fastmail.fm",
+    "zoho.com", "zohomail.com",
+    "gmx.com", "gmx.de", "gmx.net",
+    "mail.com",
+    "mail.ru", "yandex.ru", "yandex.com",
+    "rediffmail.com",
+    "hotmail.co.uk", "outlook.co.uk", "live.co.uk",
+    "163.com", "126.com", "qq.com", "sina.com",
+    "naver.com", "daum.net"
+  ]
+}
