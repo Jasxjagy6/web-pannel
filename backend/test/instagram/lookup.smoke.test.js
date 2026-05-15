@@ -47,9 +47,12 @@ async function test(name, fn) {
     assert.strictEqual(provider.capabilities.lookup_cross_platform, true);
     assert.strictEqual(provider.capabilities.lookup_geo, true);
     assert.strictEqual(provider.capabilities.lookup_dork, true);
-    // gates that should still be off in this PR
+    // PR #4 burner-pool enumerators are now wired (gated at runtime
+    // by burner-pool availability, not by the capability map).
+    assert.strictEqual(provider.capabilities.lookup_email_enumerate, true);
+    assert.strictEqual(provider.capabilities.lookup_phone_enumerate, true);
+    // gates that should still be off until PR #5 / PR #6 ship
     assert.strictEqual(provider.capabilities.lookup_breach, false);
-    assert.strictEqual(provider.capabilities.lookup_email_enumerate, false);
     assert.strictEqual(provider.capabilities.lookup_reverse_image, false);
   });
 
@@ -120,7 +123,57 @@ async function test(name, fn) {
     assert.strictEqual(q.initialized, false);
   });
 
-  await test('L7: profileInfo rejects junk usernames', async () => {
+  await test('L7a: burnerPoolService normalises 3-cookie shorthand', async () => {
+    const burnerPool = require('../../src/services/burnerPoolService');
+    const norm = burnerPool._normaliseBlob({
+      sessionid: 'abc',
+      ds_user_id: '1234',
+      csrftoken: 'tok',
+    });
+    assert.ok(Array.isArray(norm.cookies), 'expected cookies[]');
+    const names = norm.cookies.map((c) => c.name).sort();
+    assert.deepStrictEqual(names, ['csrftoken', 'ds_user_id', 'sessionid']);
+    // missing required cookie should throw
+    let threw = false;
+    try { burnerPool._normaliseBlob({ sessionid: 'abc' }); } catch (_e) { threw = true; }
+    assert.strictEqual(threw, true, 'expected missing-cookie rejection');
+  });
+
+  await test('L7b: emailEnumerator classifies a "This email is taken" response', async () => {
+    const enumr = require('../../src/providers/instagram/lookup/emailEnumerator');
+    assert.strictEqual(
+      enumr._isTakenResponse({ errors: { email: ['This email is taken.'] } }),
+      true,
+      'expected taken=true for canonical IG response',
+    );
+    assert.strictEqual(
+      enumr._isTakenResponse({ errors: { email: ['Please enter a valid email address.'] } }),
+      false,
+      'expected taken=false for validation error',
+    );
+    assert.strictEqual(
+      enumr._classifyResponse({ status: 'fail', message: 'Please wait a few minutes before you try again.' }),
+      'rate_limited',
+    );
+    assert.strictEqual(
+      enumr._classifyResponse({ status: 'fail', message: 'Checkpoint required' }),
+      'checkpoint',
+    );
+  });
+
+  await test('L7c: phoneEnumerator classifies phone responses', async () => {
+    const enumr = require('../../src/providers/instagram/lookup/phoneEnumerator');
+    assert.strictEqual(
+      enumr._isPhoneTakenResponse({ errors: { phone_number: ['This phone number is already taken.'] } }),
+      true,
+    );
+    assert.strictEqual(
+      enumr._classify({ errors: { phone_number: ['Invalid phone format'] } }),
+      'rejected',
+    );
+  });
+
+  await test('L8: profileInfo rejects junk usernames', async () => {
     const profileInfo = require('../../src/providers/instagram/lookup/profileInfo');
     let threw = false;
     try {
@@ -138,6 +191,16 @@ async function test(name, fn) {
       assert.strictEqual(err.statusCode, 400);
     }
     assert.strictEqual(threw, true, 'expected rejection for invalid username');
+  });
+
+  await test('L9: lookup METHODS now includes email_enum/phone_enum runners', async () => {
+    const lookup = require('../../src/providers/instagram/lookup');
+    assert.ok(lookup.METHODS.email_enum, 'email_enum missing');
+    assert.ok(lookup.METHODS.phone_enum, 'phone_enum missing');
+    assert.strictEqual(typeof lookup.METHODS.email_enum.runner.run, 'function');
+    assert.strictEqual(typeof lookup.METHODS.phone_enum.runner.run, 'function');
+    assert.strictEqual(lookup.METHODS.email_enum.capability, 'lookup_email_enumerate');
+    assert.strictEqual(lookup.METHODS.phone_enum.capability, 'lookup_phone_enumerate');
   });
 
   if (failures > 0) {

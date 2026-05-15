@@ -33,6 +33,8 @@ const resetOracle  = require('./resetOracle');
 const crossPlatform = require('./crossPlatform');
 const geoFromPosts = require('./geoFromPosts');
 const googleDork   = require('./googleDork');
+const emailEnumerator = require('./emailEnumerator');
+const phoneEnumerator = require('./phoneEnumerator');
 const candidateGenerator = require('./candidateGenerator');
 
 /**
@@ -51,11 +53,14 @@ const METHODS = {
   cross_platform:  { runner: crossPlatform,  capability: 'lookup_cross_platform' },
   geo_from_posts:  { runner: geoFromPosts,   capability: 'lookup_geo' },
   dork:            { runner: googleDork,     capability: 'lookup_dork' },
-  // Stubs for the methods that need PR #4/#5/#5.5/#6 infra. Calling
+  // PR #4 — burner-pool enumerators. Both require a populated burner
+  // pool; when empty they return a `no_burner_available` note finding
+  // so the operator sees exactly what to do next.
+  email_enum:      { runner: emailEnumerator,    capability: 'lookup_email_enumerate' },
+  phone_enum:      { runner: phoneEnumerator,    capability: 'lookup_phone_enumerate' },
+  // Stubs for the methods that still need PR #5/#5.5/#6 infra. Calling
   // them surfaces a `not_implemented` note instead of a hard failure
   // so the runner can complete and the operator sees the gap.
-  email_enum:      { runner: _notImplemented('email_enum',     'Requires burner-cookie pool — see PR #4'),     capability: 'lookup_email_enumerate' },
-  phone_enum:      { runner: _notImplemented('phone_enum',     'Requires burner-cookie pool — see PR #4'),     capability: 'lookup_phone_enumerate' },
   breach:          { runner: _notImplemented('breach',         'Requires Dehashed/LeakCheck/Snusbase keys — see PR #5'), capability: 'lookup_breach' },
   link_expand:     { runner: _notImplemented('link_expand',    'Link expansion + WHOIS — see PR #5'),          capability: 'lookup_link_expand' },
   reverse_image:   { runner: _notImplemented('reverse_image',  'Reverse-image (Yandex+PimEyes) — see PR #6'),   capability: 'lookup_reverse_image' },
@@ -258,6 +263,15 @@ async function runJob(jobId) {
   let spentUsd = Number(job.budget_usd_spent || 0);
   const budgetCap = Number(job.budget_usd_cap || 0);
 
+  // Methods communicate downstream context via `sharedCtx`. Earlier
+  // methods set fields here (e.g. reset_oracle stores its mask snapshot)
+  // so later methods (email_enum, phone_enum, breach, link_expand) can
+  // pick them up without re-querying.
+  const sharedCtx = {
+    resetOracleSnapshot: null,
+    profileInfo: null,
+  };
+
   for (const methodCode of methods) {
     if (await _isCancelled(jobId)) {
       logger.info(`IG.lookup.runJob: job ${jobId} cancelled mid-flight`);
@@ -268,6 +282,15 @@ async function runJob(jobId) {
       session,
       budgetUsdCap: budgetCap > 0 ? Math.max(0, budgetCap - spentUsd) : 0,
       serpApiKey: (job.options && job.options.serpApiKey) || process.env.SERPAPI_KEY || null,
+      resetOracleSnapshot: sharedCtx.resetOracleSnapshot,
+      profileInfoSnapshot: sharedCtx.profileInfo,
+      targetMask: methodCode === 'email_enum'
+        ? (sharedCtx.resetOracleSnapshot && sharedCtx.resetOracleSnapshot.obfuscated_email) || null
+        : methodCode === 'phone_enum'
+          ? (sharedCtx.resetOracleSnapshot && sharedCtx.resetOracleSnapshot.obfuscated_phone) || null
+          : null,
+      jobOptions: job.options || {},
+      userId: job.user_id,
     };
     const result = await _runMethod(methodCode, job, opts);
     if (result.ok === false) errors += 1; else completed += 1;
@@ -289,6 +312,14 @@ async function runJob(jobId) {
       });
     }
     findingsCount += await _persistFindings(jobId, resultFindings);
+
+    // Capture downstream-relevant snapshots for the next iteration.
+    if (methodCode === 'reset_oracle' && result.ok && result.snapshot) {
+      sharedCtx.resetOracleSnapshot = result.snapshot;
+    }
+    if (methodCode === 'profile_info' && result.ok && result.raw) {
+      sharedCtx.profileInfo = result.raw;
+    }
 
     // If oracle 1+2+3 returned mask hashes, surface candidates as
     // INFORMATIONAL findings so PR #4 has them ready to enumerate.

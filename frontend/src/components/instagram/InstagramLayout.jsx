@@ -49,6 +49,7 @@ import {
   Command,
   Activity,
   Compass,
+  Flame,
 } from 'lucide-react';
 import { useAuth } from '@/hooks/useAuth';
 import { usePlatform, useCapabilities } from '../../context/PlatformContext';
@@ -70,6 +71,7 @@ const IG_NAV = [
   { path: 'upload-session',    label: 'Upload session',icon: Upload,          capability: 'sessions_create',   section: 'main',                 wip: false },
   { path: 'scrape',            label: 'Scraping',      icon: Search,          capability: 'scrape_any',        section: 'main',   dock: true,  wip: false },
   { path: 'lookup',            label: 'Lookup',        icon: ScanSearch,      capability: 'lookup_any',        section: 'main',   dock: true,  wip: false },
+  { path: 'burners',           label: 'Burners',       icon: Flame,           capability: 'lookup_email_enumerate', section: 'safety',            wip: false },
   { path: 'lists',             label: 'Saved lists',   icon: ListIcon,        capability: 'lists',             section: 'engage',               wip: false },
   { path: 'reports',           label: 'Reports',       icon: BarChart3,       capability: 'reports',           section: 'engage',               wip: false },
   { path: 'proxies',           label: 'Proxies',       icon: Network,         capability: 'proxies',           section: 'safety',               wip: false },

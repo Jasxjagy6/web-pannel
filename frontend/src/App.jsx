@@ -53,6 +53,7 @@ const InstagramCreateSession   = lazy(() => import('./pages/instagram/CreateSess
 const InstagramUploadSession   = lazy(() => import('./pages/instagram/UploadSession'));
 const InstagramScrape          = lazy(() => import('./pages/instagram/Scrape'));
 const InstagramLookup          = lazy(() => import('./pages/instagram/Lookup'));
+const InstagramBurners         = lazy(() => import('./pages/instagram/Burners'));
 // IG-native pages shipped in PR #42. Each is a first-class implementation
 // (not a wrapper around the Telegram page) backed by IG-only API routes.
 const InstagramLists           = lazy(() => import('./pages/instagram/Lists'));
@@ -268,6 +269,9 @@ function PlatformRoutes() {
           sidebar; TG side falls back to the legacy Scrape page so
           /telegram/lookup at least renders something. */}
       <Route path="lookup" element={<ProtectedRoute title="Identity Lookup"><PlatformPage tg={Scrape} ig={InstagramLookup} /></ProtectedRoute>} />
+      {/* Burner-cookie pool admin (PR #4 §6.3). IG-only. Falls back to
+          the Scrape page on the TG sub-app so the URL still renders. */}
+      <Route path="burners" element={<ProtectedRoute title="Burner Pool"><PlatformPage tg={Scrape} ig={InstagramBurners} /></ProtectedRoute>} />
       {/* Messaging / Groups / Threads are Telegram-only features. They
           stay routable under /telegram/* but are hidden from the IG
           panel sidebar (and IG-side use of these URLs falls back to

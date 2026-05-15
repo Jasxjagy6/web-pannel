@@ -109,6 +109,8 @@ CREATE INDEX IF NOT EXISTS idx_lookup_watches_due
 -- PR #4 (burner pool + enumeration) will populate this table.
 CREATE TABLE IF NOT EXISTS lookup_burners (
   id                 SERIAL PRIMARY KEY,
+  created_by_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  label              VARCHAR(120),
   cookie_blob_enc    TEXT NOT NULL,
   web_fingerprint    JSONB,
   bound_proxy_id     INTEGER REFERENCES proxies(id) ON DELETE SET NULL,

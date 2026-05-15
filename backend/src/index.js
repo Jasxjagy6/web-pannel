@@ -238,6 +238,17 @@ app.use(
   instagramLookupRoutes
 );
 
+// Burner-cookie pool admin (PR #4 §6.3) — the pool feeds the
+// email/phone enumeration probes in `lookupService`. Independent
+// surface because cookie ingestion is a per-row admin action,
+// separate from job submission.
+const instagramBurnersRoutes = require('./routes/instagramBurners');
+app.use(
+  `${apiPrefix}/instagram/burners`,
+  parsePlatform('instagram'),
+  instagramBurnersRoutes
+);
+
 // 404 handler
 app.use((req, res) => {
   res.status(404).json({ success: false, error: { message: 'Route not found', code: 'NOT_FOUND' } });

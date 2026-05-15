@@ -92,8 +92,8 @@ const capabilities = {
   lookup_recovery_deep:        false,  // §2.9 oracle 4 (PR #5.5)
   lookup_recovery_watch:       false,  // §2.9 oracle 5 longitudinal (PR #7)
   lookup_breach_correlation:   false,  // §2.9 oracle 6 (PR #5.5)
-  lookup_email_enumerate:      false,  // §2.2 stage 3 (PR #4 — needs burners)
-  lookup_phone_enumerate:      false,  // §2.2 stage 4 (PR #4 — needs burners)
+  lookup_email_enumerate:      true,   // §2.2 stage 3 (PR #4 — gated at runtime by burner-pool availability)
+  lookup_phone_enumerate:      true,   // §2.2 stage 4 (PR #4 — gated at runtime by burner-pool availability)
   lookup_breach:               false,  // §2.3 (PR #5 — needs paid API keys)
   lookup_link_expand:          false,  // §2.4 (PR #5)
   lookup_cross_platform:       true,   // §2.5 Sherlock probe
