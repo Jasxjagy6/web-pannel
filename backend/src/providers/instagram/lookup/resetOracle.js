@@ -57,6 +57,7 @@ function _maskHash(mask) {
 function _anonymousCtx(username) {
   return {
     sessionId: `lookup-oracle:${username}`,
+    allowAnonymous: true,
     username: null,
     proxyUrl: null,
     bypassProxy: true,

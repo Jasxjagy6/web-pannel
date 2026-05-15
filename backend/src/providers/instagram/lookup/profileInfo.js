@@ -43,6 +43,7 @@ function _anonymousCtx(username) {
     username: null,
     proxyUrl: null,
     bypassProxy: true,
+    allowAnonymous: true,
     cookieHeader: '',
     csrftoken: '',
     dsUserId: null,
@@ -242,7 +243,7 @@ async function run(username, opts = {}) {
   const flags = [];
   if (user.is_verified) flags.push('verified');
   if (user.is_business_account) flags.push('business');
-  if (user.is_private) flags.push('private');
+  if (user.is_private) flags.push('private'); else flags.push('public');
   if (user.is_professional_account) flags.push('professional');
   if (flags.length) {
     findings.push({
@@ -251,6 +252,56 @@ async function run(username, opts = {}) {
       value: `flags: ${flags.join(', ')}`,
       confidence: 100,
       sourceUrl: `https://www.instagram.com/${cleaned}/`,
+    });
+  }
+
+  const igPk = user.id || user.pk || null;
+  if (igPk) {
+    findings.push({
+      method: 'profile_info',
+      kind: 'note',
+      value: `ig_id: ${igPk}`,
+      confidence: 100,
+      sourceUrl: `https://www.instagram.com/${cleaned}/`,
+      raw: { ig_id: String(igPk) },
+    });
+  }
+
+  const followers = user.edge_followed_by ? user.edge_followed_by.count : user.follower_count;
+  const following = user.edge_follow ? user.edge_follow.count : user.following_count;
+  const media = user.edge_owner_to_timeline_media
+    ? user.edge_owner_to_timeline_media.count
+    : user.media_count;
+  if (Number.isFinite(followers) || Number.isFinite(following) || Number.isFinite(media)) {
+    findings.push({
+      method: 'profile_info',
+      kind: 'note',
+      value: `counts: followers=${followers ?? '?'} following=${following ?? '?'} posts=${media ?? '?'}`,
+      confidence: 100,
+      sourceUrl: `https://www.instagram.com/${cleaned}/`,
+      raw: { followers, following, media },
+    });
+  }
+
+  if (user.category_name || user.category) {
+    findings.push({
+      method: 'profile_info',
+      kind: 'note',
+      value: `category: ${user.category_name || user.category}`,
+      confidence: 100,
+      sourceUrl: `https://www.instagram.com/${cleaned}/`,
+    });
+  }
+
+  if (user.connected_fb_page) {
+    findings.push({
+      method: 'profile_info',
+      kind: 'url',
+      value: `https://www.facebook.com/${user.connected_fb_page}`,
+      confidence: 95,
+      verified: true,
+      sourceUrl: `https://www.instagram.com/${cleaned}/`,
+      raw: { source: 'connected_fb_page' },
     });
   }
 

@@ -91,7 +91,7 @@ async function _resolveSessionFor(userId) {
       WHERE user_id = $1
         AND platform = 'instagram'
         AND is_logged_in = TRUE
-      ORDER BY last_used_at DESC NULLS LAST
+      ORDER BY last_used DESC NULLS LAST, last_active DESC NULLS LAST
       LIMIT 1`,
     [userId]
   );
@@ -272,7 +272,23 @@ async function runJob(jobId) {
     const result = await _runMethod(methodCode, job, opts);
     if (result.ok === false) errors += 1; else completed += 1;
     if (Number(result.cost_usd_estimate) > 0) spentUsd += Number(result.cost_usd_estimate);
-    findingsCount += await _persistFindings(jobId, result.findings || []);
+    const resultFindings = Array.isArray(result.findings) ? result.findings.slice() : [];
+    // Surface method-level errors as `note` findings so the operator
+    // can tell *why* a method returned nothing (login_required,
+    // proxy_required, rate_limited, etc.) instead of seeing a blank
+    // panel.
+    if (result.ok === false) {
+      resultFindings.push({
+        method: methodCode,
+        kind: 'note',
+        value: `${methodCode} failed: ${result.error || 'error'}${
+          result.message ? ` — ${String(result.message).slice(0, 200)}` : ''
+        }`,
+        confidence: 0,
+        raw: { error: result.error || null, message: result.message || null },
+      });
+    }
+    findingsCount += await _persistFindings(jobId, resultFindings);
 
     // If oracle 1+2+3 returned mask hashes, surface candidates as
     // INFORMATIONAL findings so PR #4 has them ready to enumerate.

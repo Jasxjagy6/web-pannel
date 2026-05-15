@@ -38,7 +38,7 @@ const IG_GRADIENT = 'bg-gradient-to-tr from-[#f09433] via-[#dc2743] to-[#bc1888]
 const LOOKUP_METHODS = [
   { code: 'profile_info',   label: 'Public profile (§2.1)',          icon: Search,    desc: 'Bio, business email/phone, address, full_name, external link.', enabled: true },
   { code: 'reset_oracle',   label: 'Recovery masks (§2.9 / Oracles 1-3)', icon: ShieldAlert, desc: 'Obfuscated email/phone, recovery-methods bitmap, account status. Single-pass, never triggers a real reset.', enabled: true },
-  { code: 'cross_platform', label: 'Cross-platform handles (§2.5)',  icon: Globe,     desc: 'Sherlock-style probe of ~45 services for the same handle.', enabled: true },
+  { code: 'cross_platform', label: 'Cross-platform handles (§2.5)',  icon: Globe,     desc: 'Sherlock-style probe of ~16 services (GitHub, GitLab, Reddit, YouTube, SoundCloud, Patreon, Behance, Substack, …) for the same handle. Per-site detection rules — biased toward false negatives, not false positives.', enabled: true },
   { code: 'geo_from_posts', label: 'Geo from posts (§2.8)',          icon: MapPin,    desc: 'Top-N city/area signal from the target\'s most recent tagged-location posts. Needs a logged-in IG session.', enabled: true },
   { code: 'dork',           label: 'Google dork (§2.7)',             icon: FileText,  desc: 'Targeted Google searches via SerpAPI. Skipped silently if no SERPAPI_KEY is set.', enabled: true },
   { code: 'email_enum',     label: 'Email enumeration (§2.2 / PR #4)',   icon: Mail,  desc: 'Validate mask-derived email candidates against IG\'s signup form. Requires burner-cookie pool (PR #4).', enabled: false },

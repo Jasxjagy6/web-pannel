@@ -1,12 +1,44 @@
 /**
  * §2.5 Cross-platform username probe (Sherlock-style).
  *
- * Pure HTTP HEAD/GET probes against ~50 services to surface accounts
- * with the same handle as the IG username. No credentials, no
- * impersonation — just "does this handle exist?".
+ * Pure HTTP probes against ~16 services to surface accounts with the
+ * same handle as the IG username. No credentials, no impersonation —
+ * just "does this handle resolve to a profile on this service?".
  *
- * Each probe is bounded by `lookupLimiter` so we don't fan out 50
+ * Each probe is bounded by `lookupLimiter` so we don't fan out N
  * parallel requests from the same IP.
+ *
+ * ## Why detection rules are per-site
+ *
+ * A naive "status === 200 means exists" rule produces *massive* false
+ * positives because:
+ *
+ *   - Many services serve a generic landing/login wall on
+ *     /<unknown_user> with status 200 (Twitch, Twitter/X, TikTok,
+ *     Spotify, Pinterest, Steam, OnlyFans, Imgur, Threads, Medium,
+ *     Hashnode are all SPAs that return the same HTML shell whether
+ *     or not the profile exists).
+ *   - Many services anti-bot 403 panel-host IPs entirely, so the
+ *     status carries no signal at all (Bitbucket, StackOverflow,
+ *     CodePen, Replit, Linktr.ee, ProductHunt, Trakt, Etsy, Quora,
+ *     Dribbble, Flickr, Tumblr).
+ *
+ * To stay accurate this module uses three detection strategies:
+ *
+ *   - `existsStatus`  — exists IFF response status ∈ existsStatus.
+ *   - `redirectExists` — a 3xx response with `location:` to a non-
+ *                        login destination means the profile exists.
+ *                        Used for services that 301/302/307 a real
+ *                        profile path (Patreon → /c/<u>, Behance →
+ *                        /<u>/moodboards, Wattpad → /user/<u>/info,
+ *                        Goodreads → /user/<id>-<slug>).
+ *   - `bodyMissing`    — fetch HTML; if the regex matches, the
+ *                        profile does NOT exist.
+ *
+ * Services that can't be reliably probed without an authenticated
+ * session or a residential proxy are deliberately omitted. The
+ * `BLOCKED_SITES` table below documents them so a future PR can
+ * re-enable them via the proxy-routed `igFetch` path.
  */
 
 'use strict';
@@ -14,90 +46,145 @@
 const logger = require('../../../utils/logger');
 const lookupLimiter = require('./lookupLimiter');
 
+const UA =
+  'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 ' +
+  '(KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36';
+
+/**
+ * Each site:
+ *   - name:           Display name.
+ *   - url(u):         Profile URL.
+ *   - method:         HTTP method (default GET; HEAD only when status alone
+ *                     is reliable AND the service answers HEAD without a
+ *                     login wall).
+ *   - existsStatus:   Status codes that mean "exists" (e.g. [200]).
+ *   - missingStatus:  Status codes that mean "missing" (e.g. [404]).
+ *   - redirectExists: If true, any 3xx with `location` not pointing at
+ *                     a login/signup URL is treated as "exists".
+ *   - bodyMissing:    Regex; if it matches the response body, the profile
+ *                     does NOT exist. Combined with existsStatus.
+ *   - confidence:     Reported confidence on a hit.
+ */
 const SITES = [
-  { name: 'GitHub',       url: (u) => `https://github.com/${u}`,                  ok: 'status', okStatus: 200 },
-  { name: 'GitLab',       url: (u) => `https://gitlab.com/${u}`,                  ok: 'status', okStatus: 200 },
-  { name: 'Bitbucket',    url: (u) => `https://bitbucket.org/${u}`,               ok: 'status', okStatus: 200 },
-  { name: 'Twitter / X',  url: (u) => `https://twitter.com/${u}`,                 ok: 'status', okStatus: 200 },
-  { name: 'Reddit',       url: (u) => `https://www.reddit.com/user/${u}/about.json`, ok: 'json',  okPath: 'data.name' },
-  { name: 'TikTok',       url: (u) => `https://www.tiktok.com/@${u}`,             ok: 'status', okStatus: 200 },
-  { name: 'YouTube',      url: (u) => `https://www.youtube.com/@${u}`,            ok: 'status', okStatus: 200 },
-  { name: 'Twitch',       url: (u) => `https://www.twitch.tv/${u}`,               ok: 'status', okStatus: 200 },
-  { name: 'Pinterest',    url: (u) => `https://www.pinterest.com/${u}/`,          ok: 'status', okStatus: 200 },
-  { name: 'Vimeo',        url: (u) => `https://vimeo.com/${u}`,                   ok: 'status', okStatus: 200 },
-  { name: 'Medium',       url: (u) => `https://medium.com/@${u}`,                 ok: 'status', okStatus: 200 },
-  { name: 'Dev.to',       url: (u) => `https://dev.to/${u}`,                      ok: 'status', okStatus: 200 },
-  { name: 'StackOverflow',url: (u) => `https://stackoverflow.com/users/${u}`,     ok: 'status', okStatus: 200 },
-  { name: 'Behance',      url: (u) => `https://www.behance.net/${u}`,             ok: 'status', okStatus: 200 },
-  { name: 'Dribbble',     url: (u) => `https://dribbble.com/${u}`,                ok: 'status', okStatus: 200 },
-  { name: 'SoundCloud',   url: (u) => `https://soundcloud.com/${u}`,              ok: 'status', okStatus: 200 },
-  { name: 'Spotify',      url: (u) => `https://open.spotify.com/user/${u}`,       ok: 'status', okStatus: 200 },
-  { name: 'Steam',        url: (u) => `https://steamcommunity.com/id/${u}`,       ok: 'status', okStatus: 200 },
-  { name: 'Roblox',       url: (u) => `https://www.roblox.com/user.aspx?username=${u}`, ok: 'status', okStatus: 200 },
-  { name: 'Patreon',      url: (u) => `https://www.patreon.com/${u}`,             ok: 'status', okStatus: 200 },
-  { name: 'Ko-fi',        url: (u) => `https://ko-fi.com/${u}`,                   ok: 'status', okStatus: 200 },
-  { name: 'BuyMeACoffee', url: (u) => `https://www.buymeacoffee.com/${u}`,        ok: 'status', okStatus: 200 },
-  { name: 'Linktree',     url: (u) => `https://linktr.ee/${u}`,                   ok: 'status', okStatus: 200 },
-  { name: 'OnlyFans',     url: (u) => `https://onlyfans.com/${u}`,                ok: 'status', okStatus: 200 },
-  { name: 'Tumblr',       url: (u) => `https://${u}.tumblr.com/`,                 ok: 'status', okStatus: 200 },
-  { name: 'Etsy',         url: (u) => `https://www.etsy.com/shop/${u}`,           ok: 'status', okStatus: 200 },
-  { name: 'Snapchat',     url: (u) => `https://www.snapchat.com/add/${u}`,        ok: 'status', okStatus: 200 },
-  { name: 'Threads',      url: (u) => `https://www.threads.net/@${u}`,            ok: 'status', okStatus: 200 },
-  { name: 'BlueSky',      url: (u) => `https://bsky.app/profile/${u}.bsky.social`,ok: 'status', okStatus: 200 },
-  { name: 'Mastodon',     url: (u) => `https://mastodon.social/@${u}`,            ok: 'status', okStatus: 200 },
-  { name: 'Flickr',       url: (u) => `https://www.flickr.com/people/${u}`,      ok: 'status', okStatus: 200 },
-  { name: 'Quora',        url: (u) => `https://www.quora.com/profile/${u}`,      ok: 'status', okStatus: 200 },
-  { name: 'Discord',      url: (u) => `https://discord.com/users/${u}`,           ok: 'status', okStatus: 200 },
-  { name: 'Goodreads',    url: (u) => `https://www.goodreads.com/${u}`,           ok: 'status', okStatus: 200 },
-  { name: 'Last.fm',      url: (u) => `https://www.last.fm/user/${u}`,            ok: 'status', okStatus: 200 },
-  { name: 'Kaggle',       url: (u) => `https://www.kaggle.com/${u}`,              ok: 'status', okStatus: 200 },
-  { name: 'HackerNews',   url: (u) => `https://news.ycombinator.com/user?id=${u}`, ok: 'status', okStatus: 200 },
-  { name: 'ProductHunt',  url: (u) => `https://www.producthunt.com/@${u}`,        ok: 'status', okStatus: 200 },
-  { name: 'Imgur',        url: (u) => `https://imgur.com/user/${u}`,              ok: 'status', okStatus: 200 },
-  { name: 'Replit',       url: (u) => `https://replit.com/@${u}`,                 ok: 'status', okStatus: 200 },
-  { name: 'CodePen',      url: (u) => `https://codepen.io/${u}`,                  ok: 'status', okStatus: 200 },
-  { name: 'Trakt',        url: (u) => `https://trakt.tv/users/${u}`,              ok: 'status', okStatus: 200 },
-  { name: 'Wattpad',      url: (u) => `https://www.wattpad.com/user/${u}`,        ok: 'status', okStatus: 200 },
-  { name: 'Hashnode',     url: (u) => `https://hashnode.com/@${u}`,               ok: 'status', okStatus: 200 },
-  { name: 'AngelList',    url: (u) => `https://wellfound.com/${u}`,               ok: 'status', okStatus: 200 },
-  { name: 'Substack',     url: (u) => `https://${u}.substack.com`,                ok: 'status', okStatus: 200 },
+  // Pure 200/404 services — HEAD is enough.
+  { name: 'GitHub',     url: (u) => `https://github.com/${u}`,                     method: 'HEAD',
+    existsStatus: [200], missingStatus: [404], confidence: 90 },
+  { name: 'GitLab',     url: (u) => `https://gitlab.com/${u}`,                     method: 'HEAD',
+    existsStatus: [200], missingStatus: [302, 404], confidence: 85 },
+  { name: 'Vimeo',      url: (u) => `https://vimeo.com/${u}`,                      method: 'HEAD',
+    existsStatus: [200], missingStatus: [404], confidence: 80 },
+  { name: 'Dev.to',     url: (u) => `https://dev.to/${u}`,                         method: 'HEAD',
+    existsStatus: [200], missingStatus: [404], confidence: 80 },
+  { name: 'Mastodon',   url: (u) => `https://mastodon.social/@${u}`,               method: 'HEAD',
+    existsStatus: [200], missingStatus: [404], confidence: 75 },
+
+  // Status-driven but require GET (HEAD returns wrong codes).
+  { name: 'YouTube',    url: (u) => `https://www.youtube.com/@${u}`,               method: 'GET',
+    existsStatus: [200], missingStatus: [404], confidence: 80 },
+  { name: 'SoundCloud', url: (u) => `https://soundcloud.com/${u}`,                 method: 'GET',
+    existsStatus: [200], missingStatus: [404], confidence: 75 },
+  { name: 'Substack',   url: (u) => `https://${u}.substack.com`,                   method: 'GET',
+    existsStatus: [200], missingStatus: [404], confidence: 75 },
+  { name: 'Last.fm',    url: (u) => `https://www.last.fm/user/${u}`,               method: 'GET',
+    existsStatus: [200], missingStatus: [404], confidence: 80 },
+  { name: 'Kaggle',     url: (u) => `https://www.kaggle.com/${u}`,                 method: 'GET',
+    existsStatus: [200], missingStatus: [404], confidence: 80 },
+
+  // Redirect-driven services — a 3xx with a non-login `location` means
+  // the profile exists.
+  { name: 'Behance',    url: (u) => `https://www.behance.net/${u}`,                method: 'HEAD',
+    redirectExists: true,  missingStatus: [404], confidence: 80 },
+  { name: 'Patreon',    url: (u) => `https://www.patreon.com/${u}`,                method: 'HEAD',
+    redirectExists: true,  missingStatus: [404], confidence: 75 },
+  { name: 'Wattpad',    url: (u) => `https://www.wattpad.com/user/${u}`,           method: 'HEAD',
+    redirectExists: true,  missingStatus: [404], confidence: 75 },
+  { name: 'Goodreads',  url: (u) => `https://www.goodreads.com/${u}`,              method: 'HEAD',
+    redirectExists: true,  missingStatus: [404], confidence: 75 },
+
+  // Reddit JSON — special handling: parse body and check data.name.
+  { name: 'Reddit',     url: (u) => `https://www.reddit.com/user/${u}/about.json`, method: 'GET',
+    jsonPath: 'data.name', confidence: 90 },
+
+  // Body-detection: HN is HTML-only, no JSON, no status signal.
+  { name: 'Hacker News', url: (u) => `https://news.ycombinator.com/user?id=${u}`,  method: 'GET',
+    existsStatus: [200], bodyMissing: /No such user\./i, confidence: 85 },
 ];
+
+/**
+ * Services we couldn't reliably probe from a panel-host IP. These
+ * are documented so a future PR can re-enable them via the proxy-
+ * routed `igFetch` path once `proxies.validated_for_lookup` is set
+ * up. Listing them in code (not just in markdown) means CI tooling
+ * can audit the surface.
+ */
+const BLOCKED_SITES = [
+  'Bitbucket', 'StackOverflow', 'CodePen', 'Replit',     // anti-bot 403
+  'Trakt', 'ProductHunt', 'Linktr.ee', 'Tumblr',         // anti-bot 403
+  'Etsy', 'Quora', 'Dribbble', 'Flickr',                 // anti-bot 403/404 for all
+  'Twitch', 'Twitter / X', 'TikTok',                     // SPA shell — same response
+  'Spotify', 'Pinterest', 'Steam', 'OnlyFans',           // SPA shell + login wall
+  'Imgur', 'Threads', 'Medium', 'Hashnode',              // SPA shell — same response
+  'Discord', 'Snapchat',                                 // no canonical public profile URL
+];
+
+/**
+ * Detect whether a 3xx `location` looks like a login/signup wall vs
+ * a real profile path. Used by `redirectExists` rules.
+ */
+function _isLoginRedirect(target) {
+  if (!target) return true; // empty location is suspicious
+  return /\/(login|signup|signin|join|register|auth)(\/|\?|$)/i.test(target);
+}
 
 async function _probe(site, username) {
   const url = site.url(username);
-  // Use HEAD when supported — some services (Reddit, Threads) return
-  // weird redirects on HEAD so we fall back to GET on those.
-  const method = site.ok === 'json' ? 'GET' : 'HEAD';
+  const method = site.method || 'GET';
   try {
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 6_000);
+    const timeout = setTimeout(() => controller.abort(), 7_000);
     const res = await fetch(url, {
       method,
       redirect: 'manual',
       headers: {
-        'user-agent':
-          'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 ' +
-          '(KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36',
-        accept: 'text/html,application/json',
+        'user-agent': UA,
+        accept: site.jsonPath ? 'application/json' : 'text/html,application/json',
+        'accept-language': 'en-US,en;q=0.9',
       },
       signal: controller.signal,
     });
     clearTimeout(timeout);
-    if (site.ok === 'json') {
-      // GET path with JSON body parse.
+
+    if (site.jsonPath) {
       let body;
       try { body = await res.json(); } catch (_e) { body = null; }
-      const path = site.okPath ? site.okPath.split('.') : [];
+      const path = site.jsonPath.split('.');
       let v = body;
       for (const p of path) v = v && v[p];
       if (v && String(v).toLowerCase() === username.toLowerCase()) {
-        return { name: site.name, url, confidence: 90 };
+        return { name: site.name, url, confidence: site.confidence || 75 };
       }
       return null;
     }
-    if (res.status === site.okStatus) {
-      return { name: site.name, url, confidence: 75 };
+
+    if (Array.isArray(site.missingStatus) && site.missingStatus.includes(res.status)) {
+      return null;
     }
+
+    if (site.redirectExists && res.status >= 300 && res.status < 400) {
+      const loc = res.headers.get('location') || '';
+      if (_isLoginRedirect(loc)) return null;
+      return { name: site.name, url, confidence: site.confidence || 75 };
+    }
+
+    if (Array.isArray(site.existsStatus) && site.existsStatus.includes(res.status)) {
+      if (site.bodyMissing) {
+        // Re-fetch body if needed (HEAD never has body).
+        const body = method === 'HEAD' ? '' : await res.text().catch(() => '');
+        if (body && site.bodyMissing.test(body)) return null;
+      }
+      return { name: site.name, url, confidence: site.confidence || 75 };
+    }
+
     return null;
   } catch (_err) {
     return null;
@@ -105,7 +192,9 @@ async function _probe(site, username) {
 }
 
 async function run(username, opts = {}) {
-  if (!username || typeof username !== 'string') return { method: 'cross_platform', ok: false, error: 'invalid_input', findings: [] };
+  if (!username || typeof username !== 'string') {
+    return { method: 'cross_platform', ok: false, error: 'invalid_input', findings: [] };
+  }
   const cleaned = username.trim().replace(/^@+/, '');
   if (!/^[a-zA-Z0-9._-]{1,30}$/.test(cleaned)) {
     return { method: 'cross_platform', ok: false, error: 'invalid_input', findings: [] };
@@ -143,8 +232,8 @@ async function run(username, opts = {}) {
     method: 'cross_platform',
     ok: true,
     findings,
-    raw: { probed: SITES.length, matched: findings.length },
+    raw: { probed: SITES.length, matched: findings.length, blocked: BLOCKED_SITES.length },
   };
 }
 
-module.exports = { run, SITES };
+module.exports = { run, SITES, BLOCKED_SITES };
