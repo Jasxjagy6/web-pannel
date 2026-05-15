@@ -617,6 +617,13 @@ async function start() {
       logger.warn(`lookupWatchWorker.start failed: ${err.message}`);
     }
 
+    try {
+      const lookupRetentionWorker = require('./services/lookupRetentionWorker');
+      lookupRetentionWorker.start();
+    } catch (err) {
+      logger.warn(`lookupRetentionWorker.start failed: ${err.message}`);
+    }
+
     // 8. Subscription / trial expiry sweep. Runs every minute so a paid
     //    user whose monthly window just elapsed gets gated out of the app
     //    on their very next request. Trial expiry happens implicitly via
