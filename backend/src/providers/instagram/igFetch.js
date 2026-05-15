@@ -378,7 +378,14 @@ function browserHeaders(ctx, opts = {}) {
  * Returns the parsed JSON on 2xx, throws a classified error otherwise.
  */
 async function igFetch(ctx, url, opts = {}) {
-  if (!ctx || !ctx.cookieHeader) {
+  // Identity-lookup public probes (web_profile_info) call this with
+  // `ctx.allowAnonymous = true` to deliberately send a cookie-less
+  // request. The endpoint accepts that as long as `x-ig-app-id` is
+  // set (browserHeaders does this). Anonymous traffic from a panel
+  // host that lacks proxies still fails at the proxy-required gate
+  // below, which is the correct production behaviour — but we no
+  // longer fail-fast on the cookie check before that gate runs.
+  if (!ctx || (!ctx.cookieHeader && !ctx.allowAnonymous)) {
     const e = new Error('Session has no cookies');
     e.kind = 'login_required';
     e.statusCode = 401;

@@ -126,6 +126,26 @@ const capabilities = {
   otp_relay:              true,   // Saved-Messages OTP relay (TG only)
 
   // ---------------------------------------------------------------------
+  // Identity-lookup module is Instagram-only. Mirror the rollup as
+  // false here so the IG-specific React sidebar entry never renders on
+  // the Telegram panel.
+  // ---------------------------------------------------------------------
+  lookup_any:                  false,
+  lookup_public_profile:       false,
+  lookup_recovery:             false,
+  lookup_recovery_deep:        false,
+  lookup_recovery_watch:       false,
+  lookup_breach_correlation:   false,
+  lookup_email_enumerate:      false,
+  lookup_phone_enumerate:      false,
+  lookup_breach:               false,
+  lookup_link_expand:          false,
+  lookup_cross_platform:       false,
+  lookup_reverse_image:        false,
+  lookup_dork:                 false,
+  lookup_geo:                  false,
+
+  // ---------------------------------------------------------------------
   // In-panel Telegram client (per-session login → real chat UI).
   // Telegram-only; the Instagram provider must NOT expose this flag.
   // Backed by /api/telegram/client/* and a custom React Telegram-style

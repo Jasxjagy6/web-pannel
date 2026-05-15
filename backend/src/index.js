@@ -226,6 +226,29 @@ app.use(
   instagramIdentityRoutes
 );
 
+// Instagram-only identity-lookup module — multi-method OSINT against
+// a public IG username (profile info, recovery masks, cross-platform
+// probes, geo from public posts, google dorks). Independent surface
+// from /scrape because the workload, rate-limit profile, and audit
+// model are all different. See instagram_upgrade.txt §4.3 and §6.4.
+const instagramLookupRoutes = require('./routes/instagramLookup');
+app.use(
+  `${apiPrefix}/instagram/lookup`,
+  parsePlatform('instagram'),
+  instagramLookupRoutes
+);
+
+// Burner-cookie pool admin (PR #4 §6.3) — the pool feeds the
+// email/phone enumeration probes in `lookupService`. Independent
+// surface because cookie ingestion is a per-row admin action,
+// separate from job submission.
+const instagramBurnersRoutes = require('./routes/instagramBurners');
+app.use(
+  `${apiPrefix}/instagram/burners`,
+  parsePlatform('instagram'),
+  instagramBurnersRoutes
+);
+
 // 404 handler
 app.use((req, res) => {
   res.status(404).json({ success: false, error: { message: 'Route not found', code: 'NOT_FOUND' } });
@@ -576,6 +599,29 @@ async function start() {
       messageScheduleService.start();
     } catch (err) {
       logger.warn(`messageScheduleService.start failed: ${err.message}`);
+    }
+
+    // 7c. Boot the IG lookup-watch worker (PR #7) + retention sweeper
+    //     (PR #8). The worker polls `lookup_watches` for due rows and
+    //     invokes `resetOracleWatch.run()` on each; the retention
+    //     sweeper hard-deletes jobs whose retained_until is past.
+    try {
+      const enabled = String(process.env.LOOKUP_WATCH_ENABLED ?? 'true').toLowerCase() !== 'false';
+      if (enabled) {
+        const lookupWatchWorker = require('./services/lookupWatchWorker');
+        lookupWatchWorker.start();
+      } else {
+        logger.info('IG lookup-watch worker disabled via LOOKUP_WATCH_ENABLED=false');
+      }
+    } catch (err) {
+      logger.warn(`lookupWatchWorker.start failed: ${err.message}`);
+    }
+
+    try {
+      const lookupRetentionWorker = require('./services/lookupRetentionWorker');
+      lookupRetentionWorker.start();
+    } catch (err) {
+      logger.warn(`lookupRetentionWorker.start failed: ${err.message}`);
     }
 
     // 8. Subscription / trial expiry sweep. Runs every minute so a paid

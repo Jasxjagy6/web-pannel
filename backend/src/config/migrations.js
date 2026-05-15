@@ -68,6 +68,8 @@ const MIGRATION_ORDER = [
   'migration_v31_profile_lists_and_revocation.sql',
   'migration_v32_env_admin_marker.sql',
   'migration_v33_auth_sessions.sql',
+  'migration_v34_instagram_lookups.sql',
+  'migration_v35_instagram_lookup_extras.sql',
 ];
 
 function listMigrationFiles() {

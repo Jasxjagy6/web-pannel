@@ -52,6 +52,11 @@ const InstagramSessions        = lazy(() => import('./pages/instagram/Sessions')
 const InstagramCreateSession   = lazy(() => import('./pages/instagram/CreateSession'));
 const InstagramUploadSession   = lazy(() => import('./pages/instagram/UploadSession'));
 const InstagramScrape          = lazy(() => import('./pages/instagram/Scrape'));
+const InstagramLookup          = lazy(() => import('./pages/instagram/Lookup'));
+const InstagramLookupWatches   = lazy(() => import('./pages/instagram/LookupWatches'));
+const InstagramLookupKeys      = lazy(() => import('./pages/instagram/LookupKeys'));
+const InstagramLookupAdmin     = lazy(() => import('./pages/instagram/LookupAdmin'));
+const InstagramBurners         = lazy(() => import('./pages/instagram/Burners'));
 // IG-native pages shipped in PR #42. Each is a first-class implementation
 // (not a wrapper around the Telegram page) backed by IG-only API routes.
 const InstagramLists           = lazy(() => import('./pages/instagram/Lists'));
@@ -263,6 +268,16 @@ function PlatformRoutes() {
           "switch to Telegram" notice when the active platform isn't TG. */}
       <Route path="login-sessions" element={<ProtectedRoute title="Login"><TelegramLoginSessions /></ProtectedRoute>} />
       <Route path="scrape" element={<ProtectedRoute title="Scrape"><PlatformPage tg={Scrape} ig={InstagramScrape} /></ProtectedRoute>} />
+      {/* Instagram-only identity-lookup module. Hidden from the TG
+          sidebar; TG side falls back to the legacy Scrape page so
+          /telegram/lookup at least renders something. */}
+      <Route path="lookup" element={<ProtectedRoute title="Identity Lookup"><PlatformPage tg={Scrape} ig={InstagramLookup} /></ProtectedRoute>} />
+      <Route path="lookup/watches" element={<ProtectedRoute title="Lookup Watches"><PlatformPage tg={Scrape} ig={InstagramLookupWatches} /></ProtectedRoute>} />
+      <Route path="lookup/keys" element={<ProtectedRoute title="Lookup API Keys"><PlatformPage tg={Scrape} ig={InstagramLookupKeys} /></ProtectedRoute>} />
+      <Route path="lookup/admin" element={<ProtectedRoute title="Lookup Admin" requireAdmin><PlatformPage tg={Scrape} ig={InstagramLookupAdmin} /></ProtectedRoute>} />
+      {/* Burner-cookie pool admin (PR #4 §6.3). IG-only. Falls back to
+          the Scrape page on the TG sub-app so the URL still renders. */}
+      <Route path="burners" element={<ProtectedRoute title="Burner Pool"><PlatformPage tg={Scrape} ig={InstagramBurners} /></ProtectedRoute>} />
       {/* Messaging / Groups / Threads are Telegram-only features. They
           stay routable under /telegram/* but are hidden from the IG
           panel sidebar (and IG-side use of these URLs falls back to
