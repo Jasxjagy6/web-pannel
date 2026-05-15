@@ -89,15 +89,16 @@ const capabilities = {
   lookup_any:                  true,
   lookup_public_profile:       true,   // §2.1 web_profile_info
   lookup_recovery:             true,   // §2.9 oracles 1+2+3 (single-pass)
-  lookup_recovery_deep:        false,  // §2.9 oracle 4 (PR #5.5)
-  lookup_recovery_watch:       false,  // §2.9 oracle 5 longitudinal (PR #7)
-  lookup_breach_correlation:   false,  // §2.9 oracle 6 (PR #5.5)
+  lookup_recovery_deep:        true,   // §2.9 oracle 4 (PR #5.5)
+  lookup_recovery_watch:       true,   // §2.9 oracle 5 longitudinal (PR #7)
+  lookup_alt_account:          true,   // §2.9 oracle 6 (PR #5.5)
+  lookup_breach_correlation:   true,   // §2.9 oracle 6 legacy alias
   lookup_email_enumerate:      true,   // §2.2 stage 3 (PR #4 — gated at runtime by burner-pool availability)
   lookup_phone_enumerate:      true,   // §2.2 stage 4 (PR #4 — gated at runtime by burner-pool availability)
-  lookup_breach:               false,  // §2.3 (PR #5 — needs paid API keys)
-  lookup_link_expand:          false,  // §2.4 (PR #5)
+  lookup_breach:               true,   // §2.3 (PR #5 — per-user keys via vault, env fallback)
+  lookup_link_expand:          true,   // §2.4 (PR #5)
   lookup_cross_platform:       true,   // §2.5 Sherlock probe
-  lookup_reverse_image:        false,  // §2.6 (PR #6 — needs PimEyes/SerpAPI)
+  lookup_reverse_image:        true,   // §2.6 (PR #6)
   lookup_dork:                 true,   // §2.7 (no-op when SERPAPI_KEY unset)
   lookup_geo:                  true,   // §2.8 city-from-posts (never IP)
 

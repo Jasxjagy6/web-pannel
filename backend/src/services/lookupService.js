@@ -27,6 +27,8 @@ const instagramLookupQueue = require('../queues/instagramLookupQueue');
 const VALID_METHODS = [
   'profile_info',
   'reset_oracle',
+  'reset_oracle_deep',
+  'alt_account',
   'cross_platform',
   'geo_from_posts',
   'dork',
@@ -84,13 +86,16 @@ async function createJob({ userId, username, methods, options, statedPurpose, cl
   const validMethods = _validateMethods(methods);
   const opts = options && typeof options === 'object' ? options : {};
   const budgetCap = Number(opts.budgetUsdCap || 0);
+  const deepMode = !!(opts.deepMode || opts.deep_mode);
+  if (deepMode && !validMethods.includes('reset_oracle_deep')) validMethods.push('reset_oracle_deep');
+  const retentionDays = parseInt(process.env.LOOKUP_JOB_RETENTION_DAYS || '90', 10);
   const insert = await pool.query(
     `INSERT INTO lookup_jobs
        (user_id, platform, username, methods, options, status,
         total_methods, completed_methods, error_methods, total_findings,
-        budget_usd_cap, budget_usd_spent, stated_purpose, client_ip)
+        budget_usd_cap, budget_usd_spent, stated_purpose, client_ip, deep_mode, retained_until)
      VALUES ($1, 'instagram', $2, $3, $4::jsonb, 'pending',
-        $5, 0, 0, 0, $6, 0, $7, $8)
+        $5, 0, 0, 0, $6, 0, $7, $8, $9, NOW() + ($10 || ' days')::interval)
      RETURNING *`,
     [
       userId,
@@ -101,10 +106,21 @@ async function createJob({ userId, username, methods, options, statedPurpose, cl
       budgetCap,
       purpose,
       clientIp || null,
+      deepMode,
+      String(Math.max(1, retentionDays)),
     ]
   );
   const row = insert.rows[0];
-  logger.info(`IG.lookup.createJob: jobId=${row.id} user=${userId} username=${cleaned} methods=${validMethods.join(',')}`);
+  logger.info(`IG.lookup.createJob: jobId=${row.id} user=${userId} username=${cleaned} methods=${validMethods.join(',')} deep=${deepMode}`);
+  try {
+    // eslint-disable-next-line global-require
+    const lookupAudit = require('./lookupAuditService');
+    lookupAudit.log({
+      userId, jobId: row.id, username: cleaned, action: 'job_created',
+      method: validMethods.join(','), statedPurpose: purpose, clientIp,
+      meta: { methods: validMethods, deepMode, budgetCap },
+    });
+  } catch (_e) { /* swallow */ }
   return row;
 }
 

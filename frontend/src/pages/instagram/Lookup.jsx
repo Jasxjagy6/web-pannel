@@ -43,9 +43,11 @@ const LOOKUP_METHODS = [
   { code: 'dork',           label: 'Google dork (§2.7)',             icon: FileText,  desc: 'Targeted Google searches via SerpAPI. Skipped silently if no SERPAPI_KEY is set.', enabled: true },
   { code: 'email_enum',     label: 'Email enumeration (§2.2 / PR #4)',   icon: Mail,  desc: 'Validate mask-derived email candidates against IG\'s signup form using a burner-cookie pool. Empty pool → no_burner_available note. Manage burners on the Burners page.', enabled: true },
   { code: 'phone_enum',     label: 'Phone enumeration (§2.2 / PR #4)',   icon: Phone, desc: 'Validate mask-derived phone candidates the same way. Search space is bigger so phones are bounded by the carrier-prefix dictionary.', enabled: true },
-  { code: 'breach',         label: 'Breach correlation (§2.3 / PR #5)',  icon: AlertTriangle, desc: 'Query Dehashed / LeakCheck / Snusbase / IntelligenceX / HIBP. Requires per-org API keys (PR #5).', enabled: false },
-  { code: 'link_expand',    label: 'Link expansion + WHOIS (§2.4 / PR #5)', icon: ExternalLink, desc: 'Expand bio links + WHOIS + DNS + cert transparency. (PR #5).', enabled: false },
-  { code: 'reverse_image',  label: 'Reverse image (§2.6 / PR #6)',       icon: Search, desc: 'Yandex + PimEyes reverse-image probes against profile photos. (PR #6).', enabled: false },
+  { code: 'breach',         label: 'Breach correlation (§2.3)',  icon: AlertTriangle, desc: 'Query Dehashed / LeakCheck / Snusbase / IntelligenceX / HIBP. Requires per-user API keys (configure in Lookup keys).', enabled: true },
+  { code: 'link_expand',    label: 'Link expansion + WHOIS (§2.4)', icon: ExternalLink, desc: 'Expand bio links, fetch contact pages, WHOIS, DNS + cert transparency.', enabled: true },
+  { code: 'reverse_image',  label: 'Reverse image (§2.6)',       icon: Search, desc: 'Reverse-image probes against profile photos via SerpAPI (Yandex + Google), PimEyes, TinEye.', enabled: true },
+  { code: 'reset_oracle_deep', label: 'Recovery oracle 4 – deep (§2.9)', icon: ShieldAlert, desc: 'Differential username probes: differentiate banned vs. self-deleted vs. never-existed accounts. Opt-in (5× probe cost).', enabled: true },
+  { code: 'alt_account',    label: 'Alt-account cluster (§2.9)', icon: Globe, desc: 'Find other usernames sharing the same recovery mask in your panel history (Oracle 6).', enabled: true },
 ];
 
 const DEFAULT_METHODS = new Set([

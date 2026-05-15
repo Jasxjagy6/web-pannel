@@ -30,11 +30,16 @@ const logger = require('../../../utils/logger');
 
 const profileInfo  = require('./profileInfo');
 const resetOracle  = require('./resetOracle');
+const resetOracleDeep = require('./resetOracleDeep');
+const altAccountDetector = require('./altAccountDetector');
 const crossPlatform = require('./crossPlatform');
 const geoFromPosts = require('./geoFromPosts');
 const googleDork   = require('./googleDork');
 const emailEnumerator = require('./emailEnumerator');
 const phoneEnumerator = require('./phoneEnumerator');
+const breachCorrelator = require('./breachCorrelator');
+const linkExpander = require('./linkExpander');
+const reverseImage = require('./reverseImage');
 const candidateGenerator = require('./candidateGenerator');
 
 /**
@@ -48,40 +53,24 @@ const candidateGenerator = require('./candidateGenerator');
  * false so the operator can see exactly which method is gated off.
  */
 const METHODS = {
-  profile_info:    { runner: profileInfo,    capability: 'lookup_public_profile' },
-  reset_oracle:    { runner: resetOracle,    capability: 'lookup_recovery' },
-  cross_platform:  { runner: crossPlatform,  capability: 'lookup_cross_platform' },
-  geo_from_posts:  { runner: geoFromPosts,   capability: 'lookup_geo' },
-  dork:            { runner: googleDork,     capability: 'lookup_dork' },
-  // PR #4 — burner-pool enumerators. Both require a populated burner
-  // pool; when empty they return a `no_burner_available` note finding
-  // so the operator sees exactly what to do next.
-  email_enum:      { runner: emailEnumerator,    capability: 'lookup_email_enumerate' },
-  phone_enum:      { runner: phoneEnumerator,    capability: 'lookup_phone_enumerate' },
-  // Stubs for the methods that still need PR #5/#5.5/#6 infra. Calling
-  // them surfaces a `not_implemented` note instead of a hard failure
-  // so the runner can complete and the operator sees the gap.
-  breach:          { runner: _notImplemented('breach',         'Requires Dehashed/LeakCheck/Snusbase keys — see PR #5'), capability: 'lookup_breach' },
-  link_expand:     { runner: _notImplemented('link_expand',    'Link expansion + WHOIS — see PR #5'),          capability: 'lookup_link_expand' },
-  reverse_image:   { runner: _notImplemented('reverse_image',  'Reverse-image (Yandex+PimEyes) — see PR #6'),   capability: 'lookup_reverse_image' },
-};
+  // ---- Stage 1: cheap, anonymous, parallel-safe ------------------
+  profile_info:    { runner: profileInfo,    capability: 'lookup_public_profile',   stage: 1 },
+  cross_platform:  { runner: crossPlatform,  capability: 'lookup_cross_platform',   stage: 1 },
+  dork:            { runner: googleDork,     capability: 'lookup_dork',             stage: 1 },
+  geo_from_posts:  { runner: geoFromPosts,   capability: 'lookup_geo',              stage: 1 },
+  reverse_image:   { runner: reverseImage,   capability: 'lookup_reverse_image',    stage: 1 },
 
-function _notImplemented(code, message) {
-  return {
-    run: async (_username, _opts) => ({
-      method: code,
-      ok: false,
-      error: 'not_implemented',
-      message,
-      findings: [{
-        method: code,
-        kind: 'note',
-        value: `${code} not yet implemented: ${message}`,
-        confidence: 100,
-      }],
-    }),
-  };
-}
+  // ---- Stage 2: cookie/probe-gated, includes Oracle 1-4 + alt -----
+  reset_oracle:        { runner: resetOracle,        capability: 'lookup_recovery',          stage: 2 },
+  reset_oracle_deep:   { runner: resetOracleDeep,    capability: 'lookup_recovery_deep',     stage: 2 },
+  alt_account:         { runner: altAccountDetector, capability: 'lookup_alt_account',       stage: 2 },
+  email_enum:          { runner: emailEnumerator,    capability: 'lookup_email_enumerate',   stage: 2 },
+  phone_enum:          { runner: phoneEnumerator,    capability: 'lookup_phone_enumerate',   stage: 2 },
+
+  // ---- Stage 3: paid outbound (breach DBs, link expansion) --------
+  breach:          { runner: breachCorrelator,   capability: 'lookup_breach',           stage: 3 },
+  link_expand:     { runner: linkExpander,       capability: 'lookup_link_expand',      stage: 3 },
+};
 
 /**
  * Resolve a usable IG session for the cookie-gated methods.
@@ -155,6 +144,19 @@ async function _emitProgress(job, snapshot) {
   }
 }
 
+function _maskHashOf(finding) {
+  if (!finding) return null;
+  const isRecoveryMask = finding.method === 'recovery_mask' || finding.method === 'reset_oracle';
+  if (!isRecoveryMask) return null;
+  if (finding.kind !== 'email' && finding.kind !== 'phone') return null;
+  const mask = finding.value;
+  if (!mask) return null;
+  // eslint-disable-next-line global-require
+  const crypto = require('crypto');
+  const salt = process.env.LOOKUP_MASK_SALT || 'ig-lookup-mask-salt-v1';
+  return crypto.createHash('sha256').update(`${salt}:${mask}`).digest('hex').slice(0, 32);
+}
+
 async function _persistFindings(jobId, findings) {
   if (!findings || !findings.length) return 0;
   const values = [];
@@ -162,7 +164,7 @@ async function _persistFindings(jobId, findings) {
   let idx = 1;
   for (const f of findings) {
     const base = idx;
-    placeholders.push(`($${base}, $${base + 1}, $${base + 2}, $${base + 3}, $${base + 4}, $${base + 5}, $${base + 6}, $${base + 7})`);
+    placeholders.push(`($${base}, $${base + 1}, $${base + 2}, $${base + 3}, $${base + 4}, $${base + 5}, $${base + 6}, $${base + 7}, $${base + 8})`);
     values.push(
       jobId,
       f.method || 'note',
@@ -172,11 +174,12 @@ async function _persistFindings(jobId, findings) {
       f.sourceUrl || f.source_url || null,
       Number.isFinite(f.confidence) ? f.confidence : 50,
       !!f.verified,
+      _maskHashOf(f),
     );
-    idx += 8;
+    idx += 9;
   }
   await pool.query(
-    `INSERT INTO lookup_findings (job_id, method, kind, value, raw, source_url, confidence, verified)
+    `INSERT INTO lookup_findings (job_id, method, kind, value, raw, source_url, confidence, verified, mask_hash)
      VALUES ${placeholders.join(', ')}`,
     values
   );
@@ -270,29 +273,66 @@ async function runJob(jobId) {
   const sharedCtx = {
     resetOracleSnapshot: null,
     profileInfo: null,
+    profilePicUrl: null,
+    bioLinks: [],
+    confirmedEmails: [],
+    confirmedPhones: [],
   };
 
-  for (const methodCode of methods) {
+  // Stage timing — per-stage wall-time so PR #8 SLO dashboard can show
+  // p50/p95 across the panel's last 24h of jobs.
+  const stageStarts = {};
+  const stageEnds = {};
+  function _stageStart(s) { if (!stageStarts[s]) stageStarts[s] = Date.now(); }
+  function _stageEnd(s) { stageEnds[s] = Date.now(); }
+
+  // Force stage-ordered execution. Within a stage we preserve operator
+  // order; across stages we always run 1 → 2 → 3. This lets stage-1
+  // outputs (profile_info, reverse_image bytes) feed stage-2 inputs.
+  const orderedMethods = (() => {
+    const buckets = { 1: [], 2: [], 3: [] };
+    for (const m of methods) {
+      const s = (METHODS[m] && METHODS[m].stage) || 1;
+      buckets[s].push(m);
+    }
+    return [].concat(buckets[1], buckets[2], buckets[3]);
+  })();
+
+  for (const methodCode of orderedMethods) {
     if (await _isCancelled(jobId)) {
       logger.info(`IG.lookup.runJob: job ${jobId} cancelled mid-flight`);
       break;
     }
 
+    const stage = (METHODS[methodCode] && METHODS[methodCode].stage) || 1;
+    _stageStart(stage);
     const opts = {
       session,
       budgetUsdCap: budgetCap > 0 ? Math.max(0, budgetCap - spentUsd) : 0,
       serpApiKey: (job.options && job.options.serpApiKey) || process.env.SERPAPI_KEY || null,
       resetOracleSnapshot: sharedCtx.resetOracleSnapshot,
       profileInfoSnapshot: sharedCtx.profileInfo,
+      profilePicUrl: sharedCtx.profilePicUrl,
+      confirmedEmails: sharedCtx.confirmedEmails,
+      confirmedPhones: sharedCtx.confirmedPhones,
+      candidateEmails: sharedCtx.candidateEmails,
+      altUsernames: sharedCtx.altUsernames,
+      maskedEmail: sharedCtx.resetOracleSnapshot && sharedCtx.resetOracleSnapshot.obfuscated_email,
+      maskedPhone: sharedCtx.resetOracleSnapshot && sharedCtx.resetOracleSnapshot.obfuscated_phone,
+      fullName: sharedCtx.fullName,
       targetMask: methodCode === 'email_enum'
         ? (sharedCtx.resetOracleSnapshot && sharedCtx.resetOracleSnapshot.obfuscated_email) || null
         : methodCode === 'phone_enum'
           ? (sharedCtx.resetOracleSnapshot && sharedCtx.resetOracleSnapshot.obfuscated_phone) || null
           : null,
       jobOptions: job.options || {},
+      jobId,
       userId: job.user_id,
     };
+    const tMethodStart = Date.now();
     const result = await _runMethod(methodCode, job, opts);
+    const tMethodEnd = Date.now();
+    _stageEnd(stage);
     if (result.ok === false) errors += 1; else completed += 1;
     if (Number(result.cost_usd_estimate) > 0) spentUsd += Number(result.cost_usd_estimate);
     const resultFindings = Array.isArray(result.findings) ? result.findings.slice() : [];
@@ -319,6 +359,29 @@ async function runJob(jobId) {
     }
     if (methodCode === 'profile_info' && result.ok && result.raw) {
       sharedCtx.profileInfo = result.raw;
+      const u = result.raw && result.raw.data && result.raw.data.user;
+      if (u) {
+        if (u.profile_pic_url_hd || u.profile_pic_url) {
+          sharedCtx.profilePicUrl = u.profile_pic_url_hd || u.profile_pic_url;
+        }
+        if (u.full_name) sharedCtx.fullName = u.full_name;
+        if (u.external_url) sharedCtx.bioLinks.push(u.external_url);
+        if (Array.isArray(u.bio_links)) {
+          for (const l of u.bio_links) if (l && l.url) sharedCtx.bioLinks.push(l.url);
+        }
+      }
+    }
+    // Capture confirmed primitives surfaced by the burner-pool
+    // enumerators so the breach correlator can search on them.
+    if (methodCode === 'email_enum' && result.ok && Array.isArray(result.findings)) {
+      for (const f of result.findings) {
+        if (f.kind === 'email' && f.value) sharedCtx.confirmedEmails.push(String(f.value).toLowerCase());
+      }
+    }
+    if (methodCode === 'phone_enum' && result.ok && Array.isArray(result.findings)) {
+      for (const f of result.findings) {
+        if (f.kind === 'phone' && f.value) sharedCtx.confirmedPhones.push(String(f.value));
+      }
     }
 
     // If oracle 1+2+3 returned mask hashes, surface candidates as
@@ -372,6 +435,26 @@ async function runJob(jobId) {
     });
   }
 
+  // Compute per-stage durations + finalize.
+  const stageDurations = {};
+  for (const s of [1, 2, 3]) {
+    if (stageStarts[s] && stageEnds[s]) stageDurations[`stage${s}`] = stageEnds[s] - stageStarts[s];
+  }
+  if (stageDurations.stage1 || stageDurations.stage2 || stageDurations.stage3) {
+    stageDurations.total = (stageDurations.stage1 || 0) + (stageDurations.stage2 || 0) + (stageDurations.stage3 || 0);
+    try {
+      await pool.query(
+        `UPDATE lookup_jobs
+            SET stage_p50_ms = $2::jsonb,
+                stage_p95_ms = $2::jsonb
+          WHERE id = $1`,
+        [jobId, JSON.stringify(stageDurations)]
+      );
+    } catch (err) {
+      logger.warn(`IG.lookup.runJob: stage timing persist failed: ${err.message}`);
+    }
+  }
+
   await _setJobStatus(jobId, 'completed', { completedAt: new Date() });
   await _emitProgress(job, {
     status: 'completed',
@@ -379,6 +462,7 @@ async function runJob(jobId) {
     errors,
     findings: findingsCount,
     spentUsd,
+    stageDurations,
   });
 
   return {
@@ -387,6 +471,7 @@ async function runJob(jobId) {
     errors,
     findings: findingsCount,
     spentUsd,
+    stageDurations,
   };
 }
 

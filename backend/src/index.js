@@ -601,6 +601,22 @@ async function start() {
       logger.warn(`messageScheduleService.start failed: ${err.message}`);
     }
 
+    // 7c. Boot the IG lookup-watch worker (PR #7) + retention sweeper
+    //     (PR #8). The worker polls `lookup_watches` for due rows and
+    //     invokes `resetOracleWatch.run()` on each; the retention
+    //     sweeper hard-deletes jobs whose retained_until is past.
+    try {
+      const enabled = String(process.env.LOOKUP_WATCH_ENABLED ?? 'true').toLowerCase() !== 'false';
+      if (enabled) {
+        const lookupWatchWorker = require('./services/lookupWatchWorker');
+        lookupWatchWorker.start();
+      } else {
+        logger.info('IG lookup-watch worker disabled via LOOKUP_WATCH_ENABLED=false');
+      }
+    } catch (err) {
+      logger.warn(`lookupWatchWorker.start failed: ${err.message}`);
+    }
+
     // 8. Subscription / trial expiry sweep. Runs every minute so a paid
     //    user whose monthly window just elapsed gets gated out of the app
     //    on their very next request. Trial expiry happens implicitly via

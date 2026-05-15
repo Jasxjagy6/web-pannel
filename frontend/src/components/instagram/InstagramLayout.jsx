@@ -50,6 +50,9 @@ import {
   Activity,
   Compass,
   Flame,
+  Eye,
+  KeyRound,
+  Gauge,
 } from 'lucide-react';
 import { useAuth } from '@/hooks/useAuth';
 import { usePlatform, useCapabilities } from '../../context/PlatformContext';
@@ -71,6 +74,9 @@ const IG_NAV = [
   { path: 'upload-session',    label: 'Upload session',icon: Upload,          capability: 'sessions_create',   section: 'main',                 wip: false },
   { path: 'scrape',            label: 'Scraping',      icon: Search,          capability: 'scrape_any',        section: 'main',   dock: true,  wip: false },
   { path: 'lookup',            label: 'Lookup',        icon: ScanSearch,      capability: 'lookup_any',        section: 'main',   dock: true,  wip: false },
+  { path: 'lookup/watches',    label: 'Watches',       icon: Eye,             capability: 'lookup_recovery_watch', section: 'main',                wip: false },
+  { path: 'lookup/keys',       label: 'Lookup keys',   icon: KeyRound,        capability: 'lookup_any',        section: 'safety',               wip: false },
+  { path: 'lookup/admin',      label: 'Lookup admin',  icon: Gauge,           capability: 'lookup_any',        section: 'system', adminOnly: true, wip: false },
   { path: 'burners',           label: 'Burners',       icon: Flame,           capability: 'lookup_email_enumerate', section: 'safety',            wip: false },
   { path: 'lists',             label: 'Saved lists',   icon: ListIcon,        capability: 'lists',             section: 'engage',               wip: false },
   { path: 'reports',           label: 'Reports',       icon: BarChart3,       capability: 'reports',           section: 'engage',               wip: false },
@@ -427,6 +433,7 @@ export default function InstagramLayout({ children, title }) {
     const list = [];
     if (isAdmin || isApproved) {
       for (const item of IG_NAV) {
+        if (item.adminOnly && !isAdmin) continue;
         if (item.capability == null || !capabilities) {
           list.push(item);
           continue;
