@@ -50,6 +50,7 @@ router.post('/bulk-login/:jobId/cancel', bulkLoginController.cancel);
 // panel's own login is preserved on every row. Mounted before /:id
 // so the `bulk-auth-purge` literal isn't shadowed by the param
 // matcher.
+router.post('/bulk-auth-purge/preview', bulkAuthPurgeController.preview);
 router.post('/bulk-auth-purge/start', bulkAuthPurgeController.start);
 router.get('/bulk-auth-purge/:jobId/status', bulkAuthPurgeController.status);
 router.post('/bulk-auth-purge/:jobId/cancel', bulkAuthPurgeController.cancel);
