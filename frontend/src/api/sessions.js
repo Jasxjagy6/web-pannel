@@ -139,6 +139,13 @@ export const cancelBulkLogin = (jobId) =>
 // preserved. Per-device status is surfaced in the job poll response.
 // ────────────────────────────────────────────────────────────────────
 
+// Read-only "what would happen" probe. The UI calls this first and
+// renders the full device list (with the row that WILL be kept
+// clearly badged) so the operator can spot any anomaly before the
+// destructive call. Required precondition for /start to be accepted.
+export const previewBulkAuthPurge = (payload) =>
+  api.post('/sessions/bulk-auth-purge/preview', payload);
+
 export const startBulkAuthPurge = (payload) =>
   api.post('/sessions/bulk-auth-purge/start', payload);
 

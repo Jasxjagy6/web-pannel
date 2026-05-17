@@ -13,6 +13,7 @@ import { useToast } from './Toast';
 import {
   cancelBulkAuthPurge,
   getBulkAuthPurgeStatus,
+  previewBulkAuthPurge,
   startBulkAuthPurge,
 } from '../../api/sessions';
 import { parseApiError } from '../../utils/formatters';
@@ -39,6 +40,99 @@ import { parseApiError } from '../../utils/formatters';
  */
 
 const TERMINAL_STATUSES = new Set(['completed', 'failed', 'cancelled']);
+
+// Preview rendering helpers — the device list returned by the
+// /preview endpoint uses `plannedStatus`, not the runtime `status`.
+function PreviewDevicePill({ dev }) {
+  if (dev.isCurrent) {
+    return (
+      <span className="inline-flex items-center rounded border border-emerald-400/60 bg-emerald-500/15 px-2 py-0.5 text-[10px] font-bold uppercase tracking-wide text-emerald-200">
+        Will KEEP (this panel)
+      </span>
+    );
+  }
+  if (dev.plannedStatus === 'would_terminate') {
+    return (
+      <span className="inline-flex items-center rounded border border-red-500/40 bg-red-500/10 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-red-300">
+        Will terminate
+      </span>
+    );
+  }
+  return (
+    <span className="inline-flex items-center rounded border border-amber-500/40 bg-amber-500/10 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-amber-300">
+      {String(dev.plannedStatus || 'unknown').replace(/_/g, ' ')}
+    </span>
+  );
+}
+
+function PreviewSessionRow({ row }) {
+  const [expanded, setExpanded] = useState(!row.eligible);
+  const Icon = expanded ? ChevronDown : ChevronRight;
+  const devices = Array.isArray(row.devices) ? row.devices : [];
+  const keepers = devices.filter((d) => d.isCurrent).length;
+  const killers = devices.filter((d) => !d.isCurrent).length;
+  return (
+    <div className="p-2.5">
+      <button
+        type="button"
+        onClick={() => setExpanded((v) => !v)}
+        className="flex w-full items-center justify-between gap-2 text-left"
+      >
+        <div className="flex min-w-0 items-center gap-2">
+          <Icon className="h-3 w-3 text-gray-500 shrink-0" />
+          <span className="truncate text-sm font-medium text-gray-100">
+            {row.phone || `session-${row.sessionId}`}
+          </span>
+          {row.eligible ? (
+            <span className="inline-flex items-center rounded border border-emerald-500/40 bg-emerald-500/10 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-emerald-300">
+              Safe to proceed
+            </span>
+          ) : (
+            <span className="inline-flex items-center rounded border border-red-500/40 bg-red-500/10 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-red-300">
+              Will be skipped
+            </span>
+          )}
+        </div>
+        <span className="text-[10px] text-gray-500">
+          {keepers} keep · {killers} kill · {devices.length} total
+        </span>
+      </button>
+      {!row.eligible && row.abortReason && (
+        <p className="mt-1 text-[11px] text-red-300" title={row.abortReason}>
+          {row.abortReason}
+        </p>
+      )}
+      {expanded && (
+        <div className="mt-2 space-y-1 rounded border border-white/5 bg-dark-950 p-2">
+          {devices.length === 0 ? (
+            <p className="text-[11px] italic text-gray-500">
+              Telegram returned no devices for this account.
+            </p>
+          ) : (
+            devices.map((d) => (
+              <div
+                key={d.hash}
+                className={`flex items-center justify-between gap-2 rounded px-2 py-1 ${
+                  d.isCurrent ? 'bg-emerald-500/5' : ''
+                }`}
+              >
+                <div className="min-w-0">
+                  <p className="truncate text-[11px] text-gray-200" title={d.label}>
+                    {d.label}
+                  </p>
+                  <p className="truncate text-[10px] text-gray-500">
+                    hash <code>{d.hash}</code>
+                  </p>
+                </div>
+                <PreviewDevicePill dev={d} />
+              </div>
+            ))
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
 
 function SessionStatusPill({ status }) {
   let label;
@@ -212,6 +306,12 @@ export function SessionBulkAuthPurgeModal({
 }) {
   const [job, setJob] = useState(null);
   const [starting, setStarting] = useState(false);
+  // Preview — list of { sessionId, eligible, abortReason, devices[],
+  // panelHash, panelHashStored } returned by /bulk-auth-purge/preview.
+  const [preview, setPreview] = useState(null);
+  const [previewError, setPreviewError] = useState(null);
+  const [loadingPreview, setLoadingPreview] = useState(false);
+  const [confirmed, setConfirmed] = useState(false);
   const pollRef = useRef(null);
   const completedNotifiedRef = useRef(false);
   const { success: showSuccess, error: showError, info: showInfo } = useToast();
@@ -222,15 +322,46 @@ export function SessionBulkAuthPurgeModal({
     };
   }, []);
 
+  // Auto-fetch the preview as soon as the modal opens. Operator
+  // sees the exact device list before the destructive button is
+  // even enabled.
   useEffect(() => {
-    if (isOpen) {
+    if (!isOpen) {
       setJob(null);
       setStarting(false);
+      setPreview(null);
+      setPreviewError(null);
+      setLoadingPreview(false);
+      setConfirmed(false);
       completedNotifiedRef.current = false;
-    } else if (pollRef.current) {
-      clearInterval(pollRef.current);
-      pollRef.current = null;
+      if (pollRef.current) {
+        clearInterval(pollRef.current);
+        pollRef.current = null;
+      }
+      return;
     }
+    let cancelled = false;
+    setLoadingPreview(true);
+    setPreviewError(null);
+    previewBulkAuthPurge({
+      sessionIds: selectedSessions.map((s) => s.id),
+    })
+      .then((res) => {
+        if (cancelled) return;
+        const data = res.data || res;
+        setPreview(Array.isArray(data.preview) ? data.preview : []);
+      })
+      .catch((err) => {
+        if (cancelled) return;
+        setPreviewError(parseApiError(err));
+      })
+      .finally(() => {
+        if (!cancelled) setLoadingPreview(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isOpen]);
 
   const startPolling = (jobId) => {
@@ -282,15 +413,29 @@ export function SessionBulkAuthPurgeModal({
   const start = async () => {
     setStarting(true);
     try {
+      // Only ship the sessions we have an eligible preview for. If
+      // every selected row is ineligible, refuse to start (would be
+      // a pointless API call — the server would no-op everything).
+      const eligibleIds = (preview || [])
+        .filter((r) => r.eligible)
+        .map((r) => r.sessionId);
+      if (eligibleIds.length === 0) {
+        showError(
+          'No selected sessions are safe to purge — every row failed the preview safety check.',
+          'Refused to start'
+        );
+        return;
+      }
       const res = await startBulkAuthPurge({
-        sessionIds: selectedSessions.map((s) => s.id),
+        sessionIds: eligibleIds,
+        acknowledged: true,
       });
       const data = res.data || res;
       if (!data || !data.jobId) {
         throw new Error('Server did not return a jobId');
       }
       showInfo(
-        `Purging other sessions for ${selectedSessions.length} account(s)…`,
+        `Purging other sessions for ${eligibleIds.length} account(s)…`,
         'Auth purge started'
       );
       startPolling(data.jobId);
@@ -323,6 +468,12 @@ export function SessionBulkAuthPurgeModal({
   const headerCount = selectedSessions.length;
   const isRunning = job && !TERMINAL_STATUSES.has(job.status);
 
+  // Eligibility derived from the preview: how many will actually run?
+  const eligibleCount = (preview || []).filter((r) => r.eligible).length;
+  const ineligibleCount = (preview || []).filter((r) => !r.eligible).length;
+  const canStart =
+    !!preview && !loadingPreview && eligibleCount > 0 && confirmed && !starting;
+
   return (
     <Modal
       isOpen={isOpen}
@@ -347,17 +498,24 @@ export function SessionBulkAuthPurgeModal({
                 </button>
                 <button
                   type="button"
-                  disabled={starting || headerCount === 0}
+                  disabled={!canStart}
                   onClick={start}
-                  className="flex items-center gap-2 rounded-lg bg-red-600 px-4 py-2 text-sm font-semibold text-white hover:bg-red-500 disabled:opacity-50"
+                  className="flex items-center gap-2 rounded-lg bg-red-600 px-4 py-2 text-sm font-semibold text-white hover:bg-red-500 disabled:cursor-not-allowed disabled:opacity-40"
+                  title={
+                    !confirmed
+                      ? 'Tick the confirm checkbox below first'
+                      : eligibleCount === 0
+                      ? 'No selected sessions are safe to purge'
+                      : ''
+                  }
                 >
                   {starting ? (
                     <Loader2 className="h-4 w-4 animate-spin" />
                   ) : (
                     <ShieldOff className="h-4 w-4" />
                   )}
-                  Terminate others on {headerCount} account
-                  {headerCount === 1 ? '' : 's'}
+                  Terminate others on {eligibleCount} account
+                  {eligibleCount === 1 ? '' : 's'}
                 </button>
               </>
             )}
@@ -388,46 +546,94 @@ export function SessionBulkAuthPurgeModal({
           <div className="rounded-lg border border-red-500/20 bg-red-500/5 p-3 text-xs text-red-200">
             <p className="flex items-center gap-2 font-semibold">
               <AlertTriangle className="h-3.5 w-3.5" />
-              What this does
+              What this does — read carefully
             </p>
             <ul className="mt-1 list-disc space-y-1 pl-5 text-red-100/90">
               <li>
-                For each selected account, asks Telegram for the full list of
-                devices currently signed in (account.getAuthorizations).
+                For each selected account, the panel asks Telegram for the full
+                list of devices currently signed in
+                (<code>account.getAuthorizations</code>). The row marked{' '}
+                <span className="text-emerald-300 font-semibold">Will KEEP</span>{' '}
+                below is the panel’s own login and is never touched.
               </li>
               <li>
-                Calls account.resetAuthorization(hash) on every device{' '}
-                <span className="font-semibold">except</span> this panel&apos;s
-                own login. Any other place that was logged into that account
-                — phones, desktops, web sessions — gets kicked.
+                For each <span className="text-red-300 font-semibold">Will terminate</span>{' '}
+                row, the panel will call <code>account.resetAuthorization(hash)</code>.
+                This is permanent — the affected device must sign in again.
+              </li>
+              <li>
+                If Telegram does not flag exactly one row as <em>current</em>,
+                or if the live current-row hash does not match the hash we have
+                previously observed for this panel session, the row is{' '}
+                <span className="font-semibold">aborted</span> and nothing is
+                terminated for that account.
               </li>
               <li>
                 Authorizations younger than 24 hours are reported as{' '}
                 <span className="font-semibold">Skipped</span> — Telegram
                 refuses to reset them. Re-run after 24h to clear them.
               </li>
-              <li>
-                Runs sequentially with brief delays so we don&apos;t trip
-                Telegram&apos;s per-egress-IP rate limits.
-              </li>
             </ul>
           </div>
 
-          <div>
-            <p className="mb-2 text-sm font-semibold text-white">
-              Accounts to purge ({headerCount})
-            </p>
-            <div className="max-h-48 overflow-auto rounded border border-white/10 bg-dark-900 p-2 text-xs text-gray-300">
-              {selectedSessions.map((s) => (
-                <div key={s.id} className="flex items-center gap-2 py-0.5">
-                  <ShieldOff className="h-3 w-3 text-red-400 shrink-0" />
-                  <span className="truncate">
-                    {s.phone || `session-${s.id}`}
+          {loadingPreview && (
+            <div className="flex items-center gap-2 rounded border border-white/10 bg-dark-900 p-3 text-xs text-gray-300">
+              <Loader2 className="h-4 w-4 animate-spin" />
+              Reading Telegram authorizations for {headerCount} account
+              {headerCount === 1 ? '' : 's'}…
+            </div>
+          )}
+
+          {previewError && !loadingPreview && (
+            <div className="rounded border border-red-500/30 bg-red-500/10 p-3 text-xs text-red-300">
+              Preview failed: {previewError}
+            </div>
+          )}
+
+          {preview && !loadingPreview && (
+            <div>
+              <div className="mb-2 flex items-center justify-between">
+                <p className="text-sm font-semibold text-white">
+                  Device preview
+                </p>
+                <div className="flex items-center gap-3 text-[11px]">
+                  <span className="text-emerald-300">
+                    {eligibleCount} eligible
+                  </span>
+                  <span className="text-red-300">
+                    {ineligibleCount} skipped
                   </span>
                 </div>
-              ))}
+              </div>
+              <div className="max-h-72 overflow-auto divide-y divide-white/5 rounded border border-white/10 bg-dark-900">
+                {preview.length === 0 ? (
+                  <p className="p-3 text-xs italic text-gray-500">
+                    No preview rows.
+                  </p>
+                ) : (
+                  preview.map((row) => (
+                    <PreviewSessionRow key={row.sessionId} row={row} />
+                  ))
+                )}
+              </div>
+              <label className="mt-3 flex items-start gap-2 rounded border border-amber-500/30 bg-amber-500/5 p-2 text-[11px] text-amber-100">
+                <input
+                  type="checkbox"
+                  className="mt-0.5"
+                  checked={confirmed}
+                  onChange={(e) => setConfirmed(e.target.checked)}
+                />
+                <span>
+                  I have reviewed the device list above and confirmed that
+                  the row marked{' '}
+                  <span className="text-emerald-300 font-semibold">Will KEEP</span>{' '}
+                  is this panel’s own session. I understand every other
+                  authorization will be terminated and that this cannot be
+                  undone.
+                </span>
+              </label>
             </div>
-          </div>
+          )}
         </div>
       )}
 

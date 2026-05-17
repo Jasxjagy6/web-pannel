@@ -52,6 +52,11 @@ const DEFAULT_INTER_DEVICE_DELAY_MS = 300;
 const JOB_TTL_MS = 30 * 60 * 1000; // 30 min after completion
 const MAX_SESSIONS_PER_JOB = 500;
 
+// Telegram historically uses hash="0" to mean "the current session".
+// Even if the schema's `current` flag is missing, we refuse to ever
+// call account.ResetAuthorization(hash=0) as belt-and-suspenders.
+const RESERVED_CURRENT_HASH = '0';
+
 function newJobId() {
   return `bulk-auth-purge-${Date.now()}-${crypto.randomBytes(4).toString('hex')}`;
 }
@@ -89,6 +94,7 @@ function publicJobView(job) {
       partial: job.sessions.filter((s) => s.status === 'partial').length,
       noOthers: job.sessions.filter((s) => s.status === 'no_others').length,
       failed: job.sessions.filter((s) => s.status === 'failed').length,
+      aborted: job.sessions.filter((s) => s.status === 'aborted_unsafe').length,
       pending: job.sessions.filter(
         (s) => s.status === 'queued' || s.status === 'listing' || s.status === 'purging'
       ).length,
@@ -112,6 +118,8 @@ function publicJobView(job) {
       status: s.status,
       progress: s.progress,
       error: s.error || null,
+      panelHash: s.panelHash || null,
+      panelHashStored: s.panelHashStored || null,
       devices: s.devices.map((d) => ({
         hash: d.hash,
         label: d.label,
@@ -135,13 +143,62 @@ function scheduleCleanup(jobId) {
 }
 
 /**
+ * Read the persisted panel auth hash for a session (if any).
+ * Best-effort: returns null on DB error rather than aborting the job.
+ */
+async function loadStoredPanelHash(userId, sessionId) {
+  try {
+    const r = await pool.query(
+      `SELECT tg_panel_auth_hash
+         FROM sessions
+        WHERE id = $1 AND user_id = $2 AND platform = 'telegram'`,
+      [sessionId, userId]
+    );
+    const row = r.rows[0];
+    return row && row.tg_panel_auth_hash ? String(row.tg_panel_auth_hash) : null;
+  } catch (e) {
+    logger.warn(
+      `sessionBulkAuthPurge: loadStoredPanelHash failed for session ${sessionId}: ${e && e.message}`
+    );
+    return null;
+  }
+}
+
+/**
+ * Persist the panel's own auth hash for future cross-checks. Called
+ * after a successful safety-check identifies exactly one row with
+ * current=true. Idempotent.
+ */
+async function persistPanelHash(userId, sessionId, hash) {
+  if (!hash) return;
+  try {
+    await pool.query(
+      `UPDATE sessions
+          SET tg_panel_auth_hash = $1,
+              tg_panel_auth_hash_observed_at = NOW()
+        WHERE id = $2 AND user_id = $3 AND platform = 'telegram'`,
+      [String(hash), sessionId, userId]
+    );
+  } catch (e) {
+    logger.warn(
+      `sessionBulkAuthPurge: persistPanelHash failed for session ${sessionId}: ${e && e.message}`
+    );
+  }
+}
+
+/**
  * Purge every other authorization for a single panel session.
  *
  * Step 1: listAuthorizations.
- * Step 2: for each non-current entry, resetAuthorization(hash).
+ * Step 2: SAFETY GATE — abort if we cannot unambiguously identify the
+ *         panel's own row. Specifically: exactly one row must have
+ *         current=true, and (if a hash was previously persisted for
+ *         this session) it must match the live current row's hash.
+ * Step 3: for each row where (hash !== panelHash) AND (current=false)
+ *         AND (hash !== "0"), call resetAuthorization(hash).
  *
  * Per-device errors are recorded inline; the session row's final
- * status reflects whether ALL succeeded / NONE / SOME.
+ * status reflects whether ALL succeeded / NONE / SOME / aborted-unsafe.
  *
  * @param {object} job
  * @param {object} sessionState
@@ -180,7 +237,65 @@ async function purgeOne(job, sessionState) {
     error: null,
   }));
 
-  const targets = sessionState.devices.filter((d) => !d.isCurrent);
+  // ── SAFETY GATE ────────────────────────────────────────────────
+  // The original (merged) implementation trusted the schema-optional
+  // `current` boolean alone. When Telegram omitted that flag on the
+  // panel's row (DC migrate / freshly bound key / transient flap)
+  // every row was treated as "other" and the panel terminated its
+  // OWN session. Refuse to proceed in any ambiguous state.
+  const currentRows = sessionState.devices.filter((d) => d.isCurrent);
+  const storedPanelHash = await loadStoredPanelHash(job.userId, sessionState.sessionId);
+  sessionState.panelHashStored = storedPanelHash || null;
+
+  if (currentRows.length !== 1) {
+    sessionState.status = 'aborted_unsafe';
+    sessionState.progress = 100;
+    sessionState.error =
+      currentRows.length === 0
+        ? 'Refused to purge: Telegram did not mark any row as the panel\'s current session. Re-try later or re-list manually.'
+        : `Refused to purge: ${currentRows.length} rows are marked current — ambiguous.`;
+    logger.warn(
+      `sessionBulkAuthPurge: ABORT session ${sessionState.sessionId} — currentRows=${currentRows.length}`,
+      { jobId: job.id }
+    );
+    return;
+  }
+
+  const panelHash = currentRows[0].hash;
+  sessionState.panelHash = panelHash;
+
+  if (storedPanelHash && storedPanelHash !== panelHash) {
+    sessionState.status = 'aborted_unsafe';
+    sessionState.progress = 100;
+    sessionState.error = `Refused to purge: live current-row hash ${panelHash} does not match previously observed panel hash ${storedPanelHash}. The panel auth_key may have been rotated externally.`;
+    logger.warn(
+      `sessionBulkAuthPurge: ABORT session ${sessionState.sessionId} — stored panel hash ${storedPanelHash} ≠ live ${panelHash}`,
+      { jobId: job.id }
+    );
+    return;
+  }
+
+  // Safe to proceed. Persist the observed hash (first observation OR
+  // confirmation) so subsequent purges have an even stronger guard.
+  await persistPanelHash(job.userId, sessionState.sessionId, panelHash);
+
+  // Defense in depth: explicitly flag any non-current row whose hash
+  // matches the reserved current value (hash="0") as skipped —
+  // surfaces in the UI as a non-failure non-kill so the operator can
+  // see we deliberately did not touch it.
+  for (const d of sessionState.devices) {
+    if (!d.isCurrent && d.hash === RESERVED_CURRENT_HASH) {
+      d.status = 'skipped';
+      d.error = 'Skipped: hash=0 is Telegram\'s reserved current-session value.';
+    }
+  }
+
+  // Build the kill list from the explicit hash (NOT from the
+  // current flag). Defense in depth: never kill panelHash or hash=0
+  // even if their `current` flag happens to be false.
+  const targets = sessionState.devices.filter(
+    (d) => d.hash !== panelHash && d.hash !== RESERVED_CURRENT_HASH && !d.isCurrent
+  );
   if (targets.length === 0) {
     sessionState.status = 'no_others';
     sessionState.progress = 100;
@@ -200,6 +315,17 @@ async function purgeOne(job, sessionState) {
   for (const d of targets) {
     if (job.status === 'cancelled') {
       d.status = 'cancelled';
+      continue;
+    }
+    // Belt-and-suspenders: re-assert the invariant immediately before
+    // every kill. If anything mutated the device list (panel reload,
+    // concurrent listAuthorizations from another tab, etc), abort
+    // this specific row rather than risk the wrong hash.
+    if (d.hash === panelHash || d.hash === RESERVED_CURRENT_HASH || d.isCurrent) {
+      d.status = 'skipped';
+      d.error = 'Refused: matches panel\'s own authorization.';
+      i += 1;
+      sessionState.progress = 10 + Math.floor((i / targets.length) * 85);
       continue;
     }
     d.status = 'terminating';
@@ -317,13 +443,28 @@ async function runJob(job) {
  * @param {number} [params.interDeviceDelayMs]
  */
 async function startBulkAuthPurgeJob(params) {
-  const { userId, sessionIds, interSessionDelayMs, interDeviceDelayMs } = params || {};
+  const {
+    userId,
+    sessionIds,
+    interSessionDelayMs,
+    interDeviceDelayMs,
+    acknowledged,
+  } = params || {};
   if (!userId) throw new Error('userId required');
   if (!Array.isArray(sessionIds) || sessionIds.length === 0) {
     throw new Error('sessionIds required (non-empty array)');
   }
   if (sessionIds.length > MAX_SESSIONS_PER_JOB) {
     throw new Error(`At most ${MAX_SESSIONS_PER_JOB} sessions can be purged per job`);
+  }
+  // The frontend must send acknowledged=true only after the operator
+  // has reviewed the preview and ticked the confirm checkbox. This
+  // makes accidental purges (e.g. from a stale tab calling the API
+  // directly) much harder.
+  if (acknowledged !== true) {
+    throw new Error(
+      'Refused to start purge: operator confirmation required. The UI must POST acknowledged=true after the device preview is shown.'
+    );
   }
 
   // Pull the rows up-front so the modal can show a phone label per
@@ -409,8 +550,124 @@ function cancelJob(jobId, userId) {
   return true;
 }
 
+/**
+ * Read-only "what would happen if I purged these now" preview.
+ * Runs listAuthorizations against each selected session and returns
+ * the device list plus the per-session safety verdict (eligible /
+ * abort reason). The frontend uses this to show the operator EXACTLY
+ * which devices will be killed and which row will be kept BEFORE
+ * they confirm Start. No RPC with side effects is invoked here.
+ *
+ * @param {object} params
+ * @param {number} params.userId
+ * @param {Array<number|string>} params.sessionIds
+ */
+async function previewPurge(params) {
+  const { userId, sessionIds } = params || {};
+  if (!userId) throw new Error('userId required');
+  if (!Array.isArray(sessionIds) || sessionIds.length === 0) {
+    throw new Error('sessionIds required (non-empty array)');
+  }
+  if (sessionIds.length > MAX_SESSIONS_PER_JOB) {
+    throw new Error(`At most ${MAX_SESSIONS_PER_JOB} sessions per preview`);
+  }
+
+  const idList = sessionIds.map((id) => Number(id));
+  const rows = await pool.query(
+    `SELECT id, phone, tg_panel_auth_hash
+       FROM sessions
+      WHERE user_id = $1
+        AND platform = 'telegram'
+        AND id = ANY($2::int[])`,
+    [userId, idList]
+  );
+  const meta = new Map();
+  for (const r of rows.rows) {
+    meta.set(Number(r.id), {
+      phone: r.phone || null,
+      storedHash: r.tg_panel_auth_hash ? String(r.tg_panel_auth_hash) : null,
+    });
+  }
+
+  const out = [];
+  for (const sid of idList) {
+    const m = meta.get(sid);
+    if (!m) {
+      out.push({
+        sessionId: sid,
+        phone: null,
+        eligible: false,
+        abortReason: 'Session not found (deleted or wrong owner).',
+        devices: [],
+        panelHash: null,
+        panelHashStored: null,
+      });
+      continue;
+    }
+
+    let authList;
+    try {
+      const res = await telegramClientService.listAuthorizations(sid, userId);
+      authList = res && Array.isArray(res.authorizations) ? res.authorizations : [];
+    } catch (err) {
+      out.push({
+        sessionId: sid,
+        phone: m.phone,
+        eligible: false,
+        abortReason: `listAuthorizations: ${err && err.message ? err.message : String(err)}`,
+        devices: [],
+        panelHash: null,
+        panelHashStored: m.storedHash,
+      });
+      continue;
+    }
+
+    const devices = authList.map((a) => ({
+      hash: String(a.hash),
+      label: authLabel(a),
+      isCurrent: !!a.isCurrent,
+      // 'kept' for current; 'would_terminate' for everything else.
+      // Skip badge added by the frontend when the device is < 24h
+      // (we don't know that here without dateCreated; pass it through).
+      plannedStatus: a.isCurrent ? 'kept' : 'would_terminate',
+      dateCreated: Number(a.dateCreated) || 0,
+    }));
+
+    const currents = devices.filter((d) => d.isCurrent);
+    let eligible = true;
+    let abortReason = null;
+    if (currents.length === 0) {
+      eligible = false;
+      abortReason =
+        "Telegram did not flag any row as the panel's current session. " +
+        "Refusing to proceed \u2014 try again later or refresh the session.";
+    } else if (currents.length > 1) {
+      eligible = false;
+      abortReason = `${currents.length} rows are flagged current \u2014 ambiguous, refusing to proceed.`;
+    } else if (m.storedHash && m.storedHash !== currents[0].hash) {
+      eligible = false;
+      abortReason =
+        `Live current-row hash ${currents[0].hash} does not match previously observed ` +
+        `panel hash ${m.storedHash}. The panel auth_key may have been rotated externally.`;
+    }
+
+    out.push({
+      sessionId: sid,
+      phone: m.phone,
+      eligible,
+      abortReason,
+      panelHash: currents.length === 1 ? currents[0].hash : null,
+      panelHashStored: m.storedHash,
+      devices,
+    });
+  }
+
+  return { preview: out };
+}
+
 module.exports = {
   startBulkAuthPurgeJob,
+  previewPurge,
   getJobStatus,
   cancelJob,
   // Exposed for tests.

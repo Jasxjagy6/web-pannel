@@ -70,6 +70,7 @@ const MIGRATION_ORDER = [
   'migration_v33_auth_sessions.sql',
   'migration_v34_instagram_lookups.sql',
   'migration_v35_instagram_lookup_extras.sql',
+  'migration_v36_session_panel_auth_hash.sql',
 ];
 
 function listMigrationFiles() {

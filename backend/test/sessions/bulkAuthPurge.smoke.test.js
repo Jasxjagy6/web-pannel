@@ -43,19 +43,43 @@ process.chdir(path.join(__dirname, '..', '..'));
 // refresh — failing it is non-fatal so we just return an empty row.
 const dbModule = require('../../src/config/database');
 const fakePhoneByPanelId = new Map();
-dbModule.pool.query = async (_sql, params) => {
-  // Match the WHERE id = ANY($2::int[]) start-of-job lookup.
-  if (Array.isArray(params) && Array.isArray(params[1])) {
-    const ids = params[1];
+const fakeStoredPanelHash = new Map();
+const persistedHashHistory = [];
+dbModule.pool.query = async (sql, params) => {
+  // UPDATE sessions SET tg_panel_auth_hash = $1 WHERE id = $2 AND user_id = $3
+  if (typeof sql === 'string' && /UPDATE\s+sessions\s+SET\s+tg_panel_auth_hash/i.test(sql)) {
+    const [hash, sessionId, userId] = params;
+    persistedHashHistory.push({ sessionId: Number(sessionId), userId, hash: String(hash) });
+    fakeStoredPanelHash.set(Number(sessionId), String(hash));
+    return { rows: [] };
+  }
+  // SELECT tg_panel_auth_hash FROM sessions WHERE id = $1 AND user_id = $2
+  if (typeof sql === 'string' && /SELECT\s+tg_panel_auth_hash\s+FROM\s+sessions/i.test(sql)) {
+    const id = Number(params[0]);
     return {
-      rows: ids.map((id) => ({
+      rows: [{ tg_panel_auth_hash: fakeStoredPanelHash.get(id) || null }],
+    };
+  }
+  // SELECT id, phone, tg_panel_auth_hash FROM sessions WHERE id = ANY (preview)
+  if (typeof sql === 'string' && Array.isArray(params[1]) && /tg_panel_auth_hash/i.test(sql)) {
+    return {
+      rows: params[1].map((id) => ({
+        id: Number(id),
+        phone: fakePhoneByPanelId.get(Number(id)) || null,
+        tg_panel_auth_hash: fakeStoredPanelHash.get(Number(id)) || null,
+      })),
+    };
+  }
+  // SELECT id, phone FROM sessions WHERE id = ANY (start-of-job).
+  if (Array.isArray(params) && Array.isArray(params[1])) {
+    return {
+      rows: params[1].map((id) => ({
         id: Number(id),
         phone: fakePhoneByPanelId.get(Number(id)) || null,
       })),
     };
   }
-  // Match the per-row WHERE id = $1 refresh. Return a synthetic row
-  // so the runner doesn't mistakenly mark the session "not found".
+  // SELECT id, phone FROM sessions WHERE id = $1 AND user_id = $2 (per-row refresh).
   if (Array.isArray(params) && params.length >= 1) {
     const id = Number(params[0]);
     return {
@@ -164,6 +188,7 @@ async function run(name, fn) {
       sessionIds: [101, 102, 103],
       interSessionDelayMs: 5,
       interDeviceDelayMs: 5,
+      acknowledged: true,
     });
     assert(typeof jobId === 'string' && jobId.startsWith('bulk-auth-purge-'), 'T1 jobId shape');
 
@@ -224,7 +249,7 @@ async function run(name, fn) {
     };
 
     const { jobId } = await service.startBulkAuthPurgeJob({
-      userId, sessionIds: [201], interDeviceDelayMs: 1,
+      userId, sessionIds: [201], interDeviceDelayMs: 1, acknowledged: true,
     });
     const view = await waitForTerminal(jobId, userId);
     const s = view.sessions[0];
@@ -258,7 +283,7 @@ async function run(name, fn) {
     };
 
     const { jobId } = await service.startBulkAuthPurgeJob({
-      userId, sessionIds: [301], interDeviceDelayMs: 1,
+      userId, sessionIds: [301], interDeviceDelayMs: 1, acknowledged: true,
     });
     const view = await waitForTerminal(jobId, userId);
     const s = view.sessions[0];
@@ -284,7 +309,7 @@ async function run(name, fn) {
     resetImpl = async () => {};
 
     const { jobId } = await service.startBulkAuthPurgeJob({
-      userId, sessionIds: [401, 402], interSessionDelayMs: 1, interDeviceDelayMs: 1,
+      userId, sessionIds: [401, 402], interSessionDelayMs: 1, interDeviceDelayMs: 1, acknowledged: true,
     });
     const view = await waitForTerminal(jobId, userId);
     assert.strictEqual(view.status, 'completed', 'T8 outer job still completed');
@@ -316,7 +341,7 @@ async function run(name, fn) {
 
     const { jobId } = await service.startBulkAuthPurgeJob({
       userId, sessionIds: [501, 502, 503],
-      interSessionDelayMs: 30, interDeviceDelayMs: 30,
+      interSessionDelayMs: 30, interDeviceDelayMs: 30, acknowledged: true,
     });
 
     // Cancel after first row's first reset is observed.
@@ -334,12 +359,194 @@ async function run(name, fn) {
     );
   });
 
+  // ────────────────────────────────────────────────────────────────
+  // NEW SAFETY TESTS (regression coverage for the v1 bug where the
+  // panel terminated its OWN session because Telegram returned the
+  // authorization list with no row flagged current).
+  // ────────────────────────────────────────────────────────────────
+
+  await run('S1  ABORT: zero rows marked current → row marked aborted_unsafe, NO kills', async () => {
+    listImpl = async () => ({
+      authorizations: [
+        // No `isCurrent: true` anywhere — exactly the failure mode
+        // from PR #106 that killed the user's panel session.
+        { hash: 'phone', isCurrent: false, deviceModel: 'iPhone' },
+        { hash: 'web',   isCurrent: false, deviceModel: 'web' },
+        { hash: 'mac',   isCurrent: false, deviceModel: 'Mac' },
+      ],
+    });
+    resetImpl = async () => {
+      throw new Error('S1: reset should never be called when no current row exists');
+    };
+    const { jobId } = await service.startBulkAuthPurgeJob({
+      userId, sessionIds: [701], acknowledged: true,
+    });
+    const view = await waitForTerminal(jobId, userId);
+    const s = view.sessions[0];
+    assert.strictEqual(s.status, 'aborted_unsafe', 'S1 row marked aborted_unsafe');
+    assert.strictEqual(calls.reset.length, 0, 'S1 NO resetAuthorization calls fired');
+    assert(/did not mark any row/i.test(s.error || ''), 'S1 error explains why');
+    assert.strictEqual(view.summary.aborted, 1, 'S1 summary.aborted incremented');
+  });
+
+  await run('S2  ABORT: multiple rows marked current → ambiguous, NO kills', async () => {
+    listImpl = async () => ({
+      authorizations: [
+        { hash: 'panelA', isCurrent: true, deviceModel: 'panel' },
+        { hash: 'panelB', isCurrent: true, deviceModel: 'panel' }, // bug case
+        { hash: 'phone',  isCurrent: false, deviceModel: 'iPhone' },
+      ],
+    });
+    resetImpl = async () => {
+      throw new Error('S2: reset must not be called when current is ambiguous');
+    };
+    const { jobId } = await service.startBulkAuthPurgeJob({
+      userId, sessionIds: [702], acknowledged: true,
+    });
+    const view = await waitForTerminal(jobId, userId);
+    const s = view.sessions[0];
+    assert.strictEqual(s.status, 'aborted_unsafe', 'S2 row marked aborted_unsafe');
+    assert.strictEqual(calls.reset.length, 0, 'S2 NO resetAuthorization calls fired');
+    assert(/ambiguous/i.test(s.error || ''), 'S2 error mentions ambiguity');
+  });
+
+  await run('S3  ABORT: stored panel hash mismatches live current row → NO kills', async () => {
+    // Simulate that we previously observed panelHash="999" but now
+    // Telegram reports the current row's hash is "111". This is a
+    // strong signal something has been rotated externally — refuse.
+    fakeStoredPanelHash.set(703, '999');
+    listImpl = async () => ({
+      authorizations: [
+        { hash: '111',  isCurrent: true,  deviceModel: 'panel' },
+        { hash: 'kill', isCurrent: false, deviceModel: 'iPhone' },
+      ],
+    });
+    resetImpl = async () => {
+      throw new Error('S3: reset must not be called on stored-hash mismatch');
+    };
+    const { jobId } = await service.startBulkAuthPurgeJob({
+      userId, sessionIds: [703], acknowledged: true,
+    });
+    const view = await waitForTerminal(jobId, userId);
+    const s = view.sessions[0];
+    assert.strictEqual(s.status, 'aborted_unsafe', 'S3 row aborted_unsafe');
+    assert.strictEqual(calls.reset.length, 0, 'S3 NO resetAuthorization calls fired');
+    assert(/does not match previously observed/i.test(s.error || ''), 'S3 error mentions stored-hash mismatch');
+    fakeStoredPanelHash.delete(703);
+  });
+
+  await run('S4  hash=0 (reserved current) row is NEVER terminated', async () => {
+    listImpl = async () => ({
+      authorizations: [
+        { hash: 'panel', isCurrent: true, deviceModel: 'panel' },
+        // Hash=0 with current=false — defense-in-depth: we still
+        // refuse to terminate it because hash=0 has historically
+        // been Telegram's "current" convention.
+        { hash: 0,        isCurrent: false, deviceModel: 'historic-current' },
+        { hash: 'phone',  isCurrent: false, deviceModel: 'iPhone' },
+      ],
+    });
+    resetImpl = async () => {};
+    const { jobId } = await service.startBulkAuthPurgeJob({
+      userId, sessionIds: [704], interDeviceDelayMs: 1, acknowledged: true,
+    });
+    const view = await waitForTerminal(jobId, userId);
+    const s = view.sessions[0];
+    const resetHashes = calls.reset.map((c) => c.hash);
+    assert(!resetHashes.includes('0'), 'S4 hash=0 NOT terminated');
+    assert(!resetHashes.includes(0),   'S4 hash=0 NOT terminated (numeric)');
+    assert(resetHashes.includes('phone'), 'S4 phone IS terminated');
+    const zeroDev = s.devices.find((d) => d.hash === '0');
+    assert(zeroDev, 'S4 hash=0 device row present');
+    assert.strictEqual(zeroDev.status, 'skipped', 'S4 hash=0 row marked skipped, not failed');
+  });
+
+  await run('S5  panel hash is persisted on first successful purge', async () => {
+    persistedHashHistory.length = 0;
+    listImpl = async () => ({
+      authorizations: [
+        { hash: 'panel_xyz', isCurrent: true,  deviceModel: 'panel' },
+        { hash: 'other',     isCurrent: false, deviceModel: 'iPhone' },
+      ],
+    });
+    resetImpl = async () => {};
+    const { jobId } = await service.startBulkAuthPurgeJob({
+      userId, sessionIds: [705], acknowledged: true,
+    });
+    const view = await waitForTerminal(jobId, userId);
+    const s = view.sessions[0];
+    assert.strictEqual(s.status, 'completed', 'S5 row completed');
+    assert.strictEqual(s.panelHash, 'panel_xyz', 'S5 panelHash exposed in public view');
+    const persisted = persistedHashHistory.find((h) => h.sessionId === 705);
+    assert(persisted, 'S5 panel hash persisted');
+    assert.strictEqual(persisted.hash, 'panel_xyz', 'S5 persisted hash value correct');
+  });
+
+  await run('S6  acknowledged=false (or missing) is rejected up-front', async () => {
+    let raised = null;
+    try {
+      await service.startBulkAuthPurgeJob({
+        userId, sessionIds: [706],
+        // no acknowledged flag
+      });
+    } catch (e) {
+      raised = e;
+    }
+    assert(raised, 'S6 missing acknowledged was rejected');
+    assert(/operator confirmation required/i.test(raised.message), 'S6 error explains why');
+
+    let raised2 = null;
+    try {
+      await service.startBulkAuthPurgeJob({
+        userId, sessionIds: [706], acknowledged: 'yes',
+      });
+    } catch (e) {
+      raised2 = e;
+    }
+    assert(raised2, 'S6 acknowledged=string-truthy is still rejected (strict boolean true required)');
+  });
+
+  await run('S7  previewPurge: zero-current → eligible=false, no resets called', async () => {
+    listImpl = async () => ({
+      authorizations: [
+        { hash: 'a', isCurrent: false, deviceModel: 'iPhone' },
+        { hash: 'b', isCurrent: false, deviceModel: 'web' },
+      ],
+    });
+    resetImpl = async () => {
+      throw new Error('S7: preview must never call resetAuthorization');
+    };
+    const { preview } = await service.previewPurge({ userId, sessionIds: [801] });
+    assert.strictEqual(preview.length, 1, 'S7 preview row returned');
+    assert.strictEqual(preview[0].eligible, false, 'S7 not eligible');
+    assert(/did not flag any row/i.test(preview[0].abortReason || ''), 'S7 abort reason');
+    assert.strictEqual(calls.reset.length, 0, 'S7 no resets called during preview');
+  });
+
+  await run('S8  previewPurge: happy path → eligible=true, panelHash exposed', async () => {
+    listImpl = async () => ({
+      authorizations: [
+        { hash: 'mine',  isCurrent: true,  deviceModel: 'panel', dateCreated: 1700000000 },
+        { hash: 'other', isCurrent: false, deviceModel: 'iPhone', dateCreated: 1700000001 },
+      ],
+    });
+    const { preview } = await service.previewPurge({ userId, sessionIds: [802] });
+    const row = preview[0];
+    assert.strictEqual(row.eligible, true, 'S8 eligible');
+    assert.strictEqual(row.panelHash, 'mine', 'S8 panelHash exposed');
+    assert.strictEqual(row.devices.length, 2, 'S8 both devices listed');
+    const kept = row.devices.find((d) => d.isCurrent);
+    assert.strictEqual(kept.plannedStatus, 'kept', 'S8 current row planned=kept');
+    const target = row.devices.find((d) => !d.isCurrent);
+    assert.strictEqual(target.plannedStatus, 'would_terminate', 'S8 other planned=would_terminate');
+  });
+
   await run('T12  getJobStatus ownership check', async () => {
     listImpl = async () => ({
       authorizations: [{ hash: 'cur', isCurrent: true, deviceModel: 'panel' }],
     });
     const { jobId } = await service.startBulkAuthPurgeJob({
-      userId: 9, sessionIds: [601],
+      userId: 9, sessionIds: [601], acknowledged: true,
     });
     await waitForTerminal(jobId, 9);
     const wrong = service.getJobStatus(jobId, 8);
