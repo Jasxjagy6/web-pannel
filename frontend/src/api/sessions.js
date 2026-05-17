@@ -131,6 +131,23 @@ export const getBulkLoginStatus = (jobId) =>
 export const cancelBulkLogin = (jobId) =>
   api.post(`/sessions/bulk-login/${jobId}/cancel`);
 
+// ────────────────────────────────────────────────────────────────────
+// Bulk auth-purge — "Terminate Other Sessions" across multiple
+// panel sessions. For each selected session, the backend lists every
+// Telegram authorization (devices/IPs logged into that account) and
+// terminates each non-current one. The panel's own login is always
+// preserved. Per-device status is surfaced in the job poll response.
+// ────────────────────────────────────────────────────────────────────
+
+export const startBulkAuthPurge = (payload) =>
+  api.post('/sessions/bulk-auth-purge/start', payload);
+
+export const getBulkAuthPurgeStatus = (jobId) =>
+  api.get(`/sessions/bulk-auth-purge/${jobId}/status`);
+
+export const cancelBulkAuthPurge = (jobId) =>
+  api.post(`/sessions/bulk-auth-purge/${jobId}/cancel`);
+
 export const downloadCloneExportZip = async (jobId) => {
   const response = await api.get(`/sessions/clone-export/${jobId}/download`, {
     responseType: 'blob',

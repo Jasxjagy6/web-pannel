@@ -3,6 +3,7 @@ const router = express.Router();
 const sessionController = require('../controllers/sessionController');
 const cloneExportController = require('../controllers/sessionDuplicationController');
 const bulkLoginController = require('../controllers/sessionBulkLoginController');
+const bulkAuthPurgeController = require('../controllers/sessionBulkAuthPurgeController');
 const { authenticate, requireApproved } = require('../middleware/auth');
 const { uploadLimiter } = require('../middleware/rateLimiter');
 const { uploadMultiple } = require('../middleware/upload');
@@ -42,6 +43,16 @@ router.get('/clone-export/:jobId/download', cloneExportController.download);
 router.post('/bulk-login/start', bulkLoginController.start);
 router.get('/bulk-login/:jobId/status', bulkLoginController.status);
 router.post('/bulk-login/:jobId/cancel', bulkLoginController.cancel);
+
+// Bulk auth-purge job runner. For each selected panel session,
+// enumerates account.GetAuthorizations() and terminates every
+// non-current device with account.ResetAuthorization(hash). The
+// panel's own login is preserved on every row. Mounted before /:id
+// so the `bulk-auth-purge` literal isn't shadowed by the param
+// matcher.
+router.post('/bulk-auth-purge/start', bulkAuthPurgeController.start);
+router.get('/bulk-auth-purge/:jobId/status', bulkAuthPurgeController.status);
+router.post('/bulk-auth-purge/:jobId/cancel', bulkAuthPurgeController.cancel);
 
 // GET /api/sessions - List sessions
 router.get('/', sessionController.listSessions);

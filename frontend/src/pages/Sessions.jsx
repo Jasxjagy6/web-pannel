@@ -18,6 +18,7 @@ import { Modal } from '../components/common/Modal';
 import StatusBadge from '../components/common/StatusBadge';
 import SessionCloneExportModal from '../components/common/SessionCloneExportModal';
 import SessionBulkLoginModal from '../components/common/SessionBulkLoginModal';
+import SessionBulkAuthPurgeModal from '../components/common/SessionBulkAuthPurgeModal';
 import {
   CloudArrowUpIcon,
   MagnifyingGlassIcon,
@@ -53,6 +54,7 @@ import {
   Download,
   LifeBuoy,
   ShieldAlert,
+  ShieldOff,
 } from 'lucide-react';
 
 // --- Helper: format file size ---
@@ -914,6 +916,8 @@ export default function Sessions() {
   // export session feature").
   const [bulkLoginOpen, setBulkLoginOpen] = useState(false);
   const [bulkLoginSelection, setBulkLoginSelection] = useState([]);
+  const [authPurgeOpen, setAuthPurgeOpen] = useState(false);
+  const [authPurgeSelection, setAuthPurgeSelection] = useState([]);
 
   // The Sessions tab lists every uploaded row in one shot — operators
   // routinely upload hundreds at a time and have asked for "no limit, list
@@ -1158,6 +1162,22 @@ export default function Sessions() {
         .map((s) => ({ id: s.id, phone: s.phone }))
     );
     setBulkLoginOpen(true);
+  };
+
+  // Bulk auth-purge: for each selected session, terminate every
+  // Telegram authorization (device/IP signed into that account)
+  // except the panel's own login. Drives a backend job runner and
+  // surfaces per-device status in a modal.
+  const handleBulkAuthPurge = () => {
+    if (selectedIds.size === 0) return;
+    const ids = Array.from(selectedIds);
+    setAuthPurgeSelection(
+      ids
+        .map((id) => sessions.find((s) => s.id === id))
+        .filter(Boolean)
+        .map((s) => ({ id: s.id, phone: s.phone }))
+    );
+    setAuthPurgeOpen(true);
   };
 
   const handleBulkLogout = async () => {
@@ -1430,6 +1450,15 @@ export default function Sessions() {
             >
               <Download className="w-3.5 h-3.5" />
               Export Cloned Sessions
+            </button>
+            <button
+              onClick={handleBulkAuthPurge}
+              disabled={uploading}
+              className="flex items-center gap-1.5 rounded-lg bg-red-600/20 border border-red-500/30 px-3 py-1.5 text-sm font-medium text-red-400 hover:bg-red-600/30 transition disabled:opacity-50"
+              title="For each selected account, list every device signed in and terminate every one except this panel's own login. Phones, desktops, and web sessions elsewhere will be kicked."
+            >
+              <ShieldOff className="w-3.5 h-3.5" />
+              Terminate Other Sessions
             </button>
             <button
               onClick={handleBulkDelete}
@@ -1879,6 +1908,21 @@ export default function Sessions() {
           // Refresh the table whenever a job finishes so the new
           // is_logged_in / account_info / status values land in the
           // UI without the operator having to manually refresh.
+          fetchSessions();
+        }}
+      />
+
+      <SessionBulkAuthPurgeModal
+        isOpen={authPurgeOpen}
+        onClose={() => {
+          setAuthPurgeOpen(false);
+        }}
+        selectedSessions={authPurgeSelection}
+        onCompleted={() => {
+          // No table fields are mutated by an auth-purge (the panel's
+          // own login is preserved), but a refresh is cheap and
+          // surfaces any side-effect status updates from the post-RPC
+          // listAuthorizations.
           fetchSessions();
         }}
       />
