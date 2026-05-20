@@ -4,7 +4,7 @@ import {
   LayoutDashboard, Users, Search, MessageSquare, UsersRound, List, BarChart3,
   Settings, LogOut, ChevronLeft, ChevronRight, UserCog, ShieldCheck, KeyRound,
   Network, UserPlus, Fingerprint, Shield, Crown, X, CreditCard, MessagesSquare,
-  LogIn,
+  LogIn, Cookie,
 } from 'lucide-react';
 import { useAuth } from '@/hooks/useAuth';
 import { usePlatform, useCapabilities, PLATFORM_LABELS } from '../../context/PlatformContext';
@@ -21,6 +21,7 @@ const userNavItems = [
   { path: 'messaging',         label: 'Messaging',        icon: MessageSquare,   capability: 'messaging_bulk' },
   { path: 'groups',            label: 'Groups',           icon: UsersRound,      capability: 'groups_invite' },
   { path: 'threads',           label: 'Threads',          icon: MessagesSquare,  capability: 'messaging_threads' },
+  { path: 'reddit-scraper',    label: 'Reddit Cookies',   icon: Cookie,          capability: 'reddit_cookie_scraper' },
   { path: 'lists',             label: 'Lists',            icon: List,            capability: 'lists' },
   { path: 'change-2fa',        label: 'Change 2FA',       icon: ShieldCheck,     capability: 'twofa_change' },
   { path: 'get-otp',           label: 'Get OTP',          icon: KeyRound,        capability: 'otp_passive' },

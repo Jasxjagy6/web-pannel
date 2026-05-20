@@ -4,6 +4,7 @@ const groupQueue = require('./groupQueue');
 const instagramScrapeQueue = require('./instagramScrapeQueue');
 const instagramMessageQueue = require('./instagramMessageQueue');
 const instagramLookupQueue = require('./instagramLookupQueue');
+const redditScrapeQueue = require('./redditScrapeQueue');
 const logger = require('../utils/logger');
 
 async function initializeQueues() {
@@ -29,6 +30,16 @@ async function initializeQueues() {
         logger.warn(`IG queue executors not registered: ${err.message}`);
       }
     }
+    if (process.env.REDDIT_QUEUE_ENABLED !== 'false') {
+      try {
+        await redditScrapeQueue.initialize();
+        // eslint-disable-next-line global-require
+        const redditService = require('../services/redditCookieScrapeService');
+        redditScrapeQueue.setJobExecutor((jobId) => redditService.executeJob(jobId));
+      } catch (err) {
+        logger.warn(`Reddit scrape queue not initialized: ${err.message}`);
+      }
+    }
     logger.info('All queues initialized');
   } catch (error) {
     logger.error('Failed to initialize queues', error);
@@ -43,6 +54,7 @@ async function closeQueues() {
   if (instagramScrapeQueue.initialized) await instagramScrapeQueue.close();
   if (instagramMessageQueue.initialized) await instagramMessageQueue.close();
   if (instagramLookupQueue.initialized) await instagramLookupQueue.close();
+  if (redditScrapeQueue.initialized) await redditScrapeQueue.close();
   logger.info('All queues closed');
 }
 
@@ -54,6 +66,7 @@ module.exports = {
   instagramScrapeQueue,
   instagramMessageQueue,
   instagramLookupQueue,
+  redditScrapeQueue,
   initializeQueues,
   closeQueues,
 };

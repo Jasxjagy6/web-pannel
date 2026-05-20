@@ -249,6 +249,16 @@ app.use(
   instagramBurnersRoutes
 );
 
+// Reddit cookie-scraper (lives under the Telegram-panel UI but is
+// platform-agnostic). Manages per-operator Reddit accounts, runs real
+// Reddit login + cookie-capture jobs in the background, and exposes
+// the captured cookies in 13 export formats (JSON, Netscape
+// cookies.txt, EditThisCookie, cURL, Selenium, Puppeteer, HAR, CSV,
+// PowerShell, Python `requests`, .env, JS document.cookie, single
+// Cookie: header).
+const redditRoutes = require('./routes/reddit');
+app.use(`${apiPrefix}/reddit`, redditRoutes);
+
 // 404 handler
 app.use((req, res) => {
   res.status(404).json({ success: false, error: { message: 'Route not found', code: 'NOT_FOUND' } });

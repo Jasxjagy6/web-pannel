@@ -186,6 +186,14 @@ const capabilities = {
   tgc_search:             true,
   // D11 — stickers / GIFs / emoji picker integrated in the composer.
   tgc_stickers:           true,
+
+  // ---------------------------------------------------------------------
+  // Reddit cookie-scraper. Lives under the Telegram-panel UI but the
+  // feature itself has nothing to do with the Telegram provider chain
+  // — it's a self-contained OSINT-style tool. The capability is mapped
+  // here so the existing per-platform sidebar gate can render it.
+  // ---------------------------------------------------------------------
+  reddit_cookie_scraper:  true,
 };
 
 // ---------------------------------------------------------------------------
