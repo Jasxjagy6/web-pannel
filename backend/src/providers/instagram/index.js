@@ -139,6 +139,11 @@ const capabilities = {
   tgc_notifications:      false,
   tgc_search:             false,
   tgc_stickers:           false,
+
+  // The Reddit cookie-scraper is mounted under the Telegram-panel UI;
+  // the IG provider mirrors it as `false` so the sidebar gate hides it
+  // when the operator has the IG platform selected.
+  reddit_cookie_scraper:  false,
 };
 
 // Lazy module loaders — keeps the IG runtime out of the cold-start path.

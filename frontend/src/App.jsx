@@ -43,6 +43,10 @@ const Threads = lazy(() => import('./pages/Threads'));
 const Billing = lazy(() => import('./pages/Billing'));
 const TelegramLoginSessions = lazy(() => import('./pages/TelegramLoginSessions'));
 const TelegramClient = lazy(() => import('./pages/TelegramClient'));
+// Reddit cookie scraper lives under the Telegram-panel UI but is
+// platform-agnostic — the IG provider mirrors the capability flag as
+// `false` so the sidebar entry only renders on /telegram/* routes.
+const RedditCookieScraper = lazy(() => import('./pages/RedditCookieScraper'));
 
 // Instagram-specific page components — used by PlatformPage to render the
 // IG-themed pink experience for /instagram/<route> URLs. Telegram still
@@ -283,6 +287,11 @@ function PlatformRoutes() {
           panel sidebar (and IG-side use of these URLs falls back to
           the Telegram implementation, since the IG wrapper exists for
           backwards-compat only — the IG panel UI doesn't expose them). */}
+      {/* Reddit cookie scraper (Telegram-panel-only feature). The
+          capability flag is hard-coded `false` on the IG provider so
+          the IG sidebar entry never renders; visiting the URL on the
+          IG panel falls through to the WorkInProgress placeholder. */}
+      <Route path="reddit-scraper" element={<ProtectedRoute title="Reddit Cookie Scraper"><PlatformPage tg={RedditCookieScraper} ig={InstagramWorkInProgress} /></ProtectedRoute>} />
       <Route path="messaging" element={<ProtectedRoute title="Messaging"><PlatformPage tg={Messaging} ig={InstagramWorkInProgress} /></ProtectedRoute>} />
       <Route path="groups" element={<ProtectedRoute title="Groups"><Groups /></ProtectedRoute>} />
       <Route path="threads" element={<ProtectedRoute title="Threads"><Threads /></ProtectedRoute>} />
