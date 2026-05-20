@@ -1,5 +1,6 @@
 /**
- * Convert a GramJS string session into a Telethon `.session` SQLite file.
+ * Convert a GramJS or Telethon string session into a Telethon `.session`
+ * SQLite file.
  *
  * The Telethon session file is a SQLite database with five tables:
  *
@@ -9,13 +10,38 @@
  *   - update_state    (id, pts, qts, date, seq)
  *   - version         (version)
  *
- * GramJS string-session format (telegram-js, version "1"):
+ * String-session formats (both start with the version byte "1"):
  *
- *   "1" + base64( dc_id[1] + server_ip[4] + port[2 BE] + auth_key[256] )
+ *   GramJS (telegram-js, what this panel actually produces):
+ *     "1" + base64(
+ *       dc_id[1] +
+ *       address_length[2 BE] +
+ *       server_address[address_length, ASCII]  // e.g. "91.108.56.152"
+ *       port[2 BE] +
+ *       auth_key[256]
+ *     )
  *
- * GramJS encodes the server address as packed IPv4 (4 bytes). Telethon
- * stores the server address as a TEXT column. We round-trip the IP back
- * into dotted-quad form and write that into `server_address`.
+ *   Telethon (python-telethon, what some imported sessions use):
+ *     "1" + base64(
+ *       dc_id[1] +
+ *       server_ip[4 packed bytes  for IPv4]   // e.g. <91><108><56><152>
+ *         (or 16 packed bytes for IPv6)
+ *       port[2 BE] +
+ *       auth_key[256]
+ *     )
+ *
+ * Historically this file only knew about the Telethon (packed-IP)
+ * format, but the panel signs sessions with GramJS. That meant the
+ * exported .session files contained junk values for `server_address`,
+ * `port`, and `auth_key` — Telethon would happily open the database
+ * and immediately fail to log in because the auth_key bytes were
+ * offset by 7 (the size of the address-prefixed header).
+ *
+ * The decoder below auto-detects which format the payload is in (the
+ * GramJS format always has `address_length >= 7` and never starts
+ * with `0x00` while the packed-IPv4 first octet is 1..255, so the
+ * second byte being 0x00 is the unambiguous signal) and round-trips
+ * the IP into dotted-quad form in either case.
  *
  * The output file is written to `outPath` and the path is returned.
  *
@@ -30,10 +56,14 @@ const Database = require('better-sqlite3');
 
 const TELETHON_SCHEMA_VERSION = 7;
 
+const TELETHON_PACKED_IPV4_LEN = 1 + 4 + 2 + 256;   // 263
+const TELETHON_PACKED_IPV6_LEN = 1 + 16 + 2 + 256;  // 275
+
 /**
- * Decode a GramJS string session into its component parts.
+ * Decode a GramJS- or Telethon-flavoured string session into its
+ * component parts.
  *
- * @param {string} sessionString - GramJS string session ("1<base64>")
+ * @param {string} sessionString - GramJS / Telethon string session ("1<base64>")
  * @returns {{ dcId: number, serverAddress: string, port: number, authKey: Buffer }}
  */
 function decodeGramJSSession(sessionString) {
@@ -46,19 +76,60 @@ function decodeGramJSSession(sessionString) {
       `(expected "1")`
     );
   }
-  const buf = Buffer.from(sessionString.slice(1), 'base64');
-  // 1 (dc) + 4 (ip) + 2 (port) + 256 (auth_key) = 263
-  if (buf.length < 1 + 4 + 2 + 256) {
+  const b64 = sessionString.slice(1).replace(/-/g, '+').replace(/_/g, '/');
+  const buf = Buffer.from(b64, 'base64');
+  if (buf.length < TELETHON_PACKED_IPV4_LEN) {
     throw new Error(
-      `GramJS session payload too short (${buf.length} bytes; ` +
-      `expected at least 263)`
+      `Session payload too short (${buf.length} bytes; ` +
+      `expected at least ${TELETHON_PACKED_IPV4_LEN})`
     );
   }
   const dcId = buf.readUInt8(0);
-  const ip = `${buf.readUInt8(1)}.${buf.readUInt8(2)}.${buf.readUInt8(3)}.${buf.readUInt8(4)}`;
-  const port = buf.readUInt16BE(5);
-  const authKey = buf.slice(7, 7 + 256);
-  return { dcId, serverAddress: ip, port, authKey };
+
+  // --- GramJS format detection ----------------------------------------
+  // Address length is a 2-byte big-endian count followed by that many
+  // ASCII bytes. A valid dotted-quad IPv4 is 7-15 chars ("1.1.1.1" to
+  // "255.255.255.255") and a valid IPv6 string is up to 45 chars. We
+  // accept 7..45 here. If the prefix matches AND the total length is
+  // exactly `1 + 2 + addrLen + 2 + 256`, treat it as GramJS.
+  const addrLen = buf.readUInt16BE(1);
+  if (addrLen >= 7 && addrLen <= 45 && buf.length === 1 + 2 + addrLen + 2 + 256) {
+    const addressBytes = buf.slice(3, 3 + addrLen);
+    const address = addressBytes.toString('utf8');
+    // Bail if the address bytes look like packed bytes accidentally
+    // — a valid GramJS address is purely characters in [0-9a-fA-F:.].
+    if (/^[0-9a-fA-F:.]+$/.test(address)) {
+      const port = buf.readUInt16BE(3 + addrLen);
+      const authKey = buf.slice(3 + addrLen + 2, 3 + addrLen + 2 + 256);
+      return { dcId, serverAddress: address, port, authKey };
+    }
+  }
+
+  // --- Telethon packed-IPv4 (263 bytes) ------------------------------
+  if (buf.length === TELETHON_PACKED_IPV4_LEN) {
+    const ip = `${buf.readUInt8(1)}.${buf.readUInt8(2)}.${buf.readUInt8(3)}.${buf.readUInt8(4)}`;
+    const port = buf.readUInt16BE(5);
+    const authKey = buf.slice(7, 7 + 256);
+    return { dcId, serverAddress: ip, port, authKey };
+  }
+
+  // --- Telethon packed-IPv6 (275 bytes) -------------------------------
+  if (buf.length === TELETHON_PACKED_IPV6_LEN) {
+    const parts = [];
+    for (let i = 0; i < 8; i += 1) {
+      parts.push(buf.readUInt16BE(1 + i * 2).toString(16));
+    }
+    const ip = parts.join(':');
+    const port = buf.readUInt16BE(1 + 16);
+    const authKey = buf.slice(1 + 16 + 2, 1 + 16 + 2 + 256);
+    return { dcId, serverAddress: ip, port, authKey };
+  }
+
+  throw new Error(
+    `Unrecognized string-session payload length: ${buf.length} bytes ` +
+    `(expected ${TELETHON_PACKED_IPV4_LEN}, ${TELETHON_PACKED_IPV6_LEN}, ` +
+    `or 1+2+addrLen+2+256 for GramJS)`
+  );
 }
 
 /**
