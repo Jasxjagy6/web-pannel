@@ -14,6 +14,8 @@ import {
   EyeOff,
   X,
   AlertTriangle,
+  ArrowRight,
+  Copy,
 } from 'lucide-react';
 import { useToast } from '../components/common/Toast';
 import { useWebSocket } from '../hooks/useWebSocket';
@@ -119,6 +121,54 @@ function SessionPicker({ sessions, selected, onToggle, onSelectAll, onClear, sea
             </button>
           );
         })}
+      </div>
+    </div>
+  );
+}
+
+function HistoryPasswordCell({ label, value }) {
+  const [show, setShow] = useState(false);
+  const hasValue = typeof value === 'string' && value.length > 0;
+  const displayed = !hasValue ? '—' : show ? value : '•'.repeat(Math.min(value.length, 10));
+  const onCopy = async (e) => {
+    e.stopPropagation();
+    if (!hasValue) return;
+    try {
+      await navigator.clipboard.writeText(value);
+    } catch {
+      // ignore clipboard errors silently — the value stays visible on screen.
+    }
+  };
+  return (
+    <div className="min-w-0">
+      <div className="text-[10px] uppercase tracking-wide text-gray-500">{label}</div>
+      <div className="flex items-center gap-1.5">
+        <span
+          className={`font-mono text-xs truncate ${hasValue ? 'text-gray-200' : 'text-gray-500 italic'}`}
+          title={hasValue && show ? value : undefined}
+        >
+          {displayed}
+        </span>
+        {hasValue && (
+          <>
+            <button
+              type="button"
+              onClick={(e) => { e.stopPropagation(); setShow((s) => !s); }}
+              className="text-gray-500 hover:text-white"
+              title={show ? 'Hide' : 'Show'}
+            >
+              {show ? <EyeOff className="w-3 h-3" /> : <Eye className="w-3 h-3" />}
+            </button>
+            <button
+              type="button"
+              onClick={onCopy}
+              className="text-gray-500 hover:text-white"
+              title="Copy to clipboard"
+            >
+              <Copy className="w-3 h-3" />
+            </button>
+          </>
+        )}
       </div>
     </div>
   );
@@ -506,15 +556,22 @@ export default function Change2FA() {
           ) : (
             <div className="max-h-[380px] overflow-y-auto divide-y divide-white/5">
               {(activeJob.items || []).map((it) => (
-                <div key={it.id} className="flex items-center gap-3 px-4 py-3">
-                  <div className="flex-1 min-w-0">
+                <div key={it.id} className="flex items-start gap-3 px-4 py-3">
+                  <div className="flex-1 min-w-0 space-y-1.5">
                     <div className="text-sm text-white truncate">{it.phone || `Session ${it.session_id}`}</div>
+                    <div className="grid grid-cols-[minmax(0,1fr)_auto_minmax(0,1fr)] items-center gap-2">
+                      <HistoryPasswordCell label="Old" value={it.old_password} />
+                      <ArrowRight className="w-3 h-3 text-gray-500" />
+                      <HistoryPasswordCell label="New" value={it.new_password} />
+                    </div>
                     {it.error_message && <div className="text-[11px] text-red-400 truncate">{it.error_code}: {it.error_message}</div>}
                     {!it.error_message && it.processed_at && <div className="text-[11px] text-gray-500">processed {formatRelativeTime(it.processed_at)}</div>}
                   </div>
-                  {it.status === 'success' && <CheckCircle2 className="w-4 h-4 text-green-400" />}
-                  {it.status === 'failed' && <XCircle className="w-4 h-4 text-red-400" />}
-                  {it.status === 'pending' && <Loader2 className="w-4 h-4 text-blue-400 animate-spin" />}
+                  <div className="pt-0.5">
+                    {it.status === 'success' && <CheckCircle2 className="w-4 h-4 text-green-400" />}
+                    {it.status === 'failed' && <XCircle className="w-4 h-4 text-red-400" />}
+                    {it.status === 'pending' && <Loader2 className="w-4 h-4 text-blue-400 animate-spin" />}
+                  </div>
                 </div>
               ))}
             </div>

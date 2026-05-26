@@ -279,14 +279,20 @@ class TwoFAJobService {
 
   /**
    * Get full job detail including per-session items.
+   *
+   * Per-item credentials are decrypted from the at-rest cipher so the panel's
+   * history view can show what was changed (old vs. new) for each task. Old
+   * rows benefit automatically because the encrypted columns have always been
+   * populated since the table was introduced.
    */
   async getJob(jobId, userId) {
     const job = await this._fetchJob(jobId);
     if (!job || job.user_id !== Number(userId))
       throw new AppError('Job not found', 404, 'JOB_NOT_FOUND');
-    const items = (await pool.query(
+    const rows = (await pool.query(
       `SELECT i.id, i.session_id, i.status, i.error_code, i.error_message,
               i.attempts, i.created_at, i.processed_at,
+              i.old_password_enc, i.new_password_enc,
               s.phone, s.account_info
        FROM change_2fa_job_items i
        LEFT JOIN sessions s ON s.id = i.session_id
@@ -294,6 +300,14 @@ class TwoFAJobService {
        ORDER BY i.id ASC`,
       [jobId]
     )).rows;
+    const items = rows.map((row) => {
+      const { old_password_enc, new_password_enc, ...rest } = row;
+      return {
+        ...rest,
+        old_password: tryDecrypt(old_password_enc),
+        new_password: tryDecrypt(new_password_enc),
+      };
+    });
     return { ...job, items };
   }
 
@@ -308,6 +322,21 @@ function safeDecrypt(text) {
     return decrypt(text);
   } catch (err) {
     throw new AppError(`Stored credential could not be decrypted: ${err.message}`, 500, 'CRYPTO_FAILED');
+  }
+}
+
+/**
+ * Non-throwing decrypt used for surfacing history. Returns null when the
+ * ciphertext is missing or unreadable (e.g. key rotation) so the panel can
+ * still render the row without crashing the whole request.
+ */
+function tryDecrypt(text) {
+  if (!text) return null;
+  try {
+    return decrypt(text);
+  } catch (err) {
+    logger.debug(`tryDecrypt failed: ${err.message}`);
+    return null;
   }
 }
 
