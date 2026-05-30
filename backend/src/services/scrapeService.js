@@ -124,7 +124,11 @@ class ScrapeService {
           targetIds, // Array of all targets
           'pending',
           JSON.stringify({
-            limit: limit || 1000,
+            limit: limit || 50000,
+            // Aggressive alphabetical search sweep (Phase B) is on by default
+            // so large channels/supergroups yield thousands rather than just
+            // the first recent page. Callers can disable it for quick runs.
+            deepSweep: options.deepSweep !== false,
             filterBots: options.filterBots !== false,
             botFilterOptions: options.botFilterOptions || {},
             saveToList: options.saveToList || false,
@@ -413,8 +417,71 @@ class ScrapeService {
 
   /**
    * Scrape a single target (group or channel).
+   *
+   * Delegates to telegramService.scrapeMembers(), which auto-detects the
+   * target type (basic group / supergroup / broadcast channel), paginates with
+   * a real advancing offset, and — for channels/supergroups — runs an
+   * aggressive alphabetical search sweep to break past Telegram's per-filter
+   * enumeration cap. Members stream back through `onBatch`; we bot-filter,
+   * persist, and publish live progress per batch. FLOOD_WAIT / SLOWMODE /
+   * PEER_FLOOD are handled inside telegramService._withFloodRetry.
    */
   async _scrapeTarget(sessionId, targetId, targetType, options, jobId) {
+    const results = { totalFound: 0, newUsers: 0, duplicates: 0, botsFiltered: 0, errors: 0 };
+
+    const limit = Number(options.limit) > 0 ? Number(options.limit) : 50000;
+    const deepSweep = options.deepSweep !== false;
+    const batchDelayMs = options.floodProtection !== false ? INITIAL_BATCH_DELAY_MS : 0;
+
+    const onBatch = async (members) => {
+      if (!members || members.length === 0) return;
+      results.totalFound += members.length;
+
+      // Comprehensive bot filtering (the scraper does its own scoring rather
+      // than relying on Telegram's coarse `bot` flag).
+      const filteredUsers = options.filterBots !== false
+        ? filterBots(members, options.botFilterOptions || {})
+        : members.map((u) => ({ ...u, botScore: 0, botFlags: [] }));
+      results.botsFiltered += members.length - filteredUsers.length;
+
+      const insertResult = await this._insertUsersBatch(jobId, filteredUsers);
+      results.newUsers += insertResult.inserted;
+      results.duplicates += insertResult.duplicates;
+
+      await this._updateProgress(jobId, {
+        totalFound: results.totalFound,
+        currentCount: results.newUsers,
+      });
+    };
+
+    try {
+      await tgService.scrapeMembers(sessionId, targetId, {
+        limit,
+        deepSweep,
+        batchDelayMs,
+        onBatch,
+        shouldStop: () => this._isCancelled(jobId),
+      });
+    } catch (error) {
+      // If Telegram returned a permanent auth error, flag the session as
+      // revoked so future jobs skip it and the Sessions UI updates.
+      try {
+        const sessionService = require('./sessionService');
+        sessionService
+          .maybeFlagRevoked(sessionId, error, `scrapeService.${targetType}`)
+          .catch(() => {});
+      } catch (_) { /* defensive — should never fire */ }
+      throw error;
+    }
+
+    return results;
+  }
+
+  /**
+   * Legacy per-batch scrape loop, retained for reference / fallback. No longer
+   * used by _scrapeTarget (which now streams via telegramService.scrapeMembers).
+   */
+  async _scrapeTargetLegacy(sessionId, targetId, targetType, options, jobId) {
     const results = { totalFound: 0, newUsers: 0, duplicates: 0, botsFiltered: 0, errors: 0 };
     let delay = options.floodProtection !== false ? INITIAL_BATCH_DELAY_MS : 0;
 
