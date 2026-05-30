@@ -30,6 +30,15 @@ const DEFAULT_DELAY_MS = 3000;
 const DEFAULT_MAX_ADDS_PER_SESSION = 4;
 
 /**
+ * Spacing (ms) between the one-time per-session JoinChannel calls in the
+ * auto-join pass. Joining is far cheaper than inviting, but a tight burst
+ * of 50-100 joins from the same IP/fleet can still draw flood flags, so we
+ * jitter them across a small window.
+ */
+const JOIN_SPACING_MS_MIN = 400;
+const JOIN_SPACING_MS_MAX = 1200;
+
+/**
  * `lists.source` prefixes that mean "the operator uploaded this list".
  * Uploaded lists are deduplicated before the run so we never burn an
  * invite request on the same target twice. Scraped lists (`source =
@@ -2579,6 +2588,120 @@ class GroupService {
 
       // Track broken sessions for this target.
       const brokenSessionsForTarget = new Set();
+
+      // -----------------------------------------------------------------
+      // Auto-join pass.
+      //
+      // To invite anyone into a supergroup/channel the inviting session
+      // must already be a PARTICIPANT of the target. `InviteToChannel`
+      // from a non-member fails target-side (CHAT_ADMIN_REQUIRED /
+      // USER_NOT_PARTICIPANT / CHANNEL_PRIVATE) — which is exactly why
+      // "add to channel" produced 0: every fresh session was marked
+      // broken on its first invite and the run ended empty.
+      //
+      // We join each session ONCE per target up-front. This is a single
+      // JoinChannel / ImportChatInvite per (session, target) — NOT a
+      // per-invite membership probe, so it does not reintroduce the
+      // round-trip the operator removed for PEER_FLOOD reasons.
+      // `joinChannel` is idempotent: an already-member returns success
+      // (status 'already_member') rather than throwing.
+      //
+      // Sessions that cannot become a member of this target (private +
+      // approval required → 'requested', banned, CHANNELS_TOO_MUCH,
+      // unresolvable, flooded) are dropped for THIS target only; the
+      // rest go on to invite.
+      //
+      // NOTE: broadcast channels still only allow ADMINS to add members.
+      // A joined-but-non-admin session subscribes here and then fails its
+      // first invite with CHAT_ADMIN_REQUIRED — a Telegram server-side
+      // rule we cannot bypass. The per-item reason is surfaced to
+      // Operation History so the cause is visible.
+      if (params.autoJoinTarget !== false && liveSessions.length > 0) {
+        await markPhase('joining_target', {
+          total: preparedUsers.length,
+          currentTarget: targetId,
+          sessionCount: liveSessions.length,
+        });
+
+        for (let jIdx = 0; jIdx < liveSessions.length; jIdx++) {
+          if (await isCancelled(opId)) break;
+          const session = liveSessions[jIdx];
+          if (brokenSessionsForTarget.has(session.id)) continue;
+
+          try {
+            const jr = await tgService.joinChannel(session.id, targetId);
+            // 'requested' = join is queued for admin approval, so the
+            // session is NOT a member yet and cannot add anyone here.
+            if (jr && jr.status === 'requested') {
+              brokenSessionsForTarget.add(session.id);
+            }
+          } catch (joinErr) {
+            const jmsg = (joinErr && joinErr.message) || String(joinErr);
+            if (tgService.isPermanentAuthError(joinErr)) {
+              sessionService
+                .maybeFlagRevoked(session.id, joinErr, 'groupService.autoJoin')
+                .catch(() => {});
+              brokenSessionsForTarget.add(session.id);
+            } else if (
+              /CHANNELS_TOO_MUCH/i.test(jmsg) ||
+              /CHANNEL_PRIVATE|CHANNEL_INVALID|CHAT_INVALID/i.test(jmsg) ||
+              /INVITE_HASH_(EXPIRED|INVALID|EMPTY)/i.test(jmsg) ||
+              /INVITE_REQUEST_SENT/i.test(jmsg) ||
+              /Could not resolve/i.test(jmsg) ||
+              /PEER_FLOOD|Too many actions|FLOOD_WAIT/i.test(jmsg)
+            ) {
+              brokenSessionsForTarget.add(session.id);
+            }
+            // Any other transient error: leave the session in the pool
+            // and let the invite attempt classify it.
+          }
+
+          if (jIdx < liveSessions.length - 1) {
+            await sleep(
+              JOIN_SPACING_MS_MIN +
+                Math.floor(Math.random() * (JOIN_SPACING_MS_MAX - JOIN_SPACING_MS_MIN + 1))
+            );
+          }
+        }
+
+        // If every session was dropped during the join pass there's
+        // nothing left to invite with for this target — record a clear
+        // reason per user instead of silently reporting 0 added.
+        const remainingForTarget = liveSessions.filter(
+          (s) => !brokenSessionsForTarget.has(s.id)
+        );
+        if (remainingForTarget.length === 0) {
+          logger.warn(
+            `V2 add-members: no session could join target ${targetId} — ` +
+              'skipping all users for this target',
+            { opId }
+          );
+          for (const p of preparedUsers) {
+            results.push({
+              userId: String(p.identifier),
+              targetId,
+              success: false,
+              skipped: true,
+              error:
+                'No session could join this target (private/approval-only, banned, ' +
+                'flooded, or unresolvable). For a broadcast channel only admin ' +
+                'sessions can add members; pass the target as @username or an ' +
+                'invite link so sessions can join.',
+            });
+            skippedCount++;
+          }
+          await persistRunningProgress(
+            {
+              progress: addedCount + failedCount + skippedCount,
+              added: addedCount,
+              failed: failedCount,
+              skipped: skippedCount,
+            },
+            { force: true }
+          );
+          continue; // next target
+        }
+      }
 
       // Build work items: each item is a prepared user entry.
       const workItems = preparedUsers.map((p, idx) => ({
