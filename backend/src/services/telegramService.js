@@ -49,6 +49,24 @@ const MAX_MESSAGE_LENGTH = 4096;
 const NEW_PASSWORD_SALT_BYTES = 32;
 
 /**
+ * Search prefixes for the aggressive member sweep (scrapeMembers Phase B).
+ *
+ * Telegram caps a single `ChannelParticipants*` enumeration (~10k rows) but
+ * answers each distinct `ChannelParticipantsSearch({ q })` independently, so
+ * querying every prefix and unioning the results recovers a far larger slice
+ * of a big channel/supergroup's membership. We cover Latin a–z, digits 0–9,
+ * and the most common Cyrillic / Arabic letters so non-English member bases
+ * are not left behind. The empty string is intentionally omitted here because
+ * Phase A (ChannelParticipantsRecent) already covers the un-prefixed roster.
+ */
+const MEMBER_SEARCH_PREFIXES = [
+  ...'abcdefghijklmnopqrstuvwxyz',
+  ...'0123456789',
+  ...'абвгдеёжзийклмнопрстуфхцчшщъыьэюя',
+  ...'ابتثجحخدذرزسشصضطظعغفقكلمنهوي',
+];
+
+/**
  * Delay utility for sleep between operations.
  * @param {number} ms - Milliseconds to sleep
  * @returns {Promise<void>}
@@ -773,7 +791,7 @@ class TelegramService {
   async getGroupMembers(sessionId, groupId, options = { limit: 10000, filterBots: true }) {
     await this._ensureConnected(sessionId);
 
-    const { limit = 10000, filterBots = true } = options;
+    const { limit = 10000, filterBots = true, offset: startOffset = 0 } = options;
 
     try {
       const entity = await this._resolveEntity(sessionId, groupId);
@@ -782,7 +800,10 @@ class TelegramService {
       }
 
       const members = [];
-      let offset = 0;
+      // Honor the caller-supplied starting offset. Previously this was
+      // hard-coded to 0, so a paginating caller that bumped `offset` between
+      // calls kept re-fetching the same first window forever.
+      let offset = Number(startOffset) || 0;
       const batchSize = 200;
 
       while (members.length < limit) {
@@ -970,7 +991,7 @@ class TelegramService {
   async getChannelSubscribers(sessionId, channelId, options = { limit: 10000 }) {
     await this._ensureConnected(sessionId);
 
-    const { limit = 10000 } = options;
+    const { limit = 10000, offset: startOffset = 0 } = options;
 
     try {
       const entity = await this._resolveEntity(sessionId, channelId);
@@ -983,7 +1004,8 @@ class TelegramService {
       }
 
       const subscribers = [];
-      let offset = 0;
+      // Honor the caller-supplied starting offset (see getGroupMembers note).
+      let offset = Number(startOffset) || 0;
       const batchSize = 200;
 
       while (subscribers.length < limit) {
@@ -1032,6 +1054,162 @@ class TelegramService {
       });
       throw this._handleTelegramError(error);
     }
+  }
+
+  /**
+   * Stream every reachable member of a Telegram group / channel to a callback.
+   *
+   * This is the institutional-grade replacement for the naive offset loop that
+   * used to top out at the first ~200 "recent" members. It de-duplicates by
+   * Telegram user-id across the whole call (so `onBatch` only ever sees users
+   * it has not seen before) and reaches far past Telegram's per-filter
+   * enumeration cap via an aggressive alphabetical search sweep.
+   *
+   * Entity handling:
+   *   - Basic group (`Api.Chat`)            → `messages.GetFullChat` (whole roster)
+   *   - Supergroup / channel (`Api.Channel`)→ `channels.GetParticipants`, paginated
+   *       with a real advancing offset, then (when `deepSweep`) re-queried with
+   *       `ChannelParticipantsSearch({ q })` for every prefix in a broad alphabet.
+   *       The search sweep is what breaks past the ~10k single-filter cap on
+   *       large targets — Telegram answers each distinct `q` independently, so
+   *       unioning the prefixes recovers a much larger slice of the member base.
+   *
+   * @param {string} sessionId
+   * @param {string|number} targetId
+   * @param {object} opts
+   * @param {number}   [opts.limit=50000]      Max unique members to emit
+   * @param {boolean}  [opts.deepSweep=true]   Run the alphabetical search sweep
+   * @param {number}   [opts.batchDelayMs=600] Delay between Telegram requests
+   * @param {(members: object[]) => (void|Promise<void>)} [opts.onBatch] new-member sink
+   * @param {() => boolean} [opts.shouldStop]  Cancellation predicate
+   * @returns {Promise<{ total:number, entityType:string, participantsCount:(number|null), sweptPrefixes:number }>}
+   */
+  async scrapeMembers(sessionId, targetId, opts = {}) {
+    const {
+      limit = 50000,
+      deepSweep = true,
+      batchDelayMs = 600,
+      onBatch = null,
+      shouldStop = () => false,
+    } = opts;
+
+    await this._ensureConnected(sessionId);
+    const client = this.clients.get(String(sessionId)).client;
+
+    const entity = await this._resolveEntity(sessionId, targetId);
+    if (!entity) {
+      throw new Error(`Could not resolve group/channel: ${targetId}`);
+    }
+
+    const seen = new Set();
+    let emitted = 0;
+
+    // Normalize + de-dup a raw list of GramJS users and hand the *new* ones
+    // to the caller. Returns how many fresh users were emitted.
+    const emit = async (rawList) => {
+      if (!rawList || rawList.length === 0) return 0;
+      const fresh = [];
+      for (const raw of rawList) {
+        if (emitted + fresh.length >= limit) break;
+        const normalized = normalizeParticipant(raw);
+        if (!normalized || normalized.id == null) continue;
+        const key = String(normalized.id);
+        if (seen.has(key)) continue;
+        seen.add(key);
+        fresh.push(normalized);
+      }
+      if (fresh.length && onBatch) await onBatch(fresh);
+      emitted += fresh.length;
+      return fresh.length;
+    };
+
+    // ---- Basic group: the whole roster comes back in one call -----------
+    if (entity.className === 'Chat') {
+      const full = await this._withFloodRetry(sessionId, async () =>
+        client.invoke(new Api.messages.GetFullChat({ chatId: entity.id })));
+      await emit(full?.users || []);
+      logger.info(`scrapeMembers: basic group ${targetId} yielded ${emitted} members`, { sessionId });
+      return { total: emitted, entityType: 'chat', participantsCount: emitted, sweptPrefixes: 0 };
+    }
+
+    // ---- Supergroup / channel ------------------------------------------
+    const peer = getInputPeer(entity);
+    const entityType = entity.broadcast ? 'channel' : 'supergroup';
+
+    // Best-effort total, used both to decide whether the sweep is worth it
+    // and to surface a sensible denominator for progress.
+    let participantsCount = Number(entity.participantsCount) || null;
+    try {
+      const fc = await this._withFloodRetry(sessionId, async () =>
+        client.invoke(new Api.channels.GetFullChannel({ channel: peer })));
+      const c = Number(fc?.fullChat?.participantsCount);
+      if (Number.isFinite(c) && c > 0) participantsCount = c;
+    } catch (_) { /* roster total not always readable — non-fatal */ }
+
+    // Page through one Telegram participant filter with an advancing offset.
+    const pageThroughFilter = async (makeFilter) => {
+      let offset = 0;
+      const PAGE = 200;
+      // Hard offset guard: Telegram stops returning rows for a single filter
+      // well before this, but a megagroup search prefix can legitimately page
+      // deep, so we keep the ceiling generous.
+      while (emitted < limit && offset < 200000) {
+        if (shouldStop()) return;
+        const res = await this._withFloodRetry(sessionId, async () =>
+          client.invoke(new Api.channels.GetParticipants({
+            channel: peer,
+            filter: makeFilter(),
+            offset,
+            limit: PAGE,
+            hash: 0,
+          })));
+
+        const parts = res?.participants || [];
+        const users = res?.users || [];
+        if (parts.length === 0) return;
+        await emit(users);
+        offset += parts.length;
+        if (parts.length < PAGE) return;
+        if (batchDelayMs > 0) await sleep(batchDelayMs);
+      }
+    };
+
+    // Phase A — recent participants (fast, covers small/medium targets fully).
+    try {
+      await pageThroughFilter(() => new Api.ChannelParticipantsRecent());
+    } catch (error) {
+      // If even the recent roster is admin-gated we surface the error so the
+      // caller (scrapeService) can fall back to the passive monitor path.
+      if (emitted === 0) throw error;
+      logger.warn(`scrapeMembers: recent pass aborted for ${targetId}: ${error.message}`, { sessionId });
+    }
+
+    // Phase B — aggressive alphabetical search sweep. This is the core channel
+    // upgrade: Telegram caps a single enumeration (~10k) but answers each
+    // distinct search prefix independently, so unioning prefixes recovers a
+    // much larger slice of the membership.
+    let sweptPrefixes = 0;
+    const gotEverything = participantsCount != null && emitted >= participantsCount;
+    if (deepSweep && emitted < limit && !gotEverything && !shouldStop()) {
+      for (const prefix of MEMBER_SEARCH_PREFIXES) {
+        if (emitted >= limit || shouldStop()) break;
+        try {
+          await pageThroughFilter(() => new Api.ChannelParticipantsSearch({ q: prefix }));
+          sweptPrefixes += 1;
+        } catch (error) {
+          logger.warn(`scrapeMembers: sweep prefix "${prefix}" failed for ${targetId}: ${error.message}`, { sessionId });
+          // A single prefix failing (e.g. transient) should not abort the sweep.
+        }
+      }
+    }
+
+    logger.info(
+      `scrapeMembers: ${entityType} ${targetId} yielded ${emitted} unique members ` +
+      `(participantsCount=${participantsCount ?? 'unknown'}, sweptPrefixes=${sweptPrefixes})`,
+      { sessionId }
+    );
+
+    return { total: emitted, entityType, participantsCount, sweptPrefixes };
   }
 
   // =========================================================================
