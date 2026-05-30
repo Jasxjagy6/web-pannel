@@ -49,6 +49,11 @@ const groupController = {
       sourceChannelIds,
       sourceChannelId,
       listId,
+      // When true (default) each worker session joins the target once
+      // before inviting — required for channel/supergroup adds, since a
+      // non-member session cannot invite anyone. Set false for quick runs
+      // against targets the sessions are already in.
+      autoJoinTarget,
     } = req.body;
 
     if (
@@ -113,6 +118,8 @@ const groupController = {
       itemDelayMsMax: itemDelayMsMax != null ? parseInt(itemDelayMsMax, 10) : undefined,
       sourceChannelIds: Array.isArray(sourceChannelIds) ? sourceChannelIds : (sourceChannelId ? [sourceChannelId] : undefined),
       listId: listId != null ? listId : undefined,
+      // Default ON — only an explicit `false` disables the auto-join pass.
+      autoJoinTarget: autoJoinTarget !== false && autoJoinTarget !== 'false',
     };
 
     // Async mode is the default. The Groups UI used to send `async: false`
