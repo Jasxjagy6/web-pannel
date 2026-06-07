@@ -25,6 +25,18 @@ export const cancelPrivacyJob = (id) =>
   api.post(`/privacy/jobs/${id}/cancel`);
 
 // ---------------------------------------------------------------------
+// Recovery email — interactive add-email flow.
+// send-code triggers Telegram to email a verification code; verify-code
+// confirms the email on the account with that code.
+// ---------------------------------------------------------------------
+
+export const sendEmailCode = (sessionId, email, twoFAPassword) =>
+  api.post('/privacy/email/send-code', { sessionId, email, twoFAPassword });
+
+export const verifyEmailCode = (sessionId, email, code) =>
+  api.post('/privacy/email/verify-code', { sessionId, email, code });
+
+// ---------------------------------------------------------------------
 // Instagram-specific privacy surface.
 // IG only exposes a single public/private flag + has_anonymous_profile_picture
 // at the API level; this is hard-routed at /api/instagram/privacy/* so the

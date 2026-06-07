@@ -13,6 +13,9 @@ router.get('/jobs/:id', ctrl.getJob);
 router.get('/jobs/:id/items', ctrl.getJobItems);
 router.post('/jobs/:id/cancel', ctrl.cancelJob);
 
+router.post('/email/send-code', ctrl.sendEmailCode);
+router.post('/email/verify-code', ctrl.verifyEmailCode);
+
 // Instagram-specific per-account privacy. The handlers themselves
 // reject non-IG platforms with 400 WRONG_PLATFORM, so it's safe to
 // mount them on the shared router (the legacy /api/privacy alias

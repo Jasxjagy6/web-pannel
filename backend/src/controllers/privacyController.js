@@ -14,6 +14,7 @@
 const { pool } = require('../config/database');
 const { AppError, asyncHandler } = require('../utils/errorHandler');
 const privacyService = require('../services/privacyService');
+const emailRecoveryService = require('../services/emailRecoveryService');
 const reportService = require('../services/reportService');
 const { resolveSessionIdsFromRequest } = require('../utils/resolveSessions');
 const logger = require('../utils/logger');
@@ -263,6 +264,116 @@ const privacyController = {
       .logActivity(userId, 'privacy_job_cancel_requested', 'privacy_job', jobId, {})
       .catch(() => {});
     return res.json({ success: true });
+  }),
+
+  // -------------------------------------------------------------------
+  // Recovery email — interactive add-email flow.
+  //
+  // Two endpoints that together let the panel add a recovery email to
+  // one Telegram session at a time. The frontend orchestrates the loop
+  // (select sessions → send code → user enters code → verify → next).
+  //
+  // POST /api/privacy/email/send-code   { sessionId, email, twoFAPassword? }
+  // POST /api/privacy/email/verify-code { sessionId, email, code }
+  // -------------------------------------------------------------------
+
+  /** POST /api/privacy/email/send-code */
+  sendEmailCode: asyncHandler(async (req, res) => {
+    const userId = req.user.id;
+    const { sessionId, email, twoFAPassword } = req.body || {};
+
+    const sid = Number(sessionId);
+    if (!sid || !Number.isInteger(sid) || sid <= 0) {
+      throw new AppError('Invalid session id', 400, 'BAD_ID');
+    }
+    if (!emailRecoveryService.validateEmail(email)) {
+      throw new AppError('Invalid email address', 400, 'INVALID_EMAIL');
+    }
+
+    const { rows } = await pool.query(
+      `SELECT id, is_2fa_enabled FROM sessions
+        WHERE id = $1 AND user_id = $2 AND is_logged_in = true
+          AND status IN ('active','uploaded')`,
+      [sid, userId]
+    );
+    if (!rows[0]) {
+      throw new AppError(
+        'Session not found, not logged in, or not owned by you',
+        404,
+        'SESSION_NOT_FOUND'
+      );
+    }
+
+    const needsPassword = !!rows[0].is_2fa_enabled;
+    if (needsPassword && !twoFAPassword) {
+      throw new AppError(
+        'This session has 2FA enabled. Provide twoFAPassword.',
+        400,
+        'TWO_FA_PASSWORD_REQUIRED'
+      );
+    }
+
+    const result = await emailRecoveryService.sendCode(sid, email, twoFAPassword || '');
+
+    reportService
+      .logActivity(userId, 'recovery_email_code_sent', 'session', sid, { email })
+      .catch(() => {});
+
+    return res.json({
+      success: true,
+      data: {
+        sessionId: sid,
+        email: email.trim(),
+        awaitingCode: true,
+        has2FA: result.has2FA,
+      },
+    });
+  }),
+
+  /** POST /api/privacy/email/verify-code */
+  verifyEmailCode: asyncHandler(async (req, res) => {
+    const userId = req.user.id;
+    const { sessionId, email, code } = req.body || {};
+
+    const sid = Number(sessionId);
+    if (!sid || !Number.isInteger(sid) || sid <= 0) {
+      throw new AppError('Invalid session id', 400, 'BAD_ID');
+    }
+    if (!emailRecoveryService.validateEmail(email)) {
+      throw new AppError('Invalid email address', 400, 'INVALID_EMAIL');
+    }
+    if (!code || typeof code !== 'string' || !code.trim()) {
+      throw new AppError('Verification code is required', 400, 'CODE_REQUIRED');
+    }
+
+    const { rowCount } = await pool.query(
+      `SELECT 1 FROM sessions
+        WHERE id = $1 AND user_id = $2 AND is_logged_in = true
+          AND status IN ('active','uploaded')`,
+      [sid, userId]
+    );
+    if (rowCount === 0) {
+      throw new AppError(
+        'Session not found, not logged in, or not owned by you',
+        404,
+        'SESSION_NOT_FOUND'
+      );
+    }
+
+    await emailRecoveryService.verifyCode(sid, email, code);
+
+    reportService
+      .logActivity(userId, 'recovery_email_verified', 'session', sid, { email })
+      .catch(() => {});
+
+    return res.json({
+      success: true,
+      data: {
+        sessionId: sid,
+        email: email.trim(),
+        verified: true,
+      },
+    });
   }),
 
   // -------------------------------------------------------------------
