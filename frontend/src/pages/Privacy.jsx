@@ -685,17 +685,14 @@ export default function Privacy() {
     if (!item) return;
     setEmailProcessing(true);
     setEmailError('');
+    setEmailCodeSent(false);
+    setEmailCode('');
     try {
       await sendEmailCode(item.sessionId, emailAddress.trim(), twoFAPassword || undefined);
       setEmailCodeSent(true);
     } catch (err) {
       const msg = parseApiError(err);
       setEmailError(msg);
-      const updated = emailQueue.map((q, i) =>
-        i === emailCurrentIndex ? { ...q, status: 'failed', error: msg } : q
-      );
-      setEmailQueue(updated);
-      advanceToNext(updated);
     } finally {
       setEmailProcessing(false);
     }
