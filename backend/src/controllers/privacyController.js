@@ -304,16 +304,7 @@ const privacyController = {
       );
     }
 
-    const needsPassword = !!rows[0].is_2fa_enabled;
-    if (needsPassword && !twoFAPassword) {
-      throw new AppError(
-        'This session has 2FA enabled. Provide twoFAPassword.',
-        400,
-        'TWO_FA_PASSWORD_REQUIRED'
-      );
-    }
-
-    const result = await emailRecoveryService.sendCode(sid, email, twoFAPassword || '');
+    const result = await emailRecoveryService.sendCode(sid, email, twoFAPassword);
 
     reportService
       .logActivity(userId, 'recovery_email_code_sent', 'session', sid, { email })
