@@ -4,6 +4,7 @@ const { Api } = require('telegram');
 const { computeCheck: gramjsComputeCheck } = require('telegram/Password');
 const tgService = require('./telegramService');
 const logger = require('../utils/logger');
+const { AppError } = require('../utils/errorHandler');
 
 const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
@@ -15,19 +16,13 @@ function validateEmail(email) {
 
 async function sendCode(sessionId, email, twoFAPassword) {
   if (!validateEmail(email)) {
-    const err = new Error('Invalid email address');
-    err.code = 'INVALID_EMAIL';
-    err.statusCode = 400;
-    throw err;
+    throw new AppError('Invalid email address', 400, 'INVALID_EMAIL');
   }
 
   await tgService._ensureConnected(sessionId);
   const entry = tgService.clients.get(String(sessionId));
   if (!entry || !entry.client) {
-    const err = new Error(`Session ${sessionId} has no live client`);
-    err.code = 'NO_CLIENT';
-    err.statusCode = 400;
-    throw err;
+    throw new AppError(`Session ${sessionId} has no live client`, 400, 'NO_CLIENT');
   }
   const client = entry.client;
 
@@ -40,18 +35,20 @@ async function sendCode(sessionId, email, twoFAPassword) {
   let passwordSrp;
   if (has2FA) {
     if (!twoFAPassword) {
-      const err = new Error('This session has 2FA enabled. A cloud password is required.');
-      err.code = 'TWO_FA_PASSWORD_REQUIRED';
-      err.statusCode = 400;
-      throw err;
+      throw new AppError(
+        'This session has 2FA enabled. Enter the cloud password to proceed.',
+        400,
+        'TWO_FA_PASSWORD_REQUIRED'
+      );
     }
     try {
       passwordSrp = await gramjsComputeCheck(passwordRequest, twoFAPassword);
     } catch (e) {
-      const err = new Error(`2FA password verification failed: ${e.message}`);
-      err.code = 'TWO_FA_PASSWORD_INVALID';
-      err.statusCode = 400;
-      throw err;
+      throw new AppError(
+        `2FA password verification failed: ${e.message}`,
+        400,
+        'TWO_FA_PASSWORD_INVALID'
+      );
     }
   } else {
     passwordSrp = new Api.InputCheckPasswordEmpty();
@@ -77,26 +74,17 @@ async function sendCode(sessionId, email, twoFAPassword) {
 
 async function verifyCode(sessionId, email, code) {
   if (!validateEmail(email)) {
-    const err = new Error('Invalid email address');
-    err.code = 'INVALID_EMAIL';
-    err.statusCode = 400;
-    throw err;
+    throw new AppError('Invalid email address', 400, 'INVALID_EMAIL');
   }
 
   if (!code || typeof code !== 'string' || code.trim().length === 0) {
-    const err = new Error('Verification code is required');
-    err.code = 'CODE_REQUIRED';
-    err.statusCode = 400;
-    throw err;
+    throw new AppError('Verification code is required', 400, 'CODE_REQUIRED');
   }
 
   await tgService._ensureConnected(sessionId);
   const entry = tgService.clients.get(String(sessionId));
   if (!entry || !entry.client) {
-    const err = new Error(`Session ${sessionId} has no live client`);
-    err.code = 'NO_CLIENT';
-    err.statusCode = 400;
-    throw err;
+    throw new AppError(`Session ${sessionId} has no live client`, 400, 'NO_CLIENT');
   }
   const client = entry.client;
 
