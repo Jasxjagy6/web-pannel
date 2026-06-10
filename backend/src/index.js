@@ -30,6 +30,7 @@ const proxyRoutes = require('./routes/proxies');
 const userProxyRoutes = require('./routes/userProxies');
 const antiDetectRoutes = require('./routes/antiDetect');
 const privacyRoutes = require('./routes/privacy');
+const loginMailRoutes = require('./routes/loginMail');
 const adminRoutes = require('./routes/admin');
 const billingRoutes = require('./routes/billing');
 const userCredentialsRoutes = require('./routes/userCredentials');
@@ -165,6 +166,7 @@ const PLATFORM_ROUTERS = [
   ['/me/proxy-providers', require('./routes/proxyProviders')],
   ['/anti-detect',      antiDetectRoutes],
   ['/privacy',          privacyRoutes],
+  ['/privacy/login-mail', loginMailRoutes],
   ['/session-lists',    sessionListRoutes],
 ];
 
@@ -540,6 +542,16 @@ async function start() {
       privacyJobWorker.startPrivacyJobWorker();
     } catch (err) {
       logger.warn(`privacyJobWorker.start failed: ${err.message}`);
+    }
+
+    // 5b. Boot the Login-Mail job worker. Processes queued
+    //     login_mail_jobs — sends verification codes, auto-reads OTP
+    //     via IMAP, verifies, and moves to the next session.
+    try {
+      const loginMailJobWorker = require('./services/loginMailJobWorker');
+      loginMailJobWorker.startLoginMailJobWorker();
+    } catch (err) {
+      logger.warn(`loginMailJobWorker.start failed: ${err.message}`);
     }
 
     // 6. Boot the Instagram session warm-up scheduler. Every minute it

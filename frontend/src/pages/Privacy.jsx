@@ -39,9 +39,18 @@ import {
   listPrivacyJobs,
   getPrivacyJobItems,
   cancelPrivacyJob,
-  sendEmailCode,
-  verifyEmailCode,
 } from '../api/privacy';
+import {
+  detectImapSettings,
+  saveLoginMailCredentials,
+  listLoginMailCredentials,
+  deleteLoginMailCredentials,
+  testLoginMailCredentials,
+  createLoginMailJob,
+  listLoginMailJobs,
+  getLoginMailJobItems,
+  cancelLoginMailJob,
+} from '../api/loginMail';
 import { parseApiError, formatRelativeTime } from '../utils/formatters';
 import SessionListSwitcher from '../components/common/SessionListSwitcher';
 
@@ -462,6 +471,147 @@ function JobItemDrawer({ job, onClose }) {
 }
 
 // ---------------------------------------------------------------------
+// Login-mail job item drawer (mirrors JobItemDrawer)
+// ---------------------------------------------------------------------
+function LoginMailJobDrawer({ job, onClose }) {
+  const [items, setItems] = useState([]);
+  const [loading, setLoading] = useState(false);
+
+  const refresh = useCallback(async () => {
+    if (!job) return;
+    setLoading(true);
+    try {
+      const r = await getLoginMailJobItems(job.id);
+      setItems(r.data?.data?.items || []);
+    } finally {
+      setLoading(false);
+    }
+  }, [job]);
+
+  useEffect(() => {
+    refresh();
+    const id = setInterval(refresh, 4000);
+    return () => clearInterval(id);
+  }, [refresh]);
+
+  if (!job) return null;
+
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm p-4"
+      onClick={onClose}
+    >
+      <div
+        className="relative w-full max-w-3xl max-h-[85vh] overflow-hidden rounded-2xl border border-white/10 bg-dark-800 shadow-2xl"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="flex items-center justify-between border-b border-white/5 px-5 py-3">
+          <div>
+            <h3 className="text-sm font-semibold text-white flex items-center gap-2">
+              <Mail className="w-4 h-4 text-primary-400" />
+              Login mail job #{job.id}
+            </h3>
+            <p className="text-[12px] text-gray-500">
+              {job.email} · {job.total_sessions} sessions ·{' '}
+              {job.created_at ? formatRelativeTime(job.created_at) : ''}
+            </p>
+          </div>
+          <button
+            onClick={onClose}
+            className="rounded-md border border-white/10 px-2 py-1 text-xs text-gray-300 hover:bg-white/5"
+          >
+            <X className="h-3.5 w-3.5" />
+          </button>
+        </div>
+
+        {/* Progress bar */}
+        <div className="px-5 py-2 border-b border-white/5">
+          <div className="flex items-center gap-3 text-[11px] text-gray-400 mb-1.5">
+            <span className="text-emerald-400">{job.succeeded_count} succeeded</span>
+            <span className="text-rose-400">{job.failed_count} failed</span>
+            <span className="text-gray-500">{job.skipped_count} skipped</span>
+          </div>
+          <div className="w-full bg-white/5 rounded-full h-1.5 overflow-hidden">
+            <div className="h-full flex">
+              <div
+                className="bg-emerald-500 transition-all"
+                style={{ width: `${job.total_sessions ? (job.succeeded_count / job.total_sessions) * 100 : 0}%` }}
+              />
+              <div
+                className="bg-rose-500 transition-all"
+                style={{ width: `${job.total_sessions ? (job.failed_count / job.total_sessions) * 100 : 0}%` }}
+              />
+              <div
+                className="bg-gray-600 transition-all"
+                style={{ width: `${job.total_sessions ? (job.skipped_count / job.total_sessions) * 100 : 0}%` }}
+              />
+            </div>
+          </div>
+        </div>
+
+        <div className="overflow-auto max-h-[65vh]">
+          <table className="w-full text-sm">
+            <thead className="bg-white/5 text-gray-400 text-xs uppercase tracking-wider sticky top-0">
+              <tr>
+                <th className="text-left px-4 py-2 font-medium">Session</th>
+                <th className="text-left px-4 py-2 font-medium">Status</th>
+                <th className="text-left px-4 py-2 font-medium">Error</th>
+                <th className="text-left px-4 py-2 font-medium">Attempts</th>
+              </tr>
+            </thead>
+            <tbody>
+              {loading && items.length === 0 && (
+                <tr>
+                  <td colSpan={4} className="px-4 py-6 text-center text-gray-500">
+                    <Loader2 className="inline h-4 w-4 animate-spin" /> loading…
+                  </td>
+                </tr>
+              )}
+              {items.map((it) => {
+                const display =
+                  it.username ? `@${it.username}` :
+                  [it.first_name, it.last_name].filter(Boolean).join(' ') ||
+                  it.phone ||
+                  `Session ${it.session_id}`;
+                return (
+                  <tr
+                    key={it.id}
+                    className="border-t border-white/5 hover:bg-white/[0.02]"
+                  >
+                    <td className="px-4 py-2.5">
+                      <div className="text-white text-sm">{display}</div>
+                      {it.phone && <div className="text-[11px] text-gray-500">{it.phone}</div>}
+                    </td>
+                    <td className="px-4 py-2.5"><StatusBadge status={it.status} /></td>
+                    <td className="px-4 py-2.5">
+                      {it.error_message ? (
+                        <span className="text-rose-300 text-[12px] truncate block max-w-xs" title={it.error_message}>
+                          {it.error_code ? `[${it.error_code}] ` : ''}{it.error_message}
+                        </span>
+                      ) : (
+                        <span className="text-gray-600">—</span>
+                      )}
+                    </td>
+                    <td className="px-4 py-2.5 text-gray-400">{it.attempts || 0}</td>
+                  </tr>
+                );
+              })}
+              {!loading && items.length === 0 && (
+                <tr>
+                  <td colSpan={4} className="px-4 py-6 text-center text-gray-500">
+                    No items yet.
+                  </td>
+                </tr>
+              )}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------
 // Main page
 // ---------------------------------------------------------------------
 export default function Privacy() {
@@ -483,16 +633,16 @@ export default function Privacy() {
   const [drawerJob, setDrawerJob] = useState(null);
   const [openSettings, setOpenSettings] = useState(true);
 
-  // Recovery email flow state
-  const [emailAddress, setEmailAddress] = useState('');
-  const [twoFAPassword, setTwoFAPassword] = useState('');
-  const [emailFlowActive, setEmailFlowActive] = useState(false);
-  const [emailQueue, setEmailQueue] = useState([]);
-  const [emailCurrentIndex, setEmailCurrentIndex] = useState(0);
-  const [emailCodeSent, setEmailCodeSent] = useState(false);
-  const [emailCode, setEmailCode] = useState('');
-  const [emailProcessing, setEmailProcessing] = useState(false);
-  const [emailError, setEmailError] = useState('');
+  // Login-mail feature state
+  const [lmCredentials, setLmCredentials] = useState([]);
+  const [lmSelectedCredId, setLmSelectedCredId] = useState('');
+  const [lmNewCred, setLmNewCred] = useState({ email: '', imapHost: '', imapPort: 993, imapUser: '', imapPass: '', useTls: true, label: '' });
+  const [lmShowAddCred, setLmShowAddCred] = useState(false);
+  const [lmSavingCred, setLmSavingCred] = useState(false);
+  const [lmTestingCred, setLmTestingCred] = useState(null);
+  const [lmSubmitting, setLmSubmitting] = useState(false);
+  const [lmJobs, setLmJobs] = useState([]);
+  const [lmDrawerJob, setLmDrawerJob] = useState(null);
 
   const fetchSessions = useCallback(async () => {
     try {
@@ -512,12 +662,32 @@ export default function Privacy() {
     }
   }, []);
 
+  const fetchLmCredentials = useCallback(async () => {
+    try {
+      const r = await listLoginMailCredentials();
+      setLmCredentials(r.data?.data?.items || []);
+    } catch (err) {
+      console.warn('listLoginMailCredentials failed', parseApiError(err));
+    }
+  }, []);
+
+  const fetchLmJobs = useCallback(async () => {
+    try {
+      const r = await listLoginMailJobs({ limit: 50 });
+      setLmJobs(r.data?.data?.items || []);
+    } catch (err) {
+      console.warn('listLoginMailJobs failed', parseApiError(err));
+    }
+  }, []);
+
   useEffect(() => {
     // Pre-warm the keys endpoint as a connectivity check.
     getPrivacyKeys().catch(() => {});
     fetchSessions();
     fetchJobs();
-  }, [fetchSessions, fetchJobs]);
+    fetchLmCredentials();
+    fetchLmJobs();
+  }, [fetchSessions, fetchJobs, fetchLmCredentials, fetchLmJobs]);
 
   // Auto-refresh job table while there is an in-flight job.
   useEffect(() => {
@@ -528,6 +698,16 @@ export default function Privacy() {
     const id = setInterval(fetchJobs, 3000);
     return () => clearInterval(id);
   }, [jobs, fetchJobs]);
+
+  // Auto-refresh login-mail job table while there is an in-flight job.
+  useEffect(() => {
+    const hasActive = lmJobs.some(
+      (j) => j.status === 'pending' || j.status === 'running'
+    );
+    if (!hasActive) return;
+    const id = setInterval(fetchLmJobs, 3000);
+    return () => clearInterval(id);
+  }, [lmJobs, fetchLmJobs]);
 
   const setRule = (keyId, value) => {
     setSettings((prev) => {
@@ -623,16 +803,83 @@ export default function Privacy() {
     }
   };
 
-  const currentEmailSession = useMemo(() => {
-    if (!emailFlowActive || emailQueue.length === 0) return null;
-    const item = emailQueue[emailCurrentIndex];
-    if (!item) return null;
-    return sessions.find((s) => s.id === item.sessionId) || null;
-  }, [emailFlowActive, emailQueue, emailCurrentIndex, sessions]);
+  // -----------------------------------------------------------------------
+  // Login-mail credential handlers
+  // -----------------------------------------------------------------------
 
-  const startEmailFlow = async () => {
-    if (!emailAddress.trim() || !emailAddress.includes('@')) {
-      showError('Enter a valid email address', 'Invalid email');
+  const handleDetectImap = async (email) => {
+    try {
+      const r = await detectImapSettings(email);
+      const d = r.data?.data;
+      if (d?.detected) {
+        setLmNewCred((prev) => ({
+          ...prev,
+          imapHost: d.host || prev.imapHost,
+          imapPort: d.port || prev.imapPort,
+          useTls: d.tls !== undefined ? d.tls : prev.useTls,
+          imapUser: email,
+        }));
+        showInfo(`Detected IMAP settings for ${email.split('@')[1]}`, 'Auto-detected');
+      }
+    } catch (_) { /* silent */ }
+  };
+
+  const handleSaveCred = async () => {
+    if (!lmNewCred.email || !lmNewCred.imapHost || !lmNewCred.imapPass) {
+      showError('Email, IMAP host, and password are required', 'Missing fields');
+      return;
+    }
+    setLmSavingCred(true);
+    try {
+      await saveLoginMailCredentials(lmNewCred);
+      showSuccess('Email credentials saved', 'Saved');
+      setLmShowAddCred(false);
+      setLmNewCred({ email: '', imapHost: '', imapPort: 993, imapUser: '', imapPass: '', useTls: true, label: '' });
+      fetchLmCredentials();
+    } catch (err) {
+      showError(parseApiError(err), 'Could not save credentials');
+    } finally {
+      setLmSavingCred(false);
+    }
+  };
+
+  const handleTestCred = async (id) => {
+    setLmTestingCred(id);
+    try {
+      const r = await testLoginMailCredentials(id);
+      const d = r.data?.data;
+      if (d?.ok) {
+        showSuccess('IMAP connection successful!', 'Test passed');
+      } else {
+        showError(d?.error || 'Connection failed', 'Test failed');
+      }
+      fetchLmCredentials();
+    } catch (err) {
+      showError(parseApiError(err), 'Test failed');
+    } finally {
+      setLmTestingCred(null);
+    }
+  };
+
+  const handleDeleteCred = async (id) => {
+    if (!confirm('Delete this email credential?')) return;
+    try {
+      await deleteLoginMailCredentials(id);
+      showInfo('Credential deleted', '');
+      fetchLmCredentials();
+      if (String(lmSelectedCredId) === String(id)) setLmSelectedCredId('');
+    } catch (err) {
+      showError(parseApiError(err), 'Delete failed');
+    }
+  };
+
+  // -----------------------------------------------------------------------
+  // Login-mail job handlers
+  // -----------------------------------------------------------------------
+
+  const submitLoginMailJob = async () => {
+    if (!lmSelectedCredId) {
+      showError('Select an email credential first', 'No credential');
       return;
     }
     const usingList = sessionPickMode === 'list' && selectedSessionListId;
@@ -640,104 +887,37 @@ export default function Privacy() {
       showError('Pick at least one session (or pick a session list)', 'No targets');
       return;
     }
-    const queue = selectedSessionIds.map((sid) => ({
-      sessionId: sid,
-      status: 'pending',
-      error: null,
-    }));
-    setEmailQueue(queue);
-    setEmailCurrentIndex(0);
-    setEmailCodeSent(false);
-    setEmailCode('');
-    setEmailError('');
-    setEmailFlowActive(true);
-  };
-
-  const advanceToNext = (queue) => {
-    const nextIdx = queue.findIndex(
-      (item, idx) => idx > emailCurrentIndex && item.status === 'pending'
-    );
-    if (nextIdx === -1) {
-      const done = queue.filter((q) => q.status === 'done').length;
-      const failed = queue.filter((q) => q.status === 'failed').length;
+    setLmSubmitting(true);
+    try {
+      const body = usingList
+        ? { credentialId: Number(lmSelectedCredId), sessionListId: Number(selectedSessionListId) }
+        : { credentialId: Number(lmSelectedCredId), sessionIds: selectedSessionIds };
+      const r = usingList
+        ? await createLoginMailJob(Number(lmSelectedCredId), { sessionListId: Number(selectedSessionListId) })
+        : await createLoginMailJob(Number(lmSelectedCredId), selectedSessionIds);
+      const data = r.data?.data || {};
       showSuccess(
-        `Email added to ${done} session(s)${failed ? `, ${failed} failed` : ''}`,
-        'Recovery email complete'
+        `Login mail job #${data.jobId} queued for ${data.sessionCount} session(s)` +
+          (data.skipped ? ` (${data.skipped} skipped)` : ''),
+        'Job queued'
       );
-      setEmailFlowActive(false);
-      setEmailQueue([]);
-      setEmailCurrentIndex(0);
-      setEmailCodeSent(false);
-      setEmailCode('');
-      setEmailError('');
-      setEmailAddress('');
-      setTwoFAPassword('');
-    } else {
-      setEmailCurrentIndex(nextIdx);
-      setEmailCodeSent(false);
-      setEmailCode('');
-      setEmailError('');
-    }
-  };
-
-  const handleSendEmailCode = async () => {
-    const item = emailQueue[emailCurrentIndex];
-    if (!item) return;
-    setEmailProcessing(true);
-    setEmailError('');
-    setEmailCodeSent(false);
-    setEmailCode('');
-    try {
-      await sendEmailCode(item.sessionId, emailAddress.trim(), twoFAPassword || undefined);
-      setEmailCodeSent(true);
+      fetchLmJobs();
     } catch (err) {
-      const msg = parseApiError(err);
-      setEmailError(msg);
+      showError(parseApiError(err), 'Could not start login mail job');
     } finally {
-      setEmailProcessing(false);
+      setLmSubmitting(false);
     }
   };
 
-  const handleVerifyEmailCode = async () => {
-    if (!emailCode.trim()) {
-      showError('Enter the verification code from the email', 'Code required');
-      return;
-    }
-    const item = emailQueue[emailCurrentIndex];
-    if (!item) return;
-    setEmailProcessing(true);
-    setEmailError('');
+  const cancelLmJob = async (id) => {
+    if (!confirm(`Cancel login mail job #${id}?`)) return;
     try {
-      await verifyEmailCode(item.sessionId, emailAddress.trim(), emailCode.trim());
-      const updated = emailQueue.map((q, i) =>
-        i === emailCurrentIndex ? { ...q, status: 'done' } : q
-      );
-      setEmailQueue(updated);
-      advanceToNext(updated);
+      await cancelLoginMailJob(id);
+      showInfo('Cancellation requested', `Job #${id}`);
+      fetchLmJobs();
     } catch (err) {
-      const msg = parseApiError(err);
-      setEmailError(msg);
-    } finally {
-      setEmailProcessing(false);
+      showError(parseApiError(err), 'Cancel failed');
     }
-  };
-
-  const skipCurrentSession = () => {
-    const updated = emailQueue.map((q, i) =>
-      i === emailCurrentIndex ? { ...q, status: 'skipped', error: 'Skipped by user' } : q
-    );
-    setEmailQueue(updated);
-    advanceToNext(updated);
-  };
-
-  const cancelEmailFlow = () => {
-    setEmailFlowActive(false);
-    setEmailQueue([]);
-    setEmailCurrentIndex(0);
-    setEmailCodeSent(false);
-    setEmailCode('');
-    setEmailError('');
-    showInfo('Email flow cancelled', '');
   };
 
   const cancel = async (id) => {
@@ -843,12 +1023,10 @@ export default function Privacy() {
         </div>
       </div>
 
-      {/* Add Recovery Email card.
-          Interactive, one-at-a-time flow: for each selected session the
-          panel sends a verification code to the email via Telegram's
-          MTProto API, then asks the user to enter the code. Once
-          verified the email is set as recovery on that account and the
-          panel moves to the next session. */}
+      {/* Set Login Email card.
+          Fully automated bulk flow: saves IMAP credentials, then for each
+          selected session sends a verification code via MTProto, auto-reads
+          the OTP from the inbox via IMAP, and verifies — all hands-free. */}
       <div className="rounded-2xl border border-white/5 bg-dark-800/40 p-5">
         <div className="flex flex-col gap-4">
           <div className="flex items-start gap-3">
@@ -857,62 +1035,185 @@ export default function Privacy() {
             </div>
             <div className="min-w-0">
               <h3 className="text-sm font-semibold text-white">
-                Add recovery email
+                Set login email
               </h3>
               <p className="text-[12px] text-gray-500 mt-0.5 max-w-2xl">
-                Add a recovery email to selected sessions one at a time.
-                Telegram sends a verification code to the email — you enter
-                it here to confirm. If a session has 2FA (cloud password)
-                enabled, enter it below so the panel can authorize the change.
+                Set a login email on Telegram sessions in bulk. The panel
+                sends a verification code via Telegram, automatically reads
+                the OTP from your email inbox (via IMAP), verifies it, and
+                moves to the next session — fully automated. Save your email
+                credentials once, then run bulk jobs anytime.
               </p>
             </div>
           </div>
 
-          <div className="flex flex-col sm:flex-row gap-3">
-            <div className="flex-1">
-              <label className="block text-xs font-medium text-gray-400 mb-1.5">
-                Recovery email
+          {/* Saved credentials list */}
+          {lmCredentials.length > 0 && (
+            <div className="space-y-2">
+              <label className="block text-xs font-medium text-gray-400">
+                Saved email credentials
               </label>
-              <input
-                type="email"
-                value={emailAddress}
-                onChange={(e) => setEmailAddress(e.target.value)}
-                placeholder="recovery@example.com"
-                disabled={emailFlowActive}
-                className="w-full rounded-lg border border-white/10 bg-dark-900 px-3 py-2 text-sm text-white placeholder:text-gray-500 focus:border-primary-500 focus:outline-none focus:ring-1 focus:ring-primary-500 disabled:opacity-40"
-              />
+              {lmCredentials.map((cred) => (
+                <div
+                  key={cred.id}
+                  className={`flex items-center justify-between gap-3 rounded-lg border px-3 py-2.5 transition cursor-pointer ${
+                    String(lmSelectedCredId) === String(cred.id)
+                      ? 'border-primary-500/60 bg-primary-500/10'
+                      : 'border-white/5 bg-dark-900/40 hover:border-white/10'
+                  }`}
+                  onClick={() => setLmSelectedCredId(String(lmSelectedCredId) === String(cred.id) ? '' : String(cred.id))}
+                >
+                  <div className="flex items-center gap-3 min-w-0">
+                    <input
+                      type="radio"
+                      checked={String(lmSelectedCredId) === String(cred.id)}
+                      readOnly
+                      className="rounded-full border-white/20 bg-dark-900 text-primary-600 focus:ring-primary-500 shrink-0"
+                    />
+                    <div className="min-w-0">
+                      <div className="text-sm text-white truncate">{cred.email}</div>
+                      <div className="text-[11px] text-gray-500 truncate">
+                        {cred.imap_host}:{cred.imap_port}
+                        {cred.label ? ` · ${cred.label}` : ''}
+                        {cred.last_test_ok === true && <span className="text-emerald-400 ml-2">✓ tested</span>}
+                        {cred.last_test_ok === false && <span className="text-rose-400 ml-2">✗ test failed</span>}
+                      </div>
+                    </div>
+                  </div>
+                  <div className="flex items-center gap-1.5 shrink-0">
+                    <button
+                      type="button"
+                      onClick={(e) => { e.stopPropagation(); handleTestCred(cred.id); }}
+                      disabled={lmTestingCred === cred.id}
+                      className="rounded-md border border-white/10 px-2 py-1 text-[11px] text-gray-300 hover:bg-white/5 disabled:opacity-40"
+                    >
+                      {lmTestingCred === cred.id ? <Loader2 className="w-3 h-3 animate-spin" /> : 'Test'}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={(e) => { e.stopPropagation(); handleDeleteCred(cred.id); }}
+                      className="rounded-md border border-rose-500/30 px-2 py-1 text-[11px] text-rose-300 hover:bg-rose-500/10"
+                    >
+                      <X className="w-3 h-3" />
+                    </button>
+                  </div>
+                </div>
+              ))}
             </div>
-            <div className="sm:w-56">
-              <label className="block text-xs font-medium text-gray-400 mb-1.5">
-                2FA password (if needed)
-              </label>
-              <input
-                type="password"
-                value={twoFAPassword}
-                onChange={(e) => setTwoFAPassword(e.target.value)}
-                placeholder="Cloud password"
-                disabled={emailFlowActive}
-                className="w-full rounded-lg border border-white/10 bg-dark-900 px-3 py-2 text-sm text-white placeholder:text-gray-500 focus:border-primary-500 focus:outline-none focus:ring-1 focus:ring-primary-500 disabled:opacity-40"
-              />
-            </div>
-          </div>
+          )}
 
+          {/* Add new credential toggle */}
+          {!lmShowAddCred ? (
+            <button
+              type="button"
+              onClick={() => setLmShowAddCred(true)}
+              className="flex items-center gap-2 rounded-lg border border-dashed border-white/10 px-3 py-2.5 text-xs text-gray-400 hover:border-primary-500/40 hover:text-primary-300 transition w-full justify-center"
+            >
+              <Mail className="w-3.5 h-3.5" />
+              {lmCredentials.length === 0 ? 'Add email credentials' : 'Add another email'}
+            </button>
+          ) : (
+            <div className="rounded-lg border border-white/10 bg-dark-900/60 p-4 space-y-3">
+              <div className="flex items-center justify-between">
+                <h4 className="text-xs font-semibold text-white">Add email credentials</h4>
+                <button onClick={() => setLmShowAddCred(false)} className="text-gray-500 hover:text-white">
+                  <X className="w-3.5 h-3.5" />
+                </button>
+              </div>
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                <div>
+                  <label className="block text-[11px] font-medium text-gray-400 mb-1">Email address</label>
+                  <input
+                    type="email"
+                    value={lmNewCred.email}
+                    onChange={(e) => {
+                      const v = e.target.value;
+                      setLmNewCred((p) => ({ ...p, email: v }));
+                      if (v.includes('@') && v.split('@')[1]?.includes('.')) handleDetectImap(v);
+                    }}
+                    placeholder="you@gmail.com"
+                    className="w-full rounded-lg border border-white/10 bg-dark-900 px-3 py-2 text-sm text-white placeholder:text-gray-500 focus:border-primary-500 focus:outline-none focus:ring-1 focus:ring-primary-500"
+                  />
+                </div>
+                <div>
+                  <label className="block text-[11px] font-medium text-gray-400 mb-1">App password</label>
+                  <input
+                    type="password"
+                    value={lmNewCred.imapPass}
+                    onChange={(e) => setLmNewCred((p) => ({ ...p, imapPass: e.target.value }))}
+                    placeholder="App-specific password"
+                    className="w-full rounded-lg border border-white/10 bg-dark-900 px-3 py-2 text-sm text-white placeholder:text-gray-500 focus:border-primary-500 focus:outline-none focus:ring-1 focus:ring-primary-500"
+                  />
+                </div>
+                <div>
+                  <label className="block text-[11px] font-medium text-gray-400 mb-1">IMAP host</label>
+                  <input
+                    type="text"
+                    value={lmNewCred.imapHost}
+                    onChange={(e) => setLmNewCred((p) => ({ ...p, imapHost: e.target.value }))}
+                    placeholder="imap.gmail.com"
+                    className="w-full rounded-lg border border-white/10 bg-dark-900 px-3 py-2 text-sm text-white placeholder:text-gray-500 focus:border-primary-500 focus:outline-none focus:ring-1 focus:ring-primary-500"
+                  />
+                </div>
+                <div className="flex gap-3">
+                  <div className="flex-1">
+                    <label className="block text-[11px] font-medium text-gray-400 mb-1">Port</label>
+                    <input
+                      type="number"
+                      value={lmNewCred.imapPort}
+                      onChange={(e) => setLmNewCred((p) => ({ ...p, imapPort: Number(e.target.value) || 993 }))}
+                      className="w-full rounded-lg border border-white/10 bg-dark-900 px-3 py-2 text-sm text-white focus:border-primary-500 focus:outline-none focus:ring-1 focus:ring-primary-500"
+                    />
+                  </div>
+                  <div className="flex-1">
+                    <label className="block text-[11px] font-medium text-gray-400 mb-1">Label (optional)</label>
+                    <input
+                      type="text"
+                      value={lmNewCred.label}
+                      onChange={(e) => setLmNewCred((p) => ({ ...p, label: e.target.value }))}
+                      placeholder="e.g. Main Gmail"
+                      className="w-full rounded-lg border border-white/10 bg-dark-900 px-3 py-2 text-sm text-white placeholder:text-gray-500 focus:border-primary-500 focus:outline-none focus:ring-1 focus:ring-primary-500"
+                    />
+                  </div>
+                </div>
+              </div>
+              <p className="text-[11px] text-gray-500">
+                For Gmail, use an <a href="https://myaccount.google.com/apppasswords" target="_blank" rel="noopener noreferrer" className="text-primary-400 underline">App Password</a>.
+                IMAP settings are auto-detected for popular providers.
+              </p>
+              <button
+                type="button"
+                onClick={handleSaveCred}
+                disabled={lmSavingCred || !lmNewCred.email || !lmNewCred.imapHost || !lmNewCred.imapPass}
+                className="flex items-center gap-2 rounded-lg bg-gradient-to-r from-primary-600 to-primary-500 px-4 py-2 text-xs font-semibold text-white shadow-md shadow-primary-500/20 disabled:opacity-40 disabled:cursor-not-allowed transition"
+              >
+                {lmSavingCred ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <CheckCircle2 className="w-3.5 h-3.5" />}
+                Save credentials
+              </button>
+            </div>
+          )}
+
+          {/* Start bulk job button */}
           <button
             type="button"
-            onClick={startEmailFlow}
+            onClick={submitLoginMailJob}
             disabled={
-              emailFlowActive ||
-              !emailAddress.trim() ||
+              lmSubmitting ||
+              !lmSelectedCredId ||
               (sessionPickMode === 'list'
                 ? !selectedSessionListId
                 : selectedSessionIds.length === 0)
             }
             className="flex items-center justify-center gap-2 rounded-lg bg-gradient-to-r from-primary-600 to-primary-500 px-4 py-2.5 text-xs font-semibold text-white shadow-md shadow-primary-500/20 hover:shadow-primary-500/40 disabled:opacity-40 disabled:cursor-not-allowed transition w-full sm:w-auto"
           >
-            <Mail className="w-3.5 h-3.5" />
+            {lmSubmitting ? (
+              <Loader2 className="w-3.5 h-3.5 animate-spin" />
+            ) : (
+              <Play className="w-3.5 h-3.5" />
+            )}
             {sessionPickMode === 'list'
-              ? 'Start for session list'
-              : `Start for ${selectedSessionIds.length} session${selectedSessionIds.length === 1 ? '' : 's'}`}
+              ? 'Start automated login mail for session list'
+              : `Start automated login mail for ${selectedSessionIds.length} session${selectedSessionIds.length === 1 ? '' : 's'}`}
           </button>
         </div>
       </div>
@@ -1077,175 +1378,89 @@ export default function Privacy() {
         </div>
       </div>
 
-      {/* Recovery email interactive modal */}
-      {emailFlowActive && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-sm p-4">
-          <div
-            className="relative w-full max-w-2xl max-h-[90vh] overflow-hidden rounded-2xl border border-white/10 bg-dark-800 shadow-2xl"
-            onClick={(e) => e.stopPropagation()}
-          >
-            <div className="flex items-center justify-between border-b border-white/5 px-5 py-3">
-              <div>
-                <h3 className="text-sm font-semibold text-white flex items-center gap-2">
-                  <Mail className="w-4 h-4 text-primary-500" />
-                  Add recovery email
-                </h3>
-                <p className="text-[12px] text-gray-500">
-                  {emailAddress} — Session {emailCurrentIndex + 1} of {emailQueue.length}
-                </p>
-              </div>
-              <button
-                onClick={cancelEmailFlow}
-                className="rounded-md border border-white/10 px-2 py-1 text-xs text-gray-300 hover:bg-white/5"
-              >
-                <X className="h-3.5 w-3.5" />
-              </button>
-            </div>
-
-            <div className="p-5 space-y-4">
-              {currentEmailSession && (
-                <div className="rounded-lg border border-white/5 bg-dark-900/60 p-4">
-                  <div className="text-sm text-white font-medium">
-                    {currentEmailSession.phone}
-                    {(currentEmailSession.account_info?.username || currentEmailSession.accountInfo?.username) && (
-                      <span className="text-gray-400 ml-2">
-                        @{currentEmailSession.account_info?.username || currentEmailSession.accountInfo?.username}
+      {/* Login-mail job history table */}
+      {lmJobs.length > 0 && (
+        <div className="rounded-2xl border border-white/5 bg-dark-800/40 overflow-hidden">
+          <div className="flex items-center justify-between border-b border-white/5 px-5 py-3">
+            <h3 className="text-sm font-semibold text-white flex items-center gap-2">
+              <Mail className="w-4 h-4 text-primary-400" />
+              Login mail jobs
+            </h3>
+            <button
+              type="button"
+              onClick={fetchLmJobs}
+              className="text-[11px] text-gray-400 hover:text-white"
+            >
+              Refresh
+            </button>
+          </div>
+          <div className="overflow-x-auto">
+            <table className="w-full text-left text-xs">
+              <thead className="text-[11px] text-gray-500 border-b border-white/5">
+                <tr>
+                  <th className="px-4 py-2.5 font-medium">#</th>
+                  <th className="px-4 py-2.5 font-medium">Email</th>
+                  <th className="px-4 py-2.5 font-medium">Status</th>
+                  <th className="px-4 py-2.5 font-medium text-center">Sessions</th>
+                  <th className="px-4 py-2.5 font-medium text-center">✓</th>
+                  <th className="px-4 py-2.5 font-medium text-center">✗</th>
+                  <th className="px-4 py-2.5 font-medium">Created</th>
+                  <th className="px-4 py-2.5 font-medium w-24"></th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-white/5">
+                {lmJobs.map((j) => (
+                  <tr key={j.id} className="hover:bg-white/[0.02]">
+                    <td className="px-4 py-2.5 text-gray-300">{j.id}</td>
+                    <td className="px-4 py-2.5 text-white truncate max-w-[180px]">{j.email}</td>
+                    <td className="px-4 py-2.5">
+                      <span className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[11px] font-medium ${
+                        j.status === 'completed' ? 'bg-emerald-500/10 text-emerald-400' :
+                        j.status === 'running' ? 'bg-blue-500/10 text-blue-400' :
+                        j.status === 'pending' ? 'bg-amber-500/10 text-amber-400' :
+                        j.status === 'cancelled' ? 'bg-gray-500/10 text-gray-400' :
+                        'bg-rose-500/10 text-rose-400'
+                      }`}>
+                        {j.status === 'running' && <Loader2 className="w-2.5 h-2.5 animate-spin" />}
+                        {j.status}
                       </span>
-                    )}
-                  </div>
-                  <div className="text-[11px] text-gray-500 mt-0.5">
-                    {((currentEmailSession.account_info?.firstName || currentEmailSession.accountInfo?.firstName) || '') +
-                     ' ' +
-                     ((currentEmailSession.account_info?.lastName || currentEmailSession.accountInfo?.lastName) || '')}
-                  </div>
-                </div>
-              )}
-
-              {!emailCodeSent && (
-                <div className="flex items-center gap-3">
-                  <button
-                    onClick={handleSendEmailCode}
-                    disabled={emailProcessing}
-                    className="flex items-center gap-2 rounded-lg bg-gradient-to-r from-primary-600 to-primary-500 px-4 py-2.5 text-sm font-semibold text-white shadow-md disabled:opacity-40 transition"
-                  >
-                    {emailProcessing ? (
-                      <Loader2 className="w-4 h-4 animate-spin" />
-                    ) : (
-                      <Mail className="w-4 h-4" />
-                    )}
-                    {emailProcessing ? 'Sending code...' : 'Send verification code'}
-                  </button>
-                  <button
-                    onClick={skipCurrentSession}
-                    disabled={emailProcessing}
-                    className="flex items-center gap-2 rounded-lg border border-white/10 px-3 py-2.5 text-sm text-gray-300 hover:bg-white/5 disabled:opacity-40 transition"
-                  >
-                    <SkipForward className="w-4 h-4" />
-                    Skip
-                  </button>
-                </div>
-              )}
-
-              {emailCodeSent && (
-                <div className="space-y-3">
-                  <div className="flex items-center gap-2 text-sm text-emerald-300">
-                    <CheckCircle2 className="w-4 h-4" />
-                    Code sent! Check your email inbox.
-                  </div>
-                  <div className="flex gap-3">
-                    <input
-                      type="text"
-                      value={emailCode}
-                      onChange={(e) => setEmailCode(e.target.value)}
-                      placeholder="Enter verification code"
-                      autoFocus
-                      onKeyDown={(e) => {
-                        if (e.key === 'Enter' && emailCode.trim()) handleVerifyEmailCode();
-                      }}
-                      className="flex-1 rounded-lg border border-white/10 bg-dark-900 px-3 py-2.5 text-sm text-white placeholder:text-gray-500 focus:border-primary-500 focus:outline-none focus:ring-1 focus:ring-primary-500"
-                    />
-                    <button
-                      onClick={handleVerifyEmailCode}
-                      disabled={emailProcessing || !emailCode.trim()}
-                      className="flex items-center gap-2 rounded-lg bg-gradient-to-r from-primary-600 to-primary-500 px-4 py-2.5 text-sm font-semibold text-white shadow-md disabled:opacity-40 transition"
-                    >
-                      {emailProcessing ? (
-                        <Loader2 className="w-4 h-4 animate-spin" />
-                      ) : (
-                        <CheckCircle2 className="w-4 h-4" />
-                      )}
-                      Verify
-                    </button>
-                    <button
-                      onClick={skipCurrentSession}
-                      disabled={emailProcessing}
-                      className="flex items-center gap-2 rounded-lg border border-white/10 px-3 py-2.5 text-sm text-gray-300 hover:bg-white/5 disabled:opacity-40 transition"
-                    >
-                      <SkipForward className="w-4 h-4" />
-                      Skip
-                    </button>
-                  </div>
-                  <button
-                    onClick={handleSendEmailCode}
-                    disabled={emailProcessing}
-                    className="text-xs text-primary-400 hover:text-primary-300 underline"
-                  >
-                    Resend code
-                  </button>
-                </div>
-              )}
-
-              {emailError && (
-                <div className="flex items-start gap-2 rounded-lg border border-rose-500/30 bg-rose-500/10 p-3">
-                  <XCircle className="w-4 h-4 text-rose-300 mt-0.5 shrink-0" />
-                  <div className="text-sm text-rose-300">{emailError}</div>
-                </div>
-              )}
-
-              <div className="border-t border-white/5 pt-3">
-                <div className="text-xs font-medium text-gray-400 mb-2">
-                  Progress ({emailQueue.filter((q) => q.status === 'done').length} done,{' '}
-                  {emailQueue.filter((q) => q.status === 'failed').length} failed,{' '}
-                  {emailQueue.filter((q) => q.status === 'skipped').length} skipped)
-                </div>
-                <div className="max-h-48 overflow-y-auto space-y-1">
-                  {emailQueue.map((item, idx) => {
-                    const s = sessions.find((sess) => sess.id === item.sessionId);
-                    const display = s?.phone || `Session ${item.sessionId}`;
-                    const isCurrent = idx === emailCurrentIndex;
-                    return (
-                      <div
-                        key={item.sessionId}
-                        className={`flex items-center justify-between gap-2 rounded-md px-3 py-1.5 text-xs ${
-                          isCurrent
-                            ? 'bg-primary-500/10 border border-primary-500/30'
-                            : 'bg-dark-900/40'
-                        }`}
-                      >
-                        <div className="flex items-center gap-2 min-w-0">
-                          {item.status === 'pending' && <Clock className="w-3 h-3 text-gray-500 shrink-0" />}
-                          {item.status === 'done' && <CheckCircle2 className="w-3 h-3 text-emerald-400 shrink-0" />}
-                          {item.status === 'failed' && <XCircle className="w-3 h-3 text-rose-400 shrink-0" />}
-                          {item.status === 'skipped' && <SkipForward className="w-3 h-3 text-amber-400 shrink-0" />}
-                          {isCurrent && item.status === 'pending' && emailProcessing && (
-                            <Loader2 className="w-3 h-3 text-blue-400 animate-spin shrink-0" />
-                          )}
-                          <span className="text-white truncate">{display}</span>
-                        </div>
-                        {item.error && (
-                          <span className="text-rose-400 truncate max-w-[180px]" title={item.error}>
-                            {item.error}
-                          </span>
+                    </td>
+                    <td className="px-4 py-2.5 text-center text-gray-300">{j.total_sessions}</td>
+                    <td className="px-4 py-2.5 text-center text-emerald-400">{j.succeeded_count}</td>
+                    <td className="px-4 py-2.5 text-center text-rose-400">{j.failed_count}</td>
+                    <td className="px-4 py-2.5 text-gray-500">
+                      {j.created_at ? new Date(j.created_at).toLocaleString() : '—'}
+                    </td>
+                    <td className="px-4 py-2.5">
+                      <div className="flex items-center gap-1.5">
+                        <button
+                          type="button"
+                          onClick={() => setLmDrawerJob(j)}
+                          className="rounded-md border border-white/10 px-2 py-1 text-[11px] text-gray-300 hover:bg-white/5"
+                        >
+                          Details
+                        </button>
+                        {(j.status === 'pending' || j.status === 'running') && !j.cancel_requested && (
+                          <button
+                            type="button"
+                            onClick={() => cancelLmJob(j.id)}
+                            className="rounded-md border border-rose-500/30 px-2 py-1 text-[11px] text-rose-300 hover:bg-rose-500/10"
+                          >
+                            Cancel
+                          </button>
                         )}
                       </div>
-                    );
-                  })}
-                </div>
-              </div>
-            </div>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
           </div>
         </div>
       )}
+
+      {/* Login-mail job detail drawer */}
+      <LoginMailJobDrawer job={lmDrawerJob} onClose={() => setLmDrawerJob(null)} />
 
       <JobItemDrawer job={drawerJob} onClose={() => setDrawerJob(null)} />
     </div>
