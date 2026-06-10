@@ -16,6 +16,11 @@ router.post('/jobs/:id/cancel', ctrl.cancelJob);
 router.post('/email/send-code', ctrl.sendEmailCode);
 router.post('/email/verify-code', ctrl.verifyEmailCode);
 
+// Login email sub-router — full redesign of the login-email-on-session
+// feature with automated IMAP OTP reading for bulk operations.
+const loginEmailRoutes = require('./loginEmail');
+router.use('/login-email', loginEmailRoutes);
+
 // Instagram-specific per-account privacy. The handlers themselves
 // reject non-IG platforms with 400 WRONG_PLATFORM, so it's safe to
 // mount them on the shared router (the legacy /api/privacy alias
