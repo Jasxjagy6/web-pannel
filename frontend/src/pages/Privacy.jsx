@@ -30,6 +30,12 @@ import {
   Power,
   Mail,
   SkipForward,
+  Zap,
+  Settings2,
+  Wifi,
+  WifiOff,
+  KeyRound,
+  Server,
 } from 'lucide-react';
 import { useToast } from '../components/common/Toast';
 import { listSessions } from '../api/sessions';
@@ -39,9 +45,16 @@ import {
   listPrivacyJobs,
   getPrivacyJobItems,
   cancelPrivacyJob,
-  sendEmailCode,
-  verifyEmailCode,
 } from '../api/privacy';
+import {
+  sendLoginEmailCode,
+  verifyLoginEmailCode,
+  testImapConnection,
+  startLoginEmailBulkJob,
+  getLoginEmailBulkStatus,
+  cancelLoginEmailBulkJob,
+  getLoginEmailProviders,
+} from '../api/loginEmail';
 import { parseApiError, formatRelativeTime } from '../utils/formatters';
 import SessionListSwitcher from '../components/common/SessionListSwitcher';
 
@@ -483,9 +496,9 @@ export default function Privacy() {
   const [drawerJob, setDrawerJob] = useState(null);
   const [openSettings, setOpenSettings] = useState(true);
 
-  // Recovery email flow state
-  const [emailAddress, setEmailAddress] = useState('');
-  const [twoFAPassword, setTwoFAPassword] = useState('');
+  // Login email flow state
+  const [loginEmailMode, setLoginEmailMode] = useState('manual'); // 'manual' | 'automated'
+  const [loginEmail, setLoginEmail] = useState('');
   const [emailFlowActive, setEmailFlowActive] = useState(false);
   const [emailQueue, setEmailQueue] = useState([]);
   const [emailCurrentIndex, setEmailCurrentIndex] = useState(0);
@@ -493,6 +506,18 @@ export default function Privacy() {
   const [emailCode, setEmailCode] = useState('');
   const [emailProcessing, setEmailProcessing] = useState(false);
   const [emailError, setEmailError] = useState('');
+  // Automated mode (IMAP) state
+  const [imapProvider, setImapProvider] = useState('gmail');
+  const [imapEmail, setImapEmail] = useState('');
+  const [imapPassword, setImapPassword] = useState('');
+  const [imapHost, setImapHost] = useState('');
+  const [imapPort, setImapPort] = useState(993);
+  const [imapTesting, setImapTesting] = useState(false);
+  const [imapTestResult, setImapTestResult] = useState(null);
+  const [bulkJobId, setBulkJobId] = useState(null);
+  const [bulkJobStatus, setBulkJobStatus] = useState(null);
+  const [bulkJobPolling, setBulkJobPolling] = useState(false);
+  const [providers, setProviders] = useState(null);
 
   const fetchSessions = useCallback(async () => {
     try {
@@ -517,6 +542,10 @@ export default function Privacy() {
     getPrivacyKeys().catch(() => {});
     fetchSessions();
     fetchJobs();
+    // Fetch IMAP providers list
+    getLoginEmailProviders()
+      .then((r) => setProviders(r.data?.data?.providers || null))
+      .catch(() => {});
   }, [fetchSessions, fetchJobs]);
 
   // Auto-refresh job table while there is an in-flight job.
@@ -623,6 +652,8 @@ export default function Privacy() {
     }
   };
 
+  // ── Login email handler functions ──────────────────────────────────
+
   const currentEmailSession = useMemo(() => {
     if (!emailFlowActive || emailQueue.length === 0) return null;
     const item = emailQueue[emailCurrentIndex];
@@ -630,8 +661,8 @@ export default function Privacy() {
     return sessions.find((s) => s.id === item.sessionId) || null;
   }, [emailFlowActive, emailQueue, emailCurrentIndex, sessions]);
 
-  const startEmailFlow = async () => {
-    if (!emailAddress.trim() || !emailAddress.includes('@')) {
+  const startManualEmailFlow = () => {
+    if (!loginEmail.trim() || !loginEmail.includes('@')) {
       showError('Enter a valid email address', 'Invalid email');
       return;
     }
@@ -661,8 +692,8 @@ export default function Privacy() {
       const done = queue.filter((q) => q.status === 'done').length;
       const failed = queue.filter((q) => q.status === 'failed').length;
       showSuccess(
-        `Email added to ${done} session(s)${failed ? `, ${failed} failed` : ''}`,
-        'Recovery email complete'
+        `Login email set on ${done} session(s)${failed ? `, ${failed} failed` : ''}`,
+        'Login email complete'
       );
       setEmailFlowActive(false);
       setEmailQueue([]);
@@ -670,8 +701,6 @@ export default function Privacy() {
       setEmailCodeSent(false);
       setEmailCode('');
       setEmailError('');
-      setEmailAddress('');
-      setTwoFAPassword('');
     } else {
       setEmailCurrentIndex(nextIdx);
       setEmailCodeSent(false);
@@ -688,7 +717,7 @@ export default function Privacy() {
     setEmailCodeSent(false);
     setEmailCode('');
     try {
-      await sendEmailCode(item.sessionId, emailAddress.trim(), twoFAPassword || undefined);
+      await sendLoginEmailCode(item.sessionId, loginEmail.trim());
       setEmailCodeSent(true);
     } catch (err) {
       const msg = parseApiError(err);
@@ -708,7 +737,7 @@ export default function Privacy() {
     setEmailProcessing(true);
     setEmailError('');
     try {
-      await verifyEmailCode(item.sessionId, emailAddress.trim(), emailCode.trim());
+      await verifyLoginEmailCode(item.sessionId, loginEmail.trim(), emailCode.trim());
       const updated = emailQueue.map((q, i) =>
         i === emailCurrentIndex ? { ...q, status: 'done' } : q
       );
@@ -737,7 +766,111 @@ export default function Privacy() {
     setEmailCodeSent(false);
     setEmailCode('');
     setEmailError('');
-    showInfo('Email flow cancelled', '');
+    showInfo('Login email flow cancelled', '');
+  };
+
+  // ── Automated / IMAP helpers ──────────────────────────────────────
+
+  const handleTestImap = async () => {
+    setImapTesting(true);
+    setImapTestResult(null);
+    try {
+      const cfg = {
+        email: imapEmail.trim(),
+        password: imapPassword,
+        provider: imapProvider,
+        ...(imapProvider === 'custom' ? { host: imapHost.trim(), port: Number(imapPort) || 993 } : {}),
+      };
+      const r = await testImapConnection(cfg);
+      setImapTestResult(r.data?.data || { success: false, error: 'No response' });
+    } catch (err) {
+      setImapTestResult({ success: false, error: parseApiError(err) });
+    } finally {
+      setImapTesting(false);
+    }
+  };
+
+  const startAutomatedFlow = async () => {
+    if (!loginEmail.trim() || !loginEmail.includes('@')) {
+      showError('Enter a valid login email address', 'Invalid email');
+      return;
+    }
+    if (!imapEmail.trim() || !imapPassword.trim()) {
+      showError('Enter IMAP email and password for automated reading', 'Missing credentials');
+      return;
+    }
+    const usingList = sessionPickMode === 'list' && selectedSessionListId;
+    if (!usingList && selectedSessionIds.length === 0) {
+      showError('Pick at least one session', 'No targets');
+      return;
+    }
+    setEmailProcessing(true);
+    setEmailError('');
+    try {
+      const payload = {
+        email: loginEmail.trim(),
+        sessionIds: selectedSessionIds,
+        imapConfig: {
+          email: imapEmail.trim(),
+          password: imapPassword,
+          provider: imapProvider,
+          ...(imapProvider === 'custom' ? { host: imapHost.trim(), port: Number(imapPort) || 993 } : {}),
+        },
+      };
+      const r = await startLoginEmailBulkJob(payload);
+      const data = r.data?.data || {};
+      setBulkJobId(data.jobId);
+      showSuccess(
+        `Automated login email job started for ${data.sessionCount} session(s)`,
+        `Job ${data.jobId}`
+      );
+      setBulkJobPolling(true);
+    } catch (err) {
+      showError(parseApiError(err), 'Could not start automated job');
+    } finally {
+      setEmailProcessing(false);
+    }
+  };
+
+  // Poll the automated bulk job while it's running.
+  useEffect(() => {
+    if (!bulkJobPolling || !bulkJobId) return;
+    let cancelled = false;
+    const poll = async () => {
+      try {
+        const r = await getLoginEmailBulkStatus(bulkJobId);
+        const data = r.data?.data;
+        if (!cancelled) {
+          setBulkJobStatus(data);
+          if (data && (data.status === 'completed' || data.status === 'failed' || data.status === 'cancelled')) {
+            setBulkJobPolling(false);
+            if (data.status === 'completed') {
+              showSuccess(
+                `Login email set on ${data.summary?.succeeded || 0} session(s)${data.summary?.failed ? `, ${data.summary.failed} failed` : ''}`,
+                'Bulk job finished'
+              );
+            } else if (data.status === 'failed') {
+              showError(data.error || 'Job failed', 'Bulk job error');
+            }
+          }
+        }
+      } catch {
+        if (!cancelled) setBulkJobPolling(false);
+      }
+    };
+    poll();
+    const id = setInterval(poll, 2500);
+    return () => { cancelled = true; clearInterval(id); };
+  }, [bulkJobPolling, bulkJobId]);
+
+  const cancelBulkJob = async () => {
+    if (!bulkJobId) return;
+    try {
+      await cancelLoginEmailBulkJob(bulkJobId);
+      showInfo('Cancelling bulk job...', '');
+    } catch {
+      showError('Failed to cancel', 'Error');
+    }
   };
 
   const cancel = async (id) => {
@@ -843,12 +976,10 @@ export default function Privacy() {
         </div>
       </div>
 
-      {/* Add Recovery Email card.
-          Interactive, one-at-a-time flow: for each selected session the
-          panel sends a verification code to the email via Telegram's
-          MTProto API, then asks the user to enter the code. Once
-          verified the email is set as recovery on that account and the
-          panel moves to the next session. */}
+      {/* ── Set Login Email ───────────────────────────────────────
+          Two modes:
+          1. Manual — send code → user enters code from their inbox → verify, one session at a time.
+          2. Automated — provide IMAP creds, panel reads the OTP from inbox automatically for all sessions in bulk. */}
       <div className="rounded-2xl border border-white/5 bg-dark-800/40 p-5">
         <div className="flex flex-col gap-4">
           <div className="flex items-start gap-3">
@@ -857,65 +988,319 @@ export default function Privacy() {
             </div>
             <div className="min-w-0">
               <h3 className="text-sm font-semibold text-white">
-                Add recovery email
+                Set login email
               </h3>
               <p className="text-[12px] text-gray-500 mt-0.5 max-w-2xl">
-                Add a recovery email to selected sessions one at a time.
-                Telegram sends a verification code to the email — you enter
-                it here to confirm. If a session has 2FA (cloud password)
-                enabled, enter it below so the panel can authorize the change.
+                Set a <span className="text-gray-300 font-medium">login email</span> on selected sessions.
+                This is the email Telegram uses to send login verification codes (not the 2FA recovery email).
+                Use <span className="text-primary-400">Manual</span> mode to enter each code yourself, or{' '}
+                <span className="text-primary-400">Automated</span> mode to let the panel read OTP codes from
+                your inbox via IMAP for a fully hands-free bulk operation.
               </p>
             </div>
           </div>
 
+          {/* Mode toggle */}
+          <div className="flex gap-1 rounded-lg bg-dark-900/60 p-0.5 w-fit">
+            <button
+              type="button"
+              onClick={() => setLoginEmailMode('manual')}
+              className={`flex items-center gap-1.5 rounded-md px-3 py-1.5 text-xs font-semibold transition-all ${
+                loginEmailMode === 'manual'
+                  ? 'bg-primary-500/20 text-primary-300 shadow-sm'
+                  : 'text-gray-500 hover:text-gray-300'
+              }`}
+            >
+              <KeyRound className="w-3.5 h-3.5" />
+              Manual
+            </button>
+            <button
+              type="button"
+              onClick={() => setLoginEmailMode('automated')}
+              className={`flex items-center gap-1.5 rounded-md px-3 py-1.5 text-xs font-semibold transition-all ${
+                loginEmailMode === 'automated'
+                  ? 'bg-primary-500/20 text-primary-300 shadow-sm'
+                  : 'text-gray-500 hover:text-gray-300'
+              }`}
+            >
+              <Zap className="w-3.5 h-3.5" />
+              Automated (IMAP)
+            </button>
+          </div>
+
+          {/* Login email address — shared between both modes */}
           <div className="flex flex-col sm:flex-row gap-3">
             <div className="flex-1">
               <label className="block text-xs font-medium text-gray-400 mb-1.5">
-                Recovery email
+                Login email to set on sessions
               </label>
               <input
                 type="email"
-                value={emailAddress}
-                onChange={(e) => setEmailAddress(e.target.value)}
-                placeholder="recovery@example.com"
-                disabled={emailFlowActive}
-                className="w-full rounded-lg border border-white/10 bg-dark-900 px-3 py-2 text-sm text-white placeholder:text-gray-500 focus:border-primary-500 focus:outline-none focus:ring-1 focus:ring-primary-500 disabled:opacity-40"
-              />
-            </div>
-            <div className="sm:w-56">
-              <label className="block text-xs font-medium text-gray-400 mb-1.5">
-                2FA password (if needed)
-              </label>
-              <input
-                type="password"
-                value={twoFAPassword}
-                onChange={(e) => setTwoFAPassword(e.target.value)}
-                placeholder="Cloud password"
-                disabled={emailFlowActive}
+                value={loginEmail}
+                onChange={(e) => setLoginEmail(e.target.value)}
+                placeholder="login@example.com"
+                disabled={emailFlowActive || bulkJobPolling}
                 className="w-full rounded-lg border border-white/10 bg-dark-900 px-3 py-2 text-sm text-white placeholder:text-gray-500 focus:border-primary-500 focus:outline-none focus:ring-1 focus:ring-primary-500 disabled:opacity-40"
               />
             </div>
           </div>
 
-          <button
-            type="button"
-            onClick={startEmailFlow}
-            disabled={
-              emailFlowActive ||
-              !emailAddress.trim() ||
-              (sessionPickMode === 'list'
-                ? !selectedSessionListId
-                : selectedSessionIds.length === 0)
-            }
-            className="flex items-center justify-center gap-2 rounded-lg bg-gradient-to-r from-primary-600 to-primary-500 px-4 py-2.5 text-xs font-semibold text-white shadow-md shadow-primary-500/20 hover:shadow-primary-500/40 disabled:opacity-40 disabled:cursor-not-allowed transition w-full sm:w-auto"
-          >
-            <Mail className="w-3.5 h-3.5" />
-            {sessionPickMode === 'list'
-              ? 'Start for session list'
-              : `Start for ${selectedSessionIds.length} session${selectedSessionIds.length === 1 ? '' : 's'}`}
-          </button>
+          {/* ── Automated mode: IMAP config ── */}
+          {loginEmailMode === 'automated' && (
+            <div className="rounded-xl border border-white/5 bg-dark-900/30 p-4 space-y-3">
+              <div className="flex items-center gap-2 text-xs font-semibold text-gray-300">
+                <Server className="w-3.5 h-3.5 text-primary-400" />
+                IMAP Email Reader — auto-reads Telegram OTP from your inbox
+              </div>
+
+              {/* Provider dropdown */}
+              <div className="flex flex-col sm:flex-row gap-3">
+                <div className="sm:w-48">
+                  <label className="block text-xs font-medium text-gray-400 mb-1.5">Provider</label>
+                  <select
+                    value={imapProvider}
+                    onChange={(e) => {
+                      setImapProvider(e.target.value);
+                      setImapTestResult(null);
+                    }}
+                    className="w-full rounded-lg border border-white/10 bg-dark-900 px-3 py-2 text-sm text-white focus:border-primary-500 focus:outline-none"
+                  >
+                    <option value="gmail">Gmail</option>
+                    <option value="outlook">Outlook / Hotmail</option>
+                    <option value="yahoo">Yahoo</option>
+                    <option value="icloud">iCloud</option>
+                    <option value="custom">Custom IMAP</option>
+                  </select>
+                </div>
+                <div className="flex-1">
+                  <label className="block text-xs font-medium text-gray-400 mb-1.5">
+                    Email (IMAP login)
+                  </label>
+                  <input
+                    type="email"
+                    value={imapEmail}
+                    onChange={(e) => setImapEmail(e.target.value)}
+                    placeholder="you@gmail.com"
+                    className="w-full rounded-lg border border-white/10 bg-dark-900 px-3 py-2 text-sm text-white placeholder:text-gray-500 focus:border-primary-500 focus:outline-none focus:ring-1 focus:ring-primary-500"
+                  />
+                </div>
+                <div className="sm:w-56">
+                  <label className="block text-xs font-medium text-gray-400 mb-1.5">
+                    Password / App password
+                  </label>
+                  <input
+                    type="password"
+                    value={imapPassword}
+                    onChange={(e) => setImapPassword(e.target.value)}
+                    placeholder="App password"
+                    className="w-full rounded-lg border border-white/10 bg-dark-900 px-3 py-2 text-sm text-white placeholder:text-gray-500 focus:border-primary-500 focus:outline-none focus:ring-1 focus:ring-primary-500"
+                  />
+                </div>
+              </div>
+
+              {/* Custom host fields */}
+              {imapProvider === 'custom' && (
+                <div className="flex flex-col sm:flex-row gap-3">
+                  <div className="flex-1">
+                    <label className="block text-xs font-medium text-gray-400 mb-1.5">IMAP Host</label>
+                    <input
+                      type="text"
+                      value={imapHost}
+                      onChange={(e) => setImapHost(e.target.value)}
+                      placeholder="imap.example.com"
+                      className="w-full rounded-lg border border-white/10 bg-dark-900 px-3 py-2 text-sm text-white placeholder:text-gray-500 focus:border-primary-500 focus:outline-none"
+                    />
+                  </div>
+                  <div className="w-28">
+                    <label className="block text-xs font-medium text-gray-400 mb-1.5">Port</label>
+                    <input
+                      type="number"
+                      value={imapPort}
+                      onChange={(e) => setImapPort(e.target.value)}
+                      placeholder="993"
+                      className="w-full rounded-lg border border-white/10 bg-dark-900 px-3 py-2 text-sm text-white placeholder:text-gray-500 focus:border-primary-500 focus:outline-none"
+                    />
+                  </div>
+                </div>
+              )}
+
+              {/* Provider hint */}
+              {providers && providers[imapProvider] && providers[imapProvider].note && (
+                <p className="text-[11px] text-amber-400/80 flex items-center gap-1.5">
+                  <AlertTriangle className="w-3 h-3 shrink-0" />
+                  {providers[imapProvider].note}
+                </p>
+              )}
+
+              {/* Test connection button */}
+              <div className="flex items-center gap-3">
+                <button
+                  type="button"
+                  onClick={handleTestImap}
+                  disabled={imapTesting || !imapEmail.trim() || !imapPassword.trim()}
+                  className="flex items-center gap-2 rounded-lg border border-white/10 px-3 py-2 text-xs font-semibold text-gray-300 hover:bg-white/5 disabled:opacity-40 disabled:cursor-not-allowed transition"
+                >
+                  {imapTesting ? (
+                    <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                  ) : (
+                    <Wifi className="w-3.5 h-3.5" />
+                  )}
+                  Test connection
+                </button>
+                {imapTestResult && (
+                  <span className={`text-xs flex items-center gap-1.5 ${imapTestResult.success ? 'text-emerald-400' : 'text-rose-400'}`}>
+                    {imapTestResult.success ? (
+                      <><CheckCircle2 className="w-3.5 h-3.5" /> Connected ({imapTestResult.mailboxCount} mailboxes)</>
+                    ) : (
+                      <><WifiOff className="w-3.5 h-3.5" /> {imapTestResult.error}</>
+                    )}
+                  </span>
+                )}
+              </div>
+            </div>
+          )}
+
+          {/* Action button */}
+          {loginEmailMode === 'manual' ? (
+            <button
+              type="button"
+              onClick={startManualEmailFlow}
+              disabled={
+                emailFlowActive ||
+                !loginEmail.trim() ||
+                (sessionPickMode === 'list'
+                  ? !selectedSessionListId
+                  : selectedSessionIds.length === 0)
+              }
+              className="flex items-center justify-center gap-2 rounded-lg bg-gradient-to-r from-primary-600 to-primary-500 px-4 py-2.5 text-xs font-semibold text-white shadow-md shadow-primary-500/20 hover:shadow-primary-500/40 disabled:opacity-40 disabled:cursor-not-allowed transition w-full sm:w-auto"
+            >
+              <Mail className="w-3.5 h-3.5" />
+              {sessionPickMode === 'list'
+                ? 'Start manual flow (session list)'
+                : `Start manual flow (${selectedSessionIds.length} session${selectedSessionIds.length === 1 ? '' : 's'})`}
+            </button>
+          ) : (
+            <button
+              type="button"
+              onClick={startAutomatedFlow}
+              disabled={
+                emailProcessing ||
+                bulkJobPolling ||
+                !loginEmail.trim() ||
+                !imapEmail.trim() ||
+                !imapPassword.trim() ||
+                (sessionPickMode === 'list'
+                  ? !selectedSessionListId
+                  : selectedSessionIds.length === 0)
+              }
+              className="flex items-center justify-center gap-2 rounded-lg bg-gradient-to-r from-emerald-600 to-emerald-500 px-4 py-2.5 text-xs font-semibold text-white shadow-md shadow-emerald-500/20 hover:shadow-emerald-500/40 disabled:opacity-40 disabled:cursor-not-allowed transition w-full sm:w-auto"
+            >
+              {emailProcessing ? (
+                <Loader2 className="w-3.5 h-3.5 animate-spin" />
+              ) : (
+                <Zap className="w-3.5 h-3.5" />
+              )}
+              {sessionPickMode === 'list'
+                ? 'Start automated bulk (session list)'
+                : `Start automated bulk (${selectedSessionIds.length} session${selectedSessionIds.length === 1 ? '' : 's'})`}
+            </button>
+          )}
         </div>
       </div>
+
+      {/* ── Automated bulk job progress card ── */}
+      {bulkJobStatus && (
+        <div className="rounded-2xl border border-white/5 bg-dark-800/40 p-5">
+          <div className="flex items-center justify-between mb-4">
+            <div className="flex items-center gap-2">
+              <Zap className="w-4 h-4 text-emerald-400" />
+              <h3 className="text-sm font-semibold text-white">
+                Automated Job Progress
+              </h3>
+              <span className={`text-[11px] font-semibold px-2 py-0.5 rounded-full ${
+                bulkJobStatus.status === 'running' ? 'bg-blue-500/20 text-blue-300' :
+                bulkJobStatus.status === 'completed' ? 'bg-emerald-500/20 text-emerald-300' :
+                bulkJobStatus.status === 'failed' ? 'bg-rose-500/20 text-rose-300' :
+                'bg-amber-500/20 text-amber-300'
+              }`}>
+                {bulkJobStatus.status}
+              </span>
+            </div>
+            {bulkJobStatus.status === 'running' && (
+              <button
+                onClick={cancelBulkJob}
+                className="rounded-md border border-rose-500/30 px-2.5 py-1 text-[11px] text-rose-300 hover:bg-rose-500/10 transition"
+              >
+                Cancel
+              </button>
+            )}
+          </div>
+
+          {/* Summary bar */}
+          {bulkJobStatus.summary && (
+            <div className="flex gap-4 mb-3 text-xs">
+              <span className="text-emerald-400">{bulkJobStatus.summary.succeeded} done</span>
+              <span className="text-rose-400">{bulkJobStatus.summary.failed} failed</span>
+              <span className="text-amber-400">{bulkJobStatus.summary.skipped} skipped</span>
+              <span className="text-gray-400">{bulkJobStatus.summary.pending} pending</span>
+              <span className="text-gray-500">/ {bulkJobStatus.summary.total} total</span>
+            </div>
+          )}
+
+          {/* Progress bar */}
+          {bulkJobStatus.summary && (
+            <div className="h-2 rounded-full bg-dark-900 overflow-hidden mb-3">
+              <div
+                className="h-full bg-gradient-to-r from-emerald-500 to-primary-500 transition-all duration-500"
+                style={{
+                  width: `${Math.round(
+                    ((bulkJobStatus.summary.succeeded + bulkJobStatus.summary.failed + bulkJobStatus.summary.skipped) /
+                      Math.max(bulkJobStatus.summary.total, 1)) * 100
+                  )}%`,
+                }}
+              />
+            </div>
+          )}
+
+          {/* Session list */}
+          <div className="max-h-64 overflow-y-auto space-y-1">
+            {(bulkJobStatus.sessions || []).map((s) => (
+              <div
+                key={s.sessionId}
+                className={`flex items-center justify-between gap-2 rounded-md px-3 py-1.5 text-xs ${
+                  s.status === 'sending_code' || s.status === 'reading_email' || s.status === 'verifying'
+                    ? 'bg-blue-500/10 border border-blue-500/20'
+                    : 'bg-dark-900/40'
+                }`}
+              >
+                <div className="flex items-center gap-2 min-w-0">
+                  {s.status === 'queued' && <Clock className="w-3 h-3 text-gray-500 shrink-0" />}
+                  {s.status === 'done' && <CheckCircle2 className="w-3 h-3 text-emerald-400 shrink-0" />}
+                  {s.status === 'failed' && <XCircle className="w-3 h-3 text-rose-400 shrink-0" />}
+                  {s.status === 'skipped' && <SkipForward className="w-3 h-3 text-amber-400 shrink-0" />}
+                  {(s.status === 'sending_code' || s.status === 'reading_email' || s.status === 'verifying') && (
+                    <Loader2 className="w-3 h-3 text-blue-400 animate-spin shrink-0" />
+                  )}
+                  <span className="text-white truncate">
+                    {s.phone || `Session ${s.sessionId}`}
+                    {s.username && <span className="text-gray-500 ml-1">@{s.username}</span>}
+                  </span>
+                </div>
+                <div className="flex items-center gap-2 shrink-0">
+                  {s.step && (
+                    <span className="text-blue-300 text-[11px] truncate max-w-[200px]">{s.step}</span>
+                  )}
+                  {s.error && (
+                    <span className="text-rose-400 text-[11px] truncate max-w-[180px]" title={s.error}>
+                      {s.error}
+                    </span>
+                  )}
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
 
       {/* Settings + Sessions */}
       <div className="grid grid-cols-1 xl:grid-cols-[2fr_1fr] gap-6">
@@ -1077,7 +1462,7 @@ export default function Privacy() {
         </div>
       </div>
 
-      {/* Recovery email interactive modal */}
+      {/* Login email manual flow modal */}
       {emailFlowActive && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-sm p-4">
           <div
@@ -1088,10 +1473,10 @@ export default function Privacy() {
               <div>
                 <h3 className="text-sm font-semibold text-white flex items-center gap-2">
                   <Mail className="w-4 h-4 text-primary-500" />
-                  Add recovery email
+                  Set login email
                 </h3>
                 <p className="text-[12px] text-gray-500">
-                  {emailAddress} — Session {emailCurrentIndex + 1} of {emailQueue.length}
+                  {loginEmail} — Session {emailCurrentIndex + 1} of {emailQueue.length}
                 </p>
               </div>
               <button
