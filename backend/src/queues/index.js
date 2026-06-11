@@ -1,6 +1,7 @@
 const scrapeQueue = require('./scrapeQueue');
 const messageQueue = require('./messageQueue');
 const groupQueue = require('./groupQueue');
+const loginEmailQueue = require('./loginEmailQueue');
 const instagramScrapeQueue = require('./instagramScrapeQueue');
 const instagramMessageQueue = require('./instagramMessageQueue');
 const instagramLookupQueue = require('./instagramLookupQueue');
@@ -12,6 +13,7 @@ async function initializeQueues() {
     await scrapeQueue.initialize();
     await messageQueue.initialize();
     await groupQueue.initialize();
+    await loginEmailQueue.initialize();
     // IG queues — register executors lazily so a Redis-less dev environment
     // doesn't crash the panel on boot. The executors are wired via
     // queueManager.js below (require'd by the IG provider on first use).
@@ -51,6 +53,7 @@ async function closeQueues() {
   await scrapeQueue.close();
   await messageQueue.close();
   await groupQueue.close();
+  if (loginEmailQueue.initialized) await loginEmailQueue.close();
   if (instagramScrapeQueue.initialized) await instagramScrapeQueue.close();
   if (instagramMessageQueue.initialized) await instagramMessageQueue.close();
   if (instagramLookupQueue.initialized) await instagramLookupQueue.close();
@@ -63,6 +66,7 @@ module.exports = {
   scrapeQueueManager: scrapeQueue,
   messageQueue,
   groupQueue,
+  loginEmailQueue,
   instagramScrapeQueue,
   instagramMessageQueue,
   instagramLookupQueue,

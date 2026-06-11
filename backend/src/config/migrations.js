@@ -72,6 +72,7 @@ const MIGRATION_ORDER = [
   'migration_v35_instagram_lookup_extras.sql',
   'migration_v36_session_panel_auth_hash.sql',
   'migration_v37_reddit_cookie_scraper.sql',
+  'migration_v38_session_login_email.sql',
 ];
 
 function listMigrationFiles() {
