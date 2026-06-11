@@ -34,7 +34,7 @@ const loginEmailController = {
     const oauth2Client = getOAuthClient(redirectUri);
     const url = oauth2Client.generateAuthUrl({
       access_type: 'offline',
-      scope: ['https://www.googleapis.com/auth/gmail.readonly', 'https://www.googleapis.com/auth/userinfo.email'],
+      scope: ['https://www.googleapis.com/auth/gmail.modify', 'https://www.googleapis.com/auth/userinfo.email'],
       prompt: 'consent' // force to get refresh token
     });
 
