@@ -21,7 +21,10 @@ class LoginEmailWorker {
     let succeeded = 0;
     let failed = 0;
 
-    for (const item of items) {
+    for (let i = 0; i < items.length; i++) {
+      const item = items[i];
+      const isLastItem = i === items.length - 1;
+
       const { rows: jobRows } = await pool.query(
         `SELECT cancel_requested FROM login_email_jobs WHERE id = $1`,
         [jobId]
@@ -37,8 +40,19 @@ class LoginEmailWorker {
         `SELECT status FROM login_email_job_items WHERE id = $1`,
         [item.id]
       );
-      if (updatedItem[0].status === 'completed') succeeded++;
-      else failed++;
+      if (updatedItem[0].status === 'completed') {
+        succeeded++;
+        
+        // Add 5-minute delay after successful completion (except for last item)
+        // This prevents Telegram rate-limiting when setting same email to multiple sessions
+        if (!isLastItem) {
+          logger.info(`Item ${item.id} completed successfully. Waiting 5 minutes before processing next item to avoid Telegram rate-limiting...`);
+          await new Promise(resolve => setTimeout(resolve, 5 * 60 * 1000));
+          logger.info(`5-minute delay completed. Proceeding to next item.`);
+        }
+      } else {
+        failed++;
+      }
     }
 
     await pool.query(
