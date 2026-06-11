@@ -2,8 +2,7 @@ const { pool } = require('../config/database');
 const { Api } = require('telegram');
 const tgService = require('../services/telegramService');
 const logger = require('../utils/logger');
-const { ImapFlow } = require('imapflow');
-const { simpleParser } = require('mailparser');
+const { google } = require('googleapis');
 
 class LoginEmailWorker {
   async processJob(jobId) {
@@ -60,6 +59,28 @@ class LoginEmailWorker {
     try {
       await pool.query(`UPDATE login_email_job_items SET status = 'requesting_code', started_at = NOW() WHERE id = $1`, [item.id]);
 
+      // Get Gmail Account tokens
+      const { rows: gmailRows } = await pool.query(
+        `SELECT access_token, refresh_token FROM gmail_accounts WHERE id = $1`,
+        [item.gmail_account_id]
+      );
+
+      if (gmailRows.length === 0) {
+        throw new Error('Gmail account not found in database');
+      }
+
+      const { access_token, refresh_token } = gmailRows[0];
+      const oauth2Client = new google.auth.OAuth2(
+        process.env.GOOGLE_CLIENT_ID || 'dummy',
+        process.env.GOOGLE_CLIENT_SECRET || 'dummy'
+      );
+      oauth2Client.setCredentials({
+        access_token,
+        refresh_token
+      });
+
+      const gmail = google.gmail({ version: 'v1', auth: oauth2Client });
+
       await tgService._ensureConnected(item.session_id);
       const entry = tgService.clients.get(String(item.session_id));
       if (!entry || !entry.client) {
@@ -78,7 +99,7 @@ class LoginEmailWorker {
       await pool.query(`UPDATE login_email_job_items SET status = 'waiting_for_email' WHERE id = $1`, [item.id]);
 
       // Wait for email
-      const code = await this.waitForEmail(item.email, item.imap_password, item.imap_host, item.imap_port);
+      const code = await this.waitForEmail(gmail);
 
       if (!code) {
         throw new Error('Timeout waiting for email or code not found in email');
@@ -108,57 +129,57 @@ class LoginEmailWorker {
     }
   }
 
-  async waitForEmail(email, password, host, port) {
-    const imapClient = new ImapFlow({
-      host,
-      port,
-      secure: port === 993,
-      auth: { user: email, pass: password },
-      logger: false,
-    });
-
-    await imapClient.connect();
-
+  async waitForEmail(gmail) {
     let foundCode = null;
     const startTime = Date.now();
     const timeoutMs = 60 * 1000 * 2; // 2 minutes timeout
 
-    try {
-      while (Date.now() - startTime < timeoutMs) {
-        const lock = await imapClient.getMailboxLock('INBOX');
-        try {
-          // Fetch last 5 messages, unseen
-          const search = await imapClient.search({ seen: false });
-          if (search && search.length > 0) {
-            for (const seq of search) {
-              const msg = await imapClient.fetchOne(seq, { source: true });
-              if (msg && msg.source) {
-                const parsed = await simpleParser(msg.source);
-                if (parsed.from && parsed.from.text.toLowerCase().includes('telegram')) {
-                  // Extract code: usually a 5-6 digit code, or a sentence like "Here is your code: 123456"
-                  const text = parsed.text || parsed.html || '';
-                  const match = text.match(/\b(\d{5,6})\b/);
-                  if (match) {
-                    foundCode = match[1];
-                    // Mark as seen
-                    await imapClient.messageFlagsAdd(seq, ['\\Seen']);
-                    break;
-                  }
-                }
+    while (Date.now() - startTime < timeoutMs) {
+      try {
+        // Query unread messages from Telegram
+        const res = await gmail.users.messages.list({
+          userId: 'me',
+          q: 'from:Telegram is:unread',
+          maxResults: 5
+        });
+
+        const messages = res.data.messages || [];
+
+        for (const message of messages) {
+          const msgDetails = await gmail.users.messages.get({
+            userId: 'me',
+            id: message.id,
+            format: 'full'
+          });
+
+          const snippet = msgDetails.data.snippet || '';
+          
+          // Telegram code is usually 5-6 digits
+          const match = snippet.match(/\b(\d{5,6})\b/);
+          if (match) {
+            foundCode = match[1];
+
+            // Mark as read
+            await gmail.users.messages.modify({
+              userId: 'me',
+              id: message.id,
+              requestBody: {
+                removeLabelIds: ['UNREAD']
               }
-            }
+            });
+
+            break;
           }
-        } finally {
-          lock.release();
         }
 
         if (foundCode) break;
-        
-        // Wait 5 seconds before next poll
-        await new Promise(r => setTimeout(r, 5000));
+
+      } catch (err) {
+        logger.error(`Error polling Gmail: ${err.message}`);
       }
-    } finally {
-      await imapClient.logout();
+
+      // Wait 5 seconds before next poll
+      await new Promise(r => setTimeout(r, 5000));
     }
 
     return foundCode;
