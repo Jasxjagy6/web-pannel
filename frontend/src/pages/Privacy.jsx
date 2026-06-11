@@ -464,7 +464,42 @@ function JobItemDrawer({ job, onClose }) {
 // ---------------------------------------------------------------------
 // Main page
 // ---------------------------------------------------------------------
+import LoginEmailTab from './LoginEmailTab';
+
 export default function Privacy() {
+  const [activeTab, setActiveTab] = useState('privacy');
+
+  return (
+    <div className="space-y-6 animate-fade-in">
+      <div className="flex border-b border-white/10 mb-6">
+        <button
+          className={`px-4 py-3 text-sm font-medium border-b-2 transition-colors ${
+            activeTab === 'privacy'
+              ? 'border-primary-500 text-primary-400'
+              : 'border-transparent text-gray-400 hover:text-gray-300'
+          }`}
+          onClick={() => setActiveTab('privacy')}
+        >
+          Privacy Settings
+        </button>
+        <button
+          className={`px-4 py-3 text-sm font-medium border-b-2 transition-colors ${
+            activeTab === 'email'
+              ? 'border-primary-500 text-primary-400'
+              : 'border-transparent text-gray-400 hover:text-gray-300'
+          }`}
+          onClick={() => setActiveTab('email')}
+        >
+          Add Login Email
+        </button>
+      </div>
+
+      {activeTab === 'privacy' ? <PrivacySettingsTab /> : <LoginEmailTab />}
+    </div>
+  );
+}
+
+function PrivacySettingsTab() {
   const { showSuccess, showError, showInfo } = useToast();
   const [sessions, setSessions] = useState([]);
   const [selectedSessionIds, setSelectedSessionIds] = useState([]);

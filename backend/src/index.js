@@ -30,6 +30,7 @@ const proxyRoutes = require('./routes/proxies');
 const userProxyRoutes = require('./routes/userProxies');
 const antiDetectRoutes = require('./routes/antiDetect');
 const privacyRoutes = require('./routes/privacy');
+const loginEmailRoutes = require('./routes/loginEmail');
 const adminRoutes = require('./routes/admin');
 const billingRoutes = require('./routes/billing');
 const userCredentialsRoutes = require('./routes/userCredentials');
@@ -164,7 +165,8 @@ const PLATFORM_ROUTERS = [
   ['/me/proxies',       userProxyRoutes],
   ['/me/proxy-providers', require('./routes/proxyProviders')],
   ['/anti-detect',      antiDetectRoutes],
-  ['/privacy',          privacyRoutes],
+  ['/privacy', privacyRoutes],
+  ['/login-email', loginEmailRoutes],
   ['/session-lists',    sessionListRoutes],
 ];
 
