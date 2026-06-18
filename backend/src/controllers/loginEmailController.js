@@ -34,7 +34,7 @@ const loginEmailController = {
     const oauth2Client = getOAuthClient(redirectUri);
     const url = oauth2Client.generateAuthUrl({
       access_type: 'offline',
-      scope: ['https://www.googleapis.com/auth/gmail.readonly', 'https://www.googleapis.com/auth/userinfo.email'],
+      scope: ['https://www.googleapis.com/auth/gmail.modify', 'https://www.googleapis.com/auth/userinfo.email'],
       prompt: 'consent' // force to get refresh token
     });
 
@@ -62,7 +62,25 @@ const loginEmailController = {
       throw new AppError('Could not retrieve email from Google', 400, 'NO_EMAIL');
     }
 
-    // Save to DB
+    const MAX_GMAIL_ACCOUNTS = 10;
+    const { rows: existingRows } = await pool.query(
+      `SELECT id FROM gmail_accounts WHERE user_id = $1 AND email = $2`,
+      [userId, email]
+    );
+    if (existingRows.length === 0) {
+      const { rows: countRows } = await pool.query(
+        `SELECT COUNT(*)::int AS cnt FROM gmail_accounts WHERE user_id = $1`,
+        [userId]
+      );
+      if (countRows[0].cnt >= MAX_GMAIL_ACCOUNTS) {
+        throw new AppError(
+          `Maximum of ${MAX_GMAIL_ACCOUNTS} Gmail accounts reached. Remove one before adding another.`,
+          400,
+          'GMAIL_LIMIT_REACHED'
+        );
+      }
+    }
+
     await pool.query(
       `INSERT INTO gmail_accounts (user_id, email, access_token, refresh_token, expiry_date)
        VALUES ($1, $2, $3, $4, $5)

@@ -25,17 +25,13 @@
 	# http://caddy:2019. Never exposed publicly.
 	admin 0.0.0.0:2019
 
-	# Caddy auto-TLS is configured by the orchestrator at runtime via the
-	# admin API JSON config (see proxy/caddyClient.js). The seed file only
-	# binds :80 so that bringing the stack up never requires a public DNS
-	# name or ACME email. To use HTTPS, set PUBLIC_DOMAIN + ACME_EMAIL in
-	# .env, then run `./bin/upgrade deploy ...` once — the orchestrator
-	# will POST the TLS config and Caddy will start :443.
-	auto_https off
+# Caddy auto-TLS is configured by the orchestrator at runtime via the
+# admin API JSON config (see proxy/caddyClient.js). When PUBLIC_DOMAIN
+# is set, Caddy will auto-provision Let's Encrypt certificates.
 }
 
-# Public site (HTTP-only seed; orchestrator adds TLS when configured).
-:80 {
+# Public site — uses domain name for auto-TLS when PUBLIC_DOMAIN is set.
+{$PUBLIC_DOMAIN}, :80 {
 	# /api/* and /socket.io/* go to the active backend color.
 	# DEFAULT seed: backend-blue. The orchestrator rewrites this on every
 	# deploy.
