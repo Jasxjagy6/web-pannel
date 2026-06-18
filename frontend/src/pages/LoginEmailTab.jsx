@@ -142,6 +142,8 @@ function JobItemDrawer({ job, onClose, token }) {
   );
 }
 
+const MAX_GMAIL = 10;
+
 export default function LoginEmailTab() {
   const { showSuccess, showError, showInfo } = useToast();
   const [sessions, setSessions] = useState([]);
@@ -336,15 +338,17 @@ export default function LoginEmailTab() {
                 Connected Gmail Accounts
               </h3>
               <p className="text-[12px] text-gray-500 mt-1">
-                Connect Google accounts to automatically read OTPs.
+                Connect Google accounts to read OTPs. If one email is rejected, the next is tried automatically.
               </p>
             </div>
             <button
               onClick={connectGmail}
-              className="flex items-center gap-1.5 rounded-lg bg-primary-600/10 border border-primary-500/30 px-3 py-1.5 text-xs font-medium text-primary-400 hover:bg-primary-500/20 transition"
+              disabled={gmailAccounts.length >= MAX_GMAIL}
+              title={gmailAccounts.length >= MAX_GMAIL ? `Maximum ${MAX_GMAIL} accounts reached` : 'Connect another Gmail account'}
+              className="flex items-center gap-1.5 rounded-lg bg-primary-600/10 border border-primary-500/30 px-3 py-1.5 text-xs font-medium text-primary-400 hover:bg-primary-500/20 disabled:opacity-40 disabled:cursor-not-allowed transition"
             >
               <Plus className="w-3.5 h-3.5" />
-              Add Gmail
+              Add Gmail ({gmailAccounts.length}/{MAX_GMAIL})
             </button>
           </div>
 
