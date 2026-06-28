@@ -36,6 +36,7 @@ const billingRoutes = require('./routes/billing');
 const userCredentialsRoutes = require('./routes/userCredentials');
 const otpRelayRoutes = require('./routes/otpRelays');
 const telegramClientRoutes = require('./routes/telegramClient');
+const aiChatRoutes = require('./routes/aiChat');
 const sessionListRoutes = require('./routes/sessionLists');
 const billingController = require('./controllers/billingController');
 const { parsePlatform, resolvePlatform } = require('./middleware/platform');
@@ -199,6 +200,13 @@ app.use(
   `${apiPrefix}/telegram/client`,
   parsePlatform('telegram'),
   telegramClientRoutes
+);
+
+// AI auto-responder management surface (Telegram-only).
+app.use(
+  `${apiPrefix}/telegram/ai-chat`,
+  parsePlatform('telegram'),
+  aiChatRoutes
 );
 
 // Instagram-only per-account 2FA (TOTP enable/disable/status). Telegram
@@ -634,6 +642,28 @@ async function start() {
       lookupRetentionWorker.start();
     } catch (err) {
       logger.warn(`lookupRetentionWorker.start failed: ${err.message}`);
+    }
+
+    // 7d. Boot the AI chat reply worker (Telegram auto-responder).
+    try {
+      const aiChatWorker = require('./workers/aiChatWorker');
+      aiChatWorker.start();
+    } catch (err) {
+      logger.warn(`aiChatWorker.start failed: ${err.message}`);
+    }
+
+    // 7e. AI response log retention sweeper (daily).
+    try {
+      const aiChatService = require('./services/aiChatService');
+      const retentionHours = parseInt(process.env.AI_LOG_RETENTION_HOURS || '24', 10);
+      const runRetention = () => {
+        aiChatService.pruneOldLogs(Math.max(1, Math.floor(retentionHours / 24)))
+          .catch((e) => logger.warn(`AI retention sweep error: ${e.message}`));
+      };
+      runRetention();
+      setInterval(runRetention, 24 * 60 * 60 * 1000);
+    } catch (err) {
+      logger.warn(`AI retention scheduler failed: ${err.message}`);
     }
 
     // 8. Subscription / trial expiry sweep. Runs every minute so a paid

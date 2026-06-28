@@ -1,0 +1,1053 @@
+# AI Auto-Responder Integration Plan — Telegram Panel + CupidBot API
+
+**Scope:** Add an AI auto-responder to the existing Telegram panel so that every active, logged-in Telegram session can have its private chats monitored and replied to automatically by CupidBot AI, with per-session and per-chat enable/disable controls and persistent per-conversation memory. Instagram is explicitly out of scope.
+
+**Target file:** This plan is written to be executed task-by-task. All paths are relative to the repo root (`/home/jashan/web-pannel`).
+
+---
+
+## 1. Executive Summary
+
+The panel already maintains a live GramJS `TelegramClient` per logged-in Telegram session in `backend/src/services/telegramService.js`. The AI feature will:
+
+1. Attach a persistent `NewMessage` event handler to every connected Telegram session (not only when a browser window is open, as `telegramClientStream.js` does today).
+2. Filter incoming messages by per-session and per-chat AI toggles.
+3. Maintain a rolling message memory per `(session_id, peer_type, peer_id)`.
+4. Call the CupidBot downstream chat-generation API (`POST https://chat-api.cupidbotofm.ai/api/generateChatResponse`) with the conversation context.
+5. Send the returned text back through the same GramJS client, via `telegramService.sendMessage`.
+6. Expose a management UI under the Telegram panel with session-level master toggles and chat-level overrides.
+
+No Telegram Bot API or Telegram Premium bulk-reply feature is used. Replies go through the logged-in user account's normal MTProto send-message flow.
+
+---
+
+## 2. Requirements Recap
+
+### Must Have
+- AI can access **all chats** of **all active logged-in Telegram sessions**.
+- AI receives **live incoming messages** for those sessions.
+- AI replies automatically after reading each incoming message.
+- AI has **persistent per-chat memory** so conversations stay coherent.
+- Per-session ON/OFF toggle.
+- Per-chat ON/OFF override inside an enabled session.
+- Only Telegram accounts/sessions; Instagram excluded.
+- Uses the user's own CupidBot API access token and credits.
+
+### Should Have
+- Configurable delay/jitter before AI replies to look human.
+- Blacklist/whitelist of peer types (user/chat/channel) or specific chats.
+- Maximum memory window per chat (e.g., last 50 messages) to control token cost.
+- Activity logging and per-session statistics.
+- Queue-based processing so CupidBot rate limits don't block the GramJS update loop.
+- A dashboard page to view AI status, toggle sessions/chats, and inspect recent AI replies.
+
+### Will Not Do (out of scope)
+- Instagram AI auto-responder.
+- Telegram Bot API or Telegram Premium bulk-reply features.
+- Media generation or sending CupidBot media URLs (text replies only in v1; media can be added later).
+- Two-way sync of messages sent by the human operator from outside the panel.
+
+---
+
+## 3. High-Level Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                              Front-end (React)                              │
+│  /telegram/ai-chat  ──►  AiChatPage  ──►  api/aiChat.js                     │
+│  TelegramClient.jsx  ──►  per-dialog AI toggle button                       │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                       │
+                                       ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                           Back-end (Express + GramJS)                       │
+│                                                                             │
+│   routes/aiChat.js  ──►  controllers/aiChatController.js                    │
+│                              │                                              │
+│                              ▼                                              │
+│   services/aiChatService.js       (orchestrator)                            │
+│      ├── services/aiSessionManager.js   (attach/detach listeners)           │
+│      ├── services/aiMemoryService.js    (memory CRUD)                       │
+│      ├── services/cupidbotService.js    (HTTP client)                       │
+│      └── queues/aiChatQueue.js          (BullMQ queue)                      │
+│              └── workers/aiChatWorker.js                                  │
+│                                                                             │
+│   telegramService.js  ──►  addNewMessageHandler()  ──►  Telegram MTProto   │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                       │
+                                       ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                              PostgreSQL / Redis                             │
+│  ai_session_settings  │  ai_chat_settings  │  ai_chat_memories              │
+│  ai_response_logs     │  sessions          │  activity_logs                 │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 4. Data Model
+
+Add a new migration file: `backend/src/config/migrations/migration_v30_ai_chat.sql` (pick the next available number; v30 is illustrative). The migration creates four tables.
+
+### 4.1 `ai_session_settings` — master toggle and per-session config
+
+```sql
+CREATE TABLE IF NOT EXISTS ai_session_settings (
+  id SERIAL PRIMARY KEY,
+  session_id INTEGER NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+  enabled BOOLEAN NOT NULL DEFAULT FALSE,
+  config JSONB NOT NULL DEFAULT '{}',
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  UNIQUE(session_id)
+);
+CREATE INDEX IF NOT EXISTS idx_ai_session_settings_session_id ON ai_session_settings(session_id);
+CREATE INDEX IF NOT EXISTS idx_ai_session_settings_enabled ON ai_session_settings(enabled);
+```
+
+`config` JSONB shape (extendable):
+```json
+{
+  "replyDelayMs": 3000,
+  "replyDelayJitterMs": 2000,
+  "memoryMessageLimit": 50,
+  "allowedPeerTypes": ["user"],
+  "allowGroups": false,
+  "allowChannels": false,
+  "cupidbot": {
+    "app": "telegram",
+    "isAPI": true,
+    "isOF": true,
+    "chatStyle": "youth",
+    "responseLanguage": "en"
+  }
+}
+```
+
+### 4.2 `ai_chat_settings` — per-chat override
+
+```sql
+CREATE TABLE IF NOT EXISTS ai_chat_settings (
+  id SERIAL PRIMARY KEY,
+  session_id INTEGER NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+  peer_type VARCHAR(20) NOT NULL CHECK (peer_type IN ('user','chat','channel')),
+  peer_id BIGINT NOT NULL,
+  enabled BOOLEAN NOT NULL DEFAULT TRUE,
+  config JSONB NOT NULL DEFAULT '{}',
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  UNIQUE(session_id, peer_type, peer_id)
+);
+CREATE INDEX IF NOT EXISTS idx_ai_chat_settings_session_id ON ai_chat_settings(session_id);
+CREATE INDEX IF NOT EXISTS idx_ai_chat_settings_peer ON ai_chat_settings(session_id, peer_type, peer_id);
+```
+
+### 4.3 `ai_chat_memories` — rolling conversation context
+
+```sql
+CREATE TABLE IF NOT EXISTS ai_chat_memories (
+  id SERIAL PRIMARY KEY,
+  session_id INTEGER NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+  peer_type VARCHAR(20) NOT NULL CHECK (peer_type IN ('user','chat','channel')),
+  peer_id BIGINT NOT NULL,
+  messages JSONB NOT NULL DEFAULT '[]',
+  message_count INTEGER NOT NULL DEFAULT 0,
+  last_incoming_at TIMESTAMPTZ,
+  last_outgoing_at TIMESTAMPTZ,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  UNIQUE(session_id, peer_type, peer_id)
+);
+CREATE INDEX IF NOT EXISTS idx_ai_chat_memories_session_id ON ai_chat_memories(session_id);
+CREATE INDEX IF NOT EXISTS idx_ai_chat_memories_peer ON ai_chat_memories(session_id, peer_type, peer_id);
+CREATE INDEX IF NOT EXISTS idx_ai_chat_memories_last_incoming ON ai_chat_memories(last_incoming_at);
+```
+
+Memory message item shape:
+```json
+{
+  "id": "msg-12345",
+  "telegramMessageId": 12345,
+  "timestamp": 1719993600,
+  "msg": "hello",
+  "isIncoming": true,
+  "medias": []
+}
+```
+
+### 4.4 `ai_response_logs` — audit + debugging
+
+```sql
+CREATE TABLE IF NOT EXISTS ai_response_logs (
+  id SERIAL PRIMARY KEY,
+  session_id INTEGER NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+  peer_type VARCHAR(20) NOT NULL,
+  peer_id BIGINT NOT NULL,
+  incoming_msg_id BIGINT,
+  request_payload JSONB,
+  response_payload JSONB,
+  status VARCHAR(20) NOT NULL,
+  error_message TEXT,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_ai_response_logs_session_id ON ai_response_logs(session_id);
+CREATE INDEX IF NOT EXISTS idx_ai_response_logs_created_at ON ai_response_logs(created_at);
+CREATE INDEX IF NOT EXISTS idx_ai_response_logs_status ON ai_response_logs(status);
+```
+
+### 4.5 Schema base update
+Also append the same `CREATE TABLE IF NOT EXISTS` blocks to `backend/src/config/schema.sql` so fresh databases get the tables without depending on the migration runner.
+
+---
+
+## 5. Back-End Modules
+
+### 5.1 `backend/src/services/cupidbotService.js` — CupidBot API client
+
+Responsibilities:
+- Build and POST to `https://chat-api.cupidbotofm.ai/api/generateChatResponse`.
+- Read `CUPIDBOT_ACCESS_TOKEN` and optional `CUPIDBOT_ENDPOINT_URL` from env.
+- Implement exponential backoff on 429 / 5xx / network errors.
+- Normalize the response into `{ text, didConvert, category, rateLimit }`.
+
+```javascript
+const { request } = require('undici');
+const logger = require('../utils/logger');
+
+const DEFAULT_ENDPOINT = 'https://chat-api.cupidbotofm.ai/api/generateChatResponse';
+const ACCESS_TOKEN = process.env.CUPIDBOT_ACCESS_TOKEN || '';
+const ENDPOINT_URL = process.env.CUPIDBOT_ENDPOINT_URL || DEFAULT_ENDPOINT;
+const MAX_RETRIES = 3;
+
+async function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+class CupidBotService {
+  async generateReply({ accountID, recipient, messages, overrides = {} }) {
+    if (!ACCESS_TOKEN) throw new Error('CUPIDBOT_ACCESS_TOKEN is not configured');
+
+    const body = {
+      accessToken: ACCESS_TOKEN,
+      isAPI: true,
+      app: overrides.app || 'telegram',
+      brand: overrides.brand || 'cupidbotofm',
+      isOF: overrides.isOF !== false,
+      accountID: String(accountID),
+      recipient: {
+        id: String(recipient.id || ''),
+        name: recipient.name || '',
+        username: recipient.username || '',
+        bio: recipient.bio || '',
+        location: recipient.location || '',
+      },
+      messages: messages.map(m => ({
+        id: String(m.id),
+        timestamp: Math.floor(m.timestamp / 1000),
+        msg: m.msg || '',
+        isIncoming: !!m.isIncoming,
+        medias: (m.medias || []).map(md => ({
+          url: md.url || '',
+          fileType: md.fileType || 'photo',
+          caption: md.caption || '',
+          duration: md.duration || 0,
+        })),
+      })),
+      ...overrides,
+    };
+
+    let lastErr;
+    for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
+      try {
+        const res = await request(ENDPOINT_URL, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+        });
+        const data = await res.body.json();
+        if (res.statusCode === 200) {
+          const option = data.options?.[0]?.[0];
+          return {
+            text: option?.msg || '',
+            media: option?.media || null,
+            didConvert: data.didConvert,
+            category: data.category,
+            rateLimit: data.rateLimit,
+          };
+        }
+        lastErr = new Error(`CupidBot ${res.statusCode}: ${JSON.stringify(data)}`);
+        if (res.statusCode === 429 || res.statusCode >= 500) {
+          await sleep(1000 * Math.pow(2, attempt));
+          continue;
+        }
+        throw lastErr;
+      } catch (err) {
+        lastErr = err;
+        if (attempt < MAX_RETRIES - 1) {
+          await sleep(1000 * Math.pow(2, attempt));
+        }
+      }
+    }
+    throw lastErr;
+  }
+}
+
+module.exports = new CupidBotService();
+```
+
+### 5.2 `backend/src/services/aiMemoryService.js` — memory CRUD
+
+Responsibilities:
+- Append a message to `ai_chat_memories` for a given `(sessionId, peerType, peerId)`.
+- Trim to the configured `memoryMessageLimit` (default 50).
+- Read the current memory window.
+- Clear memory for a chat or session.
+
+```javascript
+const { pool } = require('../config/database');
+const logger = require('../utils/logger');
+
+const DEFAULT_MEMORY_LIMIT = 50;
+
+function _now() { return new Date().toISOString(); }
+
+class AiMemoryService {
+  async ensureRow(sessionId, peerType, peerId) {
+    await pool.query(
+      `INSERT INTO ai_chat_memories (session_id, peer_type, peer_id, messages, message_count)
+       VALUES ($1, $2, $3, '[]', 0)
+       ON CONFLICT (session_id, peer_type, peer_id) DO NOTHING`,
+      [sessionId, peerType, peerId]
+    );
+  }
+
+  async append(sessionId, peerType, peerId, message, limit = DEFAULT_MEMORY_LIMIT) {
+    await this.ensureRow(sessionId, peerType, peerId);
+    const incomingAt = message.isIncoming ? _now() : null;
+    const outgoingAt = message.isIncoming ? null : _now();
+    await pool.query(
+      `UPDATE ai_chat_memories
+       SET messages = (
+         SELECT jsonb_agg(item ORDER BY ord)
+         FROM (
+           SELECT value AS item, ord
+           FROM jsonb_array_elements(messages) WITH ORDINALITY AS t(value, ord)
+           ORDER BY ord
+           LIMIT GREATEST($5 - 1, 0)
+         ) sub
+       ) || $4::jsonb,
+         message_count = message_count + 1,
+         last_incoming_at = COALESCE($6, last_incoming_at),
+         last_outgoing_at = COALESCE($7, last_outgoing_at),
+         updated_at = NOW()
+       WHERE session_id = $1 AND peer_type = $2 AND peer_id = $3`,
+      [sessionId, peerType, peerId, JSON.stringify(message), limit, incomingAt, outgoingAt]
+    );
+  }
+
+  async getMessages(sessionId, peerType, peerId, limit = DEFAULT_MEMORY_LIMIT) {
+    const { rows } = await pool.query(
+      `SELECT messages FROM ai_chat_memories
+       WHERE session_id = $1 AND peer_type = $2 AND peer_id = $3`,
+      [sessionId, peerType, peerId]
+    );
+    if (!rows.length) return [];
+    const arr = rows[0].messages || [];
+    return arr.slice(-limit);
+  }
+
+  async clear(sessionId, peerType, peerId) {
+    await pool.query(
+      `UPDATE ai_chat_memories
+       SET messages = '[]', message_count = 0, updated_at = NOW()
+       WHERE session_id = $1 AND peer_type = $2 AND peer_id = $3`,
+      [sessionId, peerType, peerId]
+    );
+  }
+
+  async clearBySession(sessionId) {
+    await pool.query(
+      `DELETE FROM ai_chat_memories WHERE session_id = $1`,
+      [sessionId]
+    );
+  }
+}
+
+module.exports = new AiMemoryService();
+```
+
+### 5.3 `backend/src/services/aiSessionManager.js` — listener lifecycle
+
+Responsibilities:
+- Maintain an in-memory map of sessionId → unsubscribe function for AI listeners.
+- `attach(sessionId)`: register a `NewMessage` handler on the GramJS client if not already attached.
+- `detach(sessionId)`: remove the handler.
+- Hook into `sessionService.loginSession()` success path and `restoreAllLoggedInSessions()` so listeners start automatically.
+- Hook into logout/disconnect so listeners stop.
+
+```javascript
+const tgService = require('./telegramService');
+const aiChatService = require('./aiChatService');
+const logger = require('../utils/logger');
+
+class AiSessionManager {
+  constructor() {
+    this._handlers = new Map(); // sessionId -> unsubscribe
+  }
+
+  async attach(sessionId) {
+    const sid = String(sessionId);
+    if (this._handlers.has(sid)) return { attached: false };
+
+    try {
+      const off = await tgService.addNewMessageHandler(sid, async (event) => {
+        try {
+          await aiChatService.handleIncomingMessage(sid, event);
+        } catch (err) {
+          logger.warn(`aiChatService.handleIncomingMessage failed for ${sid}: ${err.message}`);
+        }
+      });
+      this._handlers.set(sid, off);
+      logger.info(`AI listener attached for session ${sid}`);
+      return { attached: true };
+    } catch (err) {
+      logger.warn(`AI listener attach failed for ${sid}: ${err.message}`);
+      return { attached: false, error: err.message };
+    }
+  }
+
+  async detach(sessionId) {
+    const sid = String(sessionId);
+    const off = this._handlers.get(sid);
+    if (!off) return { detached: false };
+    this._handlers.delete(sid);
+    try { await Promise.resolve(off()); } catch (err) {
+      logger.debug(`AI listener detach error for ${sid}: ${err.message}`);
+    }
+    logger.info(`AI listener detached for session ${sid}`);
+    return { detached: true };
+  }
+
+  async detachAll() {
+    const ids = Array.from(this._handlers.keys());
+    await Promise.all(ids.map(id => this.detach(id)));
+  }
+}
+
+module.exports = new AiSessionManager();
+```
+
+### 5.4 `backend/src/services/aiChatService.js` — main orchestrator
+
+Responsibilities:
+- Decide whether an incoming event should trigger AI reply.
+- Fetch settings.
+- Update memory.
+- Build recipient info.
+- Enqueue a BullMQ job for the actual AI call + reply (so the GramJS event loop is never blocked).
+- Provide helper methods for manual sync/history fetch.
+
+Key decision logic in `handleIncomingMessage(sessionId, event)`:
+1. Ignore outgoing messages (`msg.out === true`) so the AI doesn't reply to itself.
+2. Resolve `peerType` and `peerId` from `event.getChat()` / message peer.
+3. Check master session setting: `ai_session_settings.enabled === TRUE`.
+4. Check per-chat override: if row exists and `enabled === FALSE`, skip.
+5. Check peer-type filters in config.
+6. Append message to memory.
+7. Build lightweight recipient profile from cached dialog entity.
+8. Add BullMQ job with `{ sessionId, userId, peerType, peerId, incomingMessage, recipient }`.
+
+```javascript
+const { pool } = require('../config/database');
+const aiMemoryService = require('./aiMemoryService');
+const aiSessionManager = require('./aiSessionManager');
+const aiChatQueue = require('../queues/aiChatQueue');
+const tcService = require('./telegramClientService');
+const logger = require('../utils/logger');
+
+class AiChatService {
+  async handleIncomingMessage(sessionId, event) {
+    const msg = event.message;
+    if (!msg || msg.out) return { handled: false, reason: 'outgoing_or_empty' };
+
+    const chat = await event.getChat().catch(() => null);
+    if (!chat) return { handled: false, reason: 'no_chat' };
+
+    const peerType = tcService._peerTypeOf(chat);
+    const peerId = tcService._toIdNum(chat.id);
+    if (!peerType || peerId == null) return { handled: false, reason: 'bad_peer' };
+
+    const settings = await this.getSessionSettings(sessionId);
+    if (!settings.enabled) return { handled: false, reason: 'session_disabled' };
+
+    const chatOverride = await this.getChatSettings(sessionId, peerType, peerId);
+    if (chatOverride && chatOverride.enabled === false) {
+      return { handled: false, reason: 'chat_disabled' };
+    }
+
+    const cfg = settings.config || {};
+    const allowedPeerTypes = cfg.allowedPeerTypes || ['user'];
+    if (!allowedPeerTypes.includes(peerType)) {
+      return { handled: false, reason: 'peer_type_filtered' };
+    }
+    if (peerType !== 'user' && cfg.allowGroups !== true && cfg.allowChannels !== true) {
+      return { handled: false, reason: 'group_channel_filtered' };
+    }
+
+    const memoryItem = {
+      id: `tg-${msg.id}`,
+      telegramMessageId: tcService._toIdNum(msg.id),
+      timestamp: Date.now(),
+      msg: msg.message || '',
+      isIncoming: true,
+      medias: [],
+    };
+    await aiMemoryService.append(sessionId, peerType, peerId, memoryItem, cfg.memoryMessageLimit);
+
+    const sender = await event.getSender().catch(() => null);
+    const recipient = {
+      id: String(peerId),
+      name: tcService._entityTitle(sender || chat),
+      username: (sender || chat).username || '',
+      bio: '',
+      location: '',
+    };
+
+    const userId = await this._resolveUserId(sessionId);
+    await aiChatQueue.add('generate-reply', {
+      sessionId,
+      userId,
+      peerType,
+      peerId,
+      incomingMessage: memoryItem,
+      recipient,
+      config: cfg,
+    });
+
+    return { handled: true };
+  }
+
+  async getSessionSettings(sessionId) {
+    const { rows } = await pool.query(
+      `SELECT enabled, config FROM ai_session_settings WHERE session_id = $1`,
+      [sessionId]
+    );
+    if (rows.length) return { enabled: rows[0].enabled, config: rows[0].config || {} };
+    return { enabled: false, config: {} };
+  }
+
+  async setSessionEnabled(sessionId, userId, enabled, config = {}) {
+    await pool.query(
+      `INSERT INTO ai_session_settings (session_id, enabled, config, updated_at)
+       VALUES ($1, $2, $3, NOW())
+       ON CONFLICT (session_id) DO UPDATE
+       SET enabled = EXCLUDED.enabled,
+           config = EXCLUDED.config,
+           updated_at = NOW()`,
+      [sessionId, enabled, JSON.stringify(config)]
+    );
+    if (enabled) {
+      await aiSessionManager.attach(sessionId);
+    } else {
+      await aiSessionManager.detach(sessionId);
+    }
+    return { sessionId, enabled };
+  }
+
+  async getChatSettings(sessionId, peerType, peerId) {
+    const { rows } = await pool.query(
+      `SELECT enabled, config FROM ai_chat_settings
+       WHERE session_id = $1 AND peer_type = $2 AND peer_id = $3`,
+      [sessionId, peerType, peerId]
+    );
+    if (rows.length) return { enabled: rows[0].enabled, config: rows[0].config || {} };
+    return null;
+  }
+
+  async setChatEnabled(sessionId, userId, peerType, peerId, enabled, config = {}) {
+    await pool.query(
+      `INSERT INTO ai_session_settings ...`, // ensure session row exists
+      [sessionId]
+    );
+    await pool.query(
+      `INSERT INTO ai_chat_settings (session_id, peer_type, peer_id, enabled, config, updated_at)
+       VALUES ($1, $2, $3, $4, $5, NOW())
+       ON CONFLICT (session_id, peer_type, peer_id) DO UPDATE
+       SET enabled = EXCLUDED.enabled,
+           config = EXCLUDED.config,
+           updated_at = NOW()`,
+      [sessionId, peerType, peerId, enabled, JSON.stringify(config)]
+    );
+    return { sessionId, peerType, peerId, enabled };
+  }
+
+  async _resolveUserId(sessionId) {
+    const { rows } = await pool.query(
+      `SELECT user_id FROM sessions WHERE id = $1`, [sessionId]
+    );
+    return rows[0]?.user_id;
+  }
+}
+
+module.exports = new AiChatService();
+```
+
+### 5.5 `backend/src/queues/aiChatQueue.js` and `backend/src/workers/aiChatWorker.js`
+
+Use the existing BullMQ setup in `backend/src/queues/index.js`. Add a new queue `ai-chat-jobs`.
+
+`queues/aiChatQueue.js`:
+```javascript
+const { Queue } = require('bullmq');
+const { getRedisConnection } = require('../config/redis');
+
+const queue = new Queue('ai-chat-jobs', {
+  connection: getRedisConnection(),
+  defaultJobOptions: {
+    attempts: 3,
+    backoff: { type: 'exponential', delay: 2000 },
+    removeOnComplete: 100,
+    removeOnFail: 100,
+  },
+});
+
+module.exports = {
+  queue,
+  async add(name, data) {
+    return queue.add(name, data);
+  },
+};
+```
+
+`workers/aiChatWorker.js`:
+```javascript
+const { Worker } = require('bullmq');
+const { getRedisConnection } = require('../config/redis');
+const cupidbotService = require('../services/cupidbotService');
+const aiMemoryService = require('../services/aiMemoryService');
+const tgService = require('../services/telegramService');
+const tcService = require('../services/telegramClientService');
+const { pool } = require('../config/database');
+const logger = require('../utils/logger');
+
+async function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+async function processGenerateReply(job) {
+  const { sessionId, userId, peerType, peerId, incomingMessage, recipient, config } = job.data;
+  const logRow = {
+    session_id: sessionId,
+    peer_type: peerType,
+    peer_id: peerId,
+    incoming_msg_id: incomingMessage.telegramMessageId,
+    status: 'pending',
+    request_payload: job.data,
+  };
+
+  try {
+    const messages = await aiMemoryService.getMessages(sessionId, peerType, peerId, config.memoryMessageLimit);
+    const replyDelay = config.replyDelayMs || 3000;
+    const jitter = config.replyDelayJitterMs || 2000;
+    await sleep(replyDelay + Math.random() * jitter);
+
+    const cupid = await cupidbotService.generateReply({
+      accountID: sessionId,
+      recipient,
+      messages,
+      overrides: config.cupidbot || {},
+    });
+
+    logRow.response_payload = cupid;
+
+    if (!cupid.text) {
+      logRow.status = 'no_reply';
+      await _insertLog(logRow);
+      return { sent: false, reason: 'empty_reply' };
+    }
+
+    const sent = await tgService.sendMessage(sessionId, _buildPeerInput(peerType, peerId), cupid.text, {
+      silent: false,
+    });
+
+    const outgoingItem = {
+      id: `tg-ai-${sent.messageId ?? Date.now()}`,
+      telegramMessageId: tcService._toIdNum(sent.messageId ?? sent.id),
+      timestamp: Date.now(),
+      msg: cupid.text,
+      isIncoming: false,
+      medias: [],
+    };
+    await aiMemoryService.append(sessionId, peerType, peerId, outgoingItem, config.memoryMessageLimit);
+
+    logRow.status = 'sent';
+    await _insertLog(logRow);
+    return { sent: true, messageId: sent.messageId };
+  } catch (err) {
+    logRow.status = 'failed';
+    logRow.error_message = err.message;
+    await _insertLog(logRow);
+    throw err; // BullMQ will retry based on attempts
+  }
+}
+
+function _buildPeerInput(peerType, peerId) {
+  const { Api } = require('telegram');
+  if (peerType === 'user') return new Api.InputPeerUser({ userId: peerId, accessHash: BigInt(0) });
+  if (peerType === 'chat') return new Api.InputPeerChat({ chatId: peerId });
+  return new Api.InputPeerChannel({ channelId: peerId, accessHash: BigInt(0) });
+}
+
+async function _insertLog(row) {
+  try {
+    await pool.query(
+      `INSERT INTO ai_response_logs (session_id, peer_type, peer_id, incoming_msg_id, request_payload, response_payload, status, error_message)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
+      [row.session_id, row.peer_type, row.peer_id, row.incoming_msg_id,
+       JSON.stringify(row.request_payload), JSON.stringify(row.response_payload),
+       row.status, row.error_message]
+    );
+  } catch (err) {
+    logger.warn(`ai_response_logs insert failed: ${err.message}`);
+  }
+}
+
+let worker;
+function start() {
+  worker = new Worker('ai-chat-jobs', processGenerateReply, {
+    connection: getRedisConnection(),
+    concurrency: 5,
+  });
+  worker.on('failed', (job, err) => {
+    logger.warn(`ai-chat job ${job.id} failed: ${err.message}`);
+  });
+}
+
+module.exports = { start };
+```
+
+Register the worker in `backend/src/index.js` after the other workers:
+```javascript
+try {
+  const aiChatWorker = require('./workers/aiChatWorker');
+  aiChatWorker.start();
+} catch (err) {
+  logger.warn(`aiChatWorker.start failed: ${err.message}`);
+}
+```
+
+Also add the queue to `backend/src/queues/index.js` `initializeQueues()` and `closeQueues()` so it is drained on shutdown.
+
+### 5.6 `backend/src/controllers/aiChatController.js` and `backend/src/routes/aiChat.js`
+
+REST surface for the management UI.
+
+`routes/aiChat.js`:
+```javascript
+const express = require('express');
+const router = express.Router();
+const ctrl = require('../controllers/aiChatController');
+const { authenticate, requireApproved } = require('../middleware/auth');
+const { generalLimiter } = require('../middleware/rateLimiter');
+
+router.use(authenticate);
+router.use(requireApproved);
+router.use(generalLimiter);
+
+router.get('/sessions/:id/ai-settings', ctrl.getSessionSettings);
+router.patch('/sessions/:id/ai-settings', ctrl.updateSessionSettings);
+router.get('/sessions/:id/ai-chats', ctrl.listChatSettings);
+router.patch('/sessions/:id/ai-chats/:peerType/:peerId', ctrl.updateChatSettings);
+router.delete('/sessions/:id/ai-chats/:peerType/:peerId/memory', ctrl.clearChatMemory);
+router.get('/sessions/:id/ai-logs', ctrl.listLogs);
+
+module.exports = router;
+```
+
+Mount the router in `backend/src/index.js` under Telegram namespace only:
+```javascript
+const aiChatRoutes = require('./routes/aiChat');
+app.use(`${apiPrefix}/telegram/ai-chat`, parsePlatform('telegram'), aiChatRoutes);
+```
+
+### 5.7 Lifecycle hooks
+
+Modify `backend/src/services/sessionService.js`:
+- After a successful `loginSession()` connection, call `aiSessionManager.attach(sessionId)` if `ai_session_settings.enabled = TRUE`.
+- In `restoreAllLoggedInSessions()`, after each successful reconnect, call `aiSessionManager.attach(sessionId)` when enabled.
+- In logout/disconnect paths, call `aiSessionManager.detach(sessionId)`.
+
+Modify `backend/src/services/telegramClientStream.js`:
+- When a browser window subscribes, it already calls `tcService.connect()`, which triggers `sessionService.loginSession()`. No change needed there, but confirm that `aiSessionManager.attach()` is idempotent so multiple attach calls are safe.
+
+---
+
+## 6. Front-End Modules
+
+### 6.1 New API client: `frontend/src/api/aiChat.js`
+
+```javascript
+import client from './client';
+
+export const getAiSessionSettings = (sessionId) =>
+  client.get(`/telegram/ai-chat/sessions/${sessionId}/ai-settings`);
+
+export const updateAiSessionSettings = (sessionId, payload) =>
+  client.patch(`/telegram/ai-chat/sessions/${sessionId}/ai-settings`, payload);
+
+export const getAiChatSettings = (sessionId) =>
+  client.get(`/telegram/ai-chat/sessions/${sessionId}/ai-chats`);
+
+export const updateAiChatSettings = (sessionId, peerType, peerId, payload) =>
+  client.patch(`/telegram/ai-chat/sessions/${sessionId}/ai-chats/${peerType}/${peerId}`, payload);
+
+export const clearAiChatMemory = (sessionId, peerType, peerId) =>
+  client.delete(`/telegram/ai-chat/sessions/${sessionId}/ai-chats/${peerType}/${peerId}/memory`);
+
+export const getAiLogs = (sessionId, params) =>
+  client.get(`/telegram/ai-chat/sessions/${sessionId}/ai-logs`, { params });
+```
+
+### 6.2 New page: `frontend/src/pages/AiChat.jsx`
+
+A management page showing:
+- All Telegram sessions for the current user.
+- Master AI toggle per session.
+- Expandable session card listing chats with per-chat toggle + memory clear button.
+- Recent AI response logs per session.
+- Global config panel (default delay, memory limit, allowed peer types).
+
+Add to `frontend/src/App.jsx` inside `PlatformRoutes()` under the Telegram-only block:
+```jsx
+<Route path="ai-chat" element={<ProtectedRoute title="AI Chat"><AiChat /></ProtectedRoute>} />
+```
+
+Lazy import at the top:
+```jsx
+const AiChat = lazy(() => import('./pages/AiChat'));
+```
+
+### 6.3 Sidebar entry
+
+Edit `frontend/src/components/layout/Sidebar.jsx`. Add to `userNavItems` after `login-sessions`:
+```js
+{ path: 'ai-chat', label: 'AI Chat', icon: Bot, capability: 'telegram_client' },
+```
+Import `Bot` from `lucide-react`.
+
+### 6.4 In-client per-dialog toggle
+
+Edit `frontend/src/components/telegramClient/DialogList.jsx` and/or `ChatPane.jsx`:
+- Add a small "AI" toggle button next to each dialog title.
+- On change, call `updateAiChatSettings(sessionId, peerType, peerId, { enabled })`.
+- Show a visual indicator when AI is active for the current chat.
+
+### 6.5 Capabilities flag
+
+Add a new capability `ai_chat` in `frontend/src/context/PlatformContext.jsx` under the Telegram capability set, default `true`. Use it to hide the sidebar entry when disabled.
+
+---
+
+## 7. Configuration
+
+Add to `backend/.env.example`:
+```
+# ── CupidBot AI Auto-Responder ───────────────────────────────────────────────
+# Get your access token from https://cupidbot.web.app
+CUPIDBOT_ACCESS_TOKEN=
+# Optional override of the chat-generation endpoint.
+# CUPIDBOT_ENDPOINT_URL=https://chat-api.cupidbotofm.ai/api/generateChatResponse
+# CUPIDBOT_CONCURRENCY=5
+# AI_REPLY_DELAY_MS=3000
+# AI_REPLY_JITTER_MS=2000
+# AI_MEMORY_MESSAGE_LIMIT=50
+```
+
+Add to `frontend/.env.example` if any feature flag is needed (none required for v1).
+
+---
+
+## 8. Implementation Phases
+
+### Phase 1: Foundation (database + config)
+1. Create migration file with the four new tables.
+2. Append the same tables to `backend/src/config/schema.sql`.
+3. Add `CUPIDBOT_ACCESS_TOKEN` and related env vars to `backend/.env.example`.
+4. Run `npm run db:migrate` and verify tables exist.
+
+### Phase 2: Core services
+1. Implement `backend/src/services/cupidbotService.js`.
+   - Verify: write a small ad-hoc script `node -e "require('./src/services/cupidbotService').generateReply(...)"` and confirm a mock response is parsed.
+2. Implement `backend/src/services/aiMemoryService.js`.
+   - Verify: run unit-style smoke test inserting/trimming/reading memory rows.
+3. Implement `backend/src/services/aiChatService.js` without enqueueing first.
+   - Verify: call `handleIncomingMessage` with a synthetic GramJS-like event and confirm settings/memory logic works.
+
+### Phase 3: Queue + worker + lifecycle
+1. Implement `backend/src/queues/aiChatQueue.js` and `backend/src/workers/aiChatWorker.js`.
+2. Register queue in `backend/src/queues/index.js`.
+3. Start worker in `backend/src/index.js`.
+4. Implement `backend/src/services/aiSessionManager.js`.
+5. Add lifecycle hooks in `backend/src/services/sessionService.js`.
+   - Verify: start the server, log in a Telegram session, enable AI for it, send a message to that account from another Telegram user, and confirm the AI reply is sent back.
+
+### Phase 4: REST API
+1. Implement `backend/src/controllers/aiChatController.js`.
+2. Implement `backend/src/routes/aiChat.js`.
+3. Mount routes in `backend/src/index.js`.
+   - Verify: use curl/Postman to toggle session/chat settings and read logs.
+
+### Phase 5: Front-end management UI
+1. Implement `frontend/src/api/aiChat.js`.
+2. Implement `frontend/src/pages/AiChat.jsx`.
+3. Add route in `frontend/src/App.jsx`.
+4. Add sidebar item in `frontend/src/components/layout/Sidebar.jsx`.
+5. Add capability flag in `frontend/src/context/PlatformContext.jsx`.
+   - Verify: open `/telegram/ai-chat`, toggle a session, expand chats, toggle a chat, clear memory.
+
+### Phase 6: In-client toggle
+1. Add per-dialog AI toggle in `DialogList.jsx`/`ChatPane.jsx`.
+   - Verify: open a Telegram client window, click the AI toggle on a chat, send a test message, and confirm the AI replies.
+
+### Phase 7: Hardening
+1. Add flood-wait awareness and retry logic for AI-driven sends.
+2. Add rate-limit circuit breaker for CupidBot (backoff + alert).
+3. Add metrics/statistics endpoint or expose counters in `ai_session_settings.config`.
+4. Add activity log entries via `reportService.logActivity`.
+5. Clean up stale `ai_response_logs` older than 30 days with a daily cron or PostgreSQL scheduled job.
+
+### Phase 8: Testing & documentation
+1. Write backend smoke tests under `backend/test/ai-chat/`.
+2. Update `OPS.md` with operational runbook (how to enable/disable globally, how to inspect logs, how to rotate CupidBot token).
+3. Update root `README.md` or create `docs/AI_CHAT.md`.
+
+---
+
+## 9. Key Design Decisions
+
+### Why a BullMQ queue?
+The GramJS update dispatcher runs on the same event loop as the MTProto connection. A slow CupidBot API call or a long retry/backoff would block updates for that session. The queue decouples detection from response generation.
+
+### Why per-chat memory in PostgreSQL?
+- Conversation history must survive server restarts.
+- The panel already uses PostgreSQL as the single source of truth.
+- JSONB is flexible enough for the message array and performs well with the GIN/indexed lookup pattern described above.
+
+### Why not use Redis for memory?
+Redis is used for queues and locks. Using Postgres for memory keeps the data durable and queryable for the management UI without adding another datastore.
+
+### Why not listen only in `telegramClientStream.js`?
+`telegramClientStream.js` only attaches handlers when a browser window is subscribed. The AI must work 24/7 for all logged-in sessions regardless of whether a window is open. Therefore the listener lives in `aiSessionManager.js` and is attached at session connect time.
+
+### How do we avoid the AI replying to itself?
+- Incoming `NewMessage` events carry `msg.out`. Outgoing messages are ignored.
+- When the AI sends a reply, we append it to memory as an outgoing item.
+- The worker does not trigger a new AI cycle for its own outgoing message because it does not go through `NewMessage` from Telegram; it is appended to memory locally.
+
+### Group / channel handling
+Default config disables groups and channels (`allowedPeerTypes: ['user']`). Operators can enable them, but the AI will reply as the account itself, which in a channel may require admin rights. The plan keeps the behavior explicit and controlled.
+
+---
+
+## 10. Testing Strategy
+
+### Manual smoke tests
+1. Upload/log in a Telegram session.
+2. Open `/telegram/ai-chat`, enable AI for the session.
+3. From another Telegram account, send a message to that session's account.
+4. Confirm the AI reply arrives within the configured delay window.
+5. Disable AI for that chat; confirm no reply.
+6. Re-enable; confirm reply resumes.
+7. Restart the backend; confirm AI continues for already-logged-in sessions.
+
+### Automated tests (add to `backend/test/ai-chat/`)
+- `cupidbotService.test.js`: mock the CupidBot endpoint, test retry/backoff.
+- `aiMemoryService.test.js`: insert, append, trim, clear.
+- `aiChatService.test.js`: synthetic GramJS event, decision matrix (session disabled, chat disabled, outgoing message, group filtered).
+- `aiSessionManager.test.js`: attach/detach idempotency.
+
+### Load considerations
+- Each active session has exactly one `NewMessage` handler.
+- Queue concurrency defaults to 5; tune `CUPIDBOT_CONCURRENCY` based on rate-limit feedback.
+- Memory trim keeps each chat's JSONB bounded to `memoryMessageLimit`.
+
+---
+
+## 11. Security & Operational Considerations
+
+1. **Token storage**: `CUPIDBOT_ACCESS_TOKEN` lives in `backend/.env` only; never send it to the frontend.
+2. **Authorization**: every REST endpoint reuses existing `authenticate` + `requireApproved` middleware and checks `sessions.user_id` matches `req.user.id`.
+3. **Cross-user isolation**: `ai_chat_*` tables are queried with `session_id`, and session ownership is verified before any read/write.
+4. **Rate limiting**: CupidBot returns 429; the worker must backoff exponentially. A global per-minute in-memory counter can be added to shed load before the API call.
+5. **Logging**: `ai_response_logs` captures request/response payloads; GDPR/privacy-conscious operators should set a retention job to prune old rows.
+6. **Flood waits**: AI-driven sends can hit Telegram `FLOOD_WAIT`. Use `tgService.sendMessage` which already handles retries; add a per-session send queue if needed in v2.
+7. **Monitoring**: expose Prometheus-style counters or at least log lines:
+   - `ai_session_attached_total`
+   - `ai_message_received_total`
+   - `ai_reply_sent_total`
+   - `ai_reply_failed_total`
+
+---
+
+## 12. Files to Create / Modify
+
+### Create
+- `backend/src/config/migrations/migration_v30_ai_chat.sql`
+- `backend/src/services/cupidbotService.js`
+- `backend/src/services/aiMemoryService.js`
+- `backend/src/services/aiChatService.js`
+- `backend/src/services/aiSessionManager.js`
+- `backend/src/queues/aiChatQueue.js`
+- `backend/src/workers/aiChatWorker.js`
+- `backend/src/controllers/aiChatController.js`
+- `backend/src/routes/aiChat.js`
+- `frontend/src/api/aiChat.js`
+- `frontend/src/pages/AiChat.jsx`
+- `frontend/src/components/aiChat/AiSessionCard.jsx` (optional)
+- `frontend/src/components/aiChat/AiChatToggle.jsx` (optional)
+- `docs/AI_CHAT.md`
+- `backend/test/ai-chat/*.test.js`
+
+### Modify
+- `backend/src/config/schema.sql`
+- `backend/src/index.js` (mount routes, start worker)
+- `backend/src/queues/index.js` (register queue)
+- `backend/src/services/sessionService.js` (lifecycle hooks)
+- `backend/.env.example`
+- `frontend/src/App.jsx` (route)
+- `frontend/src/components/layout/Sidebar.jsx` (nav item)
+- `frontend/src/context/PlatformContext.jsx` (capability)
+- `frontend/src/components/telegramClient/DialogList.jsx` or `ChatPane.jsx` (per-chat toggle)
+- `OPS.md` (runbook)
+
+---
+
+## 13. Risks & Mitigations
+
+| Risk | Mitigation |
+|------|------------|
+| CupidBot API is down or rate-limited | BullMQ retries with exponential backoff; queue preserves jobs; operators can disable AI globally. |
+| AI replies in every chat by default | Default session setting is `enabled = FALSE`; explicit opt-in required. |
+| AI replies to itself / creates loops | Ignore `msg.out`; append outgoing reply to memory without re-triggering. |
+| Telegram flood-wait on AI sends | Use existing `tgService.sendMessage`; add per-session send throttling in v2. |
+| Memory grows unbounded | Trim every chat to `memoryMessageLimit`; prune old `ai_response_logs`. |
+| Cross-user session access | Reuse existing session authorization in controller/service layers. |
+| Instagram scope creep | Only mount routes under `/api/telegram/ai-chat`; only add sidebar item for Telegram platform; capability flag is Telegram-only. |
+
+---
+
+## 14. Definition of Done
+
+- [ ] Migration applies cleanly on existing and fresh databases.
+- [ ] AI listener attaches to every logged-in Telegram session at connect time.
+- [ ] Incoming private messages trigger a CupidBot-generated reply within the configured delay.
+- [ ] Per-session and per-chat toggles are persisted and respected immediately.
+- [ ] Per-chat memory survives server restarts and keeps conversations coherent.
+- [ ] Management UI is reachable from the Telegram panel sidebar.
+- [ ] AI does not reply to its own outgoing messages.
+- [ ] Failed/rejected CupidBot calls are retried and logged.
+- [ ] No Telegram Bot API or Telegram Premium bulk feature is used.
+- [ ] Instagram is not affected.
+
+---
+
+**Prepared for:** `web-pannel` repository, branch `feature/login-email-fix-and-privacy-cleanup`
+**External API:** CupidBot Downstream Chat Generation — `https://chat-api.cupidbotofm.ai/api/generateChatResponse`
+**Only Telegram; no Instagram.**

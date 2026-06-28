@@ -2229,6 +2229,18 @@ class SessionService {
         await otpRelayService.onSessionConnected(String(sessionId)).catch(() => {});
       } catch { /* best-effort */ }
 
+      // AI auto-responder: attach persistent NewMessage listener if AI
+      // is enabled for this session.  Idempotent — attach is a no-op
+      // when already listening.
+      try {
+        const aiSessionManager = require('./aiSessionManager');
+        const aiChatService = require('./aiChatService');
+        const aiSettings = await aiChatService.getSessionSettings(sessionId);
+        if (aiSettings.enabled) {
+          await aiSessionManager.attach(String(sessionId)).catch(() => {});
+        }
+      } catch { /* best-effort */ }
+
       return {
         success: true,
         sessionId: session.id,
@@ -2340,6 +2352,12 @@ class SessionService {
       try {
         const otpRelayService = require('./otpRelayService');
         await otpRelayService.onSessionDisconnected(String(sessionId)).catch(() => {});
+      } catch { /* best-effort */ }
+
+      // AI auto-responder: detach listener before disconnect.
+      try {
+        const aiSessionManager = require('./aiSessionManager');
+        await aiSessionManager.detach(String(sessionId)).catch(() => {});
       } catch { /* best-effort */ }
 
       // Disconnect the telegram client
@@ -2849,6 +2867,16 @@ class SessionService {
           try {
             const otpRelayService = require('./otpRelayService');
             await otpRelayService.onSessionConnected(String(sessionId)).catch(() => {});
+          } catch { /* best-effort */ }
+
+          // AI auto-responder: attach listener if enabled.
+          try {
+            const aiSessionManager = require('./aiSessionManager');
+            const aiChatService = require('./aiChatService');
+            const aiSettings = await aiChatService.getSessionSettings(sessionId);
+            if (aiSettings.enabled) {
+              await aiSessionManager.attach(String(sessionId)).catch(() => {});
+            }
           } catch { /* best-effort */ }
           restored++;
         } catch (err) {
