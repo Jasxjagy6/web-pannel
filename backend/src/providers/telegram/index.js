@@ -154,6 +154,12 @@ const capabilities = {
   telegram_client:        true,
 
   // ---------------------------------------------------------------------
+  // AI auto-responder (Telegram-only).  CupidBot-powered replies with
+  // per-session and per-chat controls plus persistent memory.
+  // ---------------------------------------------------------------------
+  ai_chat:                true,
+
+  // ---------------------------------------------------------------------
   // Phase 2 — in-panel Telegram client feature surface (Telegram-only).
   // Each flag gates one Phase 2 deliverable on the frontend; the Instagram
   // provider must mirror them as `false`.

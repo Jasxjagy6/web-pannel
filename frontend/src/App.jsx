@@ -47,6 +47,7 @@ const TelegramClient = lazy(() => import('./pages/TelegramClient'));
 // platform-agnostic — the IG provider mirrors the capability flag as
 // `false` so the sidebar entry only renders on /telegram/* routes.
 const RedditCookieScraper = lazy(() => import('./pages/RedditCookieScraper'));
+const AiChat = lazy(() => import('./pages/AiChat'));
 
 // Instagram-specific page components — used by PlatformPage to render the
 // IG-themed pink experience for /instagram/<route> URLs. Telegram still
@@ -271,6 +272,7 @@ function PlatformRoutes() {
           The IG side renders the same component, which itself shows a
           "switch to Telegram" notice when the active platform isn't TG. */}
       <Route path="login-sessions" element={<ProtectedRoute title="Login"><TelegramLoginSessions /></ProtectedRoute>} />
+      <Route path="ai-chat" element={<ProtectedRoute title="AI Chat"><PlatformPage tg={AiChat} ig={InstagramWorkInProgress} /></ProtectedRoute>} />
       <Route path="scrape" element={<ProtectedRoute title="Scrape"><PlatformPage tg={Scrape} ig={InstagramScrape} /></ProtectedRoute>} />
       {/* Instagram-only identity-lookup module. Hidden from the TG
           sidebar; TG side falls back to the legacy Scrape page so
