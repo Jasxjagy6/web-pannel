@@ -3013,6 +3013,21 @@ class SessionService {
           const wasActive = tgService.isSessionActive(sid);
           await tgService._ensureConnected(sid);
           if (!wasActive) revived++;
+
+          // AI auto-responder: the reconnect path above may rebuild the
+          // GramJS client (proxy fallback, stale socket swap, etc.).
+          // When that happens the old event handlers are lost, so make
+          // sure the AI listener is (re-)attached whenever we revive a
+          // session.  aiSessionManager.attach is idempotent.
+          try {
+            const aiSessionManager = require('./aiSessionManager');
+            const aiChatService = require('./aiChatService');
+            const aiSettings = await aiChatService.getSessionSettings(row.id);
+            if (aiSettings.enabled) {
+              await aiSessionManager.attach(String(row.id)).catch(() => {});
+            }
+          } catch { /* best-effort */ }
+
           // Anti-revoke Phase 2 (B8): heartbeat uses MTProto Ping
           // (transport-level keepalive that real clients send), not
           // users.getFullUser. `pingSession` falls back to getMe only if
