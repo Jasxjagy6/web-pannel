@@ -3016,14 +3016,16 @@ class SessionService {
 
           // AI auto-responder: the reconnect path above may rebuild the
           // GramJS client (proxy fallback, stale socket swap, etc.).
-          // When that happens the old event handlers are lost, so make
-          // sure the AI listener is (re-)attached whenever we revive a
-          // session.  aiSessionManager.attach is idempotent.
+          // When that happens the old event handlers are lost, but
+          // aiSessionManager still thinks it is attached because its Map
+          // holds the unsubscribe function for the old client.  Detach
+          // the stale reference first, then attach to the current client.
           try {
             const aiSessionManager = require('./aiSessionManager');
             const aiChatService = require('./aiChatService');
             const aiSettings = await aiChatService.getSessionSettings(row.id);
             if (aiSettings.enabled) {
+              await aiSessionManager.detach(String(row.id)).catch(() => {});
               await aiSessionManager.attach(String(row.id)).catch(() => {});
             }
           } catch { /* best-effort */ }
