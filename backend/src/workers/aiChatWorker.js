@@ -14,14 +14,19 @@
  */
 
 const { Worker } = require('bullmq');
-const { Api } = require('telegram');
-const { getRedisConnection } = require('../config/redis');
 const cupidbotService = require('../services/cupidbotService');
 const aiMemoryService = require('../services/aiMemoryService');
 const tgService = require('../services/telegramService');
 const tcService = require('../services/telegramClientService');
 const { pool } = require('../config/database');
 const logger = require('../utils/logger');
+
+const redisConnection = {
+  host: process.env.REDIS_HOST || 'localhost',
+  port: parseInt(process.env.REDIS_PORT || '6382', 10),
+  password: process.env.REDIS_PASSWORD || undefined,
+  maxRetriesPerRequest: null,
+};
 
 const CONCURRENCY = parseInt(process.env.CUPIDBOT_CONCURRENCY || '5', 10);
 const DEFAULT_REPLY_DELAY_MS = parseInt(process.env.AI_REPLY_DELAY_MS || '3000', 10);
@@ -135,7 +140,7 @@ async function _insertLog(row) {
 let worker;
 function start() {
   worker = new Worker(QUEUE_NAME, processGenerateReply, {
-    connection: getRedisConnection(),
+    connection: redisConnection,
     concurrency: CONCURRENCY,
   });
 
