@@ -2,8 +2,9 @@
  * AiChat — management page for the Telegram AI auto-responder.
  *
  * Lists every Telegram session for the current user with a master AI
- * toggle.  Expanded session cards show per-chat overrides, memory
- * controls, and recent AI response logs.
+ * toggle.  Expanded session cards show every dialog for that session
+ * with a per-chat AI toggle and memory-clear action, plus recent AI
+ * response logs.
  */
 
 import React, { useEffect, useMemo, useState } from 'react';
@@ -19,8 +20,11 @@ import {
   CheckCircle2,
   XCircle,
   Clock,
+  Users,
+  Megaphone,
+  User as UserIcon,
 } from 'lucide-react';
-import { listClientSessions } from '../api/telegramClient';
+import { listClientSessions, getClientDialogs } from '../api/telegramClient';
 import {
   getAiSessionSettings,
   updateAiSessionSettings,
@@ -31,6 +35,7 @@ import {
 } from '../api/aiChat';
 import { usePlatform } from '../context/PlatformContext';
 import { useToast } from '../components/common/Toast';
+import Avatar from '../components/telegramClient/Avatar';
 
 const PEER_LABEL = { user: 'User', chat: 'Group', channel: 'Channel' };
 
@@ -50,6 +55,17 @@ const TONE_CLASSES = {
   gray:    'bg-white/5 text-gray-300 border-white/10',
 };
 
+function _peerKey(peerType, peerId) {
+  return `${peerType}:${peerId}`;
+}
+
+function _formatPreview(msg) {
+  if (!msg) return '';
+  if (msg.text) return msg.text;
+  if (msg.hasMedia) return '[media]';
+  return '';
+}
+
 export default function AiChat() {
   const { platform } = usePlatform();
   const toast = useToast();
@@ -60,11 +76,13 @@ export default function AiChat() {
   const [error, setError] = useState(null);
   const [expandedId, setExpandedId] = useState(null);
   const [settingsMap, setSettingsMap] = useState({});
+  const [dialogsMap, setDialogsMap] = useState({});
   const [chatSettingsMap, setChatSettingsMap] = useState({});
   const [logsMap, setLogsMap] = useState({});
   const [togglingId, setTogglingId] = useState(null);
   const [chatToggling, setChatToggling] = useState(null);
   const [clearing, setClearing] = useState(null);
+  const [dialogsLoading, setDialogsLoading] = useState(null);
 
   const loadSessions = async () => {
     setLoading(true);
@@ -73,7 +91,6 @@ export default function AiChat() {
       const { data } = await listClientSessions();
       const list = data?.data?.sessions || [];
       setSessions(list);
-      // Pre-load settings for each session.
       const settings = {};
       await Promise.all(
         list.map(async (s) => {
@@ -110,7 +127,10 @@ export default function AiChat() {
       });
       setSettingsMap((prev) => ({
         ...prev,
-        [sessionId]: { enabled: data?.data?.enabled ?? nextEnabled, config: data?.data?.config || current.config },
+        [sessionId]: {
+          enabled: data?.data?.enabled ?? nextEnabled,
+          config: data?.data?.config || current.config,
+        },
       }));
       toast.success(nextEnabled ? 'AI enabled for this session' : 'AI disabled for this session');
     } catch (err) {
@@ -126,41 +146,72 @@ export default function AiChat() {
       return;
     }
     setExpandedId(sessionId);
+
+    if (dialogsMap[sessionId]) {
+      await _refreshChatData(sessionId);
+      return;
+    }
+
+    setDialogsLoading(sessionId);
     try {
-      const [{ data: cs }, { data: ls }] = await Promise.all([
-        getAiChatSettings(sessionId),
-        getAiLogs(sessionId),
+      const [{ data: dlgData }, { data: cs }, { data: ls }] = await Promise.all([
+        getClientDialogs(sessionId, { limit: 200 }),
+        getAiChatSettings(sessionId, { limit: 500 }),
+        getAiLogs(sessionId, { limit: 50 }),
       ]);
-      setChatSettingsMap((prev) => ({
-        ...prev,
-        [sessionId]: cs?.data?.rows || [],
-      }));
-      setLogsMap((prev) => ({
-        ...prev,
-        [sessionId]: ls?.data?.rows || [],
-      }));
+      const dialogs = dlgData?.data?.dialogs || [];
+      const settingsRows = cs?.data?.rows || [];
+      const settingsByKey = {};
+      for (const row of settingsRows) {
+        settingsByKey[_peerKey(row.peer_type, row.peer_id)] = row;
+      }
+      setDialogsMap((prev) => ({ ...prev, [sessionId]: dialogs }));
+      setChatSettingsMap((prev) => ({ ...prev, [sessionId]: settingsByKey }));
+      setLogsMap((prev) => ({ ...prev, [sessionId]: ls?.data?.rows || [] }));
     } catch (err) {
-      toast.error('Failed to load chat settings or logs');
+      toast.error('Failed to load chats or AI logs');
+    } finally {
+      setDialogsLoading(null);
     }
   };
 
-  const toggleChat = async (sessionId, chat) => {
-    const { peer_type, peer_id, enabled } = chat;
-    setChatToggling(`${sessionId}:${peer_type}:${peer_id}`);
+  const _refreshChatData = async (sessionId) => {
     try {
-      await updateAiChatSettings(sessionId, peer_type, peer_id, { enabled: !enabled });
+      const [{ data: cs }, { data: ls }] = await Promise.all([
+        getAiChatSettings(sessionId, { limit: 500 }),
+        getAiLogs(sessionId, { limit: 50 }),
+      ]);
+      const settingsRows = cs?.data?.rows || [];
+      const settingsByKey = {};
+      for (const row of settingsRows) {
+        settingsByKey[_peerKey(row.peer_type, row.peer_id)] = row;
+      }
+      setChatSettingsMap((prev) => ({ ...prev, [sessionId]: settingsByKey }));
+      setLogsMap((prev) => ({ ...prev, [sessionId]: ls?.data?.rows || [] }));
+    } catch (err) {
+      toast.error('Failed to refresh chat settings');
+    }
+  };
+
+  const isAiEnabledForChat = (sessionId, peerType, peerId) => {
+    const settings = chatSettingsMap[sessionId] || {};
+    const key = _peerKey(peerType, peerId);
+    if (settings[key]) return settings[key].enabled;
+    return settingsMap[sessionId]?.enabled ?? false;
+  };
+
+  const toggleChat = async (sessionId, peerType, peerId) => {
+    const current = isAiEnabledForChat(sessionId, peerType, peerId);
+    const next = !current;
+    setChatToggling(`${sessionId}:${peerType}:${peerId}`);
+    try {
+      await updateAiChatSettings(sessionId, peerType, peerId, { enabled: next });
       setChatSettingsMap((prev) => {
-        const list = prev[sessionId] || [];
-        return {
-          ...prev,
-          [sessionId]: list.map((c) =>
-            c.peer_type === peer_type && c.peer_id === peer_id
-              ? { ...c, enabled: !enabled }
-              : c
-          ),
-        };
+        const map = { ...prev[sessionId] };
+        map[_peerKey(peerType, peerId)] = { enabled: next };
+        return { ...prev, [sessionId]: map };
       });
-      toast.success(!enabled ? 'AI enabled for this chat' : 'AI disabled for this chat');
+      toast.success(next ? 'AI enabled for this chat' : 'AI disabled for this chat');
     } catch (err) {
       toast.error(err?.response?.data?.error?.message || 'Failed to update chat setting');
     } finally {
@@ -301,98 +352,139 @@ export default function AiChat() {
                   {expanded && (
                     <div className="mt-4 border-t border-white/5 pt-4">
                       <h3 className="mb-2 text-sm font-semibold text-gray-300">
-                        Per-chat overrides
+                        Chats for this session
                       </h3>
-                      {(() => {
-                        const chats = chatSettingsMap[s.id] || [];
-                        if (!chats.length) {
-                          return (
-                            <p className="text-sm text-gray-500">
-                              No chat overrides yet. AI defaults to ON for every chat when the session is enabled.
-                            </p>
-                          );
-                        }
-                        return (
-                          <div className="space-y-2">
-                            {chats.map((c) => (
-                              <div
-                                key={`${c.peer_type}:${c.peer_id}`}
-                                className="flex items-center justify-between rounded-md bg-dark-800/50 px-3 py-2"
-                              >
-                                <div className="text-sm">
-                                  <span className="text-gray-400">{PEER_LABEL[c.peer_type]}:</span>{' '}
-                                  <span className="font-mono">{c.peer_id}</span>
-                                </div>
-                                <div className="flex items-center gap-2">
-                                  <button
-                                    type="button"
-                                    onClick={() => toggleChat(s.id, c)}
-                                    disabled={!!chatToggling}
-                                    className={`relative inline-flex h-5 w-9 items-center rounded-full transition-colors ${
-                                      c.enabled ? 'bg-sky-500' : 'bg-gray-600'
-                                    }`}
-                                  >
-                                    <span
-                                      className={`inline-block h-3 w-3 transform rounded-full bg-white transition-transform ${
-                                        c.enabled ? 'translate-x-5' : 'translate-x-1'
-                                      }`}
-                                    />
-                                  </button>
-                                  <button
-                                    type="button"
-                                    onClick={() => clearMemory(s.id, c.peer_type, c.peer_id)}
-                                    disabled={clearing === `${s.id}:${c.peer_type}:${c.peer_id}`}
-                                    title="Clear memory"
-                                    className="rounded-md p-1.5 text-gray-400 hover:bg-red-500/10 hover:text-red-300 disabled:opacity-50"
-                                  >
-                                    <Trash2 className="h-4 w-4" />
-                                  </button>
-                                </div>
-                              </div>
-                            ))}
-                          </div>
-                        );
-                      })()}
 
-                      <h3 className="mb-2 mt-4 text-sm font-semibold text-gray-300">
-                        Recent AI logs
-                      </h3>
-                      {(() => {
-                        const logs = logsMap[s.id] || [];
-                        if (!logs.length) {
-                          return (
-                            <p className="text-sm text-gray-500">No AI response logs yet.</p>
-                          );
-                        }
-                        return (
-                          <div className="max-h-64 overflow-auto rounded-md bg-dark-800/30">
-                            {logs.map((log) => {
-                              const pill = _statusPill(log.status);
-                              return (
-                                <div
-                                  key={log.id}
-                                  className="flex items-center justify-between border-b border-white/5 px-3 py-2 text-sm last:border-0"
-                                >
-                                  <div className="flex items-center gap-2">
-                                    <span
-                                      className={`flex items-center gap-1 rounded border px-1.5 py-0.5 text-xs ${TONE_CLASSES[pill.tone]}`}
-                                    >
-                                      <pill.Icon className="h-3 w-3" />
-                                      {pill.label}
-                                    </span>
-                                    <span className="text-gray-400">
-                                      {PEER_LABEL[log.peer_type]} {log.peer_id}
-                                    </span>
+                      {dialogsLoading === s.id ? (
+                        <div className="flex items-center py-6 text-gray-400">
+                          <Loader2 className="mr-2 h-5 w-5 animate-spin" />
+                          Loading chats…
+                        </div>
+                      ) : (
+                        <>
+                          <div className="mb-4 max-h-96 overflow-auto rounded-md border border-white/5">
+                            {(() => {
+                              const dialogs = dialogsMap[s.id] || [];
+                              if (!dialogs.length) {
+                                return (
+                                  <p className="p-4 text-sm text-gray-500">
+                                    No chats found. Open the Telegram client for this session first.
+                                  </p>
+                                );
+                              }
+                              return dialogs.map((d) => {
+                                const enabled = isAiEnabledForChat(s.id, d.peerType, d.peerId);
+                                const icon =
+                                  d.peerType === 'user' ? UserIcon
+                                  : d.peerType === 'channel' ? Megaphone
+                                  : Users;
+                                const busy = chatToggling === `${s.id}:${d.peerType}:${d.peerId}`;
+                                const clearBusy = clearing === `${s.id}:${d.peerType}:${d.peerId}`;
+                                return (
+                                  <div
+                                    key={_peerKey(d.peerType, d.peerId)}
+                                    className="flex items-center justify-between border-b border-white/5 px-3 py-2 last:border-0 hover:bg-white/[0.02]"
+                                  >
+                                    <div className="flex min-w-0 items-center gap-3">
+                                      <Avatar
+                                        sessionId={s.id}
+                                        peerType={d.peerType}
+                                        peerId={d.peerId}
+                                        label={d.title}
+                                        size="sm"
+                                      />
+                                      <div className="min-w-0">
+                                        <div className="flex items-center gap-1.5 text-sm font-medium">
+                                          <icon className="h-3.5 w-3.5 text-gray-500" />
+                                          <span className="truncate">{d.title || 'Unknown'}</span>
+                                          {d.username && (
+                                            <span className="text-xs text-gray-500">@{d.username}</span>
+                                          )}
+                                        </div>
+                                        <div className="truncate text-xs text-gray-500">
+                                          {_formatPreview(d.lastMessage)}
+                                        </div>
+                                      </div>
+                                    </div>
+
+                                    <div className="flex items-center gap-2 pl-3">
+                                      <button
+                                        type="button"
+                                        onClick={() => toggleChat(s.id, d.peerType, d.peerId)}
+                                        disabled={busy || !settings.enabled}
+                                        title={settings.enabled ? (enabled ? 'Disable AI for this chat' : 'Enable AI for this chat') : 'Enable session AI first'}
+                                        className={`relative inline-flex h-5 w-9 items-center rounded-full transition-colors disabled:opacity-50 ${
+                                          enabled ? 'bg-sky-500' : 'bg-gray-600'
+                                        }`}
+                                      >
+                                        <span
+                                          className={`inline-block h-3 w-3 transform rounded-full bg-white transition-transform ${
+                                            enabled ? 'translate-x-5' : 'translate-x-1'
+                                          }`}
+                                        />
+                                      </button>
+                                      <button
+                                        type="button"
+                                        onClick={() => clearMemory(s.id, d.peerType, d.peerId)}
+                                        disabled={clearBusy}
+                                        title="Clear memory"
+                                        className="rounded-md p-1.5 text-gray-400 hover:bg-red-500/10 hover:text-red-300 disabled:opacity-50"
+                                      >
+                                        <Trash2 className="h-4 w-4" />
+                                      </button>
+                                    </div>
                                   </div>
-                                  <span className="text-xs text-gray-600">
-                                    {new Date(log.created_at).toLocaleString()}
-                                  </span>
-                                </div>
-                              );
-                            })}
+                                );
+                              });
+                            })()}
                           </div>
-                        );
-                      })()}
+
+                          <h3 className="mb-2 text-sm font-semibold text-gray-300">
+                            Recent AI logs
+                          </h3>
+                          {(() => {
+                            const logs = logsMap[s.id] || [];
+                            if (!logs.length) {
+                              return (
+                                <p className="text-sm text-gray-500">No AI response logs yet.</p>
+                              );
+                            }
+                            return (
+                              <div className="max-h-64 overflow-auto rounded-md bg-dark-800/30">
+                                {logs.map((log) => {
+                                  const pill = _statusPill(log.status);
+                                  return (
+                                    <div
+                                      key={log.id}
+                                      className="flex items-center justify-between border-b border-white/5 px-3 py-2 text-sm last:border-0"
+                                    >
+                                      <div className="flex items-center gap-2">
+                                        <span
+                                          className={`flex items-center gap-1 rounded border px-1.5 py-0.5 text-xs ${TONE_CLASSES[pill.tone]}`}
+                                        >
+                                          <pill.Icon className="h-3 w-3" />
+                                          {pill.label}
+                                        </span>
+                                        <span className="text-gray-400">
+                                          {PEER_LABEL[log.peer_type]} {log.peer_id}
+                                        </span>
+                                        {log.error_message && (
+                                          <span className="truncate max-w-[200px] text-xs text-red-300" title={log.error_message}>
+                                            {log.error_message}
+                                          </span>
+                                        )}
+                                      </div>
+                                      <span className="text-xs text-gray-600">
+                                        {new Date(log.created_at).toLocaleString()}
+                                      </span>
+                                    </div>
+                                  );
+                                })}
+                              </div>
+                            );
+                          })()}
+                        </>
+                      )}
                     </div>
                   )}
                 </div>
