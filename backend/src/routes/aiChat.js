@@ -23,4 +23,9 @@ router.delete('/sessions/:id/ai-chats/:peerType/:peerId/memory', controller.clea
 
 router.get('/sessions/:id/ai-logs', controller.listLogs);
 
+// CupidBot API key management
+router.get('/cupidbot-key', controller.getCupidbotKey);
+router.post('/cupidbot-key', controller.setCupidbotKey);
+router.delete('/cupidbot-key', controller.deleteCupidbotKey);
+
 module.exports = router;

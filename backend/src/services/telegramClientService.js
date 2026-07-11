@@ -572,10 +572,17 @@ class TelegramClientService {
       if (norm) items.push(norm);
     }
 
+    // Panel-wide restriction: the web panel only surfaces personal (DM)
+    // chats for the AI auto-responder.  Groups, channels, and bot accounts
+    // are filtered out so the AI menu cannot be pointed at them.
+    const personalOnly = items.filter(
+      (it) => it.peerType === 'user' && it.isBot !== true && it.isSelf !== true
+    );
+
     return {
-      total: items.length,
+      total: personalOnly.length,
       ownId,
-      dialogs: items,
+      dialogs: personalOnly,
     };
   }
 

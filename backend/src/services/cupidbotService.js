@@ -13,10 +13,11 @@
 
 const https = require('https');
 const { URL } = require('url');
+const { pool } = require('../config/database');
 const logger = require('../utils/logger');
 
 const DEFAULT_ENDPOINT = 'https://chat-api.cupidbotofm.ai/api/generateChatResponse';
-const ACCESS_TOKEN = process.env.CUPIDBOT_ACCESS_TOKEN || '';
+const ADMIN_ACCESS_TOKEN = process.env.CUPIDBOT_ACCESS_TOKEN || '';
 const ENDPOINT_URL = process.env.CUPIDBOT_ENDPOINT_URL || DEFAULT_ENDPOINT;
 const MAX_RETRIES = 3;
 
@@ -69,9 +70,102 @@ function _requestJson(url, body) {
 
 class CupidBotService {
   /**
+   * Resolve the CupidBot access token for a user.
+   * Admin (user id 1) falls back to the global env token; all other
+   * users must have stored their own key in user_cupidbot_keys.
+   */
+  async getAccessToken(userId) {
+    const uid = Number(userId);
+    if (!uid) {
+      throw new Error('User ID is required to resolve CupidBot API key');
+    }
+
+    const { rows } = await pool.query(
+      `SELECT api_key, is_valid FROM user_cupidbot_keys WHERE user_id = $1`,
+      [uid]
+    );
+    if (rows.length && rows[0].api_key) {
+      return { token: rows[0].api_key, source: 'user', isValid: rows[0].is_valid };
+    }
+
+    if (uid === 1) {
+      if (!ADMIN_ACCESS_TOKEN) {
+        throw new Error('CUPIDBOT_ACCESS_TOKEN is not configured');
+      }
+      return { token: ADMIN_ACCESS_TOKEN, source: 'admin', isValid: true };
+    }
+
+    throw new Error('CupidBot API key is not configured. Please add your API key in the AI menu.');
+  }
+
+  /**
+   * Store or update a user's CupidBot API key.
+   */
+  async setUserApiKey(userId, apiKey) {
+    const uid = Number(userId);
+    if (!uid) throw new Error('User ID is required');
+    if (!apiKey || typeof apiKey !== 'string' || !apiKey.trim()) {
+      throw new Error('API key is required');
+    }
+    const key = apiKey.trim();
+
+    // Validate by calling CupidBot with a tiny payload.
+    const isValid = await this.validateApiKey(key);
+
+    await pool.query(
+      `INSERT INTO user_cupidbot_keys (user_id, api_key, is_valid, updated_at)
+       VALUES ($1, $2, $3, NOW())
+       ON CONFLICT (user_id) DO UPDATE
+       SET api_key = EXCLUDED.api_key,
+           is_valid = EXCLUDED.is_valid,
+           updated_at = NOW()`,
+      [uid, key, isValid]
+    );
+
+    return { userId: uid, isValid };
+  }
+
+  /**
+   * Validate an API key with a lightweight CupidBot call.
+   */
+  async validateApiKey(apiKey) {
+    const body = {
+      accessToken: apiKey,
+      isAPI: true,
+      app: 'telegram',
+      brand: 'cupidbotofm',
+      isOF: true,
+      accountID: 'validation',
+      recipient: { id: '0', name: '', username: '', bio: '', location: '' },
+      messages: [],
+    };
+
+    try {
+      const res = await _requestJson(ENDPOINT_URL, body);
+      if (res.statusCode === 401 || res.statusCode === 403) return false;
+      if (res.statusCode >= 200 && res.statusCode < 300) return true;
+      return false;
+    } catch (err) {
+      logger.debug(`CupidBot key validation request failed: ${err.message}`);
+      return false;
+    }
+  }
+
+  /**
+   * Delete a user's stored CupidBot API key.
+   */
+  async deleteUserApiKey(userId) {
+    const uid = Number(userId);
+    if (!uid) throw new Error('User ID is required');
+    await pool.query(`DELETE FROM user_cupidbot_keys WHERE user_id = $1`, [uid]);
+    return { userId: uid, deleted: true };
+  }
+
+  /**
    * Generate an AI reply for a conversation.
    *
    * @param {object} params
+   * @param {string|number} params.userId - Panel user id for API-key lookup.
    * @param {string|number} params.accountID - Panel session id used as the AI account identifier.
    * @param {object} params.recipient - { id, name, username, bio, location }
    * @param {Array<object>} params.messages - Conversation memory, each item:
@@ -80,13 +174,11 @@ class CupidBotService {
    *   (app, brand, isOF, chatStyle, responseLanguage, etc.).
    * @returns {Promise<{ text: string|null, media: object|null, didConvert: boolean, category: string|null, rateLimit: object|null }>}
    */
-  async generateReply({ accountID, recipient, messages, overrides = {} }) {
-    if (!ACCESS_TOKEN) {
-      throw new Error('CUPIDBOT_ACCESS_TOKEN is not configured');
-    }
+  async generateReply({ userId, accountID, recipient, messages, overrides = {} }) {
+    const { token: accessToken } = await this.getAccessToken(userId);
 
     const body = {
-      accessToken: ACCESS_TOKEN,
+      accessToken,
       isAPI: true,
       app: overrides.app || 'telegram',
       brand: overrides.brand || 'cupidbotofm',

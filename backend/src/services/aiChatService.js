@@ -23,9 +23,12 @@ const DEFAULT_CONFIG = {
   replyDelayMs: 3000,
   replyDelayJitterMs: 2000,
   memoryMessageLimit: 50,
+  // AI auto-responder is restricted to personal (DM) chats only.
+  // Groups, channels, and bot accounts are intentionally excluded.
   allowedPeerTypes: ['user'],
   allowGroups: false,
   allowChannels: false,
+  skipBots: true,
   cupidbot: {
     app: 'telegram',
     isAPI: true,
@@ -37,9 +40,16 @@ const DEFAULT_CONFIG = {
 };
 
 function _mergeConfig(config) {
+  // AI auto-responder is institutional-grade restricted to personal DMs.
+  // Even if the persisted config tries to enable groups/channels, force
+  // them off so a misconfigured row can never break the contract.
   return {
     ...DEFAULT_CONFIG,
     ...config,
+    allowedPeerTypes: ['user'],
+    allowGroups: false,
+    allowChannels: false,
+    skipBots: config.skipBots !== false,
     cupidbot: { ...DEFAULT_CONFIG.cupidbot, ...(config.cupidbot || {}) },
   };
 }
@@ -108,6 +118,12 @@ class AiChatService {
     const sender = await event.getSender().catch(() => null);
     const title = tcService._entityTitle(sender || chat) || '';
     const username = (sender || chat).username || '';
+
+    // AI auto-responder: skip bot accounts (Telegram users with bot=true).
+    if (cfg.skipBots && sender && sender.bot === true) {
+      logger.info(`aiChatService: dropping message ${msg.id}: sender_is_bot`);
+      return { handled: false, reason: 'sender_is_bot' };
+    }
 
     const memoryItem = {
       id: `tg-${msg.id}`,
