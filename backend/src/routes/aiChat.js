@@ -19,6 +19,7 @@ router.patch('/sessions/:id/ai-settings', controller.updateSessionSettings);
 
 router.get('/sessions/:id/ai-chats', controller.listChatSettings);
 router.patch('/sessions/:id/ai-chats/:peerType/:peerId', controller.updateChatSettings);
+router.post('/sessions/:id/ai-chats/:peerType/:peerId/seed', controller.seedChatMemory);
 router.delete('/sessions/:id/ai-chats/:peerType/:peerId/memory', controller.clearChatMemory);
 
 router.get('/sessions/:id/ai-logs', controller.listLogs);

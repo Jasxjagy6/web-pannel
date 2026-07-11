@@ -17,12 +17,13 @@ const aiMemoryService = require('./aiMemoryService');
 const aiSessionManager = require('./aiSessionManager');
 const aiChatQueue = require('../queues/aiChatQueue');
 const tcService = require('./telegramClientService');
+const telegramClientService = require('./telegramClientService');
 const logger = require('../utils/logger');
 
 const DEFAULT_CONFIG = {
   replyDelayMs: 3000,
   replyDelayJitterMs: 2000,
-  memoryMessageLimit: 50,
+  memoryMessageLimit: 100,
   // AI auto-responder is restricted to personal (DM) chats only.
   // Groups, channels, and bot accounts are intentionally excluded.
   allowedPeerTypes: ['user'],
@@ -40,15 +41,16 @@ const DEFAULT_CONFIG = {
 };
 
 function _mergeConfig(config) {
-  // AI auto-responder is institutional-grade restricted to personal DMs.
-  // Even if the persisted config tries to enable groups/channels, force
-  // them off so a misconfigured row can never break the contract.
+  // Stored config is honoured so operators can opt into groups / channels
+  // either at the session level or via a per-chat override. The safe
+  // defaults baked into DEFAULT_CONFIG (DM-only, no groups, no channels)
+  // apply only when the stored config is missing the relevant keys.
   return {
     ...DEFAULT_CONFIG,
     ...config,
-    allowedPeerTypes: ['user'],
-    allowGroups: false,
-    allowChannels: false,
+    allowedPeerTypes: config.allowedPeerTypes || DEFAULT_CONFIG.allowedPeerTypes,
+    allowGroups: config.allowGroups !== undefined ? config.allowGroups : DEFAULT_CONFIG.allowGroups,
+    allowChannels: config.allowChannels !== undefined ? config.allowChannels : DEFAULT_CONFIG.allowChannels,
     skipBots: config.skipBots !== false,
     cupidbot: { ...DEFAULT_CONFIG.cupidbot, ...(config.cupidbot || {}) },
   };
@@ -95,7 +97,20 @@ class AiChatService {
       return { handled: false, reason: 'session_disabled' };
     }
 
-    const cfg = _mergeConfig(sessionSettings.config);
+    // Per-chat override. A row with enabled=FALSE disables this chat;
+    // no row means default enabled. The chat config (if any) is layered
+    // on top of the session-level config so an operator can opt a single
+    // chat into group/channel replies even when the session default is
+    // more restrictive.
+    const chatOverride = await this.getChatSettings(sid, peerType, peerId);
+    if (chatOverride && chatOverride.enabled === false) {
+      return { handled: false, reason: 'chat_disabled' };
+    }
+
+    const cfg = _mergeConfig({
+      ...sessionSettings.config,
+      ...(chatOverride?.config || {}),
+    });
 
     // Peer-type / group / channel filters.
     if (!cfg.allowedPeerTypes.includes(peerType)) {
@@ -106,13 +121,6 @@ class AiChatService {
     }
     if (peerType === 'channel' && cfg.allowChannels !== true) {
       return { handled: false, reason: 'channels_disabled' };
-    }
-
-    // Per-chat override.  A row with enabled=FALSE disables this chat;
-    // no row means default enabled.
-    const chatOverride = await this.getChatSettings(sid, peerType, peerId);
-    if (chatOverride && chatOverride.enabled === false) {
-      return { handled: false, reason: 'chat_disabled' };
     }
 
     const sender = await event.getSender().catch(() => null);
@@ -180,6 +188,17 @@ class AiChatService {
   /**
    * Enable/disable AI for a session and persist default config.
    * Also attaches/detaches the persistent GramJS listener.
+   *
+   * Attach is attempted BEFORE the DB write so a listener failure cannot
+   * leave the row marked enabled while no listener is actually running.
+   * If attach throws we surface a 502 AppError and the DB row is left
+   * untouched (existing rows keep their previous enabled flag; new rows
+   * are not created).
+   *
+   * If the DB write fails after a successful attach we detach again to
+   * keep DB and listener state consistent.
+   *
+   * @returns {Promise<{ sessionId: number, enabled: boolean, config: object, attached: boolean }>}
    */
   async setSessionEnabled(sessionId, userId, enabled, config = {}) {
     const sid = Number(sessionId);
@@ -187,23 +206,51 @@ class AiChatService {
 
     const cfg = _mergeConfig(config);
 
-    await pool.query(
-      `INSERT INTO ai_session_settings (session_id, enabled, config, updated_at)
-       VALUES ($1, $2, $3, NOW())
-       ON CONFLICT (session_id) DO UPDATE
-       SET enabled = EXCLUDED.enabled,
-           config = EXCLUDED.config,
-           updated_at = NOW()`,
-      [sid, !!enabled, JSON.stringify(cfg)]
-    );
-
+    let attached = false;
     if (enabled) {
-      await aiSessionManager.attach(sid);
+      let attachResult;
+      try {
+        attachResult = await aiSessionManager.attach(sid);
+      } catch (attachErr) {
+        throw new AppError(
+          `Failed to attach AI listener for session ${sid}: ${attachErr.message}`,
+          502,
+          'AI_LISTENER_ATTACH_FAILED'
+        );
+      }
+      // `already_attached` from a prior successful toggle still counts as
+      // the listener being live for this session; the only failure mode
+      // that falls through is throw, which is handled above.
+      attached = !!attachResult?.attached;
     } else {
       await aiSessionManager.detach(sid);
+      attached = false;
     }
 
-    return { sessionId: sid, enabled: !!enabled, config: cfg };
+    try {
+      await pool.query(
+        `INSERT INTO ai_session_settings (session_id, enabled, config, updated_at)
+         VALUES ($1, $2, $3, NOW())
+         ON CONFLICT (session_id) DO UPDATE
+         SET enabled = EXCLUDED.enabled,
+             config = EXCLUDED.config,
+             updated_at = NOW()`,
+        [sid, !!enabled, JSON.stringify(cfg)]
+      );
+    } catch (dbErr) {
+      // Roll back the listener we just attached so DB and runtime stay
+      // in sync. Don't mask the original DB error.
+      if (enabled) {
+        await aiSessionManager.detach(sid).catch((detachErr) => {
+          logger.warn(
+            `Failed to detach AI listener after DB write failure for session ${sid}: ${detachErr.message}`
+          );
+        });
+      }
+      throw dbErr;
+    }
+
+    return { sessionId: sid, enabled: !!enabled, config: cfg, attached };
   }
 
   /**
@@ -249,7 +296,29 @@ class AiChatService {
       [sid, peerType, peerId, !!enabled, JSON.stringify(config)]
     );
 
+    // When a chat override is enabled for the first time on an empty
+    // memory row, opportunistically backfill from recent Telegram
+    // history so the first AI reply has context. Fire-and-forget so the
+    // toggle responds quickly; failures are logged but do not roll back
+    // the override write.
+    if (enabled) {
+      this._maybeAutoSeedOnEnable(sid, userId, peerType, peerId).catch((err) => {
+        logger.warn(
+          `seedChatMemory auto-backfill failed for ${sid}/${peerType}/${peerId}: ${err && err.message}`
+        );
+      });
+    }
+
     return { sessionId: sid, peerType, peerId, enabled: !!enabled };
+  }
+
+  async _maybeAutoSeedOnEnable(sessionId, userId, peerType, peerId) {
+    const sid = Number(sessionId);
+    const pid = Number(peerId);
+    const existing = await aiMemoryService.getMessages(sid, peerType, pid, 1);
+    if (Array.isArray(existing) && existing.length > 0) return false;
+    await this.seedChatMemory(sid, userId, peerType, pid, { limit: 100 });
+    return true;
   }
 
   /**
@@ -279,6 +348,63 @@ class AiChatService {
     await this._authorizeSession(sid, userId);
     await aiMemoryService.clear(sid, peerType, peerId);
     return { sessionId: sid, peerType, peerId, cleared: true };
+  }
+
+  /**
+   * Seed a chat's AI memory from recent Telegram history.
+   *
+   * Fetches up to 100 messages from the peer via telegramClientService,
+   * normalizes each to the memory shape used by append(), and bulk-writes
+   * the result via aiMemoryService.seedFromHistory.
+   *
+   * This is invoked explicitly via POST /seed and also (optionally,
+   * fire-and-forget) the first time an operator enables a chat override
+   * on a memory row that is still empty.
+   *
+   * @param {string|number} sessionId
+   * @param {string|number} userId
+   * @param {string} peerType
+   * @param {string|number} peerId
+   * @param {object} [opts]
+   * @param {number} [opts.limit=100]
+   * @returns {Promise<{ sessionId: number, peerType: string, peerId: number, seeded: number }>}
+   */
+  async seedChatMemory(sessionId, userId, peerType, peerId, opts = {}) {
+    const sid = Number(sessionId);
+    const pid = Number(peerId);
+    await this._authorizeSession(sid, userId);
+
+    const limit = Math.min(
+      Math.max(1, parseInt(opts.limit, 10) || 100),
+      100
+    );
+
+    const result = await telegramClientService.getMessages(sid, userId, peerType, pid, {
+      limit,
+    });
+
+    const raw = Array.isArray(result?.messages) ? result.messages : [];
+
+    const memoryItems = raw.map((m) => {
+      const ts = m && m.date ? new Date(m.date).getTime() : Date.now();
+      return {
+        id: m && m.id != null ? `tg-${m.id}` : null,
+        telegramMessageId: m && m.id != null ? Number(m.id) : null,
+        timestamp: Number.isFinite(ts) ? ts : Date.now(),
+        msg: (m && m.text) || '',
+        isIncoming: !(m && m.out),
+        medias: m && m.mediaKind ? [{ kind: m.mediaKind, hasMedia: !!m.hasMedia }] : [],
+      };
+    });
+
+    await aiMemoryService.seedFromHistory(sid, peerType, pid, memoryItems);
+
+    return {
+      sessionId: sid,
+      peerType,
+      peerId: pid,
+      seeded: memoryItems.length,
+    };
   }
 
   /**

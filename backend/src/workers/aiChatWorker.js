@@ -40,7 +40,7 @@ function sleep(ms) {
 }
 
 async function processGenerateReply(job) {
-  const { sessionId, peerType, peerId, incomingMessage, recipient, config } = job.data;
+  const { sessionId, userId, peerType, peerId, incomingMessage, recipient, config } = job.data;
   const logRow = {
     session_id: sessionId,
     peer_type: peerType,
@@ -65,6 +65,7 @@ async function processGenerateReply(job) {
     await sleep(replyDelay + Math.random() * jitter);
 
     const cupid = await cupidbotService.generateReply({
+      userId,
       accountID: sessionId,
       recipient,
       messages,
@@ -79,12 +80,24 @@ async function processGenerateReply(job) {
       return { sent: false, reason: 'empty_reply' };
     }
 
-    const sent = await tgService.sendMessage(
-      sessionId,
-      peerId,
-      cupid.text,
-      { silent: false }
-    );
+    let sent;
+    try {
+      sent = await tgService.sendMessage(
+        sessionId,
+        peerId,
+        cupid.text,
+        { silent: false }
+      );
+    } catch (sendErr) {
+      logger.warn(
+        `AI chat sendMessage failed for session ${sessionId} peer ${peerId}: ${sendErr.message}. ` +
+        `CupidBot response: ${JSON.stringify(cupid)}`
+      );
+      logRow.status = 'send_failed';
+      logRow.error_message = sendErr.message;
+      await _insertLog(logRow);
+      return { sent: false, reason: 'send_failed' };
+    }
 
     const outgoingItem = {
       id: `tg-ai-${sent?.messageId ?? Date.now()}`,

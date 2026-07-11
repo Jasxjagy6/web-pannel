@@ -23,6 +23,7 @@ import {
   Users,
   Megaphone,
   User as UserIcon,
+  Database,
 } from 'lucide-react';
 import { listClientSessions, getClientDialogs } from '../api/telegramClient';
 import {
@@ -32,6 +33,10 @@ import {
   updateAiChatSettings,
   clearAiChatMemory,
   getAiLogs,
+  getCupidbotKey,
+  setCupidbotKey,
+  deleteCupidbotKey,
+  seedAiChatMemory,
 } from '../api/aiChat';
 import { usePlatform } from '../context/PlatformContext';
 import { useToast } from '../components/common/Toast';
@@ -82,6 +87,7 @@ export default function AiChat() {
   const [togglingId, setTogglingId] = useState(null);
   const [chatToggling, setChatToggling] = useState(null);
   const [clearing, setClearing] = useState(null);
+  const [seeding, setSeeding] = useState(null);
   const [dialogsLoading, setDialogsLoading] = useState(null);
   const [keyStatus, setKeyStatus] = useState(null);
   const [keyDraft, setKeyDraft] = useState('');
@@ -145,7 +151,11 @@ export default function AiChat() {
       }));
       toast.success(nextEnabled ? 'AI enabled for this session' : 'AI disabled for this session');
     } catch (err) {
-      toast.error(err?.response?.data?.error?.message || 'Failed to update AI setting');
+      toast.error(
+        err?.response?.data?.error?.message ||
+        err?.response?.data?.error ||
+        'Failed to update AI setting'
+      );
     } finally {
       setTogglingId(null);
     }
@@ -202,7 +212,7 @@ export default function AiChat() {
     setDialogsLoading(sessionId);
     try {
       const [{ data: dlgData }, { data: cs }, { data: ls }] = await Promise.all([
-        getClientDialogs(sessionId, { limit: 200 }),
+        getClientDialogs(sessionId, { limit: 200, includeAllPeerTypes: true }),
         getAiChatSettings(sessionId, { limit: 500 }),
         getAiLogs(sessionId, { limit: 50 }),
       ]);
@@ -275,6 +285,18 @@ export default function AiChat() {
       toast.error(err?.response?.data?.error?.message || 'Failed to clear memory');
     } finally {
       setClearing(null);
+    }
+  };
+
+  const seedMemory = async (sessionId, peerType, peerId) => {
+    setSeeding(`${sessionId}:${peerType}:${peerId}`);
+    try {
+      await seedAiChatMemory(sessionId, peerType, peerId);
+      toast.success('Chat memory seeded from recent history');
+    } catch (err) {
+      toast.error(err?.response?.data?.error?.message || 'Failed to seed memory');
+    } finally {
+      setSeeding(null);
     }
   };
 
@@ -493,6 +515,7 @@ export default function AiChat() {
                                   : Users;
                                 const busy = chatToggling === `${s.id}:${d.peerType}:${d.peerId}`;
                                 const clearBusy = clearing === `${s.id}:${d.peerType}:${d.peerId}`;
+                                const seedBusy = seeding === `${s.id}:${d.peerType}:${d.peerId}`;
                                 return (
                                   <div
                                     key={_peerKey(d.peerType, d.peerId)}
@@ -535,6 +558,15 @@ export default function AiChat() {
                                             enabled ? 'translate-x-5' : 'translate-x-1'
                                           }`}
                                         />
+                                      </button>
+                                      <button
+                                        type="button"
+                                        onClick={() => seedMemory(s.id, d.peerType, d.peerId)}
+                                        disabled={seedBusy || !settings.enabled}
+                                        title="Seed memory from recent history"
+                                        className="rounded-md p-1.5 text-gray-400 hover:bg-sky-500/10 hover:text-sky-300 disabled:opacity-50"
+                                      >
+                                        <Database className="h-4 w-4" />
                                       </button>
                                       <button
                                         type="button"

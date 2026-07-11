@@ -19,6 +19,8 @@ const { Api } = require('telegram');
 const { pool } = require('../config/database');
 const tgService = require('./telegramService');
 const sessionService = require('./sessionService');
+const aiChatService = require('./aiChatService');
+const aiMemoryService = require('./aiMemoryService');
 const logger = require('../utils/logger');
 const { AppError } = require('../utils/errorHandler');
 
@@ -543,6 +545,11 @@ class TelegramClientService {
    * @param {string|number} userId
    * @param {object} [opts]
    * @param {number} [opts.limit]
+   * @param {boolean} [opts.includeAllPeerTypes=false]  When true, return all
+   *   peer types (user/chat/channel) including bots and the self chat, with
+   *   no personal-DM-only filter. Used by the AI settings flow so an
+   *   operator can point the auto-responder at groups / channels. When
+   *   false (the default), keep the legacy personal-only filter.
    */
   async getDialogs(sessionId, userId, opts = {}) {
     await _loadAndAuthSession(sessionId, userId);
@@ -551,6 +558,7 @@ class TelegramClientService {
       Math.max(1, parseInt(opts.limit, 10) || DEFAULT_DIALOGS_LIMIT),
       MAX_DIALOGS_LIMIT
     );
+    const includeAllPeerTypes = opts.includeAllPeerTypes === true;
 
     const entry = tgService.clients.get(String(sessionId));
     if (!entry) throw new AppError('Session client not loaded', 500, 'CLIENT_NOT_LOADED');
@@ -572,17 +580,25 @@ class TelegramClientService {
       if (norm) items.push(norm);
     }
 
-    // Panel-wide restriction: the web panel only surfaces personal (DM)
-    // chats for the AI auto-responder.  Groups, channels, and bot accounts
-    // are filtered out so the AI menu cannot be pointed at them.
-    const personalOnly = items.filter(
-      (it) => it.peerType === 'user' && it.isBot !== true && it.isSelf !== true
-    );
+    let result;
+    if (includeAllPeerTypes) {
+      // Caller (e.g. AI settings UI) wants every peer type so the user can
+      // enable the auto-responder for groups / channels / bot-controlled
+      // chats as well as DMs. No additional filtering.
+      result = items;
+    } else {
+      // Default: panel-wide restriction to personal (DM) chats — only
+      // human users, no bots, no self chat. Groups, channels, and bot
+      // accounts are filtered out so the AI menu cannot be pointed at them.
+      result = items.filter(
+        (it) => it.peerType === 'user' && it.isBot !== true && it.isSelf !== true
+      );
+    }
 
     return {
-      total: personalOnly.length,
+      total: result.length,
       ownId,
-      dialogs: personalOnly,
+      dialogs: result,
     };
   }
 
@@ -697,6 +713,12 @@ class TelegramClientService {
     const messageId = _toIdNum(result.messageId ?? result.id ?? null);
     const date = result.date || new Date().toISOString();
     const peerIdNum = _toIdNum(peerId);
+
+    // Mirror the outgoing message into the AI chat memory so future
+    // auto-responses for this peer have the panel-operator's reply
+    // as context. Best-effort: failures here must never break the
+    // send path the user is waiting on.
+    await _appendOutgoingMemory(sessionId, peerType, peerIdNum, messageId, text);
 
     // Build the same UI-shaped message + chat summary the live-event
     // bridge would produce, then emit `tg-client:dialogUpdate` /
@@ -923,6 +945,11 @@ class TelegramClientService {
 
     const messageId = _toIdNum(sent?.id ?? null);
     const date = sent?.date ? _toIsoDate(sent.date) : new Date().toISOString();
+
+    // Mirror the outgoing media into the AI chat memory so future
+    // auto-responses for this peer see the panel-operator's media
+    // caption as context. Best-effort only.
+    await _appendOutgoingMemory(sessionId, peerType, peerIdNum, messageId, caption);
 
     const ownId = (await tgService.getMe(sessionId).catch(() => null))?.id;
     const dialogPeer = entity.id != null ? { [`${peerType}Id`]: entity.id } : null;
@@ -5133,6 +5160,44 @@ function _extractFirstMessageFromUpdates(result) {
     if (u && u.message) return u.message;
   }
   return null;
+}
+
+/**
+ * Mirror a successfully-sent outgoing Telegram message into the AI
+ * chat memory store so future auto-responses for the same peer see
+ * the panel-operator's reply as context.
+ *
+ * Gated on AI being enabled for the session AND the chat not being
+ * explicitly disabled (per-chat override returning { enabled: false }).
+ * Failures are caught + logged at debug — never propagate, since this
+ * runs on the hot path of sendMessage / sendMedia and the user is
+ * waiting on the Telegram round-trip.
+ */
+async function _appendOutgoingMemory(sessionId, peerType, peerId, messageId, text) {
+  if (messageId == null) return;
+  if (!PEER_TYPES.has(peerType)) return;
+  if (peerId == null) return;
+  try {
+    const sessionSettings = await aiChatService.getSessionSettings(sessionId);
+    if (!sessionSettings || !sessionSettings.enabled) return;
+
+    const chatSettings = await aiChatService
+      .getChatSettings(sessionId, peerType, peerId)
+      .catch(() => null);
+    if (chatSettings && chatSettings.enabled === false) return;
+
+    const memoryItem = {
+      id: `tg-out-${messageId}`,
+      telegramMessageId: messageId,
+      timestamp: Date.now(),
+      msg: text || '',
+      isIncoming: false,
+      medias: [],
+    };
+    await aiMemoryService.append(sessionId, peerType, peerId, memoryItem);
+  } catch (err) {
+    logger.debug(`_appendOutgoingMemory failed for ${sessionId}/${peerType}/${peerId}: ${err && err.message}`);
+  }
 }
 
 module.exports = new TelegramClientService();

@@ -30,18 +30,23 @@ test('aiMemoryService loads', () => {
   const svc = require('../../src/services/aiMemoryService');
   assert.ok(svc, 'aiMemoryService should export an object');
   assert.strictEqual(typeof svc.append, 'function', 'append should be a function');
+  assert.strictEqual(typeof svc.seedFromHistory, 'function', 'seedFromHistory should be a function');
 });
 
 test('aiChatService loads', () => {
   const svc = require('../../src/services/aiChatService');
   assert.ok(svc, 'aiChatService should export an object');
   assert.strictEqual(typeof svc.handleIncomingMessage, 'function', 'handleIncomingMessage should be a function');
+  assert.strictEqual(typeof svc.seedChatMemory, 'function', 'seedChatMemory should be a function');
 });
 
 test('aiSessionManager loads', () => {
   const svc = require('../../src/services/aiSessionManager');
   assert.ok(svc, 'aiSessionManager should export an object');
   assert.strictEqual(typeof svc.attach, 'function', 'attach should be a function');
+  assert.strictEqual(typeof svc.reattach, 'function', 'reattach should be a function');
+  assert.strictEqual(typeof svc.detach, 'function', 'detach should be a function');
+  assert.strictEqual(typeof svc.isAttached, 'function', 'isAttached should be a function');
 });
 
 test('aiChatQueue loads', () => {

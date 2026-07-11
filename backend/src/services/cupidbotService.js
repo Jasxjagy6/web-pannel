@@ -21,6 +21,11 @@ const ADMIN_ACCESS_TOKEN = process.env.CUPIDBOT_ACCESS_TOKEN || '';
 const ENDPOINT_URL = process.env.CUPIDBOT_ENDPOINT_URL || DEFAULT_ENDPOINT;
 const MAX_RETRIES = 3;
 
+// Short-lived in-memory cache for env-token validation so we don't hit
+// CupidBot on every message. Keyed on process lifetime only.
+const ENV_KEY_CACHE_TTL_MS = 5 * 60 * 1000;
+const _envKeyCache = { value: null, expiresAt: 0 };
+
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -70,9 +75,32 @@ function _requestJson(url, body) {
 
 class CupidBotService {
   /**
+   * Resolve the env-supplied CupidBot token with a short-lived validation
+   * cache. Validation runs lazily on first use and is reused for
+   * ENV_KEY_CACHE_TTL_MS across subsequent calls.
+   */
+  async _resolveEnvKey() {
+    if (!ADMIN_ACCESS_TOKEN) {
+      throw new Error('CUPIDBOT_ACCESS_TOKEN is not configured');
+    }
+    const now = Date.now();
+    if (_envKeyCache.value && _envKeyCache.expiresAt > now) {
+      return _envKeyCache.value;
+    }
+    const isValid = await this.validateApiKey(ADMIN_ACCESS_TOKEN);
+    _envKeyCache.value = { token: ADMIN_ACCESS_TOKEN, isValid };
+    _envKeyCache.expiresAt = now + ENV_KEY_CACHE_TTL_MS;
+    return _envKeyCache.value;
+  }
+
+  /**
    * Resolve the CupidBot access token for a user.
-   * Admin (user id 1) falls back to the global env token; all other
-   * users must have stored their own key in user_cupidbot_keys.
+   *
+   * Resolution order:
+   *   1. Per-user key from `user_cupidbot_keys` (always wins).
+   *   2. For users with `role IN ('admin','superadmin')`, fall back to
+   *      `process.env.CUPIDBOT_ACCESS_TOKEN` (validated lazily, cached).
+   *   3. Otherwise throw so the UI can prompt for a key.
    */
   async getAccessToken(userId) {
     const uid = Number(userId);
@@ -88,11 +116,14 @@ class CupidBotService {
       return { token: rows[0].api_key, source: 'user', isValid: rows[0].is_valid };
     }
 
-    if (uid === 1) {
-      if (!ADMIN_ACCESS_TOKEN) {
-        throw new Error('CUPIDBOT_ACCESS_TOKEN is not configured');
-      }
-      return { token: ADMIN_ACCESS_TOKEN, source: 'admin', isValid: true };
+    const userRes = await pool.query(
+      `SELECT role FROM users WHERE id = $1`,
+      [uid]
+    );
+    const role = userRes.rows[0] && userRes.rows[0].role;
+    if (role === 'admin' || role === 'superadmin') {
+      const envKey = await this._resolveEnvKey();
+      return { token: envKey.token, source: 'admin', isValid: envKey.isValid };
     }
 
     throw new Error('CupidBot API key is not configured. Please add your API key in the AI menu.');
@@ -214,6 +245,7 @@ class CupidBotService {
         if (res.statusCode === 200 && res.data) {
           const option = res.data.options?.[0]?.[0];
           return {
+            statusCode: res.statusCode,
             text: option?.msg || null,
             media: option?.media || null,
             didConvert: !!res.data.didConvert,
@@ -225,6 +257,7 @@ class CupidBotService {
         lastErr = new Error(
           `CupidBot ${res.statusCode}: ${res.data ? JSON.stringify(res.data) : 'empty body'}`
         );
+        lastErr.statusCode = res.statusCode;
 
         if (res.statusCode === 429 || res.statusCode >= 500) {
           await sleep(1000 * Math.pow(2, attempt));
