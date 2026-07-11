@@ -17,7 +17,6 @@ const aiMemoryService = require('./aiMemoryService');
 const aiSessionManager = require('./aiSessionManager');
 const aiChatQueue = require('../queues/aiChatQueue');
 const tcService = require('./telegramClientService');
-const telegramClientService = require('./telegramClientService');
 const logger = require('../utils/logger');
 
 const DEFAULT_CONFIG = {
@@ -381,7 +380,7 @@ class AiChatService {
       100
     );
 
-    const result = await telegramClientService.getMessages(sid, userId, peerType, pid, {
+    const result = await tcService.getMessages(sid, userId, peerType, pid, {
       limit,
     });
 
