@@ -95,6 +95,30 @@ const aiChatController = {
   }),
 
   /**
+   * POST /api/telegram/ai-chat/sessions/:id/ai-chats/:peerType/:peerId/seed
+   *
+   * Backfill AI memory from the recent Telegram message history for this peer.
+   */
+  seedChatMemory: asyncHandler(async (req, res) => {
+    const sessionId = _toNumber(req.params.id, 'session id');
+    const userId = req.user.id;
+    const peerType = String(req.params.peerType || '').toLowerCase();
+    if (!['user', 'chat', 'channel'].includes(peerType)) {
+      throw new AppError('Invalid peer type', 400, 'INVALID_PEER_TYPE');
+    }
+    const peerId = _toNumber(req.params.peerId, 'peer id');
+    const result = await aiChatService.seedChatMemory(
+      sessionId,
+      userId,
+      peerType,
+      peerId,
+      req.body || {}
+    );
+    logger.info(`AI chat memory seeded`, { sessionId, peerType, peerId, seeded: result.seeded });
+    res.json({ success: true, data: result });
+  }),
+
+  /**
    * DELETE /api/telegram/ai-chat/sessions/:id/ai-chats/:peerType/:peerId/memory
    */
   clearChatMemory: asyncHandler(async (req, res) => {
@@ -129,23 +153,19 @@ const aiChatController = {
    */
   getCupidbotKey: asyncHandler(async (req, res) => {
     const userId = req.user.id;
+    const role = req.user && req.user.role;
+    const isAdmin =
+      userId === 1 || role === 'admin' || role === 'superadmin';
     let hasKey = false;
     let isValid = false;
-    let isAdmin = false;
 
-    if (userId === 1 && process.env.CUPIDBOT_ACCESS_TOKEN) {
-      isAdmin = true;
+    try {
+      const result = await cupidbotService.getAccessToken(userId);
       hasKey = true;
-      isValid = true;
-    } else {
-      try {
-        const result = await cupidbotService.getAccessToken(userId);
-        hasKey = true;
-        isValid = result.isValid;
-      } catch {
-        hasKey = false;
-        isValid = false;
-      }
+      isValid = result.isValid;
+    } catch {
+      hasKey = false;
+      isValid = false;
     }
 
     res.json({

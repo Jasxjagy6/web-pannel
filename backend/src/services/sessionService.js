@@ -126,6 +126,11 @@ class SessionService {
      * @type {TelegramService|null}
      */
     this._telegramService = null;
+    /**
+     * Per-session reconnect backoff state.
+     * @type {Map<string, { untilMs: number, failures: number }>}
+     */
+    this._reconnectBackoff = new Map();
   }
 
   // Uses the shared singleton TelegramService instance (tgService)
@@ -2231,15 +2236,20 @@ class SessionService {
 
       // AI auto-responder: attach persistent NewMessage listener if AI
       // is enabled for this session.  Idempotent — attach is a no-op
-      // when already listening.
+      // when already listening.  We log a warning on failure but never
+      // fail the login itself: the operator can retry via the AI panel.
       try {
         const aiSessionManager = require('./aiSessionManager');
         const aiChatService = require('./aiChatService');
         const aiSettings = await aiChatService.getSessionSettings(sessionId);
         if (aiSettings.enabled) {
-          await aiSessionManager.attach(String(sessionId)).catch(() => {});
+          await aiSessionManager.attach(String(sessionId));
         }
-      } catch { /* best-effort */ }
+      } catch (aiErr) {
+        logger.warn(
+          `AI listener attach failed during login for session ${sessionId}: ${aiErr.message}`
+        );
+      }
 
       return {
         success: true,
@@ -2354,11 +2364,17 @@ class SessionService {
         await otpRelayService.onSessionDisconnected(String(sessionId)).catch(() => {});
       } catch { /* best-effort */ }
 
-      // AI auto-responder: detach listener before disconnect.
+      // AI auto-responder: detach listener before disconnect.  detach()
+      // is idempotent and never throws on its own; the outer catch is a
+      // belt-and-braces guard so a buggy module load never blocks logout.
       try {
         const aiSessionManager = require('./aiSessionManager');
-        await aiSessionManager.detach(String(sessionId)).catch(() => {});
-      } catch { /* best-effort */ }
+        await aiSessionManager.detach(String(sessionId));
+      } catch (aiErr) {
+        logger.warn(
+          `AI listener detach failed during logout for session ${sessionId}: ${aiErr.message}`
+        );
+      }
 
       // Disconnect the telegram client
       try {
@@ -2869,15 +2885,21 @@ class SessionService {
             await otpRelayService.onSessionConnected(String(sessionId)).catch(() => {});
           } catch { /* best-effort */ }
 
-          // AI auto-responder: attach listener if enabled.
+          // AI auto-responder: attach listener if enabled.  Heartbeat
+          // restore runs on every backend boot, so transient GramJS
+          // failures here are normal — log and continue.
           try {
             const aiSessionManager = require('./aiSessionManager');
             const aiChatService = require('./aiChatService');
             const aiSettings = await aiChatService.getSessionSettings(sessionId);
             if (aiSettings.enabled) {
-              await aiSessionManager.attach(String(sessionId)).catch(() => {});
+              await aiSessionManager.attach(String(sessionId));
             }
-          } catch { /* best-effort */ }
+          } catch (aiErr) {
+            logger.warn(
+              `AI listener attach failed during restore for session ${sessionId}: ${aiErr.message}`
+            );
+          }
           restored++;
         } catch (err) {
           if (tgService.isPermanentAuthError(err)) {
@@ -2993,14 +3015,12 @@ class SessionService {
    * a rapid connect/disconnect storm.
    * Map<sessionId, { untilMs: number, failures: number }>
    */
-  _reconnectBackoff: new Map(),
-
   _isInBackoff(sessionId) {
     const entry = this._reconnectBackoff.get(String(sessionId));
     if (!entry) return false;
     if (Date.now() >= entry.untilMs) return false;
     return true;
-  },
+  }
 
   _bumpBackoff(sessionId) {
     const sid = String(sessionId);
@@ -3013,13 +3033,13 @@ class SessionService {
     logger.warn(
       `Session ${sid} reconnect backoff active (failures=${failures}, skipMs=${ms})`
     );
-  },
+  }
 
   _clearBackoff(sessionId) {
     if (this._reconnectBackoff.delete(String(sessionId))) {
       logger.debug(`Session ${sessionId} reconnect backoff cleared`);
     }
-  },
+  }
 
   /**
    * Run a heartbeat sweep over every session marked logged-in: ensure the
@@ -3074,17 +3094,21 @@ class SessionService {
           // GramJS client (proxy fallback, stale socket swap, etc.).
           // When that happens the old event handlers are lost, but
           // aiSessionManager still thinks it is attached because its Map
-          // holds the unsubscribe function for the old client.  Detach
-          // the stale reference first, then attach to the current client.
+          // holds the unsubscribe function for the old client.  Use
+          // reattach() so the stale reference is dropped and a fresh
+          // listener is registered against the current client.
           try {
             const aiSessionManager = require('./aiSessionManager');
             const aiChatService = require('./aiChatService');
             const aiSettings = await aiChatService.getSessionSettings(row.id);
             if (aiSettings.enabled) {
-              await aiSessionManager.detach(String(row.id)).catch(() => {});
-              await aiSessionManager.attach(String(row.id)).catch(() => {});
+              await aiSessionManager.reattach(String(row.id));
             }
-          } catch { /* best-effort */ }
+          } catch (aiErr) {
+            logger.warn(
+              `AI listener reattach failed during heartbeat for session ${row.id}: ${aiErr.message}`
+            );
+          }
 
           // Anti-revoke Phase 2 (B8): heartbeat uses MTProto Ping
           // (transport-level keepalive that real clients send), not

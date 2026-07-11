@@ -23,6 +23,9 @@ export const updateAiChatSettings = (sessionId, peerType, peerId, payload) =>
 export const clearAiChatMemory = (sessionId, peerType, peerId) =>
   api.delete(`${BASE}/sessions/${sessionId}/ai-chats/${peerType}/${peerId}/memory`);
 
+export const seedAiChatMemory = (sessionId, peerType, peerId) =>
+  api.post(`${BASE}/sessions/${sessionId}/ai-chats/${peerType}/${peerId}/seed`);
+
 export const getAiLogs = (sessionId, params = {}) =>
   api.get(`${BASE}/sessions/${sessionId}/ai-logs`, { params });
 

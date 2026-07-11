@@ -73,10 +73,18 @@ const telegramClientController = {
 
   /**
    * GET /sessions/:id/dialogs
+   *
+   * Query params:
+   *   limit                  Max dialogs to return (capped server-side).
+   *   includeAllPeerTypes    'true' to return groups / channels / bots /
+   *                          self chat in addition to DMs. Used by the AI
+   *                          auto-responder settings page so an operator
+   *                          can enable the bot for non-DM peers.
    */
   getDialogs: asyncHandler(async (req, res) => {
     const data = await tcService.getDialogs(req.params.id, req.user.id, {
       limit: req.query.limit,
+      includeAllPeerTypes: req.query.includeAllPeerTypes === 'true',
     });
     res.json({ success: true, data });
   }),
