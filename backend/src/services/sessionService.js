@@ -2011,7 +2011,7 @@ class SessionService {
         fileData.session,
         session.api_id || undefined,
         session.api_hash || undefined,
-        { proxy: assignedProxy, identity }
+        { identity }
       );
       let connectTimer;
       const connectTimeout = new Promise((_, reject) => {
@@ -2987,6 +2987,41 @@ class SessionService {
   }
 
   /**
+   * Per-session reconnect backoff: when ensureConnected fails repeatedly
+   * we skip reconnects for an exponentially growing window so Telegram's
+   * rate-limiter (and AUTH_KEY_DUPLICATED risk) doesn't get triggered by
+   * a rapid connect/disconnect storm.
+   * Map<sessionId, { untilMs: number, failures: number }>
+   */
+  _reconnectBackoff: new Map(),
+
+  _isInBackoff(sessionId) {
+    const entry = this._reconnectBackoff.get(String(sessionId));
+    if (!entry) return false;
+    if (Date.now() >= entry.untilMs) return false;
+    return true;
+  },
+
+  _bumpBackoff(sessionId) {
+    const sid = String(sessionId);
+    const prev = this._reconnectBackoff.get(sid);
+    const failures = (prev?.failures || 0) + 1;
+    // 30s, 1m, 2m, 5m, 10m cap
+    const delays = [30_000, 60_000, 120_000, 300_000, 600_000];
+    const ms = delays[Math.min(failures - 1, delays.length - 1)];
+    this._reconnectBackoff.set(sid, { failures, untilMs: Date.now() + ms });
+    logger.warn(
+      `Session ${sid} reconnect backoff active (failures=${failures}, skipMs=${ms})`
+    );
+  },
+
+  _clearBackoff(sessionId) {
+    if (this._reconnectBackoff.delete(String(sessionId))) {
+      logger.debug(`Session ${sessionId} reconnect backoff cleared`);
+    }
+  },
+
+  /**
    * Run a heartbeat sweep over every session marked logged-in: ensure the
    * underlying Telegram client is connected, and update last_heartbeat on
    * success. Keeps clients alive for the duration of the container.
@@ -3010,8 +3045,29 @@ class SessionService {
       for (const row of result.rows) {
         const sid = String(row.id);
         try {
+          // Backoff: skip reconnect if this session recently failed and is cooling off.
+          if (this._isInBackoff(sid)) {
+            logger.debug(`Heartbeat: skipping session ${sid} (in backoff)`);
+            continue;
+          }
           const wasActive = tgService.isSessionActive(sid);
-          await tgService._ensureConnected(sid);
+          try {
+            await tgService._ensureConnected(sid);
+          } catch (connErr) {
+            // _ensureConnected throws when it cannot revive the client.
+            // Apply backoff so we don't keep hammering Telegram.
+            if (tgService.isPermanentAuthError(connErr)) {
+              // Real permanent error — let the existing revoke-signal
+              // machinery handle it, no backoff needed.
+              throw connErr;
+            }
+            this._bumpBackoff(sid);
+            logger.warn(
+              `Heartbeat: ensureConnected failed for ${sid}: ${connErr.message}`
+            );
+            failed++;
+            continue;
+          }
           if (!wasActive) revived++;
 
           // AI auto-responder: the reconnect path above may rebuild the
@@ -3110,6 +3166,7 @@ class SessionService {
           } catch { /* non-fatal */ }
 
           await pool.query(`UPDATE sessions SET last_heartbeat = NOW(), last_ping_at = NOW() WHERE id = $1`, [row.id]);
+          this._clearBackoff(row.id);
           pinged++;
         } catch (err) {
           if (tgService.isPermanentAuthError(err)) {

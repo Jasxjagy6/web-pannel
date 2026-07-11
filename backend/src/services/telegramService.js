@@ -2762,15 +2762,10 @@ class TelegramService {
       }
       const idOpts = fingerprint.toClientOptions(identity);
 
-      // Anti-Detect: respect the bound proxy if one is configured.
-      let proxyConf = null;
-      try {
-        const proxyService = require('./proxyService');
-        const row = await proxyService.assignProxyForSession(sessionId);
-        proxyConf = proxyService.buildGramJSProxy(row);
-      } catch (proxyErr) {
-        logger.debug(`proxy assign failed during _loadSessionFromDB ${sessionId}: ${proxyErr.message}`);
-      }
+      // Proxies are intentionally disabled: every session connects via
+      // the panel's direct egress IP.  Proxies were a frequent cause of
+      // disconnect storms and AUTH_KEY_DUPLICATED events.
+      const proxyConf = null;
 
       const stringSession = new StringSession(sessionString);
       // Anti-revoke Phase 1 (B1): if STRICT_FINGERPRINT is on and we
@@ -2927,61 +2922,10 @@ class TelegramService {
       }
 
       if (connectError) {
-        // First fallback path: when the bound proxy times out and
-        // the caller opted into a direct-IP retry, rebuild a fresh
-        // client without the proxy and try once more on this VM's
-        // egress IP. This is the "added proxies didn't respond in
-        // 10s, use the present device IP" behaviour.
-        const isProxyTimeout =
-          allowProxyFallback
-          && proxyConf
-          && (connectError.isTimeout || /timed out|timeout/i.test(connectError.message || ''));
-        if (isProxyTimeout) {
-          const sessionData = this.sessionStore.get(sessionId);
-          if (sessionData) {
-            try {
-              const sessionString = decrypt(sessionData);
-              const stringSession = new StringSession(sessionString);
-              const directClient = new TelegramClient(stringSession, apiId, apiHash, {
-                connectionRetries: 1,
-                timeout: telegramConfig.timeout,
-                deviceModel: idOpts.deviceModel || telegramConfig.deviceModel,
-                systemVersion: idOpts.systemVersion || telegramConfig.systemVersion,
-                appVersion: idOpts.appVersion || telegramConfig.appVersion,
-                langCode: idOpts.langCode || telegramConfig.langCode,
-                systemLangCode: idOpts.systemLangCode || idOpts.langCode || telegramConfig.langCode,
-                baseLogger: telegramConfig.baseLogger,
-                useWSS: telegramConfig.useWSS,
-                autoReconnect: true,
-                // No proxy — use the panel's egress IP directly.
-                proxy: undefined,
-              });
-              await withTimeout(
-                directClient.connect(),
-                timeoutMs,
-                'TG_CONNECT_DIRECT',
-              );
-              entry.client = directClient;
-              entry.connected = true;
-              entry.proxyBypassed = true;
-              this.clients.set(sessionId, entry);
-              logger.warn(
-                `Session ${sessionId} bound proxy unreachable in ${timeoutMs}ms; reconnected directly`,
-              );
-              return entry;
-            } catch (directErr) {
-              logger.error(
-                `Session ${sessionId} direct-IP fallback also failed: ${directErr.message}`,
-              );
-              try { /* best-effort cleanup */ } catch (_) {}
-              throw new Error(
-                `Session ${sessionId} could not connect via proxy or direct IP: ${directErr.message}`,
-              );
-            }
-          }
-        }
+        // Proxies are disabled at the panel level.  All sessions connect
+        // direct.  If the connect failed, surface the original error.
 
-        // Second fallback (legacy): if reconnect fails, try to
+        // Legacy fallback: if reconnect fails, try to
         // create a new client from stored session, still respecting
         // the bound proxy. Wrapped in a timeout so a dead proxy
         // doesn't stall here either.
