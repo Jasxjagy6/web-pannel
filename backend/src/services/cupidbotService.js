@@ -158,6 +158,12 @@ class CupidBotService {
 
   /**
    * Validate an API key with a lightweight CupidBot call.
+   *
+   * We send a minimal but realistic payload. The only definitive "bad key"
+   * signal from CupidBot is HTTP 401/403. Other status codes (200, 400 for
+   * malformed params, 429 for rate-limit, 5xx for server issues) are treated
+   * as the key being accepted by CupidBot's auth layer, so we don't block
+   * users because of API-side validation quirks.
    */
   async validateApiKey(apiKey) {
     const body = {
@@ -167,18 +173,35 @@ class CupidBotService {
       brand: 'cupidbotofm',
       isOF: true,
       accountID: 'validation',
+      chatStyle: 'youth',
+      responseLanguage: 'en',
       recipient: { id: '0', name: '', username: '', bio: '', location: '' },
-      messages: [],
+      messages: [
+        {
+          id: '1',
+          timestamp: Math.floor(Date.now() / 1000),
+          msg: 'hi',
+          isIncoming: true,
+          medias: [],
+        },
+      ],
     };
 
     try {
       const res = await _requestJson(ENDPOINT_URL, body);
+      logger.debug(
+        `CupidBot key validation status=${res.statusCode} body=${
+          res.data ? JSON.stringify(res.data).slice(0, 200) : 'empty'
+        }`
+      );
       if (res.statusCode === 401 || res.statusCode === 403) return false;
-      if (res.statusCode >= 200 && res.statusCode < 300) return true;
-      return false;
+      return true;
     } catch (err) {
-      logger.debug(`CupidBot key validation request failed: ${err.message}`);
-      return false;
+      logger.warn(`CupidBot key validation request failed: ${err.message}`);
+      // Network / timeout failures should not permanently lock a user out of
+      // the feature; accept the key and let the real generateReply calls show
+      // whether it actually works.
+      return true;
     }
   }
 
