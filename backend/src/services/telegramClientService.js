@@ -19,8 +19,9 @@ const { Api } = require('telegram');
 const { pool } = require('../config/database');
 const tgService = require('./telegramService');
 const sessionService = require('./sessionService');
-const aiChatService = require('./aiChatService');
-const aiMemoryService = require('./aiMemoryService');
+// NOTE: aiChatService and aiMemoryService are NOT required here to avoid a
+// circular dependency (aiChatService -> telegramClientService). They are
+// lazy-required inside _appendOutgoingMemory.
 const logger = require('../utils/logger');
 const { AppError } = require('../utils/errorHandler');
 
@@ -5178,6 +5179,12 @@ async function _appendOutgoingMemory(sessionId, peerType, peerId, messageId, tex
   if (!PEER_TYPES.has(peerType)) return;
   if (peerId == null) return;
   try {
+    // Lazy require to break the circular dependency between
+    // telegramClientService and aiChatService (aiChatService -> telegramClientService).
+    // At module load time, requiring aiChatService here would cause telegramClientService
+    // to receive an incomplete export from aiChatService (and vice versa).
+    const aiChatService = require('./aiChatService');
+    const aiMemoryService = require('./aiMemoryService');
     const sessionSettings = await aiChatService.getSessionSettings(sessionId);
     if (!sessionSettings || !sessionSettings.enabled) return;
 

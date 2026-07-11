@@ -76,6 +76,8 @@ class AiChatService {
       return { handled: false, reason: 'outgoing' };
     }
 
+    logger.info(`AI: incoming message received session=${sid} msgId=${msg.id}`);
+
     let chat;
     try {
       chat = await event.getChat();
