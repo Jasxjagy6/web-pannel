@@ -130,7 +130,8 @@ export default function AiChat() {
   }, [isTelegram]);
 
   const toggleSession = async (sessionId) => {
-    if (!keyStatus?.isValid) {
+    const adminCanUseEnvKey = keyStatus?.isAdmin && keyStatus?.configuredInEnv;
+    if (!keyStatus?.isValid && !adminCanUseEnvKey) {
       toast.error('Add and validate your CupidBot API key before enabling AI.');
       return;
     }

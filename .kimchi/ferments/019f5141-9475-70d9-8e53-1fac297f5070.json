@@ -1,0 +1,17 @@
+{
+  "id": "019f5141-9475-70d9-8e53-1fac297f5070",
+  "name": "/ferment exit",
+  "description": "/ferment exit",
+  "status": "draft",
+  "worktree": {
+    "path": "/home/jashan/web-pannel",
+    "branch": "HEAD",
+    "commit": "bf78699422fc56de6de32fdb5c39045f9ff43a3b"
+  },
+  "scoping": {},
+  "phases": [],
+  "decisions": [],
+  "memories": [],
+  "createdAt": "2026-07-11T12:58:00.181Z",
+  "updatedAt": "2026-07-11T12:58:00.181Z"
+}

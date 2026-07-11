@@ -1,0 +1,17 @@
+{
+  "id": "019f0e0b-7631-76b8-bbc0-6c486111e12a",
+  "name": "hey listen understabd the current repository completely .",
+  "description": "hey listen understabd the current repository completely . its the complete code of my telegram pann ( full institutional level pannel ) so understand ut fully. no mistakes are excepted . i want to add a new next levek feature to it . i want to add a ai to to the pannel such that all sessions that are active and logged in on the pannel the ai must have access to all the chats and to all incoming messages that are coming on every singke logged in sessions and the ai must respond and reply to all after reading the messages . note its a very very serious task and a huge upgrade. so plan everything first properly. that how the ai will have access to all chats of all telegram sessions along with live incoming messages ( also ai must have a proper memory per chat ) of a session so that ai must not go off from a already active conversation. i have the ai and its fully trained . i want to integerate it into the pannel so that it can access all chats of all active logged in sessions on the pann. i am not gonna use telegram in buukt feature that allow account that a bot to repky to chats ( as it requires telegram premium ). so i want you to upgrade the pannel such a way that without telegram premiun ai can get access to all the chats of a accounts ( for bul accounts also ) with memory per conversation and everything else. explore the code base fully furst than make a proper plan how to implement this feature and write the compkete plan in plan.txt file. this is the setup of the ai that i want to use . you can explore it from the links provided { You can add our AI chatter to a website in two ways: the Chrome extension (for Chrome and anti-detect browsers), or the API (for building your own integration). https://www.cupidbotofm.ai/x\nOption A (easiest): Chrome extension\n\nGo to https://cupidbot.web.app/download and download the extension.\nInstall it in Chrome (or an anti-detect browser like AdsPower or Dolphin).\nLog into our platform in the browser, and the bot will run inside the browser app.\nSetup is the same across platforms because the settings are virtually the same.\nVideo walkthrough: https://vimeo.com/983745522/7c3cb7fa97\n\n\nOption B (developer): API\n\nUse our API docs at https://cupidbot.apidog.io.\nNo special access needed - you just buy normal credits and use your normal access token.\nPricing is the same whether you use the API or the Chrome extension.\n\nIf you tell me whether you want the extension route or the API route, I can map out the exact steps for your exact site.\n\nSource:\nCupidBot - #1 AI X Bot For OFM Funneling ( https://www.cupidbotofm.ai/x ) } . there must be option to on of ai for a particular sessions or for sessions which i wanted that ai must responds to those even for per chat control luke if a logged in sessions have 20 chats and i want ai to only handle 5 chats and incoming chat than u must have full control for this. it is a very massive upgrade . so wirte a detailed plan firsf than we will start building ut. i want it only for telegram side and accounts. not instagram",
+  "status": "draft",
+  "worktree": {
+    "path": "/home/jashan/web-pannel",
+    "branch": "feature/login-email-fix-and-privacy-cleanup",
+    "commit": "91c9ea5b1f56ae78de25878329bf607c78314ef1"
+  },
+  "scoping": {},
+  "phases": [],
+  "decisions": [],
+  "memories": [],
+  "createdAt": "2026-06-28T11:44:20.017Z",
+  "updatedAt": "2026-06-28T11:44:20.017Z"
+}
