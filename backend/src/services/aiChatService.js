@@ -41,16 +41,16 @@ const DEFAULT_CONFIG = {
 };
 
 function _mergeConfig(config) {
-  // Stored config is honoured so operators can opt into groups / channels
-  // either at the session level or via a per-chat override. The safe
-  // defaults baked into DEFAULT_CONFIG (DM-only, no groups, no channels)
-  // apply only when the stored config is missing the relevant keys.
+  // AI auto-responder is institutional-grade restricted to personal DMs.
+  // Groups, channels, and bot accounts are intentionally excluded even if a
+  // stored config row tries to enable them — this keeps the feature safe for
+  // large-scale panels where accidental group/channel replies are dangerous.
   return {
     ...DEFAULT_CONFIG,
     ...config,
-    allowedPeerTypes: config.allowedPeerTypes || DEFAULT_CONFIG.allowedPeerTypes,
-    allowGroups: config.allowGroups !== undefined ? config.allowGroups : DEFAULT_CONFIG.allowGroups,
-    allowChannels: config.allowChannels !== undefined ? config.allowChannels : DEFAULT_CONFIG.allowChannels,
+    allowedPeerTypes: ['user'],
+    allowGroups: false,
+    allowChannels: false,
     skipBots: config.skipBots !== false,
     cupidbot: { ...DEFAULT_CONFIG.cupidbot, ...(config.cupidbot || {}) },
   };
