@@ -6,6 +6,7 @@
  */
 
 const aiChatService = require('../services/aiChatService');
+const cupidbotService = require('../services/cupidbotService');
 const { AppError, asyncHandler } = require('../utils/errorHandler');
 const logger = require('../utils/logger');
 
@@ -121,6 +122,63 @@ const aiChatController = {
       offset: req.query.offset,
     });
     res.json({ success: true, data: { rows, total: rows.length } });
+  }),
+
+  /**
+   * GET /api/telegram/ai-chat/cupidbot-key
+   */
+  getCupidbotKey: asyncHandler(async (req, res) => {
+    const userId = req.user.id;
+    let hasKey = false;
+    let isValid = false;
+    let isAdmin = false;
+
+    if (userId === 1 && process.env.CUPIDBOT_ACCESS_TOKEN) {
+      isAdmin = true;
+      hasKey = true;
+      isValid = true;
+    } else {
+      try {
+        const result = await cupidbotService.getAccessToken(userId);
+        hasKey = true;
+        isValid = result.isValid;
+      } catch {
+        hasKey = false;
+        isValid = false;
+      }
+    }
+
+    res.json({
+      success: true,
+      data: { hasKey, isValid, isAdmin, configuredInEnv: !!process.env.CUPIDBOT_ACCESS_TOKEN },
+    });
+  }),
+
+  /**
+   * POST /api/telegram/ai-chat/cupidbot-key
+   */
+  setCupidbotKey: asyncHandler(async (req, res) => {
+    const userId = req.user.id;
+    const { apiKey } = req.body || {};
+    if (typeof apiKey !== 'string' || !apiKey.trim()) {
+      throw new AppError('apiKey is required', 400, 'MISSING_API_KEY');
+    }
+    const result = await cupidbotService.setUserApiKey(userId, apiKey.trim());
+    if (!result.isValid) {
+      throw new AppError('Invalid CupidBot API key', 400, 'INVALID_CUPIDBOT_KEY');
+    }
+    logger.info(`CupidBot API key updated`, { userId });
+    res.json({ success: true, data: result });
+  }),
+
+  /**
+   * DELETE /api/telegram/ai-chat/cupidbot-key
+   */
+  deleteCupidbotKey: asyncHandler(async (req, res) => {
+    const userId = req.user.id;
+    await cupidbotService.deleteUserApiKey(userId);
+    logger.info(`CupidBot API key deleted`, { userId });
+    res.json({ success: true, data: { deleted: true } });
   }),
 };
 

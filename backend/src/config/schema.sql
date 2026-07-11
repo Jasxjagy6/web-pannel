@@ -248,3 +248,15 @@ CREATE TABLE IF NOT EXISTS ai_response_logs (
 CREATE INDEX IF NOT EXISTS idx_ai_response_logs_session_id ON ai_response_logs(session_id);
 CREATE INDEX IF NOT EXISTS idx_ai_response_logs_created_at ON ai_response_logs(created_at);
 CREATE INDEX IF NOT EXISTS idx_ai_response_logs_status ON ai_response_logs(status);
+
+
+-- CupidBot per-user API keys
+CREATE TABLE IF NOT EXISTS user_cupidbot_keys (
+  id SERIAL PRIMARY KEY,
+  user_id INTEGER NOT NULL UNIQUE REFERENCES users(id) ON DELETE CASCADE,
+  api_key VARCHAR(255) NOT NULL,
+  is_valid BOOLEAN DEFAULT FALSE,
+  created_at TIMESTAMP DEFAULT NOW(),
+  updated_at TIMESTAMP DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_user_cupidbot_keys_user_id ON user_cupidbot_keys(user_id);

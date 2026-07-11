@@ -83,6 +83,10 @@ export default function AiChat() {
   const [chatToggling, setChatToggling] = useState(null);
   const [clearing, setClearing] = useState(null);
   const [dialogsLoading, setDialogsLoading] = useState(null);
+  const [keyStatus, setKeyStatus] = useState(null);
+  const [keyDraft, setKeyDraft] = useState('');
+  const [keySaving, setKeySaving] = useState(false);
+  const [keyError, setKeyError] = useState(null);
 
   const loadSessions = async () => {
     setLoading(true);
@@ -113,10 +117,17 @@ export default function AiChat() {
   useEffect(() => {
     if (!isTelegram) return;
     loadSessions();
+    getCupidbotKey()
+      .then((res) => setKeyStatus(res?.data?.data || null))
+      .catch(() => setKeyStatus({ hasKey: false, isValid: false, isAdmin: false }));
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isTelegram]);
 
   const toggleSession = async (sessionId) => {
+    if (!keyStatus?.isValid) {
+      toast.error('Add and validate your CupidBot API key before enabling AI.');
+      return;
+    }
     const current = settingsMap[sessionId] || { enabled: false, config: {} };
     const nextEnabled = !current.enabled;
     setTogglingId(sessionId);
@@ -137,6 +148,42 @@ export default function AiChat() {
       toast.error(err?.response?.data?.error?.message || 'Failed to update AI setting');
     } finally {
       setTogglingId(null);
+    }
+  };
+
+  const saveCupidbotKey = async () => {
+    if (!keyDraft.trim()) {
+      setKeyError('Please paste your CupidBot API key.');
+      return;
+    }
+    setKeySaving(true);
+    setKeyError(null);
+    try {
+      await setCupidbotKey(keyDraft.trim());
+      const res = await getCupidbotKey();
+      setKeyStatus(res?.data?.data || null);
+      setKeyDraft('');
+      toast.success('CupidBot API key validated and saved.');
+    } catch (err) {
+      const msg = err?.response?.data?.error?.message || 'Invalid CupidBot API key.';
+      setKeyError(msg);
+      toast.error(msg);
+    } finally {
+      setKeySaving(false);
+    }
+  };
+
+  const removeCupidbotKey = async () => {
+    setKeySaving(true);
+    setKeyError(null);
+    try {
+      await deleteCupidbotKey();
+      setKeyStatus({ hasKey: false, isValid: false, isAdmin: keyStatus?.isAdmin });
+      toast.success('CupidBot API key removed.');
+    } catch (err) {
+      toast.error(err?.response?.data?.error?.message || 'Failed to remove API key');
+    } finally {
+      setKeySaving(false);
     }
   };
 
@@ -269,6 +316,72 @@ export default function AiChat() {
             Refresh
           </button>
         </div>
+
+        {keyStatus && (
+          <div
+            className={`mb-4 rounded-lg border p-4 ${
+              keyStatus.isValid
+                ? 'border-emerald-500/30 bg-emerald-500/10 text-emerald-200'
+                : 'border-amber-500/30 bg-amber-500/10 text-amber-100'
+            }`}
+          >
+            <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+              <div>
+                <p className="text-sm font-semibold">
+                  {keyStatus.isValid
+                    ? 'CupidBot API key is active.'
+                    : 'CupidBot API key required.'}
+                </p>
+                <p className="text-xs opacity-80">
+                  {keyStatus.isAdmin
+                    ? 'Admin account — using the server-configured key.'
+                    : keyStatus.hasKey
+                    ? 'Your saved key failed validation. Please re-enter a valid key.'
+                    : 'Paste your CupidBot API key below to unlock the AI auto-responder.'}
+                </p>
+              </div>
+              {keyStatus.isAdmin && keyStatus.configuredInEnv && (
+                <span className="rounded border border-emerald-500/40 bg-emerald-500/10 px-2 py-0.5 text-xs">
+                  ENV key in use
+                </span>
+              )}
+            </div>
+
+            {!keyStatus.isAdmin && (
+              <div className="mt-3 flex flex-col gap-2 sm:flex-row">
+                <input
+                  type="password"
+                  value={keyDraft}
+                  onChange={(e) => setKeyDraft(e.target.value)}
+                  placeholder="Paste your CupidBot API key"
+                  className="flex-1 rounded-md border border-white/10 bg-dark-900 px-3 py-2 text-sm placeholder:text-gray-500 focus:border-sky-500 focus:outline-none"
+                  disabled={keySaving}
+                />
+                <button
+                  type="button"
+                  onClick={saveCupidbotKey}
+                  disabled={keySaving || !keyDraft.trim()}
+                  className="rounded-md bg-sky-500 px-3 py-2 text-sm font-medium text-white hover:bg-sky-400 disabled:opacity-50"
+                >
+                  {keySaving ? 'Validating…' : 'Save & Validate'}
+                </button>
+                {keyStatus.hasKey && (
+                  <button
+                    type="button"
+                    onClick={removeCupidbotKey}
+                    disabled={keySaving}
+                    className="rounded-md border border-white/10 px-3 py-2 text-sm hover:bg-white/5 disabled:opacity-50"
+                  >
+                    Remove
+                  </button>
+                )}
+              </div>
+            )}
+            {keyError && (
+              <p className="mt-2 text-xs text-red-300">{keyError}</p>
+            )}
+          </div>
+        )}
 
         {error && (
           <div className="mb-4 flex items-center gap-2 rounded-md border border-red-500/30 bg-red-500/10 p-4 text-red-300">

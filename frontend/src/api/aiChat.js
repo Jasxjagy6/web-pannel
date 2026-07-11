@@ -25,3 +25,9 @@ export const clearAiChatMemory = (sessionId, peerType, peerId) =>
 
 export const getAiLogs = (sessionId, params = {}) =>
   api.get(`${BASE}/sessions/${sessionId}/ai-logs`, { params });
+
+// CupidBot API key management (per-user)
+export const getCupidbotKey = () => api.get(`${BASE}/cupidbot-key`);
+export const setCupidbotKey = (apiKey) =>
+  api.post(`${BASE}/cupidbot-key`, { apiKey });
+export const deleteCupidbotKey = () => api.delete(`${BASE}/cupidbot-key`);
