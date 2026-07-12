@@ -2,15 +2,18 @@
  * AiChatWorker — BullMQ worker that generates AI replies and sends them.
  *
  * Job data:
- *   { sessionId, userId, peerType, peerId, incomingMessage, recipient, config }
+ *   { sessionId, userId, peerType, peerId, incomingMessage, recipient, config,
+ *     conversationState: { messages, lastExchange }, confirmedMessageIds }
  *
  * Steps:
- *   1. Read the current memory window.
+ *   1. Get conversation state from job data (includes unconfirmed AI msgs + new user msgs).
  *   2. Wait for the configured reply delay + jitter.
- *   3. Call CupidBot generateChatResponse.
- *   4. Send the returned text through the session's GramJS client.
- *   5. Append the outgoing message to memory.
- *   6. Log the attempt to ai_response_logs.
+ *   3. Call CupidBot generateChatResponse with proper conversation state.
+ *   4. Handle CupidBot response categories (notOurTurn, ghosting, etc.).
+ *   5. If response has text, send through the session's GramJS client.
+ *   6. Track confirmed AI message IDs for next API call.
+ *   7. Append outgoing message to memory with confirmed=false.
+ *   8. Log the attempt to ai_response_logs with CupidBot metadata.
  */
 
 const { Worker } = require('bullmq');
@@ -31,7 +34,7 @@ const redisConnection = {
 const CONCURRENCY = parseInt(process.env.CUPIDBOT_CONCURRENCY || '5', 10);
 const DEFAULT_REPLY_DELAY_MS = parseInt(process.env.AI_REPLY_DELAY_MS || '3000', 10);
 const DEFAULT_JITTER_MS = parseInt(process.env.AI_REPLY_JITTER_MS || '2000', 10);
-const DEFAULT_MEMORY_LIMIT = parseInt(process.env.AI_MEMORY_MESSAGE_LIMIT || '50', 10);
+const DEFAULT_MEMORY_LIMIT = parseInt(process.env.AI_MEMORY_MESSAGE_LIMIT || '100', 10);
 
 const QUEUE_NAME = 'ai-chat-jobs';
 
@@ -40,39 +43,94 @@ function sleep(ms) {
 }
 
 async function processGenerateReply(job) {
-  const { sessionId, userId, peerType, peerId, incomingMessage, recipient, config } = job.data;
+  const {
+    sessionId,
+    userId,
+    peerType,
+    peerId,
+    incomingMessage,
+    recipient,
+    config,
+    conversationState,
+    confirmedMessageIds = [],
+  } = job.data;
+
+  const sid = Number(sessionId);
+  const pid = Number(peerId);
+
   const logRow = {
-    session_id: sessionId,
+    session_id: sid,
     peer_type: peerType,
-    peer_id: peerId,
+    peer_id: pid,
     incoming_msg_id: incomingMessage?.telegramMessageId || null,
     request_payload: job.data,
     response_payload: null,
     status: 'pending',
     error_message: null,
+    cupidbot_category: null,
+    cupidbot_did_convert: null,
+    cupidbot_rate_limit: null,
+    is_followup: false,
+    confirmed_ai_message_ids: [],
   };
 
   try {
-    const messages = await aiMemoryService.getMessages(
-      sessionId,
-      peerType,
-      peerId,
-      config.memoryMessageLimit || DEFAULT_MEMORY_LIMIT
-    );
+    // Use conversation state from aiChatService (includes unconfirmed AI msgs + new user msgs)
+    const messagesForCupidBot = conversationState?.messages || [];
+    const lastExchange = conversationState?.lastExchange || { lastIncoming: null, lastOutgoing: null };
+
+    // Determine if this should be a follow-up call
+    // Per CupidBot docs: isFollowUp=true when there's no new user message and we want to generate a follow-up
+    const isFollowUp = messagesForCupidBot.length === 0 && lastExchange.lastIncoming;
 
     const replyDelay = config.replyDelayMs ?? DEFAULT_REPLY_DELAY_MS;
     const jitter = config.replyDelayJitterMs ?? DEFAULT_JITTER_MS;
     await sleep(replyDelay + Math.random() * jitter);
 
+    logger.info(`AI Worker: calling CupidBot for session ${sid} peer ${peerType}:${pid}, messages=${messagesForCupidBot.length}, isFollowUp=${isFollowUp}`);
+
     const cupid = await cupidbotService.generateReply({
       userId,
       accountID: sessionId,
       recipient,
-      messages,
+      messages: messagesForCupidBot,
       overrides: config.cupidbot || {},
+      isFollowUp,
+      confirmedMessageIds: confirmedMessageIds,
     });
 
     logRow.response_payload = cupid;
+    logRow.cupidbot_category = cupid.category;
+    logRow.cupidbot_did_convert = cupid.didConvert;
+    logRow.cupidbot_rate_limit = cupid.rateLimit;
+    logRow.is_followup = isFollowUp;
+
+    // Parse CupidBot response category
+    const categoryInfo = cupidbotService.parseResponseCategory(cupid.category);
+
+    // Handle special response categories
+    if (categoryInfo.isNotOurTurn) {
+      logger.info(`AI Worker: CupidBot says not our turn for session ${sid} peer ${pid}`);
+      logRow.status = 'not_our_turn';
+      await _insertLog(logRow);
+      return { sent: false, reason: 'not_our_turn' };
+    }
+
+    if (categoryInfo.isGhosting) {
+      logger.warn(`AI Worker: CupidBot ghosting for session ${sid} peer ${pid}: ${categoryInfo.reason}`);
+      logRow.status = 'ghosting';
+      logRow.error_message = categoryInfo.reason;
+      await _insertLog(logRow);
+
+      // Update conversation state to mark as ghosted
+      await _updateConversationState(sid, peerType, pid, 'ghosted', cupid.category);
+      return { sent: false, reason: 'ghosting', category: cupid.category };
+    }
+
+    // Handle rate limiting
+    if (cupid.rateLimit) {
+      logger.warn(`AI Worker: CupidBot rate limit for session ${sid}: ${JSON.stringify(cupid.rateLimit)}`);
+    }
 
     if (!cupid.text) {
       logRow.status = 'no_reply';
@@ -80,17 +138,18 @@ async function processGenerateReply(job) {
       return { sent: false, reason: 'empty_reply' };
     }
 
+    // Send the message via Telegram
     let sent;
     try {
       sent = await tgService.sendMessage(
         sessionId,
-        peerId,
+        pid,
         cupid.text,
         { silent: false }
       );
     } catch (sendErr) {
       logger.warn(
-        `AI chat sendMessage failed for session ${sessionId} peer ${peerId}: ${sendErr.message}. ` +
+        `AI chat sendMessage failed for session ${sid} peer ${pid}: ${sendErr.message}. ` +
         `CupidBot response: ${JSON.stringify(cupid)}`
       );
       logRow.status = 'send_failed';
@@ -99,32 +158,79 @@ async function processGenerateReply(job) {
       return { sent: false, reason: 'send_failed' };
     }
 
+    // Track the outgoing message ID for confirmation on next API call
+    const outgoingMessageId = tcService._toIdNum(sent?.messageId ?? sent?.id);
     const outgoingItem = {
-      id: `tg-ai-${sent?.messageId ?? Date.now()}`,
-      telegramMessageId: tcService._toIdNum(sent?.messageId ?? sent?.id),
+      id: `tg-ai-${outgoingMessageId ?? Date.now()}`,
+      telegramMessageId: outgoingMessageId,
       timestamp: Date.now(),
       msg: cupid.text,
       isIncoming: false,
       medias: [],
+      confirmed: false, // Will be marked confirmed on next successful API call
     };
+
     await aiMemoryService.append(
-      sessionId,
+      sid,
       peerType,
-      peerId,
+      pid,
       outgoingItem,
       config.memoryMessageLimit || DEFAULT_MEMORY_LIMIT
     );
 
+    // Mark this outgoing message as pending confirmation
+    // We'll confirm it on the next successful API call
+    const confirmedIds = [String(outgoingMessageId)].filter(Boolean);
+
+    // Log success with confirmed message IDs
     logRow.status = 'sent';
+    logRow.confirmed_ai_message_ids = confirmedIds;
     await _insertLog(logRow);
 
-    return { sent: true, messageId: sent?.messageId };
+    // Update conversation state with last AI message sent
+    await _updateConversationState(sid, peerType, pid, 'active', cupid.category, outgoingMessageId);
+
+    logger.info(`AI Worker: successfully sent reply for session ${sid} peer ${pid}, msgId=${outgoingMessageId}`);
+    return { sent: true, messageId: outgoingMessageId, category: cupid.category, didConvert: cupid.didConvert };
   } catch (err) {
     logRow.status = 'failed';
     logRow.error_message = err.message;
     await _insertLog(logRow);
-    logger.warn(`AI chat job failed for session ${sessionId}: ${err.message}`);
+
+    // Check if it's a rate limit error
+    if (err.statusCode === 429) {
+      logRow.status = 'rate_limited';
+      await _insertLog(logRow);
+    }
+
+    logger.warn(`AI chat job failed for session ${sid}: ${err.message}`);
     throw err;
+  }
+}
+
+/**
+ * Update conversation state in ai_chat_memories after a response.
+ */
+async function _updateConversationState(sessionId, peerType, peerId, state, category, lastAiMessageId = null) {
+  try {
+    await pool.query(
+      `UPDATE ai_chat_memories
+       SET cupidbot_conversation_state = $4,
+           last_cupidbot_category = $5,
+           last_cupidbot_response = $6,
+           updated_at = NOW()
+       WHERE session_id = $1 AND peer_type = $2 AND peer_id = $3`,
+      [
+        sessionId,
+        peerType,
+        peerId,
+        state,
+        category,
+        JSON.stringify({ lastAiMessageId, updatedAt: new Date().toISOString() }),
+      ]
+    );
+  } catch (err) {
+    logger.warn(`Failed to update conversation state: ${err.message}`);
   }
 }
 
@@ -132,8 +238,9 @@ async function _insertLog(row) {
   try {
     await pool.query(
       `INSERT INTO ai_response_logs
-         (session_id, peer_type, peer_id, incoming_msg_id, request_payload, response_payload, status, error_message)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+         (session_id, peer_type, peer_id, incoming_msg_id, request_payload, response_payload, status, error_message,
+          cupidbot_category, cupidbot_did_convert, cupidbot_rate_limit, is_followup, confirmed_ai_message_ids)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)`,
       [
         row.session_id,
         row.peer_type,
@@ -143,6 +250,11 @@ async function _insertLog(row) {
         JSON.stringify(row.response_payload),
         row.status,
         row.error_message,
+        row.cupidbot_category,
+        row.cupidbot_did_convert,
+        JSON.stringify(row.cupidbot_rate_limit),
+        row.is_followup,
+        row.confirmed_ai_message_ids,
       ]
     );
   } catch (err) {

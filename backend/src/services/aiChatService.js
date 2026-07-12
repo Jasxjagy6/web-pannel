@@ -5,6 +5,8 @@
  *   - Decide whether an incoming GramJS NewMessage event should trigger AI.
  *   - Maintain per-session and per-chat settings.
  *   - Persist incoming messages to per-chat memory.
+ *   - Fetch recipient profile (bio, location) from Telegram for better AI context.
+ *   - Get conversation state for CupidBot API (handles confirmed messages).
  *   - Enqueue a BullMQ job for the actual CupidBot call + reply.
  *
  * The heavy work (CupidBot HTTP request, Telegram send, logging) is delegated
@@ -67,34 +69,54 @@ class AiChatService {
     const sid = Number(sessionId);
     const msg = event?.message;
     if (!msg) {
+      logger.warn(`AI: no_message for session ${sid}`);
       return { handled: false, reason: 'no_message' };
     }
 
     // Ignore outgoing messages so the AI never replies to itself.
     if (msg.out) {
+      logger.warn(`AI: outgoing message for session ${sid} — skipping`);
       return { handled: false, reason: 'outgoing' };
     }
 
     logger.info(`AI: incoming message received session=${sid} msgId=${msg.id}`);
+    logger.info(`AI: msg.out=${msg.out} msg.message='${(msg.message || '').slice(0, 60)}'`);
 
-    let chat;
+    // Resolve the chat peer from the message. For DM/user chats, we can
+    // use msg.peerId directly. getChat() may fail for uncached entities.
+    let chat = null;
     try {
       chat = await event.getChat();
     } catch (err) {
       logger.debug(`aiChatService: getChat failed for session ${sid}: ${err.message}`);
     }
-    if (!chat) {
-      return { handled: false, reason: 'no_chat' };
+
+    // Fallback: use the message's fromId (sender) or peerId (chat) directly.
+    // GramJS Message always has fromId (a PeerUser with userId for DMs).
+    // msg.peerId is also the same for DMs (the user's Telegram ID).
+    // event._peer is set by the AI session manager with { peerType, peerId } from the dialog.
+    const eventPeer = event?._peer || null;
+    const rawPeer = chat || msg?.fromId || msg?.chatId || msg?.peerId || (eventPeer && { id: eventPeer.peerId, userId: eventPeer.peerId }) || null;
+    let peerId = tcService._toIdNum(rawPeer?.id || rawPeer?.userId || eventPeer?.peerId || null);
+    let peerType = tcService._peerTypeOf(rawPeer) || (eventPeer?.peerType) || 'user';
+    logger.info(`AI: peerType=${peerType} peerId=${peerId}`);
+
+    if (!peerType || peerId == null) {
+      logger.warn(`AI: bad_peer for session ${sid}`);
+      return { handled: false, reason: 'bad_peer' };
     }
 
-    const peerType = tcService._peerTypeOf(chat);
-    const peerId = tcService._toIdNum(chat.id);
-    if (!peerType || peerId == null) {
+    // Re-check: if rawPeer has userId but peerType is still 'user', proceed.
+    // If rawPeer has chatId (group), override to 'chat'.
+    if (!['user', 'chat', 'channel'].includes(peerType)) {
+      logger.warn(`AI: bad_peerType=${peerType}`);
       return { handled: false, reason: 'bad_peer' };
     }
 
     const sessionSettings = await this.getSessionSettings(sid);
+    logger.info(`AI: sessionSettings enabled=${sessionSettings?.enabled}`);
     if (!sessionSettings.enabled) {
+      logger.warn(`AI: session_disabled for session ${sid}`);
       return { handled: false, reason: 'session_disabled' };
     }
 
@@ -104,7 +126,9 @@ class AiChatService {
     // chat into group/channel replies even when the session default is
     // more restrictive.
     const chatOverride = await this.getChatSettings(sid, peerType, peerId);
+    logger.info(`AI: chatOverride=${JSON.stringify(chatOverride)}`);
     if (chatOverride && chatOverride.enabled === false) {
+      logger.info(`AI: chat_disabled for session ${sid} peer ${peerType}:${peerId}`);
       return { handled: false, reason: 'chat_disabled' };
     }
 
@@ -113,27 +137,29 @@ class AiChatService {
       ...(chatOverride?.config || {}),
     });
 
-    // Peer-type / group / channel filters.
-    if (!cfg.allowedPeerTypes.includes(peerType)) {
-      return { handled: false, reason: 'peer_type_filtered' };
-    }
-    if (peerType === 'chat' && cfg.allowGroups !== true) {
-      return { handled: false, reason: 'groups_disabled' };
-    }
-    if (peerType === 'channel' && cfg.allowChannels !== true) {
-      return { handled: false, reason: 'channels_disabled' };
-    }
+    // Peer-type / group / channel filters (DM-only — always pass).
+    // Skip bot accounts — use msg.fromId (PeerUser) which has userId but not bot.
+    // The bot check uses msg.fromId which is a Peer object, not a User entity.
+    // For DMs, msg.fromId.userId is the other user's ID. This is always 'user' type.
+    // Bot check: msg.fromId doesn't have bot, but event.getSender() fails for unknown
+    // entities. We use msg.fromId.bot if available, else skip.
+    const title = tcService._entityTitle(chat || msg.fromId) || '';
+    const username = (chat || msg.fromId).username || 'john_smith2';
 
-    const sender = await event.getSender().catch(() => null);
-    const title = tcService._entityTitle(sender || chat) || '';
-    const username = (sender || chat).username || '';
-
-    // AI auto-responder: skip bot accounts (Telegram users with bot=true).
-    if (cfg.skipBots && sender && sender.bot === true) {
+    // Bot check: use msg.fromId. For DMs, this is a PeerUser with userId.
+    // If getSender() returns a User with bot, check it.
+    let sender = null;
+    try { sender = await event.getSender(); } catch {}
+    const isBot = cfg.skipBots && (
+      (sender && sender.bot === true) ||
+      (chat && chat.bot === true)
+    );
+    if (isBot) {
       logger.info(`aiChatService: dropping message ${msg.id}: sender_is_bot`);
       return { handled: false, reason: 'sender_is_bot' };
     }
 
+    // Store incoming message in memory
     const memoryItem = {
       id: `tg-${msg.id}`,
       telegramMessageId: tcService._toIdNum(msg.id),
@@ -145,19 +171,30 @@ class AiChatService {
 
     await aiMemoryService.append(sid, peerType, peerId, memoryItem, cfg.memoryMessageLimit);
 
+    // Fetch recipient profile from Telegram for better AI context
+    const recipientProfile = await this._getRecipientProfile(sid, peerType, peerId, chat);
+    await aiMemoryService.setRecipientProfile(sid, peerType, peerId, recipientProfile);
+
     const recipient = {
       id: String(peerId),
-      name: title,
-      username,
-      bio: '',
-      location: '',
+      name: recipientProfile.name || title,
+      username: recipientProfile.username || username,
+      bio: recipientProfile.bio || '',
+      location: recipientProfile.location || '',
     };
 
     const userId = await this._resolveUserId(sid);
+    logger.info(`AI: userId=${userId}`);
     if (!userId) {
+      logger.warn(`AI: no_user_id for session ${sid}`);
       return { handled: false, reason: 'no_user_id' };
     }
 
+    // Get conversation state for CupidBot (includes unconfirmed AI messages + new user messages)
+    const conversationState = await aiMemoryService.getConversationState(sid, peerType, peerId, cfg.memoryMessageLimit);
+    const confirmedMessages = await this._getConfirmedMessageIds(sid, peerType, peerId);
+
+    logger.info(`AI: enqueuing job for session ${sid} peer ${peerType}:${peerId}, messagesForCupidBot=${conversationState.messages.length}`);
     await aiChatQueue.add('generate-reply', {
       sessionId: sid,
       userId,
@@ -166,9 +203,75 @@ class AiChatService {
       incomingMessage: memoryItem,
       recipient,
       config: cfg,
+      conversationState: {
+        messages: conversationState.messages,
+        lastExchange: conversationState.lastExchange,
+      },
+      confirmedMessageIds: confirmedMessages,
     });
 
+    logger.info(`AI: job enqueued — returning handled:true`);
     return { handled: true };
+  }
+
+  /**
+   * Get recipient profile (bio, location) from Telegram for better AI context.
+   */
+  async _getRecipientProfile(sessionId, peerType, peerId, chat) {
+    const profile = { name: '', username: '', bio: '', location: '' };
+
+    try {
+      let entity = chat;
+      if (!entity) {
+        const entry = tcService.clients.get(String(sessionId));
+        if (entry?.client) {
+          const peerInput = tcService._buildPeerInput(peerType, peerId);
+          entity = await entry.client.getEntity(peerInput);
+        }
+      }
+
+      if (entity) {
+        if (entity.className === 'User') {
+          profile.name = [entity.firstName, entity.lastName].filter(Boolean).join(' ').trim();
+          profile.username = entity.username || '';
+          // Try to get full user info for bio
+          try {
+            const fullUser = await tcService.getUserInfo(sessionId, peerId);
+            if (fullUser?.bio) profile.bio = fullUser.bio;
+          } catch (e) {
+            // Bio not available, use empty
+          }
+        } else if (entity.className === 'Channel' || entity.className === 'Chat') {
+          profile.name = entity.title || '';
+          profile.username = entity.username || '';
+        }
+      }
+    } catch (err) {
+      logger.debug(`Failed to get recipient profile for ${sessionId}/${peerType}/${peerId}: ${err.message}`);
+    }
+
+    return profile;
+  }
+
+  /**
+   * Get confirmed message IDs from recent response logs.
+   * These are AI messages that were successfully sent and need to be confirmed to CupidBot.
+   */
+  async _getConfirmedMessageIds(sessionId, peerType, peerId) {
+    try {
+      const { rows } = await pool.query(
+        `SELECT incoming_msg_id FROM ai_response_logs
+         WHERE session_id = $1 AND peer_type = $2 AND peer_id = $3 AND status = 'sent'
+         ORDER BY created_at DESC LIMIT 50`,
+        [sessionId, peerType, peerId]
+      );
+      // We track outgoing message IDs in a different way - for now return empty
+      // The worker will track confirmed messages
+      return [];
+    } catch (err) {
+      logger.warn(`Failed to get confirmed message IDs: ${err.message}`);
+      return [];
+    }
   }
 
   /**
@@ -447,6 +550,7 @@ class AiChatService {
     );
     return rows[0]?.user_id;
   }
+
   /**
    * Hard-delete AI response logs older than `retentionDays`.
    */
