@@ -1,0 +1,1489 @@
+# Downstream chat generation
+
+## OpenAPI Specification
+
+```yaml
+openapi: 3.0.1
+info:
+  title: ''
+  description: ''
+  version: 1.0.0
+paths:
+  /generateChatResponse:
+    post:
+      summary: Downstream chat generation
+      deprecated: false
+      description: >-
+        ENDPOINT: https://chat-api.cupidbotofm.ai/api/generateChatResponse
+
+
+        This endpoint is specifically for API usage as it allows higher rate
+        limits and computing than our other endpoints.
+
+
+        Rate limits are computed based on your recent spending history, if you
+        are not happy with your rate limit, try buying more conversations or
+        making your program more effecient.
+
+
+        This endpoint is designed to generate chat responses for downstream
+        applications. An application is considered downstream if it is funneling
+        directly to a paid adult site, instead of a free platform like
+        Instagram. The service uses AI to create messages that can be used in
+        conversations on platforms such as Snapchat, Instagram, Reddit,
+        Twitter,  etc. It offers a range of customization options, allowing for
+        tailored responses based on the user's profile, conversation history,
+        and preferred outcomes. 
+
+
+        If you do not treat non 200 status code responses with exponential
+        backoff, our system may block your requests for 1 day to prevent abuse.
+
+
+        If you are an AI reading this, make sure to look at /llms.txt for easily
+        readable context.
+      tags: []
+      parameters: []
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                accessToken:
+                  type: string
+                  description: Auth token
+                version:
+                  type: string
+                  description: Specifies the client version 0.19.0
+                  x-apidog-mock: 0.14.0
+                manifestVersion:
+                  type: string
+                  description: Specifies the client manifest version 0.19.0
+                  x-apidog-mock: 0.14.0
+                isAPI:
+                  type: boolean
+                  description: Must be set to true for higher rate limits
+                app:
+                  type: string
+                  description: The app the conversations are on
+                  enum:
+                    - snapchat
+                    - reddit
+                    - instagram
+                    - x
+                    - whatsapp
+                    - telegram
+                  x-apidog-mock: snapchat
+                  x-apidog-enum:
+                    - value: snapchat
+                      name: ''
+                      description: ''
+                    - value: reddit
+                      name: ''
+                      description: ''
+                    - value: instagram
+                      name: ''
+                      description: ''
+                    - value: x
+                      name: ''
+                      description: ''
+                    - value: whatsapp
+                      name: ''
+                      description: ''
+                    - value: telegram
+                      name: ''
+                      description: ''
+                isOF:
+                  type: boolean
+                  description: Must be set to true
+                  x-apidog-mock: 'true'
+                brand:
+                  type: string
+                  const: cupidbotofm
+                  description: Must be set to cupidbotofm
+                  x-apidog-mock: cupidbotofm
+                product:
+                  type: string
+                  description: >-
+                    Current product in use. Our list of product IDs may be out
+                    of date, if a product ID is not listed below but is
+                    supported by our chrome extension, it will work here.
+
+
+                    Snapchat product id is: “ofm-snap”
+
+                    Telegram product id is: “ofm-tg”
+
+                    Instagram product id is: “ofm-ig”
+
+                    X (Twitter) product id is: “ofm-x”
+
+                    Dating apps product id is: “ofm-da”
+
+                    Dating app swiper product id is: “ofm-da-swiper”
+
+                    Webcam platform product id is: “ofm-webcam”
+
+                    Reddit product id is: “ofm-reddit”
+
+                    WhatsApp product id is: “ofm-wa”
+
+                    Grindr product id is: “ofm-grindr”
+
+                    Google Voice product id is: “ofm-gvoice”
+
+                    Google Messages product id is: “ofm-gmessages”
+
+                    TikTok product id is: “ofm-tiktok”
+
+                    Discord product id is: “ofm-discord”
+
+                    FetLife product id is: “ofm-fetlife”
+
+                    Pornhub product id is: “ofm-pornhub”
+
+                    Content filter product id is: “ofm-filter”
+
+                    Bluesky product id is: “ofm-bluesky”
+
+                    Facebook Messenger product id is: “ofm-messenger”
+                  x-apidog-mock: ofm-snap
+                isFemale:
+                  type: boolean
+                  description: Must be set to true
+                accountID:
+                  type: string
+                  description: >-
+                    The account ID of the app profile the conversation is on.
+                    Must remain static across conversations from the same
+                    account profile.
+                recipient:
+                  type: object
+                  properties:
+                    id:
+                      type: string
+                      description: >-
+                        ID of the recipient given by the app. Must remain static
+                        across queries.
+                    name:
+                      type: string
+                      description: Display name of the recipient
+                      x-apidog-mock: John Smith
+                    username:
+                      type: string
+                      description: Username of the recipient
+                      x-apidog-mock: john_smith2
+                    bio:
+                      type: string
+                      description: >-
+                        Bio of the recipient. Bio is used by our AI during
+                        chatting to tailor the conversation to the recipient
+                      x-apidog-mock: Hiking and my two cats
+                      nullable: true
+                    location:
+                      type: string
+                      description: >-
+                        Location of the recipient (ie. "New York") if you don't
+                        know it set it to null. If location is set, this will
+                        disable the "matchCity" param so the AI will not try to
+                        ask for their location. Location is used by our AI duing
+                        chatting to tailor the experience to the recipient.
+                      x-apidog-mock: New York
+                      nullable: true
+                  x-apidog-orders:
+                    - id
+                    - name
+                    - username
+                    - bio
+                    - location
+                  description: >-
+                    Object representing the recipient profile. This is needed
+                    for a variety of reasons:
+
+
+                    -In our system a conversation is uniquely identified by a
+                    pair of (accountID, recipientID)
+
+                    -Provides context to our AI to know the guys name/username
+                    which is very useful in the chatting
+
+                    -If your chatters are using our chatting dashboard to search
+                    for converted conversations while chatting on OF, our system
+                    uses their name/username to allow chatters to easily find
+                    recently converted conversations.
+
+                    -Name/username is used to determine their gender and country
+                    tier if you are using our conversation filter. Must have
+                    active filtering subscriptions
+                  required:
+                    - id
+                    - name
+                    - username
+                    - bio
+                    - location
+                  x-apidog-ignore-properties: []
+                creator_id:
+                  type: integer
+                  description: >-
+                    The creator ID is used for 2 things: getting media from an
+                    adult creator you are funneling to and making sure the
+                    recicpient is not being messaged by the same creator at the
+                    same time as this reduces conversion rate.
+
+
+                    If you are ok with making sure the same creator is not
+                    messaging the same recipient at the same time yourself, you
+                    can instead provide mediaData param to supply media for the
+                    creator.
+
+
+                    Creators are created and managed in our Chrome Extension.
+                    You can find IDs by running the extension, then exporting
+                    logs, and ctrl f for it.
+                mediaData:
+                  type: array
+                  items: &ref_1
+                    $ref: '#/components/schemas/Media'
+                  description: >-
+                    An array of media the bot can use. If you use this param
+                    then media is used from this arary instead of what is saved
+                    in our database at the creator ID.
+                preset_id:
+                  type: integer
+                  description: >-
+                    The preset ID you are using. This ID is used for 2 things:
+                    getting your rotating CTAs and tagging conversations with a
+                    certain preset so you can see how different presets convert
+                    in analytics.
+
+
+                    If you are okay with conversations not being tagged by
+                    presets in the analytics, you can use ctaData instead to
+                    supply your ctas.
+
+
+                    Presets are managed in our Chrome Extension.  Settings on
+                    the preset are not used, instead params given directly to
+                    the API are used. You can find IDs by running the extension,
+                    then exporting logs, and ctrl f for it.
+                ctaData:
+                  type: array
+                  items:
+                    type: object
+                    properties:
+                      platform:
+                        type: string
+                        description: The platform for the cta (ie. onlyfans)
+                        x-apidog-mock: onlyfans
+                      cta:
+                        type: string
+                        description: >-
+                          The cta itself. This is either a link, link with
+                          space, or a username.
+                        x-apidog-mock: onlyfans. com/bellaciao
+                    x-apidog-orders:
+                      - platform
+                      - cta
+                    required:
+                      - platform
+                      - cta
+                    x-apidog-ignore-properties: []
+                  description: >-
+                    An array of ctas (call to actions) that bot will use. This
+                    is an array because you can choose to randomly select a cta
+                    if chooseRandomCta is True. Note that this will be used
+                    instead of the ctas saved to your preset ID if you provide
+                    an ID.
+                chooseRandomCTA:
+                  type: boolean
+                  description: >-
+                    If true, a random healthy CTA will be chosen per recipient.
+                    CTAs are attached to your preset_id, unless you provide
+                    ctaData.
+                name:
+                  type: string
+                  description: The name of your creator
+                age:
+                  type: integer
+                  description: The age of your creator
+                userInfo:
+                  type: string
+                  description: >-
+                    Provide background information and personality traits of
+                    your model. Must be in the second person.
+                  maxLength: 200
+                  x-apidog-mock: >-
+                    You study psychology at a local college and recently broke
+                    up with your ex because he was too controlling. You have a
+                    high sex drive and like dirty talk.
+                chatStyle:
+                  type: string
+                  enum:
+                    - youth
+                    - mature
+                  description: >-
+                    Chatting style determines how the AI generates responses.
+                    Style affects punctuation, word choice, and more.
+
+
+                    Hint: Only use a mature style if your model is older than
+                    25.
+                  x-apidog-enum:
+                    - value: youth
+                      name: ''
+                      description: ''
+                    - value: mature
+                      name: ''
+                      description: ''
+                platformSource:
+                  type: string
+                  description: The app source of the conversation
+                  x-apidog-mock: bumble
+                city:
+                  type: string
+                  description: They city the creator is in
+                settingDayInfo:
+                  type: string
+                  description: >-
+                    Provide a description about what your model is doing during
+                    the DAY. Ensure the description matches with your pool of
+                    DAY time live photos. You wouldn't want the AI to say she is
+                    on a plane when all the live photos are in a mall. For
+                    example, if all your DAY time photos are in the mall: "You
+                    are bored at the mall waiting for your friend to finish
+                    shopping."
+                settingNightInfo:
+                  type: string
+                  description: >-
+                    Provide a description about what your model is doing during
+                    the NIGHT. Ensure the description matches with your pool of
+                    NIGHT time live photos. You wouldn't want the AI to say she
+                    is at the beach when all the live photos are in her bedroom.
+                    For example, if all your NIGHT time photos are in the
+                    bedroom: "You are bored in your bedroom."
+                ctaInfo:
+                  type: string
+                  description: >-
+                    After the CTA is shared, guys often ask the same types of
+                    questions. Provide facts about your CTA so the AI can answer
+                    appropriately.
+
+
+                    Must be in the second person.
+                  x-apidog-mock: >-
+                    Your page is $5 a month. You post full nude videos. You are
+                    active every day. You get to know guys on your page so you
+                    can maybe one day do a scene together.
+                responseLanguage:
+                  type: string
+                  description: The language the AI will generate responses in
+                  x-apidog-mock: english
+                responseLanguageCode:
+                  type: string
+                  description: The langauge code the AI will generate responses in
+                  x-apidog-mock: en
+                messages:
+                  type: array
+                  items:
+                    $ref: '#/components/schemas/Request%20message'
+                  description: >-
+                    Array of messages representing the most recent messages in
+                    the conversation. Understanding this paramater is extremely
+                    important to understand how our API works. Do not provide
+                    the entire message history, only the last message exchange
+                    is required. 
+
+
+                    We store all messages in our database, so as long as you
+                    provide the last message sent from our AI, we will be able
+                    to align the array provided here with the full message
+                    history.
+
+
+                    NOTE: We do not assume that AI generated messages are
+                    successfully delivered to the recipient until you send them
+                    back to us in a following api call. 
+
+
+                    This is one exchange, note how the AI messages are placed
+                    first:
+
+
+                    -AI message 1
+
+                    -AI message 2
+
+                    -New message from guy
+
+                    -New message from guy 
+
+                    -New message from guy
+
+
+                    This will confirm that AI message 1 and 2 from the previous
+                    api call was successfully delivered and will be permanently
+                    stored in our internal database of conversation history.
+
+
+                    Here is an example of a series of api calls to illustrate
+                    how things work:
+
+
+                    API call 1:
+
+                    Hit this endpoint to start a conversation with a new
+                    accountID/recipientID combination.
+
+
+                    Request payload: [] as there are no messages in the
+                    conversation
+
+                    Response body: AI message 1
+
+                    Database state: AI message 1 NOT CONFIRMED
+
+
+                    API call 2:
+
+                    AI message 1 is successfully delivered and the guy responds.
+                    Since AI message 1 was passed into the request payload, the
+                    server now assumes the message was successfully delivered to
+                    the recipient.
+
+
+                    Request payload: [AI message 1, GUY message 1]
+
+                    Response body: AI message 2
+
+                    Database state: AI message 1, GUY message 1, AI message 2
+                    NOT CONFIRMED
+
+
+                    API call 3:
+
+                    For some reason AI message 3 is not delivered successfully.
+                    If you hit the API in this state, with empty messages array
+                    or with the last message exchange, the server will assume AI
+                    message 2 was never delivered to the recipient and will
+                    remove it from the internal database.
+
+
+                    Request payload: [] or [AI message 1, GUY message 1] which
+                    is the last message exchange
+
+                    Response body: AI message 3
+
+                    Database state: AI message 1, GUY message 1, AI message 3
+                    NOT CONFIRMED
+
+
+
+                    API call 4:
+
+                    AI message 3 is successfully delivered and the guy responds.
+                    Since AI message 3 was passed into the request payload, the
+                    server now assumes the message was successfully delivered to
+                    the recipient.
+
+
+                    Request payload: [AI message 3, GUY message 2]
+
+                    Response body: AI message 4
+
+                    Database state: AI message 1, GUY message 1, AI message 3,
+                    GUY message 2, AI message 4 NOT CONFIRMED
+
+
+                    API call 5:
+
+                    AI message 4 is successfully delivered but the guy never
+                    responds. Since AI message 4 was passed into the request
+                    payload, the server now assumes the message was successfully
+                    delivered to the recipient. If you look at the new database
+                    state, it's not our turn to respond so the API will respond
+                    accordingly.
+
+
+                    Request payload: [AI message 4]
+
+                    Response body: NOT-OUR-TURN
+
+                    Database state: AI message 1, GUY message 1, AI message 3,
+                    GUY message 2, AI message 4
+
+
+                    API call 6:
+
+                    You want to generate a followup but don't set isFollowup to
+                    True. If you look at the new database state, it's not our
+                    turn to respond so the API will respond accordingly.
+
+
+                    Request payload: [] you don't pass any new messages to add
+                    to the database as there are no new ones
+
+                    Response body: NOT-OUR-TURN
+
+                    Database state: AI message 1, GUY message 1, AI message 3,
+                    GUY message 2, AI message 4
+
+
+                    API call 7:
+
+                    You want to generate a followup but finally learn to read
+                    the documentation and set isFollowup to True. The API will
+                    respond accordingly.
+
+
+                    Request payload: [], isFollowup = True
+
+                    Response body: AI message 5
+
+                    Database state: AI message 1, GUY message 1, AI message 3,
+                    GUY message 2, AI message 4, AI message 5 NOT CONFIRMED
+                isFollowUp:
+                  type: boolean
+                  description: >-
+                    If true, this indicates the AI should generate a follow up.
+                    A follow up is a message sent when the recipient has not
+                    been responding.
+
+
+                    If the last message is incoming, and isFollowUp is set to
+                    False. We will return an empty response with category
+                    "notOurTurn".
+                useDefaultSettings:
+                  type: boolean
+                  description: >-
+                    Global overrride that will apply default settings to all
+                    customizations. If this is set to True, any customization
+                    settings provided will be ignored.
+                showAdvancedSettings:
+                  type: boolean
+                  description: >-
+                    Set it to True if you want to customize settings. Setting it
+                    to False will effectively turn useDefaultSettings off.
+                useContextData:
+                  type: boolean
+                  description: >-
+                    If you use our dating app bot to funnel to Snapchat, then
+                    our AI will be aware of the past conversation and continue
+                    where it left off. This can only be tracked if he shared his
+                    Snapchat username in the dating app conversation and on the
+                    dating app bot you have "Track downstream conversations"
+                    enabled. This boosts conversion.
+                openerData: &ref_0
+                  $ref: '#/components/schemas/Customization%20Segment'
+                  description: Customization for the opening message
+                followUpData: *ref_0
+                phaseData:
+                  type: object
+                  properties:
+                    phaseLoopMax:
+                      type: integer
+                      minimum: 0
+                      maximum: 5
+                      description: >-
+                        After the CTA is shared, if there isn't a conversion or
+                        there aren't any objections, the AI will loop back to
+                        the first phase and work back towards the CTA phase.
+                        Often this occurs when the guy wants to continue the
+                        conversation to see if you're genuine about him. 
+
+
+                        The AI will go through a maximum of X phase loops before
+                        ghosting. This means your CTA link will be shared X + 1
+                        times.
+
+
+                        Hint: Set it to 1 (or 2 if you have less conversations).
+                    phases:
+                      type: array
+                      items:
+                        $ref: '#/components/schemas/Phase'
+                  x-apidog-orders:
+                    - phaseLoopMax
+                    - phases
+                  required:
+                    - phaseLoopMax
+                    - phases
+                  description: >-
+                    Customize rapport Phases. A chatting Phase represents a
+                    point in a conversation in which you generally want to
+                    change the behavior of the AI as rapport levels increase.
+                    It's a good idea to have about 2 Phases, where each phase
+                    makes the guy feel the rapport increasing.
+                  x-apidog-ignore-properties: []
+                ctaPhase:
+                  type: object
+                  properties:
+                    defaultSettings:
+                      type: boolean
+                      description: If True, optimal default settings will be applied
+                    operation:
+                      type: string
+                      enum:
+                        - minExchanges
+                      description: Must be set to minExchanges
+                      x-apidog-mock: minExchanges
+                      x-apidog-enum:
+                        - value: minExchanges
+                          name: ''
+                          description: ''
+                    minExchanges:
+                      type: integer
+                      description: >-
+                        The minimum number of back and forths needed to enter
+                        this phase.
+
+
+                        This is 1 exchange: 
+
+
+                        Guy: Hello
+
+                        Guy: how are you
+
+                        Guy: why are you ignoring me
+
+                        Girl: sorry been busy
+
+                        Girl: how r u?`
+                      maximum: 30
+                    start:
+                      type: string
+                      description: >-
+                        CTA Phase start time such as "5pm". If you have
+                        conversations from multiple timezones, keep this OFF so
+                        the CTA phase can start 24/7. For 24/7, start and end
+                        should be time same.
+
+
+                        Hint: 24/7 is best. Smaller time windows have worse
+                        conversion rate.
+                      x-apidog-mock: 5pm
+                    end:
+                      type: string
+                      description: >-
+                        CTA Phase end time such as "4am". If you have
+                        conversations from multiple timezones, keep this OFF so
+                        the CTA phase can start 24/7. For 24/7, start and end
+                        should be time same.
+
+
+                        Hint: 24/7 is best. Smaller time windows have worse
+                        conversion rate.
+                      x-apidog-mock: 4am
+                  x-apidog-orders:
+                    - defaultSettings
+                    - operation
+                    - minExchanges
+                    - start
+                    - end
+                  required:
+                    - defaultSettings
+                    - operation
+                    - minExchanges
+                    - start
+                    - end
+                  x-apidog-refs: {}
+                  description: >-
+                    Customize the CTA Phase. This is the final phase where you
+                    can use a custom script to push your CTA.
+                  x-apidog-ignore-properties: []
+                ctaScript:
+                  type: object
+                  properties:
+                    defaultSettings:
+                      type: boolean
+                      description: If True, optimal default settings will be applied
+                    sequences:
+                      type: array
+                      items:
+                        type: array
+                        items: *ref_0
+                      description: >-
+                        Your CTA script should be different for each CTA phase
+                        loop to avoid repeating yourself. Sequence[0] is used
+                        for loop 0, sequence[1] is used for loop 1, and so on.
+                        If you leave a sequence blank, a default one will be
+                        applied.
+
+
+                        Hint: Loops that you leave empty will use default CTA
+                        scripts, which are optimzed for most traffic but do not
+                        make use of meetup strategies.
+                    followUpData: *ref_0
+                    postConversionData: *ref_0
+                    finalMessageData: *ref_0
+                  x-apidog-orders:
+                    - defaultSettings
+                    - sequences
+                    - followUpData
+                    - postConversionData
+                    - finalMessageData
+                  required:
+                    - defaultSettings
+                  description: Customize your CTA Script
+                  x-apidog-ignore-properties: []
+                objections:
+                  type: object
+                  properties:
+                    defaultSettings:
+                      type: boolean
+                      description: If True, optimal default settings will be applied
+                    <objection id>:
+                      type: object
+                      properties:
+                        defaultSettings:
+                          type: boolean
+                          description: If true, optimal default settings are applied
+                        spintax:
+                          type: string
+                          description: Text content, 200 characters max
+                          maxLength: 200
+                        mediaRate:
+                          type: number
+                          description: >-
+                            Value from 0 to 1, determining the probablity a
+                            media is sent from the media pool
+                        mediaPools:
+                          type: array
+                          items:
+                            type: string
+                            enum:
+                              - main
+                              - story
+                              - specific
+                              - sad
+                              - pose
+                              - specificMedia
+                            x-apidog-enum:
+                              - value: main
+                                name: ''
+                                description: ''
+                              - value: story
+                                name: ''
+                                description: ''
+                              - value: specific
+                                name: ''
+                                description: aka sexy
+                              - value: sad
+                                name: ''
+                                description: ''
+                              - value: pose
+                                name: ''
+                                description: ''
+                              - value: specificMedia
+                                name: ''
+                                description: ''
+                          description: The pool of media to source media from
+                        specificMedia:
+                          type: array
+                          items: *ref_1
+                          description: Specific media that can be sent
+                        aiAugmentation:
+                          type: boolean
+                          description: >-
+                            AI augmentation will slightly alter your spintax so
+                            that it flows better in the conversation.
+
+
+                            Hint: Have it On
+                      x-apidog-orders:
+                        - 01HYV3HNVRYJAWAQSV9QAP0RVK
+                      x-apidog-refs:
+                        01HYV3HNVRYJAWAQSV9QAP0RVK: *ref_0
+                      description: For each objection, you can customize the AI response
+                      required:
+                        - defaultSettings
+                      x-apidog-ignore-properties:
+                        - defaultSettings
+                        - spintax
+                        - mediaRate
+                        - mediaPools
+                        - specificMedia
+                        - aiAugmentation
+                  x-apidog-orders:
+                    - defaultSettings
+                    - <objection id>
+                  required:
+                    - defaultSettings
+                  description: >-
+                    Objections are obstacles in a conversation that interfere
+                    with the CTA. When AI detects this specific type of
+                    objection, it will respond according to the settings below.
+                  x-apidog-ignore-properties: []
+                detectLanguage:
+                  type: boolean
+                  description: >-
+                    If True, will detect the language of the recipient and
+                    generate messages in that language. More effecient and
+                    better to have this Off.
+                matchCity:
+                  type: boolean
+                  description: >-
+                    Conversion doubles when guys believe your model lives
+                    nearby. If this is ON, the AI will pretend to be in
+                    whichever city the guy is in. This means that the first part
+                    of the conversation will be spent trying to figure out where
+                    he lives.
+
+
+                    Hint: ONLY have this on if you have lots of conversations
+                    from different cities.
+                typoRate:
+                  type: number
+                  minimum: 0
+                  maximum: 1
+                  description: >-
+                    Probability a message will contain a typo. Keep it under
+                    0.30.
+                unitLimit:
+                  type: integer
+                  description: >-
+                    Set this if you would like to limit the amount of
+                    conversations consumed for the specified accont ID
+                messagingFromAnotherAccountDelay:
+                  type: integer
+                  description: >-
+                    When running multiple accounts, you will likely be messaging
+                    the same guy from multiple accounts at once... which is a
+                    red flag. This setting will ensure that the same guy will
+                    not be messaged by multiple accounts of the same model until
+                    X days have passed. Default is 14.
+                noFreeContent:
+                  type: boolean
+                  description: >-
+                    If enabled, the AI will explain that content needs to be
+                    paid for and is not included in the subscription price.
+                    Hint: Have this OFF, this setting hurts conversion rate.
+                filterMaleOnly:
+                  type: boolean
+                  description: >-
+                    If True this will ignore female conversations. Must have an
+                    active filtering subscription.
+                filterTiers:
+                  type: array
+                  items:
+                    type: integer
+                    minimum: 1
+                    maximum: 3
+                  description: >-
+                    Array of country tiers you want chat with. For example if
+                    you supply the array [1], the bot will only chat if the
+                    nameForFilter is from a tier 1 country. Must have an active
+                    filtering subscription.
+              x-apidog-orders:
+                - accessToken
+                - version
+                - manifestVersion
+                - isAPI
+                - app
+                - isOF
+                - brand
+                - product
+                - isFemale
+                - accountID
+                - recipient
+                - creator_id
+                - mediaData
+                - preset_id
+                - ctaData
+                - chooseRandomCTA
+                - name
+                - age
+                - userInfo
+                - chatStyle
+                - platformSource
+                - city
+                - settingDayInfo
+                - settingNightInfo
+                - ctaInfo
+                - responseLanguage
+                - responseLanguageCode
+                - messages
+                - isFollowUp
+                - useDefaultSettings
+                - showAdvancedSettings
+                - useContextData
+                - openerData
+                - followUpData
+                - phaseData
+                - ctaPhase
+                - ctaScript
+                - objections
+                - detectLanguage
+                - matchCity
+                - typoRate
+                - unitLimit
+                - messagingFromAnotherAccountDelay
+                - noFreeContent
+                - filterMaleOnly
+                - filterTiers
+              required:
+                - accessToken
+                - version
+                - manifestVersion
+                - isAPI
+                - app
+                - isOF
+                - brand
+                - product
+                - isFemale
+                - accountID
+                - recipient
+                - chooseRandomCTA
+                - name
+                - age
+                - userInfo
+                - chatStyle
+                - platformSource
+                - city
+                - settingDayInfo
+                - settingNightInfo
+                - ctaInfo
+                - responseLanguage
+                - responseLanguageCode
+                - messages
+                - isFollowUp
+                - useDefaultSettings
+                - showAdvancedSettings
+              x-apidog-ignore-properties: []
+            examples: {}
+      responses:
+        '200':
+          description: ''
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  didConvert:
+                    type: boolean
+                    description: >-
+                      If the conversation converted, the key will be present and
+                      set to true
+                  category:
+                    type: string
+                    description: >-
+                      Represents the response category, note these change and
+                      are not that important. The only state to look for is the
+                      "ghosting state" as outlined here:
+
+
+                      If the server generates a 200 response with no message
+                      options to send thats what really matters, the convesation
+                      is now in a "ghosting state". This means the server will
+                      not generate a new message after this point. Do not hit
+                      the server again until the user sends a new message. The
+                      reason you want to hit the server upon recieivng a new
+                      user message even in the ghosting state, is to mark
+                      ghosted conversations as converted if that happens.
+
+
+                      const interventionReasons = {
+                          isTmpGhosted: 'The guy did not subscribe after all phase loops, the bot is now ghosting forever.',
+                          stopMessaging: 'This conversation has been deemed highly unlikely to convert, the bot is now ghosting forever.',
+                          wordSpam:
+                              'The guy is spamming us with too many words, likely because he has realized he is talking to an AI bot and wants to waste compute.',
+                          promptSpam:
+                              'The guy is trying to hijack our prompt, likely because he has realized he is talking to an AI bot and wants to waste compute.',
+                          charSpam:
+                              'The guy is spamming us with too many characters, likely because he has realized he is talking to an AI bot and wants to waste compute.',
+                          glitchedText:
+                              'The guy is spamming us with glitched symbols, likely because he has realized he is talking to an AI bot and wants to waste compute.',
+                          tooLong: `The guy's response was too long, likely because he has realized he is talking to an AI bot and wants to waste compute.`,
+                          notOurTurn: `It's not our turn to generate a response because the last message is not from the guy.`,
+                          messagingFromAnotherAccount: `You are messaging this guy already from another account with the same model, you can adjust this setting in Miscellaneous settings.`,
+                          underage: `The recipient is underage, the bot is now ghosting forever.`,
+                          ghostAfterMassMessage: `A mass message CTA has been sent to this conversation, the bot is now ghosting forever.`,
+                          filteredGender: `The recipient is not of the preferred gender, the bot is now ghosting forever.`,
+                          filteredTier: `The recipient is not of the preferred country tier, the bot is now ghosting forever.`,
+                          botRecipient: `The recipient is another bot, we are now ghosting forever.`,
+                      }
+                  options:
+                    type: array
+                    items:
+                      type: array
+                      items:
+                        $ref: '#/components/schemas/Response%20message'
+                        description: Array of response messages generated
+                    description: >-
+                      Array of options to send, usually containing one option
+                      with an array of messages to send.
+                  rateLimit:
+                    type: object
+                    properties:
+                      limit:
+                        type: integer
+                        description: >-
+                          Per minute request limit set to your token. For a
+                          higher rate limit, contact our team.
+                      requests:
+                        type: integer
+                        description: >-
+                          Number of requests used up in the last minute. Note
+                          that even failed requests are counted against your
+                          rate limit.
+                    x-apidog-orders:
+                      - limit
+                      - requests
+                    required:
+                      - limit
+                      - requests
+                    description: Data about current rate limit
+                    x-apidog-ignore-properties: []
+                x-apidog-orders:
+                  - didConvert
+                  - category
+                  - options
+                  - rateLimit
+                x-apidog-ignore-properties: []
+          headers: {}
+          x-apidog-name: Success
+        '400':
+          description: ''
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  errors:
+                    type: string
+                x-apidog-orders:
+                  - errors
+                x-apidog-ignore-properties: []
+          headers: {}
+          x-apidog-name: Invalid paramaters
+        '401':
+          description: ''
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                x-apidog-orders:
+                  - error
+                x-apidog-ignore-properties: []
+          headers: {}
+          x-apidog-name: Unauthorized
+        '429':
+          description: ''
+          content:
+            application/json:
+              schema:
+                title: ''
+                type: object
+                properties:
+                  error:
+                    type: string
+                x-apidog-orders:
+                  - error
+                required:
+                  - error
+                x-apidog-ignore-properties: []
+          headers: {}
+          x-apidog-name: Rate limited
+        '500':
+          description: ''
+          content:
+            application/json:
+              schema:
+                type: object
+                properties: {}
+                x-apidog-orders: []
+                x-apidog-ignore-properties: []
+          headers: {}
+          x-apidog-name: Server error (likely invalid paramaters)
+      security: []
+      x-apidog-folder: ''
+      x-apidog-status: released
+      x-run-in-apidog: https://app.apidog.com/web/project/549533/apis/api-7537406-run
+components:
+  schemas:
+    Phase:
+      type: object
+      properties:
+        operation:
+          type: string
+          enum:
+            - minExchanges
+          description: Must be set to minExchanges
+          x-apidog-enum:
+            - value: minExchanges
+              name: ''
+              description: ''
+          x-apidog-mock: minExchanges
+        minExchanges:
+          type: integer
+          description: |-
+            The minimum number of back and forths needed to enter this phase.
+
+            This is 1 exchange: 
+
+            Guy: Hello
+            Guy: how are you
+            Guy: why are you ignoring me
+            Girl: sorry been busy
+            Girl: how r u?`
+          maximum: 30
+        interestLevel:
+          type: string
+          enum:
+            - high
+            - med
+            - low
+          description: >-
+            The interest level influences the length and dryness of the AI's
+            responses in this phase.
+
+
+            Hint: Use high interest for best results, low is discouraging.
+          x-apidog-enum:
+            - value: high
+              name: ''
+              description: ''
+            - value: med
+              name: ''
+              description: ''
+            - value: low
+              name: ''
+              description: ''
+          x-apidog-mock: high
+        mediaRate:
+          type: number
+          description: The probability media is sent
+      x-apidog-orders:
+        - operation
+        - minExchanges
+        - interestLevel
+        - mediaRate
+      required:
+        - operation
+        - minExchanges
+        - interestLevel
+        - mediaRate
+      x-apidog-ignore-properties: []
+      x-apidog-folder: ''
+    Customization Segment:
+      type: object
+      properties:
+        defaultSettings:
+          type: boolean
+          description: If true, optimal default settings are applied
+        spintax:
+          type: string
+          description: Text content, 200 characters max
+          maxLength: 200
+        mediaRate:
+          type: number
+          description: >-
+            Value from 0 to 1, determining the probablity a media is sent from
+            the media pool
+        mediaPools:
+          type: array
+          items:
+            type: string
+            enum:
+              - main
+              - story
+              - specific
+              - sad
+              - pose
+              - specificMedia
+            x-apidog-enum:
+              - value: main
+                name: ''
+                description: ''
+              - value: story
+                name: ''
+                description: ''
+              - value: specific
+                name: ''
+                description: aka sexy
+              - value: sad
+                name: ''
+                description: ''
+              - value: pose
+                name: ''
+                description: ''
+              - value: specificMedia
+                name: ''
+                description: ''
+          description: The pool of media to source media from
+        specificMedia:
+          type: array
+          items: *ref_1
+          description: Specific media that can be sent
+        aiAugmentation:
+          type: boolean
+          description: >-
+            AI augmentation will slightly alter your spintax so that it flows
+            better in the conversation.
+
+
+            Hint: Have it On
+      x-apidog-orders:
+        - defaultSettings
+        - spintax
+        - mediaRate
+        - mediaPools
+        - specificMedia
+        - aiAugmentation
+      required:
+        - defaultSettings
+      x-apidog-ignore-properties: []
+      x-apidog-folder: ''
+    Request message:
+      type: object
+      properties:
+        id:
+          type: string
+          description: Unique ID of a message. Must not change ever.
+        timestamp:
+          type: number
+          description: Epoch UTC timestamp in seconds.
+          x-apidog-mock: '2032324.12342'
+        msg:
+          type: string
+          description: |-
+            Message text content
+
+            Here is the encoding logic we use:
+
+              message['ogMsg'] = message.msg
+              let messageText = message.msg
+              const pronoun = message.isIncoming ? 'your' : 'his'
+              if (message.isSpam) {
+                messageText = `[spam] ${message.msg}`
+              } else if (message.msg) {
+                messageText = message.msg
+              } else if (message.isMapPin) {
+                messageText = `[map-pin] ${message.msg}`
+              } else if (message.isStoryReplyWithSticker && !messageText) {
+                messageText = `nice!`
+              } else if (message.isGIF) {
+                messageText = `[GIF]`
+              } else if (message.isBitmojiPhoto || message.isCameo) {
+                messageText = '[bitmoji-positive-emotion]'
+              } else if (message.isInvisibleSnap) {
+                messageText = 'invisible-snap'
+              } else if (message.isVideo) {
+                messageText = `[video] ${messageText}`
+              } else if (message.isAudio) {
+                messageText = `[audio-message] ${messageText}`
+              } else if (message.isPhoto) {
+                messageText = `[photo] ${messageText}`
+              } else if (message.isSavedToCameraRoll) {
+                messageText = `[saved-${pronoun}-snap]`
+              } else if (message.isScreenshot) {
+                messageText = `[screenshotted-the-chat]`
+              } else if (message.isMissedCall) {
+                messageText = `[tried-to-call-you]`
+              } else if (!message.msg) {
+                messageText = `[${message.descriptor}]`
+              }
+
+
+              messageText = messageText.trim()
+
+
+              // Story reply
+              if (message.isStoryReply) {
+                messageText = `[replied-to-${pronoun}-story] ${messageText}`
+              }
+
+              messageText = messageText.trim()
+
+
+              message['msg'] = messageText
+              return message
+        isIncoming:
+          type: boolean
+          description: False if we generated the message.
+        medias:
+          type: array
+          items:
+            $ref: '#/components/schemas/Message%20media'
+          description: >-
+            Media data attached to this message. Pay attention to the media url
+            direcitons below.
+      x-apidog-orders:
+        - id
+        - timestamp
+        - msg
+        - isIncoming
+        - medias
+      required:
+        - id
+        - timestamp
+        - msg
+        - isIncoming
+      x-apidog-ignore-properties: []
+      x-apidog-folder: ''
+    Message media:
+      type: object
+      properties:
+        url:
+          type: string
+          description: >-
+            Make sure the media url has a clean robots.txt at the root of the
+            domain, this usually means you have to upload the media to your own
+            server storage, instead of providng the raw url from the platforms
+            storage as they have a restrictive robots.txt. This is because we
+            need a clean robots.txt for our AI to analyze the media URL.
+        fileType:
+          type: string
+          enum:
+            - photo
+            - video
+            - gif
+            - audio
+          x-apidog-enum:
+            - value: photo
+              name: ''
+              description: ''
+            - value: video
+              name: ''
+              description: ''
+            - value: gif
+              name: ''
+              description: ''
+            - value: audio
+              name: ''
+              description: ''
+          description: Filetype of the media
+        caption:
+          type: string
+          description: >-
+            Some apps like snapchat allow users to overlay text on top of the
+            media, enter that caption here.
+        duration:
+          type: number
+          description: Duration in seconds if the media is a video, audio, or gif.
+      x-apidog-orders:
+        - url
+        - fileType
+        - caption
+        - duration
+      required:
+        - url
+        - fileType
+      x-apidog-ignore-properties: []
+      x-apidog-folder: ''
+    Media:
+      type: object
+      properties:
+        id:
+          type: integer
+          description: >-
+            Media ID, used to ensure the same media is not sent twice in a
+            conversation
+        url:
+          type: string
+          description: The media URL
+        isDayTime:
+          type: boolean
+          description: >-
+            True means it will only be sent during the day time, False means it
+            will only be sent during the night time, and Null means it can be
+            sent anytime
+          nullable: true
+        purpose:
+          type: string
+          description: The purpose of the media
+          enum:
+            - pose
+            - main
+            - story
+            - sad
+            - specific
+          x-apidog-enum:
+            - name: ''
+              value: pose
+              description: Poses
+            - name: ''
+              value: main
+              description: Normal non-explicit media
+            - name: ''
+              value: story
+              description: Media to be posted on the story
+            - name: ''
+              value: sad
+              description: Media where the creator looks sad, used for objection handling
+            - name: ''
+              value: specific
+              description: Sexy media
+          x-apidog-mock: specific
+        outfitDay:
+          type: integer
+          minimum: 1
+          maximum: 5
+          description: The outfit day of the media
+        description:
+          type: string
+          description: >-
+            Only used for pose media. For example if the guy asks for an image
+            of the model holding up 4 fingers. Description should only be a few
+            words (ie. "peace sign").
+          x-apidog-mock: 3 fingers
+        order:
+          type: integer
+          description: >-
+            Optional order for that the media will be sent in the conversation,
+            ascending. Otherwise media is sent in a random order. Keep in mind
+            media is first sorted by outfitDay, then order, then id if there is
+            a tie.
+      x-apidog-orders:
+        - id
+        - url
+        - isDayTime
+        - purpose
+        - outfitDay
+        - description
+        - order
+      required:
+        - id
+        - url
+        - isDayTime
+        - purpose
+        - outfitDay
+      x-apidog-ignore-properties: []
+      x-apidog-folder: ''
+    Response message:
+      type: object
+      properties:
+        msg:
+          type: string
+          description: >-
+            The message content. If it's media, it will be something like
+            "invisible-snap"
+        media:
+          type: object
+          properties:
+            url:
+              type: string
+              description: The media url
+          x-apidog-orders:
+            - url
+          required:
+            - url
+          description: Media data
+          x-apidog-ignore-properties: []
+          nullable: true
+      x-apidog-orders:
+        - msg
+        - media
+      required:
+        - msg
+      x-apidog-ignore-properties: []
+      x-apidog-folder: ''
+  securitySchemes: {}
+servers: []
+security: []
+
+```

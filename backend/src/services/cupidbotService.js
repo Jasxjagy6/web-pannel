@@ -168,14 +168,32 @@ class CupidBotService {
   async validateApiKey(apiKey) {
     const body = {
       accessToken: apiKey,
+      version: '0.19.0',
+      manifestVersion: '0.19.0',
       isAPI: true,
       app: 'telegram',
       brand: 'cupidbotofm',
+      product: 'ofm-tg',
       isOF: true,
+      isFemale: true,
       accountID: 'validation',
+      platformSource: 'telegram',
+      responseLanguageCode: 'en',
+      isFollowUp: false,
+      settingDayInfo: 'Just lounging around, waiting for a reply',
+      settingNightInfo: 'Just winding down, waiting for a reply',
+      name: 'Test Model',
+      age: 25,
+      userInfo: 'You are a friendly test model',
+      city: 'New York',
+      ctaInfo: 'Page subscription details will be provided later',
+      chooseRandomCTA: false,
+      useDefaultSettings: true,
+      showAdvancedSettings: false,
+      ctaData: [{ platform: 'onlyfans', cta: 'check my link' }],
       chatStyle: 'youth',
-      responseLanguage: 'en',
-      recipient: { id: '0', name: '', username: '', bio: '', location: '' },
+      responseLanguage: 'english',
+      recipient: { id: '0', name: 'John Smith', username: 'john_smith2', bio: 'Hiking and my two cats', location: 'New York' },
       messages: [
         {
           id: '1',
@@ -218,26 +236,63 @@ class CupidBotService {
   /**
    * Generate an AI reply for a conversation.
    *
+   * CRITICAL: Per CupidBot API docs, we must send the LAST EXCHANGE of messages
+   * to confirm delivery of previous AI messages. The API maintains its own
+   * conversation state keyed by (accountID, recipient.id).
+   *
    * @param {object} params
    * @param {string|number} params.userId - Panel user id for API-key lookup.
    * @param {string|number} params.accountID - Panel session id used as the AI account identifier.
    * @param {object} params.recipient - { id, name, username, bio, location }
-   * @param {Array<object>} params.messages - Conversation memory, each item:
-   *   { id, timestamp, msg, isIncoming, medias }
-   * @param {object} [params.overrides] - Optional CupidBot payload overrides
-   *   (app, brand, isOF, chatStyle, responseLanguage, etc.).
-   * @returns {Promise<{ text: string|null, media: object|null, didConvert: boolean, category: string|null, rateLimit: object|null }>}
+   * @param {Array<object>} params.messages - Full conversation memory (max 100), each item:
+   *   { id, timestamp, msg, isIncoming, medias, confirmed? }
+   * @param {object} [params.overrides] - Optional CupidBot payload overrides.
+   * @param {boolean} [params.isFollowUp] - Whether this is a follow-up (no new user message).
+   * @param {Array<string>} [params.confirmedMessageIds] - IDs of AI messages confirmed delivered.
+   * @returns {Promise<{ text: string|null, media: object|null, didConvert: boolean, category: string|null, rateLimit: object|null, statusCode: number }>}
    */
-  async generateReply({ userId, accountID, recipient, messages, overrides = {} }) {
+  async generateReply({
+    userId,
+    accountID,
+    recipient,
+    messages,
+    overrides = {},
+    isFollowUp = false,
+    confirmedMessageIds = [],
+  }) {
     const { token: accessToken } = await this.getAccessToken(userId);
+
+    // Per CupidBot docs: only send the LAST EXCHANGE to confirm previous AI messages
+    // and include any new incoming messages.
+    // The API will use this to align with its internal database.
+    const messagesToSend = this._buildMessagePayload(messages, confirmedMessageIds, isFollowUp);
 
     const body = {
       accessToken,
+      version: overrides.version || '0.19.0',
+      manifestVersion: overrides.manifestVersion || '0.19.0',
       isAPI: true,
-      app: overrides.app || 'telegram',
+      app: 'telegram',
       brand: overrides.brand || 'cupidbotofm',
+      product: overrides.product || 'ofm-tg',
       isOF: overrides.isOF !== false,
+      isFemale: true,
       accountID: String(accountID),
+      platformSource: 'telegram',
+      responseLanguageCode: 'en',
+      responseLanguage: 'english',
+      isFollowUp,
+      name: overrides.name || 'Test Model',
+      age: overrides.age || 25,
+      userInfo: overrides.userInfo || 'You are a friendly test model',
+      city: overrides.city || recipient.location || 'New York',
+      ctaInfo: overrides.ctaInfo || 'Page subscription details will be provided later',
+      chooseRandomCTA: false,
+      useDefaultSettings: true,
+      showAdvancedSettings: false,
+      ctaData: overrides.ctaData || [{ platform: 'onlyfans', cta: 'check my link' }],
+      settingDayInfo: overrides.settingDayInfo || 'Just lounging around, waiting for a reply',
+      settingNightInfo: overrides.settingNightInfo || 'Just winding down, waiting for a reply',
       recipient: {
         id: String(recipient.id || ''),
         name: recipient.name || '',
@@ -245,18 +300,7 @@ class CupidBotService {
         bio: recipient.bio || '',
         location: recipient.location || '',
       },
-      messages: messages.map((m) => ({
-        id: String(m.id),
-        timestamp: Math.floor(m.timestamp / 1000),
-        msg: m.msg || '',
-        isIncoming: !!m.isIncoming,
-        medias: (m.medias || []).map((md) => ({
-          url: md.url || '',
-          fileType: md.fileType || 'photo',
-          caption: md.caption || '',
-          duration: md.duration || 0,
-        })),
-      })),
+      messages: messagesToSend,
       ...overrides,
     };
 
@@ -274,6 +318,7 @@ class CupidBotService {
             didConvert: !!res.data.didConvert,
             category: res.data.category || null,
             rateLimit: res.data.rateLimit || null,
+            rawResponse: res.data,
           };
         }
 
@@ -281,7 +326,9 @@ class CupidBotService {
           `CupidBot ${res.statusCode}: ${res.data ? JSON.stringify(res.data) : 'empty body'}`
         );
         lastErr.statusCode = res.statusCode;
+        lastErr.responseData = res.data;
 
+        // Retry on rate limit or server errors
         if (res.statusCode === 429 || res.statusCode >= 500) {
           await sleep(1000 * Math.pow(2, attempt));
           continue;
@@ -298,6 +345,93 @@ class CupidBotService {
     }
 
     throw lastErr;
+  }
+
+  /**
+   * Build the messages payload for CupidBot API.
+   *
+   * Per docs: We should only send the last exchange (last AI messages + new user messages).
+   * The API uses this to confirm delivery of previous AI messages and get new user messages.
+   * We also need to track which of our AI messages have been confirmed delivered.
+   */
+  _buildMessagePayload(messages, confirmedMessageIds, isFollowUp) {
+    if (!Array.isArray(messages) || messages.length === 0) {
+      return [];
+    }
+
+    // Filter to get messages that need to be sent to CupidBot:
+    // 1. Unconfirmed outgoing (AI) messages
+    // 2. New incoming messages since last call
+    // 3. For follow-up, we send empty array but with isFollowUp=true
+
+    if (isFollowUp) {
+      return [];
+    }
+
+    // Find the last confirmed outgoing message index
+    const confirmedSet = new Set(confirmedMessageIds.map(String));
+
+    // We need to send:
+    // - Any outgoing AI messages that haven't been confirmed yet
+    // - All incoming messages after the last confirmed outgoing message
+    const result = [];
+    let lastConfirmedIndex = -1;
+
+    for (let i = 0; i < messages.length; i++) {
+      const m = messages[i];
+      const msgId = String(m.id);
+      if (!m.isIncoming && confirmedSet.has(msgId)) {
+        lastConfirmedIndex = i;
+      }
+    }
+
+    // Send unconfirmed outgoing messages + all incoming messages after last confirmed
+    for (let i = lastConfirmedIndex + 1; i < messages.length; i++) {
+      const m = messages[i];
+      result.push({
+        id: String(m.id),
+        timestamp: Math.floor((m.timestamp || Date.now()) / 1000),
+        msg: m.msg || '',
+        isIncoming: !!m.isIncoming,
+        medias: (m.medias || []).map((md) => ({
+          url: md.url || '',
+          fileType: md.fileType || 'photo',
+          caption: md.caption || '',
+          duration: md.duration || 0,
+        })),
+      });
+    }
+
+    return result;
+  }
+
+  /**
+   * Parse CupidBot response category and handle special cases.
+   */
+  parseResponseCategory(category) {
+    const interventionReasons = {
+      isTmpGhosted: 'The guy did not subscribe after all phase loops, the bot is now ghosting forever.',
+      stopMessaging: 'This conversation has been deemed highly unlikely to convert, the bot is now ghosting forever.',
+      wordSpam: 'The guy is spamming us with too many words, likely because he has realized he is talking to an AI bot and wants to waste compute.',
+      promptSpam: 'The guy is trying to hijack our prompt, likely because he has realized he is talking to an AI bot and wants to waste compute.',
+      charSpam: 'The guy is spamming us with too many characters, likely because he has realized he is talking to an AI bot and wants to waste compute.',
+      glitchedText: 'The guy is spamming us with glitched symbols, likely because he has realized he is talking to an AI bot and wants to waste compute.',
+      tooLong: 'The guy\'s response was too long, likely because he has realized he is talking to an AI bot and wants to waste compute.',
+      notOurTurn: 'It\'s not our turn to generate a response because the last message is not from the guy.',
+      messagingFromAnotherAccount: 'You are messaging this guy already from another account with the same model, you can adjust this setting in Miscellaneous settings.',
+      underage: 'The recipient is underage, the bot is now ghosting forever.',
+      ghostAfterMassMessage: 'A mass message CTA has been sent to this conversation, the bot is now ghosting forever.',
+      filteredGender: 'The recipient is not of the preferred gender, the bot is now ghosting forever.',
+      filteredTier: 'The recipient is not of the preferred country tier, the bot is now ghosting forever.',
+      botRecipient: 'The recipient is another bot, we are now ghosting forever.',
+    };
+
+    return {
+      category,
+      isGhosting: category && Object.keys(interventionReasons).includes(category),
+      isNotOurTurn: category === 'notOurTurn',
+      reason: category ? interventionReasons[category] : null,
+    };
   }
 }
 
