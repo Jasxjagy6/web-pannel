@@ -34,6 +34,12 @@ const loginEmailRoutes = require('./routes/loginEmail');
 const adminRoutes = require('./routes/admin');
 const billingRoutes = require('./routes/billing');
 const userCredentialsRoutes = require('./routes/userCredentials');
+const trackingRoutes = require('./routes/tracking');
+const trackingTagsRoutes = require('./routes/trackingTags');
+const trackingBulkRoutes = require('./routes/trackingBulk');
+const trackingImportExportRoutes = require('./routes/trackingImportExport');
+const trackingDashboardRoutes = require('./routes/trackingDashboard');
+const trackingTeamRoutes = require('./routes/trackingTeam');
 const otpRelayRoutes = require('./routes/otpRelays');
 const telegramClientRoutes = require('./routes/telegramClient');
 const aiChatRoutes = require('./routes/aiChat');
@@ -185,6 +191,16 @@ app.use(`${apiPrefix}/auth`, authRoutes);
 app.use(`${apiPrefix}/admin`, adminRoutes);
 app.use(`${apiPrefix}/billing`, resolvePlatform, billingRoutes);
 app.use(`${apiPrefix}/user-credentials`, userCredentialsRoutes);
+
+// Tracking module (Telegram account inventory/CRM). Manual data-entry only —
+// never connects to Telegram — so it's a top-level module mounted once,
+// like admin, rather than going through PLATFORM_ROUTERS.
+app.use(`${apiPrefix}/tracking`, trackingRoutes);
+app.use(`${apiPrefix}/tracking/tags`, trackingTagsRoutes);
+app.use(`${apiPrefix}/tracking/bulk`, trackingBulkRoutes);
+app.use(`${apiPrefix}/tracking/import-export`, trackingImportExportRoutes);
+app.use(`${apiPrefix}/tracking/dashboard`, trackingDashboardRoutes);
+app.use(`${apiPrefix}/tracking/team`, trackingTeamRoutes);
 
 // Saved-Messages OTP Relay (Telegram-only). Mounted under both the
 // Telegram namespace and a legacy alias so the existing frontend

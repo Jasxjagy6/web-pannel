@@ -22,6 +22,7 @@ import Landing from './pages/Landing';
 
 const Admin = lazy(() => import('./pages/Admin'));
 const AdminProxies = lazy(() => import('./pages/admin/AdminProxies'));
+const TrackingRoutes = lazy(() => import('./pages/tracking/TrackingRoutes'));
 const Dashboard = lazy(() => import('./pages/Dashboard'));
 const Sessions = lazy(() => import('./pages/Sessions'));
 const Scrape = lazy(() => import('./pages/Scrape'));
@@ -337,6 +338,13 @@ export default function App() {
               <Route path="/pending" element={<PendingGate />} />
               <Route path="/admin" element={<ProtectedRoute title="Admin Panel" requireAdmin><Admin /></ProtectedRoute>} />
               <Route path="/admin/proxies" element={<ProtectedRoute title="Admin Proxies" requireAdmin><AdminProxies /></ProtectedRoute>} />
+
+              {/* Tracking module (Telegram account inventory/CRM). Top-level,
+                  like /admin — not part of the TG/IG platform toggle since
+                  it's a manual CRM, not an account-automation surface.
+                  allowWithoutSubscription: tracking access is gated by its
+                  own RBAC (owner/admin/staff/viewer), not platform billing. */}
+              <Route path="/tracking/*" element={<ProtectedRoute title="Tracking" allowWithoutSubscription><TrackingRoutes /></ProtectedRoute>} />
 
               {/* In-panel Telegram client — opens in its own browser
                   window per session (window.open from /telegram/login-sessions).
