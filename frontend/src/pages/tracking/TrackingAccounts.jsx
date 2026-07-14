@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { Plus, Trash2, Pencil, RefreshCw, ArrowLeftRight, LayoutDashboard } from 'lucide-react';
+import { Plus, Trash2, Pencil, RefreshCw, ArrowLeftRight } from 'lucide-react';
 import { trackingAccountsAPI } from '@/api';
 import { useToast } from '../../components/common/Toast';
 import { parseApiError, formatDate } from '@/utils/formatters';
@@ -190,12 +190,6 @@ export default function TrackingAccounts() {
           <p className="text-sm text-gray-400 mt-1">{pagination.total} account{pagination.total === 1 ? '' : 's'}</p>
         </div>
         <div className="flex items-center gap-2">
-          <button
-            onClick={() => navigate('/tracking')}
-            className="flex items-center gap-2 rounded-lg border border-white/10 px-3 py-2 text-sm text-gray-300 hover:bg-white/5"
-          >
-            <LayoutDashboard className="h-4 w-4" /> Dashboard
-          </button>
           <button
             onClick={fetchAccounts}
             className="flex items-center gap-2 rounded-lg border border-white/10 px-3 py-2 text-sm text-gray-300 hover:bg-white/5"

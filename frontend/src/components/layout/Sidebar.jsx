@@ -4,7 +4,7 @@ import {
   LayoutDashboard, Users, Search, MessageSquare, UsersRound, List, BarChart3,
   Settings, LogOut, ChevronLeft, ChevronRight, UserCog, ShieldCheck, KeyRound,
   Network, UserPlus, Fingerprint, Shield, Crown, X, CreditCard, MessagesSquare,
-  LogIn, Cookie, Bot, ClipboardList,
+  LogIn, Cookie, Bot,
 } from 'lucide-react';
 import { useAuth } from '@/hooks/useAuth';
 import { usePlatform, useCapabilities, PLATFORM_LABELS } from '../../context/PlatformContext';
@@ -41,15 +41,6 @@ const adminNavItems = [
   { path: '/admin', label: 'Admin Panel', icon: Crown, absolute: true },
 ];
 
-// Tracking is a separate RBAC axis from panel admin/user (Owner/Admin/
-// Staff/Viewer, resolved server-side), so — unlike adminNavItems — it
-// can't be hidden based on `isAdmin`. It's shown to every approved user;
-// TrackingRoutes itself renders an access-denied state for anyone who
-// hasn't been added to the tracking team.
-const trackingNavItems = [
-  { path: '/tracking', label: 'Tracking', icon: ClipboardList, absolute: true },
-];
-
 export default function Sidebar({ collapsed, mobileOpen, onToggle, onCloseMobile }) {
   const location = useLocation();
   const { user, logout, isAdmin, isApproved } = useAuth();
@@ -76,7 +67,6 @@ export default function Sidebar({ collapsed, mobileOpen, onToggle, onCloseMobile
   const items = [];
   if (isAdmin) items.push(...adminNavItems);
   if (isAdmin || isApproved) {
-    items.push(...trackingNavItems);
     for (const item of userNavItems) {
       if (item.capability == null || !capabilities) {
         // Either the page is platform-agnostic, or capabilities haven't

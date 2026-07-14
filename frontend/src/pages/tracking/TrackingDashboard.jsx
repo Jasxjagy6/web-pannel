@@ -2,7 +2,7 @@ import { useState, useEffect, useCallback } from 'react';
 import { useNavigate } from 'react-router-dom';
 import {
   Users, CheckCircle2, DollarSign, TrendingUp, Star, Ban, Clock, UploadCloud,
-  AlertTriangle, ShieldAlert, HardDriveDownload, Loader2, ListChecks, UserCog,
+  AlertTriangle, ShieldAlert, HardDriveDownload, Loader2, ListChecks,
 } from 'lucide-react';
 import { trackingDashboardAPI } from '@/api';
 import { useToast } from '../../components/common/Toast';
@@ -64,22 +64,12 @@ export default function TrackingDashboard() {
           <h1 className="text-2xl font-bold text-white">Tracking Dashboard</h1>
           <p className="text-sm text-gray-400 mt-1">Telegram account inventory overview</p>
         </div>
-        <div className="flex items-center gap-2">
-          <button
-            onClick={() => navigate('/tracking/accounts')}
-            className="flex items-center gap-2 rounded-lg bg-primary-600 px-4 py-2 text-sm font-medium text-white hover:bg-primary-700"
-          >
-            <ListChecks className="h-4 w-4" /> View Accounts
-          </button>
-          {hasPermission('manageTeam') && (
-            <button
-              onClick={() => navigate('/tracking/team')}
-              className="flex items-center gap-2 rounded-lg border border-white/10 px-4 py-2 text-sm text-gray-300 hover:bg-white/5"
-            >
-              <UserCog className="h-4 w-4" /> Team
-            </button>
-          )}
-        </div>
+        <button
+          onClick={() => navigate('/tracking/accounts')}
+          className="flex items-center gap-2 rounded-lg bg-primary-600 px-4 py-2 text-sm font-medium text-white hover:bg-primary-700"
+        >
+          <ListChecks className="h-4 w-4" /> View Accounts
+        </button>
       </div>
 
       {totalAlerts > 0 && (

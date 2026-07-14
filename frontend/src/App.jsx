@@ -203,6 +203,19 @@ function ProtectedRoute({ children, title, requireAdmin = false, allowWithoutSub
   return <Shell title={title}>{children}</Shell>;
 }
 
+/**
+ * Standalone gate for the Tracking panel. Only requires a valid,
+ * non-banned login — Tracking brings its own chrome (TrackingLayout) and
+ * its own RBAC (owner/admin/staff/viewer), so it bypasses the platform +
+ * subscription logic in ProtectedRoute entirely.
+ */
+function TrackingPanelRoute() {
+  const { isAuthenticated, user } = useAuth();
+  if (!isAuthenticated) return <Navigate to="/login" replace />;
+  if (user?.status === 'banned') return <Navigate to="/pending" replace />;
+  return <TrackingRoutes />;
+}
+
 function PendingGate() {
   const { isAuthenticated, user, isAdmin } = useAuth();
   if (!isAuthenticated) return <Navigate to="/login" replace />;
@@ -339,12 +352,13 @@ export default function App() {
               <Route path="/admin" element={<ProtectedRoute title="Admin Panel" requireAdmin><Admin /></ProtectedRoute>} />
               <Route path="/admin/proxies" element={<ProtectedRoute title="Admin Proxies" requireAdmin><AdminProxies /></ProtectedRoute>} />
 
-              {/* Tracking module (Telegram account inventory/CRM). Top-level,
-                  like /admin — not part of the TG/IG platform toggle since
-                  it's a manual CRM, not an account-automation surface.
-                  allowWithoutSubscription: tracking access is gated by its
-                  own RBAC (owner/admin/staff/viewer), not platform billing. */}
-              <Route path="/tracking/*" element={<ProtectedRoute title="Tracking" allowWithoutSubscription><TrackingRoutes /></ProtectedRoute>} />
+              {/* Tracking is its own standalone panel (like Instagram is
+                  its own world) — reached from the header PanelSwitcher,
+                  not a Telegram sidebar item. It brings its own chrome
+                  (TrackingLayout) and RBAC gate, so it deliberately does
+                  NOT go through ProtectedRoute (no platform/subscription
+                  gating — tracking access is owner/admin/staff/viewer). */}
+              <Route path="/tracking/*" element={<TrackingPanelRoute />} />
 
               {/* In-panel Telegram client — opens in its own browser
                   window per session (window.open from /telegram/login-sessions).
