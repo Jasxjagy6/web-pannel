@@ -7,7 +7,7 @@
  */
 
 const { pool } = require('../config/database');
-const tcService = require('./telegramClientService');
+const tgService = require('./telegramService');
 const logger = require('../utils/logger');
 
 class AiSessionManager {
@@ -65,9 +65,9 @@ class AiSessionManager {
 
     try {
       // Ensure the Telegram client is connected
-      await tcService._ensureConnected(sid);
+      await tgService._ensureConnected(sid);
 
-      const entry = tcService.clients.get(sid);
+      const entry = tgService.clients.get(sid);
       if (!entry || !entry.client) {
         throw new Error(`Telegram client not available for session ${sid}`);
       }
@@ -135,6 +135,7 @@ class AiSessionManager {
     // Resolve peer info
     let peerType = 'user';
     let peerId = null;
+    let accessHash = null;
 
     try {
       const chat = await event.getChat();
@@ -142,6 +143,7 @@ class AiSessionManager {
         if (chat.className === 'User') {
           peerType = 'user';
           peerId = chat.id ? Number(chat.id) : null;
+          accessHash = chat.accessHash ? String(chat.accessHash) : null;
         } else if (chat.className === 'Chat') {
           peerType = 'chat';
           peerId = chat.id ? Number(chat.id) : null;
@@ -183,10 +185,10 @@ class AiSessionManager {
       this._lastMsgIds.set(key, msgId);
     }
 
-    // Create fake event for aiChatService
+    // Create fake event for aiChatService, include accessHash if available
     const fakeEvent = {
       message: msg,
-      _peer: { peerType, peerId },
+      _peer: { peerType, peerId, accessHash },
     };
 
     const aiChatService = require('./aiChatService');
@@ -243,23 +245,53 @@ class AiSessionManager {
    */
   async _pollOnce(sessionId, userIdStr) {
     const sid = String(sessionId);
-    const dialogsResult = await tcService.getDialogs(sid, userIdStr, { limit: 200 });
-    const dialogs = Array.isArray(dialogsResult?.dialogs) ? dialogsResult.dialogs : [];
+    const entry = tgService.clients.get(sid);
+    if (!entry || !entry.client) return;
 
-    for (const dlg of dialogs) {
-      const peerType = dlg.peerType;
-      const peerId = dlg.peerId;
+    const client = entry.client;
+
+    // Get dialogs directly from GramJS client
+    let dialogs;
+    try {
+      dialogs = await client.getDialogs({ limit: 200 });
+    } catch (err) {
+      logger.warn(`AI poll getDialogs failed for ${sid}: ${err.message}`);
+      return;
+    }
+
+    for (const dlg of dialogs || []) {
+      const entity = dlg.entity;
+      if (!entity) continue;
+
+      let peerType = 'user';
+      let peerId = null;
+
+      if (entity.className === 'User') {
+        peerType = 'user';
+        peerId = entity.id ? Number(entity.id) : null;
+      } else if (entity.className === 'Chat') {
+        peerType = 'chat';
+        peerId = entity.id ? Number(entity.id) : null;
+      } else if (entity.className === 'Channel') {
+        peerType = entity.megagroup ? 'chat' : 'channel';
+        peerId = entity.id ? Number(entity.id) : null;
+      }
 
       if (peerType !== 'user' || !peerId) continue;
 
       try {
-        const msgsResult = await tcService.getMessages(sid, userIdStr, peerType, String(peerId), { limit: 20 });
-        const msgs = Array.isArray(msgsResult?.messages) ? msgsResult.messages : [];
+        // Get messages directly from GramJS
+        let msgs;
+        try {
+          msgs = await client.getMessages(entity, { limit: 20 });
+        } catch (err) {
+          continue; // Skip dialogs that fail
+        }
 
         const key = `${sid}:${peerType}:${peerId}`;
         const lastPolled = this._lastMsgIds.get(key) || 0;
 
-        for (const msg of msgs) {
+        for (const msg of msgs || []) {
           if (!msg.id) continue;
           if (msg.id <= lastPolled) continue;
           if (msg.out) continue;
@@ -291,15 +323,23 @@ class AiSessionManager {
    */
   _setupConnectionMonitoring(sessionId, userIdStr) {
     const sid = String(sessionId);
-    const entry = tcService.clients.get(sid);
+    const entry = tgService.clients.get(sid);
     if (!entry?.client) return;
 
     const client = entry.client;
 
     // Monitor for disconnection
     const disconnectHandler = () => {
-      logger.warn(`AI session ${sid} disconnected, scheduling reconnect`);
-      this._scheduleReconnect(sid, userIdStr);
+      // Check if client is actually disconnected (not just a transient event)
+      setTimeout(() => {
+        const currentEntry = tgService.clients.get(sid);
+        if (currentEntry?.client?.connected === false) {
+          logger.warn(`AI session ${sid} confirmed disconnected, scheduling reconnect`);
+          this._scheduleReconnect(sid, userIdStr);
+        } else {
+          logger.debug(`AI session ${sid} disconnected event fired but client still connected, ignoring`);
+        }
+      }, 1000); // Wait a bit to see if it reconnects automatically
     };
 
     client.on('disconnected', disconnectHandler);
@@ -399,7 +439,7 @@ class AiSessionManager {
     this._stopPollFallback(sid);
 
     // Remove GramJS event handler
-    const entry = tcService.clients.get(sid);
+    const entry = tgService.clients.get(sid);
     if (entry?.client && sessionData.handler) {
       try {
         entry.client.removeEventHandler(sessionData.handler);

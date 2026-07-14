@@ -1239,10 +1239,11 @@ class TelegramService {
       replyTo = null,
       scheduleDate = null,
       parseMarkdown = false,
+      accessHash = null,
     } = options;
 
     try {
-      const entity = await this._resolveEntity(sessionId, targetId);
+      const entity = await this._resolveEntity(sessionId, targetId, { accessHash });
       if (!entity) {
         throw new Error(`Could not resolve target: ${targetId}`);
       }
