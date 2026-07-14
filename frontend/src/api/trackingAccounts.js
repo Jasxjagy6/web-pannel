@@ -50,4 +50,8 @@ export const trackingAccountsAPI = {
   getTags: (id) => api.get(`/tracking/accounts/${id}/tags`),
   setTags: (id, tagIds) => api.post(`/tracking/accounts/${id}/tags`, { tagIds }),
   removeTag: (id, tagId) => api.delete(`/tracking/accounts/${id}/tags/${tagId}`),
+
+  // Live Telegram session sync
+  sync: (id) => api.post(`/tracking/accounts/${id}/sync`),
+  syncAllLoggedIn: () => api.post('/tracking/sync/logged-in'),
 };

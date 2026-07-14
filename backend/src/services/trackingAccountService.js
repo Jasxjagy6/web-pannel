@@ -5,6 +5,7 @@ const trackingSessionInfoService = require('./trackingSessionInfoService');
 const trackingSimInfoService = require('./trackingSimInfoService');
 const trackingPurchaseService = require('./trackingPurchaseService');
 const trackingTelegramMetaService = require('./trackingTelegramMetaService');
+const trackingLoginsService = require('./trackingLoginsService');
 
 const VALID_STATUSES = ['available', 'reserved', 'sold', 'dead', 'banned', 'deleted', 'lost_access'];
 const SORTABLE_FIELDS = [
@@ -64,6 +65,11 @@ function toAccountDTO(row) {
     updatedBy: row.updated_by,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
+    // Live-session sync (v44)
+    sourceSessionId: row.source_session_id || null,
+    isSessionLinked: row.is_session_linked || false,
+    sessionSyncedAt: row.session_synced_at || null,
+    avatarThumb: row.avatar_thumb || null,
     tags: row.tags || undefined,
   };
 }
@@ -230,11 +236,12 @@ const trackingAccountService = {
       throw new AppError('Account not found', 404, 'TRACKING_ACCOUNT_NOT_FOUND');
     }
 
-    const [session, sim, purchase, telegramMeta, latestSale, openAssignment, tags, noteCount, attachmentCount] = await Promise.all([
+    const [session, sim, purchase, telegramMeta, logins, latestSale, openAssignment, tags, noteCount, attachmentCount] = await Promise.all([
       trackingSessionInfoService.getByAccount(id),
       trackingSimInfoService.getByAccount(id),
       trackingPurchaseService.getByAccount(id),
       trackingTelegramMetaService.getByAccount(id),
+      trackingLoginsService.listByAccount(id),
       pool.query(
         'SELECT * FROM tracking_account_sales WHERE account_id = $1 ORDER BY sale_date DESC LIMIT 1',
         [id]
@@ -263,6 +270,7 @@ const trackingAccountService = {
     dto.sim = sim;
     dto.purchase = purchase;
     dto.telegramMeta = telegramMeta;
+    dto.logins = logins;
     dto.latestSale = latestSale.rows[0] || null;
     dto.currentAssignment = openAssignment.rows[0] || null;
     dto.notesCount = noteCount.rows[0].n;

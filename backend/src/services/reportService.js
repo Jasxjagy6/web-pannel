@@ -102,6 +102,7 @@ const VALID_ACTIONS = [
   'tracking_bulk_tag',
   'tracking_import',
   'tracking_session_zip_import',
+  'tracking_session_synced',
   'tracking_export',
   'tracking_team_member_added',
   'tracking_team_member_updated',

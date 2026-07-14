@@ -173,4 +173,11 @@ router.post(
 );
 router.delete('/accounts/:id/tags/:tagId', requireTrackingPermission('edit'), trackingAccountController.removeAccountTag);
 
+// --- Live Telegram session sync -----------------------------------------
+// Sync ALL currently logged-in Telegram sessions into tracking. Declared
+// before the :id route so "sync" isn't captured as an account id.
+router.post('/sync/logged-in', requireTrackingPermission('edit'), trackingAccountController.syncAllLoggedIn);
+// Re-sync a single tracking account from its linked session.
+router.post('/accounts/:id/sync', requireTrackingPermission('edit'), trackingAccountController.syncAccount);
+
 module.exports = router;

@@ -15,7 +15,20 @@ const UPSERT_FIELDS = {
   stats_spam_count: 'statsSpamCount',
   stats_invites_count: 'statsInvitesCount',
   extra_params: 'extraParams',
+  // Live-session sync fields (v44)
+  profile_photo_data: 'profilePhotoData',
+  privacy_settings: 'privacySettings',
+  two_fa_enabled_live: 'twoFaEnabledLive',
+  two_fa_hint: 'twoFaHint',
+  has_recovery_email: 'hasRecoveryEmail',
+  masked_recovery_email: 'maskedRecoveryEmail',
+  lang_code: 'langCode',
+  dc_id: 'dcId',
+  login_count: 'loginCount',
 };
+
+// Columns that hold JSON and must be JSON.stringify'd before binding.
+const JSON_COLUMNS = new Set(['extra_params', 'privacy_settings']);
 
 async function assertAccountExists(accountId) {
   const { rows } = await pool.query('SELECT id FROM tracking_accounts WHERE id = $1', [accountId]);
@@ -35,6 +48,15 @@ function toDTO(row) {
     statsSpamCount: row.stats_spam_count,
     statsInvitesCount: row.stats_invites_count,
     extraParams: row.extra_params,
+    profilePhotoData: row.profile_photo_data,
+    privacySettings: row.privacy_settings,
+    twoFaEnabledLive: row.two_fa_enabled_live,
+    twoFaHint: row.two_fa_hint,
+    hasRecoveryEmail: row.has_recovery_email,
+    maskedRecoveryEmail: row.masked_recovery_email,
+    langCode: row.lang_code,
+    dcId: row.dc_id,
+    loginCount: row.login_count,
     updatedAt: row.updated_at,
   };
 }
@@ -57,7 +79,8 @@ const trackingTelegramMetaService = {
     for (const [column, bodyKey] of Object.entries(UPSERT_FIELDS)) {
       if (data[bodyKey] !== undefined) {
         fields.push(column);
-        values.push(column === 'extra_params' ? JSON.stringify(data[bodyKey]) : data[bodyKey]);
+        const val = data[bodyKey];
+        values.push(JSON_COLUMNS.has(column) && val !== null ? JSON.stringify(val) : val);
         updates.push(`${column} = EXCLUDED.${column}`);
       }
     }

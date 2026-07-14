@@ -703,6 +703,26 @@ async function start() {
       logger.warn(`subscription sweep init failed: ${err.message}`);
     }
 
+    // 8b. Tracking session-sync sweep. Refreshes the Tracking CRM
+    //     snapshot (profile, avatar, privacy, logins, live 2FA state) for
+    //     logged-in Telegram sessions whose snapshot is older than the
+    //     stale window. Interval is generous and batches are stale-gated
+    //     so this never hammers Telegram; the primary sync path is the
+    //     immediate fire on login (see sessionService.loginSession).
+    try {
+      const trackingSync = require('./services/trackingTelegramSyncService');
+      const SWEEP_MS = parseInt(process.env.TRACKING_SYNC_SWEEP_MS || String(30 * 60_000), 10);
+      const STALE_MIN = parseInt(process.env.TRACKING_SYNC_STALE_MIN || '360', 10);
+      setInterval(
+        () => trackingSync.syncAllLoggedIn({ staleMinutes: STALE_MIN, limit: 50 }).catch((e) =>
+          logger.warn(`tracking sync sweep error: ${e.message}`)
+        ),
+        SWEEP_MS
+      );
+    } catch (err) {
+      logger.warn(`tracking sync sweep init failed: ${err.message}`);
+    }
+
     // All background workers have been launched (or have failed
     // soft and logged). Flip the readiness flag so the upgrade
     // orchestrator can proceed with the cutover.

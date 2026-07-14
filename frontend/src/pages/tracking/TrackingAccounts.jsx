@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { Plus, Trash2, Pencil, RefreshCw, ArrowLeftRight } from 'lucide-react';
+import { Plus, Trash2, Pencil, RefreshCw, ArrowLeftRight, DownloadCloud } from 'lucide-react';
 import { trackingAccountsAPI } from '@/api';
 import { useToast } from '../../components/common/Toast';
 import { parseApiError, formatDate } from '@/utils/formatters';
@@ -11,6 +11,7 @@ import ConfirmDialog from '../../components/common/ConfirmDialog';
 import StatusBadge from '../../components/common/StatusBadge';
 import BulkActionToolbar from '../../components/tracking/BulkActionToolbar';
 import ImportExportModal from '../../components/tracking/ImportExportModal';
+import Avatar from '../../components/tracking/Avatar';
 import { useTrackingAccess } from '../../context/TrackingAccessContext';
 
 const STATUS_OPTIONS = ['available', 'reserved', 'sold', 'dead', 'banned', 'deleted', 'lost_access'];
@@ -34,6 +35,7 @@ export default function TrackingAccounts() {
   const [submitting, setSubmitting] = useState(false);
   const [deleteTarget, setDeleteTarget] = useState(null);
   const [showImportExport, setShowImportExport] = useState(false);
+  const [syncing, setSyncing] = useState(false);
 
   const fetchAccounts = useCallback(async () => {
     setLoading(true);
@@ -110,6 +112,20 @@ export default function TrackingAccounts() {
     }
   };
 
+  const handleSyncSessions = async () => {
+    setSyncing(true);
+    try {
+      const res = await trackingAccountsAPI.syncAllLoggedIn();
+      const d = res.data.data || {};
+      success(`Synced ${d.synced || 0} of ${d.candidates || 0} logged-in session(s)`);
+      fetchAccounts();
+    } catch (err) {
+      showError(parseApiError(err), 'Session sync failed');
+    } finally {
+      setSyncing(false);
+    }
+  };
+
   const handleQuickStatus = async (account, status) => {
     try {
       await trackingAccountsAPI.changeStatus(account.id, { status });
@@ -128,9 +144,12 @@ export default function TrackingAccounts() {
     {
       key: 'username', label: 'Account', sortable: true,
       render: (r) => (
-        <div>
-          <div className="text-gray-100 font-medium">{r.displayName || (r.username ? `@${r.username}` : '—')}</div>
-          <div className="text-xs text-gray-500">{r.username && r.displayName ? `@${r.username}` : ''} {r.phoneNumber}</div>
+        <div className="flex items-center gap-2.5">
+          <Avatar src={r.avatarThumb} name={r.displayName || r.username} size={32} />
+          <div>
+            <div className="text-gray-100 font-medium">{r.displayName || (r.username ? `@${r.username}` : '—')}</div>
+            <div className="text-xs text-gray-500">{r.username && r.displayName ? `@${r.username}` : ''} {r.phoneNumber}</div>
+          </div>
         </div>
       ),
     },
@@ -202,6 +221,16 @@ export default function TrackingAccounts() {
           >
             <ArrowLeftRight className="h-4 w-4" /> Import / Export
           </button>
+          {hasPermission('edit') && (
+            <button
+              onClick={handleSyncSessions}
+              disabled={syncing}
+              className="flex items-center gap-2 rounded-lg border border-white/10 px-3 py-2 text-sm text-gray-300 hover:bg-white/5 disabled:opacity-50"
+              title="Pull live details from all logged-in Telegram sessions"
+            >
+              <DownloadCloud className={`h-4 w-4 ${syncing ? 'animate-spin' : ''}`} /> {syncing ? 'Syncing…' : 'Sync sessions'}
+            </button>
+          )}
           {hasPermission('edit') && (
             <button
               onClick={openCreate}

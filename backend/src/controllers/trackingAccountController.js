@@ -8,6 +8,7 @@ const trackingAssignmentService = require('../services/trackingAssignmentService
 const trackingNoteService = require('../services/trackingNoteService');
 const trackingTagService = require('../services/trackingTagService');
 const trackingAttachmentService = require('../services/trackingAttachmentService');
+const trackingTelegramSyncService = require('../services/trackingTelegramSyncService');
 const reportService = require('../services/reportService');
 const { AppError, asyncHandler } = require('../utils/errorHandler');
 const logger = require('../utils/logger');
@@ -386,6 +387,36 @@ const trackingAccountController = {
     await reportService.logActivity(userId, 'tracking_tag_removed', 'tracking_account', id, { tagId });
 
     return res.status(200).json({ success: true, data: tags });
+  }),
+
+  // ---------------------------------------------------------------------
+  // Live Telegram session sync
+  // ---------------------------------------------------------------------
+  syncAccount: asyncHandler(async (req, res) => {
+    const userId = req.user.id;
+    const id = req.params.id;
+    const account = await trackingAccountService.getAccountRow(id);
+    if (!account) {
+      throw new AppError('Account not found', 404, 'TRACKING_ACCOUNT_NOT_FOUND');
+    }
+    if (!account.source_session_id) {
+      throw new AppError('This account is not linked to a logged-in session', 400, 'NOT_SESSION_LINKED');
+    }
+    const detail = await trackingTelegramSyncService.syncFromSession(account.source_session_id, { actorUserId: userId });
+    if (!detail) {
+      throw new AppError('Source session is not a syncable Telegram session', 400, 'SESSION_NOT_SYNCABLE');
+    }
+    await reportService.logActivity(userId, 'tracking_session_synced', 'tracking_account', id, {});
+    return res.status(200).json({ success: true, data: detail });
+  }),
+
+  syncAllLoggedIn: asyncHandler(async (req, res) => {
+    const userId = req.user.id;
+    const result = await trackingTelegramSyncService.syncAllLoggedIn({ actorUserId: userId });
+    await reportService.logActivity(userId, 'tracking_session_synced', 'tracking_account', null, {
+      candidates: result.candidates, synced: result.synced, errorCount: result.errors.length,
+    });
+    return res.status(200).json({ success: true, data: result });
   }),
 };
 

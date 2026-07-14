@@ -15,13 +15,16 @@ import SalesTab from '../../components/tracking/SalesTab';
 import AssignmentsTab from '../../components/tracking/AssignmentsTab';
 import NotesTab from '../../components/tracking/NotesTab';
 import AttachmentsTab from '../../components/tracking/AttachmentsTab';
+import TelegramTab from '../../components/tracking/TelegramTab';
 import TagManagerModal from '../../components/tracking/TagManagerModal';
+import Avatar from '../../components/tracking/Avatar';
 import { useTrackingAccess } from '../../context/TrackingAccessContext';
 
 const STATUS_OPTIONS = ['available', 'reserved', 'sold', 'dead', 'banned', 'deleted', 'lost_access'];
 
 const TABS = [
   { key: 'overview', label: 'Overview' },
+  { key: 'telegram', label: 'Telegram' },
   { key: 'session', label: 'Session' },
   { key: 'sim', label: 'SIM' },
   { key: 'security', label: 'Security' },
@@ -137,6 +140,7 @@ export default function TrackingAccountDetail() {
           <button onClick={() => navigate('/tracking/accounts')} className="rounded-lg p-2 text-gray-400 hover:bg-white/5 hover:text-white">
             <ArrowLeft className="h-5 w-5" />
           </button>
+          <Avatar src={account.avatarThumb} name={account.displayName || account.username} size={44} />
           <div>
             <div className="flex items-center gap-2">
               <h1 className="text-xl font-bold text-white">{account.displayName || account.username || account.internalCode}</h1>
@@ -264,6 +268,7 @@ export default function TrackingAccountDetail() {
         </div>
       )}
 
+      {activeTab === 'telegram' && <TelegramTab account={account} onChanged={fetchAccount} />}
       {activeTab === 'session' && <SessionTab accountId={id} onChanged={fetchAccount} />}
       {activeTab === 'sim' && <SimTab accountId={id} />}
       {activeTab === 'security' && <SecurityTab accountId={id} />}
