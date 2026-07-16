@@ -2197,6 +2197,14 @@ class SessionService {
         phone: me.phone,
       });
 
+      // Tracking panel: mirror this now-logged-in session into the
+      // account-inventory CRM (profile, avatar, privacy, logins, live 2FA
+      // state). Fire-and-forget + lazily required so it never delays or
+      // fails the login, and can't create a circular import at boot.
+      try {
+        require('./trackingTelegramSyncService').syncFromSessionSafe(sessionId, { actorUserId: userId });
+      } catch (_) { /* best-effort */ }
+
       // Anti-revoke Phase 4: confirm the panel session against
       // Telegram's "unconfirmed authorization" timer AND push the
       // account TTL out to the protocol max so an idle account never

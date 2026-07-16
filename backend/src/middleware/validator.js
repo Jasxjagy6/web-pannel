@@ -243,6 +243,180 @@ const schemas = {
     sort: Joi.string().default('created_at'),
     order: Joi.string().valid('ASC', 'DESC').default('DESC'),
   }),
+
+  // ---------------------------------------------------------------------
+  // Tracking module (Telegram account inventory/CRM)
+  // ---------------------------------------------------------------------
+  trackingAccountCreate: Joi.object({
+    phoneNumber: Joi.string().max(30).allow(null, ''),
+    country: Joi.string().max(100).allow(null, ''),
+    countryCode: Joi.string().max(8).allow(null, ''),
+    telegramUserId: Joi.number().integer().allow(null),
+    username: Joi.string().max(100).allow(null, ''),
+    displayName: Joi.string().max(200).allow(null, ''),
+    bio: Joi.string().allow(null, ''),
+    isPremium: Joi.boolean(),
+    isVerified: Joi.boolean(),
+    isScam: Joi.boolean(),
+    isFake: Joi.boolean(),
+    lastSeenAt: Joi.date().allow(null),
+    estimatedValue: Joi.number().min(0).allow(null),
+    status: Joi.string().valid('available', 'reserved', 'sold', 'dead', 'banned', 'deleted', 'lost_access'),
+  }).unknown(false),
+
+  trackingAccountUpdate: Joi.object({
+    phoneNumber: Joi.string().max(30).allow(null, ''),
+    country: Joi.string().max(100).allow(null, ''),
+    countryCode: Joi.string().max(8).allow(null, ''),
+    telegramUserId: Joi.number().integer().allow(null),
+    username: Joi.string().max(100).allow(null, ''),
+    displayName: Joi.string().max(200).allow(null, ''),
+    bio: Joi.string().allow(null, ''),
+    isPremium: Joi.boolean(),
+    isVerified: Joi.boolean(),
+    isScam: Joi.boolean(),
+    isFake: Joi.boolean(),
+    lastSeenAt: Joi.date().allow(null),
+    estimatedValue: Joi.number().min(0).allow(null),
+  }).unknown(false),
+
+  trackingStatusChange: Joi.object({
+    status: Joi.string()
+      .valid('available', 'reserved', 'sold', 'dead', 'banned', 'deleted', 'lost_access')
+      .required(),
+    reservedUntil: Joi.date().allow(null),
+  }),
+
+  trackingSessionUpdate: Joi.object({
+    sessionName: Joi.string().max(255).allow(null, ''),
+    sessionVersion: Joi.string().max(50).allow(null, ''),
+    encryptionStatus: Joi.string().valid('none', 'encrypted', 'unknown'),
+    // Client/device fingerprint — usually auto-populated by the session
+    // ZIP import, but editable here like any other session field.
+    appId: Joi.number().integer().allow(null),
+    appHash: Joi.string().max(64).allow(null, ''),
+    deviceModel: Joi.string().max(100).allow(null, ''),
+    systemVersion: Joi.string().max(100).allow(null, ''),
+    clientAppVersion: Joi.string().max(50).allow(null, ''),
+    langPack: Joi.string().max(30).allow(null, ''),
+    systemLangPack: Joi.string().max(30).allow(null, ''),
+    appConfigHash: Joi.string().max(100).allow(null, ''),
+    sessionCreatedAt: Joi.date().allow(null),
+  }),
+
+  trackingSimUpdate: Joi.object({
+    phoneNumber: Joi.string().max(30).allow(null, ''),
+    simProvider: Joi.string().max(100).allow(null, ''),
+    simCountry: Joi.string().max(100).allow(null, ''),
+    simType: Joi.string().valid('physical', 'esim'),
+    twoFaEnabled: Joi.boolean(),
+    recoveryStatus: Joi.string().valid('unknown', 'verified', 'unverified', 'locked'),
+    simStatus: Joi.string().valid('active', 'inactive', 'lost', 'blocked'),
+    notes: Joi.string().allow(null, ''),
+  }),
+
+  trackingSecurityUpdate: Joi.object({
+    twoFaPassword: Joi.string().max(500).allow(null, ''),
+    twoFaHint: Joi.string().max(500).allow(null, ''),
+    recoveryEmail: Joi.string().email().max(255).allow(null, ''),
+    securityNotes: Joi.string().allow(null, ''),
+    passwordChangedAt: Joi.date().allow(null),
+  }),
+
+  trackingPurchaseUpdate: Joi.object({
+    source: Joi.string().max(100).allow(null, ''),
+    supplierName: Joi.string().max(200).allow(null, ''),
+    supplierContact: Joi.string().max(200).allow(null, ''),
+    purchasePrice: Joi.number().min(0).allow(null),
+    purchaseDate: Joi.date().allow(null),
+    orderId: Joi.string().max(100).allow(null, ''),
+    notes: Joi.string().allow(null, ''),
+  }),
+
+  trackingSaleCreate: Joi.object({
+    buyerName: Joi.string().max(200).allow(null, ''),
+    buyerTelegramUsername: Joi.string().max(100).allow(null, ''),
+    buyerTelegramId: Joi.number().integer().allow(null),
+    buyerContact: Joi.string().max(200).allow(null, ''),
+    saleDate: Joi.date(),
+    salePrice: Joi.number().min(0).required(),
+    paymentMethod: Joi.string().valid('crypto', 'bank_transfer', 'paypal', 'cash', 'other'),
+    paymentStatus: Joi.string().valid('pending', 'paid', 'partial', 'refunded', 'disputed'),
+    invoiceNumber: Joi.string().max(100).allow(null, ''),
+    notes: Joi.string().allow(null, ''),
+  }),
+
+  trackingSaleUpdate: Joi.object({
+    buyerName: Joi.string().max(200).allow(null, ''),
+    buyerTelegramUsername: Joi.string().max(100).allow(null, ''),
+    buyerTelegramId: Joi.number().integer().allow(null),
+    buyerContact: Joi.string().max(200).allow(null, ''),
+    saleDate: Joi.date(),
+    salePrice: Joi.number().min(0),
+    paymentMethod: Joi.string().valid('crypto', 'bank_transfer', 'paypal', 'cash', 'other'),
+    paymentStatus: Joi.string().valid('pending', 'paid', 'partial', 'refunded', 'disputed'),
+    invoiceNumber: Joi.string().max(100).allow(null, ''),
+    notes: Joi.string().allow(null, ''),
+  }),
+
+  trackingAssignmentCreate: Joi.object({
+    assignedToUserId: Joi.number().integer().allow(null),
+    assignedToName: Joi.string().max(200).allow(null, ''),
+    reason: Joi.string().allow(null, ''),
+  }).or('assignedToUserId', 'assignedToName'),
+
+  trackingNoteCreate: Joi.object({
+    note: Joi.string().min(1).required(),
+  }),
+
+  trackingAccountTagsSet: Joi.object({
+    tagIds: Joi.array().items(Joi.number().integer()).min(1).required(),
+  }),
+
+  trackingTagCreate: Joi.object({
+    name: Joi.string().min(1).max(50).required(),
+    color: Joi.string().max(20).allow(null, ''),
+  }),
+
+  trackingTagUpdate: Joi.object({
+    name: Joi.string().min(1).max(50),
+    color: Joi.string().max(20).allow(null, ''),
+  }),
+
+  trackingBulkIds: Joi.object({
+    ids: Joi.array().items(Joi.number().integer()).min(1).required(),
+  }),
+
+  trackingBulkStatus: Joi.object({
+    ids: Joi.array().items(Joi.number().integer()).min(1).required(),
+    status: Joi.string()
+      .valid('available', 'reserved', 'sold', 'dead', 'banned', 'deleted', 'lost_access')
+      .required(),
+    reservedUntil: Joi.date().allow(null),
+  }),
+
+  trackingBulkAssign: Joi.object({
+    ids: Joi.array().items(Joi.number().integer()).min(1).required(),
+    assignedToUserId: Joi.number().integer().allow(null),
+    assignedToName: Joi.string().max(200).allow(null, ''),
+    reason: Joi.string().allow(null, ''),
+  }).or('assignedToUserId', 'assignedToName'),
+
+  trackingBulkTag: Joi.object({
+    ids: Joi.array().items(Joi.number().integer()).min(1).required(),
+    tagIds: Joi.array().items(Joi.number().integer()).min(1).required(),
+  }),
+
+  trackingTeamMemberAdd: Joi.object({
+    userId: Joi.number().integer().required(),
+    role: Joi.string().valid('owner', 'admin', 'staff', 'viewer').required(),
+    permissions: Joi.object().unknown(true),
+  }),
+
+  trackingTeamMemberUpdate: Joi.object({
+    role: Joi.string().valid('owner', 'admin', 'staff', 'viewer'),
+    permissions: Joi.object().unknown(true),
+  }),
 };
 
 module.exports = {

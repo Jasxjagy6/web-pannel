@@ -34,6 +34,12 @@ const loginEmailRoutes = require('./routes/loginEmail');
 const adminRoutes = require('./routes/admin');
 const billingRoutes = require('./routes/billing');
 const userCredentialsRoutes = require('./routes/userCredentials');
+const trackingRoutes = require('./routes/tracking');
+const trackingTagsRoutes = require('./routes/trackingTags');
+const trackingBulkRoutes = require('./routes/trackingBulk');
+const trackingImportExportRoutes = require('./routes/trackingImportExport');
+const trackingDashboardRoutes = require('./routes/trackingDashboard');
+const trackingTeamRoutes = require('./routes/trackingTeam');
 const otpRelayRoutes = require('./routes/otpRelays');
 const telegramClientRoutes = require('./routes/telegramClient');
 const aiChatRoutes = require('./routes/aiChat');
@@ -185,6 +191,16 @@ app.use(`${apiPrefix}/auth`, authRoutes);
 app.use(`${apiPrefix}/admin`, adminRoutes);
 app.use(`${apiPrefix}/billing`, resolvePlatform, billingRoutes);
 app.use(`${apiPrefix}/user-credentials`, userCredentialsRoutes);
+
+// Tracking module (Telegram account inventory/CRM). Manual data-entry only —
+// never connects to Telegram — so it's a top-level module mounted once,
+// like admin, rather than going through PLATFORM_ROUTERS.
+app.use(`${apiPrefix}/tracking`, trackingRoutes);
+app.use(`${apiPrefix}/tracking/tags`, trackingTagsRoutes);
+app.use(`${apiPrefix}/tracking/bulk`, trackingBulkRoutes);
+app.use(`${apiPrefix}/tracking/import-export`, trackingImportExportRoutes);
+app.use(`${apiPrefix}/tracking/dashboard`, trackingDashboardRoutes);
+app.use(`${apiPrefix}/tracking/team`, trackingTeamRoutes);
 
 // Saved-Messages OTP Relay (Telegram-only). Mounted under both the
 // Telegram namespace and a legacy alias so the existing frontend
@@ -685,6 +701,26 @@ async function start() {
       );
     } catch (err) {
       logger.warn(`subscription sweep init failed: ${err.message}`);
+    }
+
+    // 8b. Tracking session-sync sweep. Refreshes the Tracking CRM
+    //     snapshot (profile, avatar, privacy, logins, live 2FA state) for
+    //     logged-in Telegram sessions whose snapshot is older than the
+    //     stale window. Interval is generous and batches are stale-gated
+    //     so this never hammers Telegram; the primary sync path is the
+    //     immediate fire on login (see sessionService.loginSession).
+    try {
+      const trackingSync = require('./services/trackingTelegramSyncService');
+      const SWEEP_MS = parseInt(process.env.TRACKING_SYNC_SWEEP_MS || String(30 * 60_000), 10);
+      const STALE_MIN = parseInt(process.env.TRACKING_SYNC_STALE_MIN || '360', 10);
+      setInterval(
+        () => trackingSync.syncAllLoggedIn({ staleMinutes: STALE_MIN, limit: 50 }).catch((e) =>
+          logger.warn(`tracking sync sweep error: ${e.message}`)
+        ),
+        SWEEP_MS
+      );
+    } catch (err) {
+      logger.warn(`tracking sync sweep init failed: ${err.message}`);
     }
 
     // All background workers have been launched (or have failed

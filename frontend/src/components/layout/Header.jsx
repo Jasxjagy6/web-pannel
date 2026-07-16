@@ -3,7 +3,7 @@ import { Bell, Menu, User, Sun, Moon, LogOut, Settings as SettingsIcon, Mail } f
 import { useAuth } from '@/hooks/useAuth';
 import { useTheme } from '../../context/ThemeContext';
 import { usePlatform } from '../../context/PlatformContext';
-import PlatformToggle from './PlatformToggle';
+import PanelSwitcher from './PanelSwitcher';
 
 /**
  * Top app bar for the Telegram panel.
@@ -84,10 +84,10 @@ export default function Header({ onMenuClick, title }) {
             `size=sm` variant keeps it from blowing out the header on
             <360px screens. */}
         <div className="block sm:hidden">
-          <PlatformToggle size="sm" />
+          <PanelSwitcher size="sm" />
         </div>
         <div className="hidden sm:block">
-          <PlatformToggle />
+          <PanelSwitcher />
         </div>
 
         {/* Theme toggle — only meaningful inside the Telegram panel.

@@ -53,6 +53,7 @@ async function processGenerateReply(job) {
     config,
     conversationState,
     confirmedMessageIds = [],
+    botProfile = {},
   } = job.data;
 
   const sid = Number(sessionId);
@@ -97,6 +98,7 @@ async function processGenerateReply(job) {
       overrides: config.cupidbot || {},
       isFollowUp,
       confirmedMessageIds: confirmedMessageIds,
+      botProfile,
     });
 
     logRow.response_payload = cupid;
@@ -145,7 +147,7 @@ async function processGenerateReply(job) {
         sessionId,
         pid,
         cupid.text,
-        { silent: false }
+        { silent: false, accessHash: recipient?.accessHash || null }
       );
     } catch (sendErr) {
       logger.warn(

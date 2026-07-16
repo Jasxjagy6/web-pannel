@@ -28,25 +28,31 @@ export default function StatusBadge({ status, size = 'md' }) {
       case 'online':
       case 'completed':
       case 'success':
+      case 'available':
         return 'green';
       case 'inactive':
       case 'offline':
       case 'pending':
       case 'uploaded':
+      case 'deleted':
         return 'gray';
       case 'running':
       case 'processing':
       case 'filtering':
       case 'validating':
+      case 'sold':
         return 'blue';
       case 'queued':
       case 'cooldown':
+      case 'reserved':
         return 'yellow';
       case 'error':
       case 'failed':
       case 'banned':
       case 'revoked':
       case 'expired':
+      case 'dead':
+      case 'lost_access':
         return 'red';
       case 'warning':
       case 'paused':
@@ -67,6 +73,7 @@ export default function StatusBadge({ status, size = 'md' }) {
     'validating',
     'queued',
     'cooldown',
+    'reserved',
   ]);
 
   /** Background color for the badge pill */
@@ -97,7 +104,8 @@ export default function StatusBadge({ status, size = 'md' }) {
   const sizes = sizeStyles[size] || sizeStyles.md;
   const isAnimated = ANIMATED_STATUSES.has(normalizedStatus);
 
-  const label = normalizedStatus.charAt(0).toUpperCase() + normalizedStatus.slice(1);
+  const spaced = normalizedStatus.replace(/_/g, ' ');
+  const label = spaced.charAt(0).toUpperCase() + spaced.slice(1);
 
   return (
     <span

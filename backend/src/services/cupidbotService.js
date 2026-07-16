@@ -259,6 +259,7 @@ class CupidBotService {
     overrides = {},
     isFollowUp = false,
     confirmedMessageIds = [],
+    botProfile = {},
   }) {
     const { token: accessToken } = await this.getAccessToken(userId);
 
@@ -266,6 +267,16 @@ class CupidBotService {
     // and include any new incoming messages.
     // The API will use this to align with its internal database.
     const messagesToSend = this._buildMessagePayload(messages, confirmedMessageIds, isFollowUp);
+
+    // Use bot's actual Telegram profile name, fallback to overrides or default
+    const botName = botProfile?.name || overrides.name || 'Test Model';
+    const botFirstName = botProfile?.firstName || '';
+    const botLastName = botProfile?.lastName || '';
+
+    // Build dynamic userInfo based on bot's actual profile
+    const dynamicUserInfo = botName && botName !== 'Test Model'
+      ? `Your name is ${botName}. ${overrides.userInfo || 'You are a friendly and engaging model.'}`
+      : (overrides.userInfo || 'You are a friendly test model');
 
     const body = {
       accessToken,
@@ -282,9 +293,9 @@ class CupidBotService {
       responseLanguageCode: 'en',
       responseLanguage: 'english',
       isFollowUp,
-      name: overrides.name || 'Test Model',
+      name: botName,
       age: overrides.age || 25,
-      userInfo: overrides.userInfo || 'You are a friendly test model',
+      userInfo: dynamicUserInfo,
       city: overrides.city || recipient.location || 'New York',
       ctaInfo: overrides.ctaInfo || 'Page subscription details will be provided later',
       chooseRandomCTA: false,

@@ -19,6 +19,7 @@ const aiMemoryService = require('./aiMemoryService');
 const aiSessionManager = require('./aiSessionManager');
 const aiChatQueue = require('../queues/aiChatQueue');
 const tcService = require('./telegramClientService');
+const tgService = require('./telegramService');
 const logger = require('../utils/logger');
 
 const DEFAULT_CONFIG = {
@@ -175,13 +176,27 @@ class AiChatService {
     const recipientProfile = await this._getRecipientProfile(sid, peerType, peerId, chat);
     await aiMemoryService.setRecipientProfile(sid, peerType, peerId, recipientProfile);
 
+    // Get accessHash for entity resolution when sending replies
+    let accessHash = null;
+    if (chat && chat.accessHash != null) {
+      accessHash = String(chat.accessHash);
+    } else if (msg?.fromId?.accessHash != null) {
+      accessHash = String(msg.fromId.accessHash);
+    } else if (msg?.peerId?.accessHash != null) {
+      accessHash = String(msg.peerId.accessHash);
+    }
+
     const recipient = {
       id: String(peerId),
       name: recipientProfile.name || title,
       username: recipientProfile.username || username,
       bio: recipientProfile.bio || '',
       location: recipientProfile.location || '',
+      accessHash: accessHash || '',
     };
+
+    // Fetch the bot's own profile for CupidBot context
+    const botProfile = await this._getBotProfile(sid);
 
     const userId = await this._resolveUserId(sid);
     logger.info(`AI: userId=${userId}`);
@@ -208,6 +223,7 @@ class AiChatService {
         lastExchange: conversationState.lastExchange,
       },
       confirmedMessageIds: confirmedMessages,
+      botProfile,
     });
 
     logger.info(`AI: job enqueued — returning handled:true`);
@@ -248,6 +264,28 @@ class AiChatService {
       }
     } catch (err) {
       logger.debug(`Failed to get recipient profile for ${sessionId}/${peerType}/${peerId}: ${err.message}`);
+    }
+
+    return profile;
+  }
+
+  /**
+   * Get the bot's own profile (firstName, lastName, username) for CupidBot context.
+   * This is the identity of the Telegram account running the AI.
+   */
+  async _getBotProfile(sessionId) {
+    const profile = { name: '', username: '', firstName: '', lastName: '' };
+
+    try {
+      const me = await tgService.getMe(sessionId);
+      if (me) {
+        profile.firstName = me.firstName || '';
+        profile.lastName = me.lastName || '';
+        profile.name = [me.firstName, me.lastName].filter(Boolean).join(' ').trim();
+        profile.username = me.username || '';
+      }
+    } catch (err) {
+      logger.debug(`Failed to get bot profile for ${sessionId}: ${err.message}`);
     }
 
     return profile;

@@ -56,6 +56,7 @@ import {
 } from 'lucide-react';
 import { useAuth } from '@/hooks/useAuth';
 import { usePlatform, useCapabilities } from '../../context/PlatformContext';
+import PanelSwitcher from '../layout/PanelSwitcher';
 
 /* -------------------------------------------------------------------------- */
 /* Navigation model                                                           */
@@ -529,10 +530,10 @@ export default function InstagramLayout({ children, title }) {
               </button>
 
               <div className="block sm:hidden">
-                <PlatformSwitch size="sm" />
+                <PanelSwitcher size="sm" />
               </div>
               <div className="hidden sm:block">
-                <PlatformSwitch />
+                <PanelSwitcher />
               </div>
 
               <button
