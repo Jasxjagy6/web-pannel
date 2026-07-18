@@ -32,6 +32,8 @@ const DEFAULT_CONFIG = {
   allowGroups: false,
   allowChannels: false,
   skipBots: true,
+  // AI provider selection: 'cupidbot' or 'capitalbot'
+  provider: 'cupidbot',
   cupidbot: {
     app: 'telegram',
     isAPI: true,
@@ -39,6 +41,16 @@ const DEFAULT_CONFIG = {
     isOF: true,
     chatStyle: 'youth',
     responseLanguage: 'en',
+  },
+  capitalbot: {
+    modelId: 43,
+    presetId: 88,
+    platform: 'Telegram',
+    conversationSource: 'Telegram',
+    language: 'en',
+    audio: true,
+    video: true,
+    image: true,
   },
 };
 
@@ -55,6 +67,7 @@ function _mergeConfig(config) {
     allowChannels: false,
     skipBots: config.skipBots !== false,
     cupidbot: { ...DEFAULT_CONFIG.cupidbot, ...(config.cupidbot || {}) },
+    capitalbot: { ...DEFAULT_CONFIG.capitalbot, ...(config.capitalbot || {}) },
   };
 }
 
@@ -566,6 +579,239 @@ class AiChatService {
       [sid, limit, offset]
     );
     return rows;
+  }
+
+  /**
+   * -----------------------------------------------------------------
+   * AI activity tracking (analytics over ai_response_logs)
+   * -----------------------------------------------------------------
+   *
+   * Everything below reads the existing audit trail -- no new tables.
+   * `request_payload.incomingMessage.msg` holds the user's message and
+   * `response_payload.text` holds the exact message the AI sent, so the
+   * tracking surface works over ALL historical records too.
+   */
+
+  /**
+   * Extract the AI's sent text from a stored response_payload, tolerating
+   * the couple of shapes the workers have written over time.
+   */
+  _extractAiText(responsePayload) {
+    const rp = responsePayload || {};
+    if (typeof rp.text === 'string' && rp.text.trim()) return rp.text;
+    const raw = rp.rawResponse || {};
+    if (Array.isArray(raw.messages) && raw.messages.length) {
+      return raw.messages.filter(Boolean).join('\n');
+    }
+    if (Array.isArray(raw.content) && raw.content.length) {
+      return raw.content
+        .map((c) => (c && typeof c.content === 'string' ? c.content : ''))
+        .filter(Boolean)
+        .join('\n');
+    }
+    if (typeof raw.content === 'string' && raw.content.trim()) return raw.content;
+    return '';
+  }
+
+  /**
+   * A single owner-wide tracking summary: totals across every Telegram
+   * session the user owns, plus a per-session breakdown. Powers the
+   * "how many convos did the AI do and what did it send" overview.
+   *
+   * @param {number} userId
+   * @param {object} [opts] { sessionId?, since?, until? }
+   */
+  async getTrackingOverview(userId, opts = {}) {
+    const params = [userId];
+    const where = [`s.user_id = $1`, `s.platform = 'telegram'`];
+
+    if (opts.sessionId != null && opts.sessionId !== '') {
+      params.push(Number(opts.sessionId));
+      where.push(`l.session_id = $${params.length}`);
+    }
+    if (opts.since) {
+      params.push(new Date(opts.since));
+      where.push(`l.created_at >= $${params.length}`);
+    }
+    if (opts.until) {
+      params.push(new Date(opts.until));
+      where.push(`l.created_at <= $${params.length}`);
+    }
+
+    const whereSql = where.join(' AND ');
+
+    // Owner-wide totals.
+    const totalsQ = await pool.query(
+      `SELECT
+         COUNT(*)                                         AS total_events,
+         COUNT(*) FILTER (WHERE l.status = 'sent')        AS sent,
+         COUNT(*) FILTER (WHERE l.status <> 'sent')       AS not_sent,
+         COUNT(DISTINCT (l.session_id))                   AS active_sessions,
+         COUNT(DISTINCT (l.session_id, l.peer_type, l.peer_id)) AS conversations,
+         COUNT(*) FILTER (WHERE l.cupidbot_did_convert IS TRUE) AS conversions,
+         MIN(l.created_at)                                AS first_activity,
+         MAX(l.created_at)                                AS last_activity
+       FROM ai_response_logs l
+       JOIN sessions s ON s.id = l.session_id
+       WHERE ${whereSql}`,
+      params
+    );
+
+    // Status breakdown for the whole scope.
+    const statusQ = await pool.query(
+      `SELECT l.status, COUNT(*) AS count
+       FROM ai_response_logs l
+       JOIN sessions s ON s.id = l.session_id
+       WHERE ${whereSql}
+       GROUP BY l.status
+       ORDER BY count DESC`,
+      params
+    );
+
+    // Per-session breakdown so the operator can see each account at a glance.
+    const perSessionQ = await pool.query(
+      `SELECT
+         l.session_id,
+         s.phone,
+         s.username,
+         s.account_info->>'firstName' AS first_name,
+         s.account_info->>'lastName'  AS last_name,
+         COUNT(*)                                         AS total_events,
+         COUNT(*) FILTER (WHERE l.status = 'sent')        AS sent,
+         COUNT(DISTINCT (l.peer_type, l.peer_id))         AS conversations,
+         COUNT(*) FILTER (WHERE l.cupidbot_did_convert IS TRUE) AS conversions,
+         MAX(l.created_at)                                AS last_activity
+       FROM ai_response_logs l
+       JOIN sessions s ON s.id = l.session_id
+       WHERE ${whereSql}
+       GROUP BY l.session_id, s.phone, s.username, s.account_info
+       ORDER BY last_activity DESC NULLS LAST`,
+      params
+    );
+
+    const t = totalsQ.rows[0] || {};
+    return {
+      totals: {
+        totalEvents: Number(t.total_events || 0),
+        sent: Number(t.sent || 0),
+        notSent: Number(t.not_sent || 0),
+        activeSessions: Number(t.active_sessions || 0),
+        conversations: Number(t.conversations || 0),
+        conversions: Number(t.conversions || 0),
+        firstActivity: t.first_activity || null,
+        lastActivity: t.last_activity || null,
+      },
+      statusBreakdown: statusQ.rows.map((r) => ({
+        status: r.status,
+        count: Number(r.count),
+      })),
+      sessions: perSessionQ.rows.map((r) => ({
+        sessionId: r.session_id,
+        phone: r.phone,
+        username: r.username,
+        displayName:
+          [r.first_name, r.last_name].filter(Boolean).join(' ').trim() ||
+          (r.username ? `@${r.username}` : null) ||
+          r.phone ||
+          `Session #${r.session_id}`,
+        totalEvents: Number(r.total_events || 0),
+        sent: Number(r.sent || 0),
+        conversations: Number(r.conversations || 0),
+        conversions: Number(r.conversions || 0),
+        lastActivity: r.last_activity || null,
+      })),
+    };
+  }
+
+  /**
+   * List every conversation (distinct peer) the AI touched for a session,
+   * with per-conversation counts and recipient labels. This is the
+   * "each session -> its conversations" drill-down.
+   */
+  async listTrackedConversations(sessionId, userId, opts = {}) {
+    const sid = Number(sessionId);
+    await this._authorizeSession(sid, userId);
+
+    const { rows } = await pool.query(
+      `SELECT
+         peer_type,
+         peer_id,
+         COUNT(*)                                   AS total_events,
+         COUNT(*) FILTER (WHERE status = 'sent')    AS sent,
+         COUNT(*) FILTER (WHERE cupidbot_did_convert IS TRUE) AS conversions,
+         MIN(created_at)                            AS first_at,
+         MAX(created_at)                            AS last_at,
+         (ARRAY_AGG(request_payload->'recipient'->>'name'
+            ORDER BY created_at DESC)
+            FILTER (WHERE request_payload->'recipient'->>'name' <> ''))[1] AS recipient_name,
+         (ARRAY_AGG(request_payload->'recipient'->>'username'
+            ORDER BY created_at DESC)
+            FILTER (WHERE request_payload->'recipient'->>'username' <> ''))[1] AS recipient_username
+       FROM ai_response_logs
+       WHERE session_id = $1
+       GROUP BY peer_type, peer_id
+       ORDER BY last_at DESC`,
+      [sid]
+    );
+
+    return rows.map((r) => ({
+      peerType: r.peer_type,
+      peerId: String(r.peer_id),
+      recipientName: r.recipient_name || null,
+      recipientUsername: r.recipient_username || null,
+      totalEvents: Number(r.total_events || 0),
+      sent: Number(r.sent || 0),
+      conversions: Number(r.conversions || 0),
+      firstAt: r.first_at,
+      lastAt: r.last_at,
+    }));
+  }
+
+  /**
+   * Full message-by-message transcript for one tracked conversation:
+   * every incoming user message the AI saw and every message the AI sent,
+   * in chronological order, with status and error context. This is the
+   * "exactly what the AI sent in each chat" view.
+   */
+  async getConversationTranscript(sessionId, userId, peerType, peerId, opts = {}) {
+    const sid = Number(sessionId);
+    const pid = Number(peerId);
+    await this._authorizeSession(sid, userId);
+
+    const limit = Math.max(1, Math.min(1000, parseInt(opts.limit, 10) || 500));
+
+    const { rows } = await pool.query(
+      `SELECT id, status, error_message, created_at,
+              incoming_msg_id, cupidbot_category, cupidbot_did_convert,
+              is_followup,
+              request_payload->'incomingMessage' AS incoming,
+              response_payload            AS response
+       FROM ai_response_logs
+       WHERE session_id = $1 AND peer_type = $2 AND peer_id = $3
+       ORDER BY created_at ASC
+       LIMIT $4`,
+      [sid, peerType, pid, limit]
+    );
+
+    const events = rows.map((r) => {
+      const incoming = r.incoming || null;
+      const aiText = this._extractAiText(r.response);
+      return {
+        id: r.id,
+        createdAt: r.created_at,
+        status: r.status,
+        errorMessage: r.error_message || null,
+        category: r.cupidbot_category || null,
+        didConvert: r.cupidbot_did_convert === true,
+        isFollowUp: r.is_followup === true,
+        incomingText: incoming && typeof incoming.msg === 'string' ? incoming.msg : '',
+        incomingMsgId: r.incoming_msg_id != null ? String(r.incoming_msg_id) : null,
+        aiText,
+        aiSent: r.status === 'sent' && !!aiText,
+      };
+    });
+
+    return { events, total: events.length };
   }
 
   /**

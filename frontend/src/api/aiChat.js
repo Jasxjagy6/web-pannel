@@ -34,3 +34,33 @@ export const getCupidbotKey = () => api.get(`${BASE}/cupidbot-key`);
 export const setCupidbotKey = (apiKey) =>
   api.post(`${BASE}/cupidbot-key`, { apiKey });
 export const deleteCupidbotKey = () => api.delete(`${BASE}/cupidbot-key`);
+
+// CapitalBot API key management (per-user)
+export const getCapitalbotKey = () => api.get(`${BASE}/capitalbot-key`);
+export const setCapitalbotKey = (apiKey, modelId, presetId) =>
+  api.post(`${BASE}/capitalbot-key`, { apiKey, modelId, presetId });
+export const updateCapitalbotModelPreset = (modelId, presetId) =>
+  api.patch(`${BASE}/capitalbot-model-preset`, { modelId, presetId });
+export const fetchCapitalbotModels = (apiKey) =>
+  api.post(`${BASE}/capitalbot-models`, { apiKey });
+export const getMyCapitalbotModels = () =>
+  api.get(`${BASE}/capitalbot-my-models`);
+export const deleteCapitalbotKey = () => api.delete(`${BASE}/capitalbot-key`);
+
+// ─── AI activity tracking (analytics over the existing audit trail) ───
+
+// Owner-wide overview: totals + per-session breakdown.
+// Optional params: { sessionId, since, until }
+export const getAiTrackingOverview = (params = {}) =>
+  api.get(`${BASE}/tracking/overview`, { params });
+
+// Every conversation (distinct peer) the AI touched for a session.
+export const getAiTrackedConversations = (sessionId) =>
+  api.get(`${BASE}/sessions/${sessionId}/tracking/conversations`);
+
+// Full message-by-message transcript for one tracked conversation.
+export const getAiConversationTranscript = (sessionId, peerType, peerId, params = {}) =>
+  api.get(
+    `${BASE}/sessions/${sessionId}/tracking/conversations/${peerType}/${peerId}`,
+    { params }
+  );

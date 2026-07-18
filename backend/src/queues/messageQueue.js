@@ -52,6 +52,7 @@ class MessageQueueManager {
         // bulk-DM job that's saturating the same user's sessions.
         let heavyCategory = null;
         if (type === 'bulk') heavyCategory = 'message:bulk';
+        else if (type === 'failover') heavyCategory = 'message:failover';
         else if (type === 'single_user_mass_dm') heavyCategory = 'message:single_user_mass_dm';
 
         const run = async () => {
@@ -59,6 +60,8 @@ class MessageQueueManager {
             return await messageService.sendMessage(sessionId, targetId, message, options, userId);
           } else if (type === 'bulk') {
             return await messageService.sendBulkMessage(params, userId);
+          } else if (type === 'failover') {
+            return await messageService.sendFailoverMessage(params, userId);
           } else if (type === 'group-message') {
             return await messageService.sendMessageToGroup(sessionId, groupId, message, userId);
           } else if (type === 'forward') {

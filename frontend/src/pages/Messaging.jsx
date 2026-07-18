@@ -1,9 +1,10 @@
-import { useState, useEffect, useCallback, useRef, useMemo } from 'react';
+import { useState, useEffect, useCallback, useRef, useMemo, Fragment } from 'react';
 import { useSearchParams } from 'react-router-dom';
 import { useWebSocket } from '../hooks/useWebSocket';
 import { listSessions } from '../api/sessions';
 import {
   sendBulk,
+  sendFailover,
   getJobs,
   cancelJob,
   previewMessage,
@@ -22,6 +23,7 @@ import MessageGroupsTab from './MessageGroupsTab';
 import MessageSchedulesTab from './MessageSchedulesTab';
 import MessageSingleUserTab from './MessageSingleUserTab';
 import MessageSingleUserHistoryTab from './MessageSingleUserHistoryTab';
+import MessageReplyDetails from './MessageReplyDetails';
 import {
   Send,
   Loader2,
@@ -846,6 +848,12 @@ export default function Messaging() {
   const [msgsPerSession, setMsgsPerSession] = useState('');
   // Distribution-engine state — auto/manual rotation+cooldown.
   const [distribution, setDistribution] = useState({ mode: 'auto' });
+  // Delivery strategy: 'distribute' (round-robin across sessions, the
+  // classic bulk engine) vs 'failover' (one session at a time; on a
+  // rate-limit / mutual-contact error hand off to the next session and
+  // resume from the same target).
+  const [deliveryMode, setDeliveryMode] = useState('distribute');
+  const [trackReplies, setTrackReplies] = useState(true);
   const [distPlan, setDistPlan] = useState(null);
   const [distLoading, setDistLoading] = useState(false);
   const [distError, setDistError] = useState(null);
@@ -862,6 +870,7 @@ export default function Messaging() {
 
   // Pagination & filters
   const [searchTerm, setSearchTerm] = useState('');
+  const [expandedReplyJobId, setExpandedReplyJobId] = useState(null);
   const [statusFilter, setStatusFilter] = useState('all');
   const [currentPage, setCurrentPage] = useState(1);
   const pageSize = 10;
@@ -1200,6 +1209,42 @@ export default function Messaging() {
         console.warn('Media attachment selected but not yet supported in bulk messaging');
       }
 
+      // FAILOVER delivery: one session at a time, hand off on rate-limit /
+      // mutual-contact errors and resume from the same target. Runs async
+      // (background job) and starts 24h reply tracking on completion.
+      if (deliveryMode === 'failover') {
+        const failoverPayload = {
+          message: payload.message,
+          messageType: payload.messageType,
+          targetList: payload.targetList,
+          sourceType: payload.sourceType,
+          sourceId: payload.sourceId,
+          // delay here is in milliseconds between sends on the same session
+          delayMin: Math.max(0, Number(delayMin) * 1000),
+          delayMax: Math.max(0, Number(delayMax) * 1000),
+          trackReplies,
+          replyWindowHours: 24,
+          async: true,
+        };
+        if (payload.sessionListId) failoverPayload.sessionListId = payload.sessionListId;
+        if (payload.sessionIds) failoverPayload.sessionIds = payload.sessionIds;
+
+        const fRes = await sendFailover(failoverPayload);
+        const elapsedF = Date.now() - startTime;
+        await new Promise((r) => setTimeout(r, Math.max(0, minLoadingTime - elapsedF)));
+        const fData = fRes.data?.data || {};
+        showSuccess(
+          `Failover send started across ${fData.sessionCount || (payload.sessionIds ? payload.sessionIds.length : 0)} session(s) ` +
+          `for ${fData.totalTargets || (payload.targetList ? payload.targetList.length : 0)} target(s). ` +
+          `Reply tracking will run for 24h — open the job in History to see who replies.`,
+          'Failover Started'
+        );
+        fetchActiveJobs();
+        fetchHistory();
+        setMessage('');
+        return;
+      }
+
       const response = await sendBulk(payload);
       const elapsed = Date.now() - startTime;
       const remaining = Math.max(0, minLoadingTime - elapsed);
@@ -1471,9 +1516,59 @@ export default function Messaging() {
         />
       </div>
 
+      {/* Delivery strategy: distribute (round-robin) vs failover (sequential) */}
+      <div className="rounded-xl border border-white/5 bg-dark-800 p-4">
+        <div className="mb-3 flex items-center gap-2">
+          <Send className="h-4 w-4 text-primary-500" />
+          <h3 className="text-sm font-semibold text-white">Delivery strategy</h3>
+        </div>
+        <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
+          <button
+            type="button"
+            onClick={() => setDeliveryMode('distribute')}
+            className={`rounded-lg border p-3 text-left transition ${
+              deliveryMode === 'distribute'
+                ? 'border-primary-500/60 bg-primary-500/10'
+                : 'border-white/10 bg-dark-900 hover:border-white/20'
+            }`}
+          >
+            <p className="text-sm font-medium text-white">Distribute (default)</p>
+            <p className="mt-0.5 text-xs text-gray-400">
+              Split the list across all selected sessions in parallel (rotation + cooldown engine).
+            </p>
+          </button>
+          <button
+            type="button"
+            onClick={() => setDeliveryMode('failover')}
+            className={`rounded-lg border p-3 text-left transition ${
+              deliveryMode === 'failover'
+                ? 'border-primary-500/60 bg-primary-500/10'
+                : 'border-white/10 bg-dark-900 hover:border-white/20'
+            }`}
+          >
+            <p className="text-sm font-medium text-white">Sequential failover</p>
+            <p className="mt-0.5 text-xs text-gray-400">
+              One session sends the whole list; if it gets limited / can only message mutual contacts,
+              the next session resumes from the same user. Not-found users are skipped.
+            </p>
+          </button>
+        </div>
+        {deliveryMode === 'failover' && (
+          <label className="mt-3 flex items-center gap-2 text-xs text-gray-300">
+            <input
+              type="checkbox"
+              checked={trackReplies}
+              onChange={(e) => setTrackReplies(e.target.checked)}
+              className="h-3.5 w-3.5 rounded border-white/20 bg-dark-900"
+            />
+            Track replies for 24h after sending (see who replies per user in History)
+          </label>
+        )}
+      </div>
+
       {/* Distribution Visualization + Send Button */}
       {/* Distribution engine — auto/manual rotation+cooldown */}
-      <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
+      <div className={`grid grid-cols-1 gap-4 lg:grid-cols-2 ${deliveryMode === 'failover' ? 'opacity-50 pointer-events-none' : ''}`}>
         <DistributionControls
           value={distribution}
           onChange={setDistribution}
@@ -1522,7 +1617,7 @@ export default function Messaging() {
               ) : (
                 <>
                   <Send className="w-4 h-4" />
-                  Send Bulk Messages
+                  {deliveryMode === 'failover' ? 'Start Failover Send' : 'Send Bulk Messages'}
                 </>
               )}
             </button>
@@ -1646,8 +1741,10 @@ export default function Messaging() {
                       job.status === 'queued' ||
                       job.status === 'pending';
 
+                    const isExpanded = expandedReplyJobId === job.id;
                     return (
-                      <tr key={job.id} className="transition-colors hover:bg-white/[0.02]">
+                      <Fragment key={job.id}>
+                      <tr className="transition-colors hover:bg-white/[0.02]">
                         <td className="px-4 py-3">
                           <span className="text-sm font-mono text-gray-400">
                             #{job.id}
@@ -1685,6 +1782,11 @@ export default function Messaging() {
                             <span className="text-gray-600">/</span>
                             <span className="text-gray-400">{formatNumber(skipped)}</span>
                           </div>
+                          {(job.repliedCount > 0 || job.replyTrackingStatus) && (
+                            <div className="mt-0.5 text-xs text-emerald-400" title="Recipients who replied within the 24h tracking window">
+                              {formatNumber(job.repliedCount || 0)} replied
+                            </div>
+                          )}
                         </td>
                         <td className="px-4 py-3">
                           <StatusBadge status={job.status || 'pending'} size="sm" />
@@ -1718,8 +1820,9 @@ export default function Messaging() {
                         <td className="px-4 py-3 text-right">
                           <div className="inline-flex items-center gap-1">
                             <button
-                              className="p-1.5 rounded-lg text-gray-400 hover:text-primary-400 hover:bg-primary-500/10 transition"
-                              title="View Details"
+                              onClick={() => setExpandedReplyJobId(isExpanded ? null : job.id)}
+                              className={`p-1.5 rounded-lg transition ${isExpanded ? 'text-primary-400 bg-primary-500/10' : 'text-gray-400 hover:text-primary-400 hover:bg-primary-500/10'}`}
+                              title="View reply tracking / who replied"
                             >
                               <Eye className="w-4 h-4" />
                             </button>
@@ -1735,6 +1838,14 @@ export default function Messaging() {
                           </div>
                         </td>
                       </tr>
+                      {isExpanded && (
+                        <tr className="bg-dark-900/40">
+                          <td colSpan={8} className="px-4 py-3">
+                            <MessageReplyDetails jobId={job.id} />
+                          </td>
+                        </tr>
+                      )}
+                      </Fragment>
                     );
                   })
                 )}

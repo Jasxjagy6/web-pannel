@@ -116,16 +116,6 @@ class CupidBotService {
       return { token: rows[0].api_key, source: 'user', isValid: rows[0].is_valid };
     }
 
-    const userRes = await pool.query(
-      `SELECT role FROM users WHERE id = $1`,
-      [uid]
-    );
-    const role = userRes.rows[0] && userRes.rows[0].role;
-    if (role === 'admin' || role === 'superadmin') {
-      const envKey = await this._resolveEnvKey();
-      return { token: envKey.token, source: 'admin', isValid: envKey.isValid };
-    }
-
     throw new Error('CupidBot API key is not configured. Please add your API key in the AI menu.');
   }
 

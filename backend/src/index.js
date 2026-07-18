@@ -682,6 +682,23 @@ async function start() {
       logger.warn(`AI retention scheduler failed: ${err.message}`);
     }
 
+    // 7f. Reply-tracking scanner. After a send job finishes it opens a
+    //     24h window; this timer scans every open window periodically and
+    //     flips per-recipient `replied` flags (counted once per user).
+    try {
+      const replyTrackingService = require('./services/replyTrackingService');
+      const scanIntervalMs = parseInt(process.env.REPLY_SCAN_INTERVAL_MS || '300000', 10); // 5 min
+      const runReplyScan = () => {
+        replyTrackingService.scanDueJobs()
+          .catch((e) => logger.warn(`reply-tracking scan error: ${e.message}`));
+      };
+      runReplyScan();
+      setInterval(runReplyScan, Math.max(60_000, scanIntervalMs));
+      logger.info(`Reply-tracking scanner started (every ${Math.max(60000, scanIntervalMs)}ms)`);
+    } catch (err) {
+      logger.warn(`reply-tracking scheduler failed: ${err.message}`);
+    }
+
     // 8. Subscription / trial expiry sweep. Runs every minute so a paid
     //    user whose monthly window just elapsed gets gated out of the app
     //    on their very next request. Trial expiry happens implicitly via

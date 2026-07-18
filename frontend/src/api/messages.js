@@ -59,3 +59,16 @@ export const getSchedule = (id) => api.get(`/messages/schedules/${id}`);
 export const cancelSchedule = (id) => api.post(`/messages/schedules/${id}/cancel`);
 
 export const cancelAllSchedules = () => api.post('/messages/schedules/cancel-all');
+
+// ---------------------------------------------------------------------
+// Sequential multi-session failover send. Session #1 sends until
+// Telegram limits it / refuses (mutual-contact), then hands off to
+// session #2 resuming from the same target; target-not-found errors
+// skip just that target. Body shape mirrors sendBulk plus:
+//   { trackReplies?: boolean, replyWindowHours?: number }
+// ---------------------------------------------------------------------
+export const sendFailover = (data) => api.post('/messages/failover', data);
+
+// Per-recipient reply breakdown for a finished send job (job-history
+// dropdown: "sent to user 1 — not replied", "sent to user 2 — replied").
+export const getJobReplyDetails = (id) => api.get(`/messages/jobs/${id}/replies`);

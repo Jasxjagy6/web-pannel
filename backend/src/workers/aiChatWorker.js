@@ -8,16 +8,17 @@
  * Steps:
  *   1. Get conversation state from job data (includes unconfirmed AI msgs + new user msgs).
  *   2. Wait for the configured reply delay + jitter.
- *   3. Call CupidBot generateChatResponse with proper conversation state.
- *   4. Handle CupidBot response categories (notOurTurn, ghosting, etc.).
+ *   3. Call the selected AI provider (CupidBot or CapitalBot) based on config.provider.
+ *   4. Handle response categories (notOurTurn, ghosting, etc.).
  *   5. If response has text, send through the session's GramJS client.
  *   6. Track confirmed AI message IDs for next API call.
  *   7. Append outgoing message to memory with confirmed=false.
- *   8. Log the attempt to ai_response_logs with CupidBot metadata.
+ *   8. Log the attempt to ai_response_logs with provider metadata.
  */
 
 const { Worker } = require('bullmq');
 const cupidbotService = require('../services/cupidbotService');
+const capitalbotService = require('../services/capitalbotService');
 const aiMemoryService = require('../services/aiMemoryService');
 const tgService = require('../services/telegramService');
 const tcService = require('../services/telegramClientService');
@@ -31,7 +32,7 @@ const redisConnection = {
   maxRetriesPerRequest: null,
 };
 
-const CONCURRENCY = parseInt(process.env.CUPIDBOT_CONCURRENCY || '5', 10);
+const CONCURRENCY = parseInt(process.env.CUPIDBOT_CONCURRENCY || process.env.CAPITALBOT_CONCURRENCY || '5', 10);
 const DEFAULT_REPLY_DELAY_MS = parseInt(process.env.AI_REPLY_DELAY_MS || '3000', 10);
 const DEFAULT_JITTER_MS = parseInt(process.env.AI_REPLY_JITTER_MS || '2000', 10);
 const DEFAULT_MEMORY_LIMIT = parseInt(process.env.AI_MEMORY_MESSAGE_LIMIT || '100', 10);
@@ -75,66 +76,77 @@ async function processGenerateReply(job) {
     confirmed_ai_message_ids: [],
   };
 
+  // Select AI provider from config (default: cupidbot for backward compatibility)
+  const provider = (config.provider || config.aiProvider || 'cupidbot').toLowerCase();
+  const aiService = provider === 'capitalbot' ? capitalbotService : cupidbotService;
+
   try {
-    // Use conversation state from aiChatService (includes unconfirmed AI msgs + new user msgs)
-    const messagesForCupidBot = conversationState?.messages || [];
+    // Use conversation state from aiChatService
     const lastExchange = conversationState?.lastExchange || { lastIncoming: null, lastOutgoing: null };
 
-    // Determine if this should be a follow-up call
-    // Per CupidBot docs: isFollowUp=true when there's no new user message and we want to generate a follow-up
-    const isFollowUp = messagesForCupidBot.length === 0 && lastExchange.lastIncoming;
+    // CapitalBot uses full chat history (API handles state internally)
+    // CupidBot only needs unconfirmed AI msgs + new incoming msgs
+    const messagesForAI = provider === 'capitalbot'
+      ? (conversationState?.allRecent || conversationState?.messages || [])
+      : (conversationState?.messages || []);
+
+    // Follow-up handling differs per provider:
+    // CupidBot requires explicit isFollowUp flag; CapitalBot auto-detects from chatHistory roles
+    const isFollowUp = provider !== 'capitalbot' && messagesForAI.length === 0 && lastExchange.lastIncoming;
 
     const replyDelay = config.replyDelayMs ?? DEFAULT_REPLY_DELAY_MS;
     const jitter = config.replyDelayJitterMs ?? DEFAULT_JITTER_MS;
     await sleep(replyDelay + Math.random() * jitter);
 
-    logger.info(`AI Worker: calling CupidBot for session ${sid} peer ${peerType}:${pid}, messages=${messagesForCupidBot.length}, isFollowUp=${isFollowUp}`);
+    logger.info(`AI Worker: calling ${provider} for session ${sid} peer ${peerType}:${pid}, messages=${messagesForAI.length}, isFollowUp=${isFollowUp}`);
 
-    const cupid = await cupidbotService.generateReply({
+    const providerOverrides = provider === 'capitalbot' ? (config.capitalbot || {}) : (config.cupidbot || {});
+
+    const aiResponse = await aiService.generateReply({
       userId,
       accountID: sessionId,
       recipient,
-      messages: messagesForCupidBot,
-      overrides: config.cupidbot || {},
+      messages: messagesForAI,
+      overrides: providerOverrides,
       isFollowUp,
-      confirmedMessageIds: confirmedMessageIds,
+      confirmedMessageIds: provider === 'capitalbot' ? [] : confirmedMessageIds,
       botProfile,
     });
 
-    logRow.response_payload = cupid;
-    logRow.cupidbot_category = cupid.category;
-    logRow.cupidbot_did_convert = cupid.didConvert;
-    logRow.cupidbot_rate_limit = cupid.rateLimit;
+    logRow.response_payload = aiResponse;
+    logRow.cupidbot_category = aiResponse.category;
+    logRow.cupidbot_did_convert = aiResponse.didConvert;
+    logRow.cupidbot_rate_limit = aiResponse.rateLimit;
     logRow.is_followup = isFollowUp;
 
-    // Parse CupidBot response category
-    const categoryInfo = cupidbotService.parseResponseCategory(cupid.category);
+    // Parse provider response category
+    const categoryInfo = aiService.parseResponseCategory(aiResponse.category);
 
     // Handle special response categories
     if (categoryInfo.isNotOurTurn) {
-      logger.info(`AI Worker: CupidBot says not our turn for session ${sid} peer ${pid}`);
+      logger.info(`AI Worker: ${provider} says not our turn for session ${sid} peer ${pid}`);
       logRow.status = 'not_our_turn';
       await _insertLog(logRow);
       return { sent: false, reason: 'not_our_turn' };
     }
 
     if (categoryInfo.isGhosting) {
-      logger.warn(`AI Worker: CupidBot ghosting for session ${sid} peer ${pid}: ${categoryInfo.reason}`);
+      logger.warn(`AI Worker: ${provider} ghosting for session ${sid} peer ${pid}: ${categoryInfo.reason}`);
       logRow.status = 'ghosting';
       logRow.error_message = categoryInfo.reason;
       await _insertLog(logRow);
 
       // Update conversation state to mark as ghosted
-      await _updateConversationState(sid, peerType, pid, 'ghosted', cupid.category);
-      return { sent: false, reason: 'ghosting', category: cupid.category };
+      await _updateConversationState(sid, peerType, pid, 'ghosted', aiResponse.category);
+      return { sent: false, reason: 'ghosting', category: aiResponse.category };
     }
 
     // Handle rate limiting
-    if (cupid.rateLimit) {
-      logger.warn(`AI Worker: CupidBot rate limit for session ${sid}: ${JSON.stringify(cupid.rateLimit)}`);
+    if (aiResponse.rateLimit) {
+      logger.warn(`AI Worker: ${provider} rate limit for session ${sid}: ${JSON.stringify(aiResponse.rateLimit)}`);
     }
 
-    if (!cupid.text) {
+    if (!aiResponse.text) {
       logRow.status = 'no_reply';
       await _insertLog(logRow);
       return { sent: false, reason: 'empty_reply' };
@@ -146,13 +158,13 @@ async function processGenerateReply(job) {
       sent = await tgService.sendMessage(
         sessionId,
         pid,
-        cupid.text,
+        aiResponse.text,
         { silent: false, accessHash: recipient?.accessHash || null }
       );
     } catch (sendErr) {
       logger.warn(
         `AI chat sendMessage failed for session ${sid} peer ${pid}: ${sendErr.message}. ` +
-        `CupidBot response: ${JSON.stringify(cupid)}`
+        `${provider} response: ${JSON.stringify(aiResponse)}`
       );
       logRow.status = 'send_failed';
       logRow.error_message = sendErr.message;
@@ -166,7 +178,7 @@ async function processGenerateReply(job) {
       id: `tg-ai-${outgoingMessageId ?? Date.now()}`,
       telegramMessageId: outgoingMessageId,
       timestamp: Date.now(),
-      msg: cupid.text,
+      msg: aiResponse.text,
       isIncoming: false,
       medias: [],
       confirmed: false, // Will be marked confirmed on next successful API call
@@ -190,10 +202,10 @@ async function processGenerateReply(job) {
     await _insertLog(logRow);
 
     // Update conversation state with last AI message sent
-    await _updateConversationState(sid, peerType, pid, 'active', cupid.category, outgoingMessageId);
+    await _updateConversationState(sid, peerType, pid, 'active', aiResponse.category, outgoingMessageId);
 
     logger.info(`AI Worker: successfully sent reply for session ${sid} peer ${pid}, msgId=${outgoingMessageId}`);
-    return { sent: true, messageId: outgoingMessageId, category: cupid.category, didConvert: cupid.didConvert };
+    return { sent: true, messageId: outgoingMessageId, category: aiResponse.category, didConvert: aiResponse.didConvert };
   } catch (err) {
     logRow.status = 'failed';
     logRow.error_message = err.message;
@@ -217,9 +229,9 @@ async function _updateConversationState(sessionId, peerType, peerId, state, cate
   try {
     await pool.query(
       `UPDATE ai_chat_memories
-       SET cupidbot_conversation_state = $4,
-           last_cupidbot_category = $5,
-           last_cupidbot_response = $6,
+       SET ai_conversation_state = $4,
+           last_ai_category = $5,
+           last_ai_response = $6,
            updated_at = NOW()
        WHERE session_id = $1 AND peer_type = $2 AND peer_id = $3`,
       [
