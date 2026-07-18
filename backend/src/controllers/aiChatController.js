@@ -7,6 +7,7 @@
 
 const aiChatService = require('../services/aiChatService');
 const cupidbotService = require('../services/cupidbotService');
+const capitalbotService = require('../services/capitalbotService');
 const { AppError, asyncHandler } = require('../utils/errorHandler');
 const logger = require('../utils/logger');
 
@@ -149,6 +150,57 @@ const aiChatController = {
   }),
 
   /**
+   * GET /api/telegram/ai-chat/tracking/overview
+   *
+   * Owner-wide AI activity summary + per-session breakdown.
+   * Query: ?sessionId=&since=&until=
+   */
+  getTrackingOverview: asyncHandler(async (req, res) => {
+    const userId = req.user.id;
+    const data = await aiChatService.getTrackingOverview(userId, {
+      sessionId: req.query.sessionId,
+      since: req.query.since,
+      until: req.query.until,
+    });
+    res.json({ success: true, data });
+  }),
+
+  /**
+   * GET /api/telegram/ai-chat/sessions/:id/tracking/conversations
+   *
+   * Every conversation (distinct peer) the AI touched for this session.
+   */
+  listTrackedConversations: asyncHandler(async (req, res) => {
+    const sessionId = _toNumber(req.params.id, 'session id');
+    const userId = req.user.id;
+    const rows = await aiChatService.listTrackedConversations(sessionId, userId, {});
+    res.json({ success: true, data: { rows, total: rows.length } });
+  }),
+
+  /**
+   * GET /api/telegram/ai-chat/sessions/:id/tracking/conversations/:peerType/:peerId
+   *
+   * Full message-by-message transcript for one tracked conversation.
+   */
+  getConversationTranscript: asyncHandler(async (req, res) => {
+    const sessionId = _toNumber(req.params.id, 'session id');
+    const userId = req.user.id;
+    const peerType = String(req.params.peerType || '').toLowerCase();
+    if (!['user', 'chat', 'channel'].includes(peerType)) {
+      throw new AppError('Invalid peer type', 400, 'INVALID_PEER_TYPE');
+    }
+    const peerId = _toNumber(req.params.peerId, 'peer id');
+    const data = await aiChatService.getConversationTranscript(
+      sessionId,
+      userId,
+      peerType,
+      peerId,
+      { limit: req.query.limit }
+    );
+    res.json({ success: true, data });
+  }),
+
+  /**
    * GET /api/telegram/ai-chat/cupidbot-key
    */
   getCupidbotKey: asyncHandler(async (req, res) => {
@@ -198,6 +250,102 @@ const aiChatController = {
     const userId = req.user.id;
     await cupidbotService.deleteUserApiKey(userId);
     logger.info(`CupidBot API key deleted`, { userId });
+    res.json({ success: true, data: { deleted: true } });
+  }),
+
+  /**
+   * GET /api/telegram/ai-chat/capitalbot-key
+   */
+  getCapitalbotKey: asyncHandler(async (req, res) => {
+    const userId = req.user.id;
+    const role = req.user && req.user.role;
+    const isAdmin =
+      userId === 1 || role === 'admin' || role === 'superadmin';
+    let hasKey = false;
+    let isValid = false;
+    let modelId = null;
+    let presetId = null;
+
+    try {
+      const result = await capitalbotService.getAccessToken(userId);
+      hasKey = true;
+      isValid = result.isValid;
+      modelId = result.modelId;
+      presetId = result.presetId;
+    } catch {
+      hasKey = false;
+      isValid = false;
+    }
+
+    res.json({
+      success: true,
+      data: { hasKey, isValid, isAdmin, modelId, presetId, configuredInEnv: !!process.env.CAPITALBOT_ACCESS_TOKEN },
+    });
+  }),
+
+  /**
+   * POST /api/telegram/ai-chat/capitalbot-key
+   */
+  setCapitalbotKey: asyncHandler(async (req, res) => {
+    const userId = req.user.id;
+    const { apiKey, modelId, presetId } = req.body || {};
+    if (typeof apiKey !== 'string' || !apiKey.trim()) {
+      throw new AppError('apiKey is required', 400, 'MISSING_API_KEY');
+    }
+    const result = await capitalbotService.setUserApiKey(userId, apiKey.trim(), modelId, presetId);
+    if (!result.isValid) {
+      throw new AppError('Invalid CapitalBot license key', 400, 'INVALID_CAPITALBOT_KEY');
+    }
+    logger.info(`CapitalBot API key updated`, { userId });
+    res.json({ success: true, data: result });
+  }),
+
+  /**
+   * PATCH /api/telegram/ai-chat/capitalbot-model-preset
+   * Update modelId/presetId without re-entering the API key.
+   */
+  updateCapitalbotModelPreset: asyncHandler(async (req, res) => {
+    const userId = req.user.id;
+    const { modelId, presetId } = req.body || {};
+    if (modelId == null || presetId == null) {
+      throw new AppError('modelId and presetId are required', 400, 'MISSING_MODEL_PRESET');
+    }
+    const result = await capitalbotService.updateModelPreset(userId, modelId, presetId);
+    logger.info(`CapitalBot model/preset updated`, { userId, modelId, presetId });
+    res.json({ success: true, data: result });
+  }),
+
+  /**
+   * GET /api/telegram/ai-chat/capitalbot-my-models
+   * Fetch available models/presets for the current user's stored key.
+   */
+  getMyCapitalbotModels: asyncHandler(async (req, res) => {
+    const userId = req.user.id;
+    const { token: apiKey } = await capitalbotService.getAccessToken(userId);
+    const result = await capitalbotService.getAvailableModels(apiKey);
+    res.json({ success: result.success, data: result.data || null, error: result.error || null });
+  }),
+
+  /**
+   * POST /api/telegram/ai-chat/capitalbot-models
+   * Fetch available models/presets for a given license key.
+   */
+  fetchCapitalbotModels: asyncHandler(async (req, res) => {
+    const { apiKey } = req.body || {};
+    if (typeof apiKey !== 'string' || !apiKey.trim()) {
+      throw new AppError('apiKey is required', 400, 'MISSING_API_KEY');
+    }
+    const result = await capitalbotService.getAvailableModels(apiKey.trim());
+    res.json({ success: result.success, data: result.data || null, error: result.error || null });
+  }),
+
+  /**
+   * DELETE /api/telegram/ai-chat/capitalbot-key
+   */
+  deleteCapitalbotKey: asyncHandler(async (req, res) => {
+    const userId = req.user.id;
+    await capitalbotService.deleteUserApiKey(userId);
+    logger.info(`CapitalBot API key deleted`, { userId });
     res.json({ success: true, data: { deleted: true } });
   }),
 };

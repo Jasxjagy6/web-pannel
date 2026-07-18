@@ -24,6 +24,7 @@ import {
   Megaphone,
   User as UserIcon,
   Database,
+  Activity,
 } from 'lucide-react';
 import { listClientSessions, getClientDialogs } from '../api/telegramClient';
 import {
@@ -36,13 +37,25 @@ import {
   getCupidbotKey,
   setCupidbotKey,
   deleteCupidbotKey,
+  getCapitalbotKey,
+  setCapitalbotKey,
+  updateCapitalbotModelPreset,
+  fetchCapitalbotModels,
+  getMyCapitalbotModels,
+  deleteCapitalbotKey,
   seedAiChatMemory,
 } from '../api/aiChat';
 import { usePlatform } from '../context/PlatformContext';
 import { useToast } from '../components/common/Toast';
 import Avatar from '../components/telegramClient/Avatar';
+import AiChatTracking from './AiChatTracking';
 
 const PEER_LABEL = { user: 'User', chat: 'Group', channel: 'Channel' };
+
+const AI_PROVIDERS = [
+  { id: 'cupidbot', label: 'CupidBot', desc: 'OFM-focused AI chat automation.' },
+  { id: 'capitalbot', label: 'CapitalBot', desc: 'Multi-platform AI chat automation.' },
+];
 
 function _statusPill(status) {
   if (status === 'sent')
@@ -76,6 +89,8 @@ export default function AiChat() {
   const toast = useToast();
   const isTelegram = platform === 'telegram';
 
+  const [activeTab, setActiveTab] = useState('manage');
+
   const [sessions, setSessions] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
@@ -89,10 +104,21 @@ export default function AiChat() {
   const [clearing, setClearing] = useState(null);
   const [seeding, setSeeding] = useState(null);
   const [dialogsLoading, setDialogsLoading] = useState(null);
-  const [keyStatus, setKeyStatus] = useState(null);
+  const [keyStatusByProvider, setKeyStatusByProvider] = useState({
+    cupidbot: null,
+    capitalbot: null,
+  });
   const [keyDraft, setKeyDraft] = useState('');
   const [keySaving, setKeySaving] = useState(false);
   const [keyError, setKeyError] = useState(null);
+  const [activeKeyProvider, setActiveKeyProvider] = useState('cupidbot');
+  const [modelIdDraft, setModelIdDraft] = useState('');
+  const [presetIdDraft, setPresetIdDraft] = useState('');
+  const [availableModels, setAvailableModels] = useState([]);
+  const [availablePresets, setAvailablePresets] = useState([]);
+  const [showModelPresetForm, setShowModelPresetForm] = useState(false);
+  const [modelPresetSaving, setModelPresetSaving] = useState(false);
+  const [modelCustomMode, setModelCustomMode] = useState(false);
 
   const loadSessions = async () => {
     setLoading(true);
@@ -123,19 +149,41 @@ export default function AiChat() {
   useEffect(() => {
     if (!isTelegram) return;
     loadSessions();
-    getCupidbotKey()
-      .then((res) => setKeyStatus(res?.data?.data || null))
-      .catch(() => setKeyStatus({ hasKey: false, isValid: false, isAdmin: false }));
+    Promise.all([
+      getCupidbotKey().then((res) => res?.data?.data || null).catch(() => ({ hasKey: false, isValid: false, isAdmin: false })),
+      getCapitalbotKey().then((res) => res?.data?.data || null).catch(() => ({ hasKey: false, isValid: false, isAdmin: false })),
+    ]).then(([cupidbotStatus, capitalbotStatus]) => {
+      setKeyStatusByProvider({
+        cupidbot: cupidbotStatus,
+        capitalbot: capitalbotStatus,
+      });
+      if (capitalbotStatus?.isValid && (!capitalbotStatus.modelId || !capitalbotStatus.presetId)) {
+        getMyCapitalbotModels().then((res) => {
+          const body = res?.data;
+          if (body?.success && body?.data?.data) {
+            const d = body.data.data;
+            if (Array.isArray(d.models)) setAvailableModels(d.models);
+            if (Array.isArray(d.presets)) setAvailablePresets(d.presets);
+            setModelCustomMode(!d.models?.length);
+          }
+        }).catch(() => {});
+        setModelIdDraft(String(capitalbotStatus.modelId || ''));
+        setPresetIdDraft(String(capitalbotStatus.presetId || ''));
+        setShowModelPresetForm(true);
+        setActiveKeyProvider('capitalbot');
+      }
+    });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isTelegram]);
 
   const toggleSession = async (sessionId) => {
-    const adminCanUseEnvKey = keyStatus?.isAdmin && keyStatus?.configuredInEnv;
-    if (!keyStatus?.isValid && !adminCanUseEnvKey) {
-      toast.error('Add and validate your CupidBot API key before enabling AI.');
+    const current = settingsMap[sessionId] || { enabled: false, config: {} };
+    const provider = current.config?.provider || 'cupidbot';
+    const keyStatus = keyStatusByProvider[provider];
+    if (!keyStatus?.isValid) {
+      toast.error(`Add and validate your ${provider === 'cupidbot' ? 'CupidBot' : 'CapitalBot'} API key before enabling AI.`);
       return;
     }
-    const current = settingsMap[sessionId] || { enabled: false, config: {} };
     const nextEnabled = !current.enabled;
     setTogglingId(sessionId);
     try {
@@ -162,25 +210,82 @@ export default function AiChat() {
     }
   };
 
-  const saveCupidbotKey = async () => {
+  const saveActiveProviderKey = async () => {
+    const providerLabel = activeKeyProvider === 'cupidbot' ? 'CupidBot' : 'CapitalBot';
     if (!keyDraft.trim()) {
-      setKeyError('Please paste your CupidBot API key.');
+      setKeyError(`Please paste your ${providerLabel} API key.`);
       return;
     }
     setKeySaving(true);
     setKeyError(null);
     try {
-      await setCupidbotKey(keyDraft.trim());
-      const res = await getCupidbotKey();
-      setKeyStatus(res?.data?.data || null);
-      setKeyDraft('');
-      toast.success('CupidBot API key validated and saved.');
+      if (activeKeyProvider === 'cupidbot') {
+        await setCupidbotKey(keyDraft.trim());
+        const res = await getCupidbotKey();
+        setKeyStatusByProvider((prev) => ({ ...prev, cupidbot: res?.data?.data || null }));
+        setKeyDraft('');
+        toast.success(`CupidBot API key validated and saved.`);
+      } else {
+        const saveRes = await setCapitalbotKey(keyDraft.trim());
+        const saveData = saveRes?.data?.data || {};
+        setKeyStatusByProvider((prev) => ({
+          ...prev,
+          capitalbot: {
+            hasKey: true,
+            isValid: true,
+            isAdmin: prev.capitalbot?.isAdmin || false,
+            modelId: saveData.modelId,
+            presetId: saveData.presetId,
+          },
+        }));
+        setKeyDraft('');
+        toast.success(`CapitalBot license key validated and saved.`);
+        const fetchedModels = saveData.models || [];
+        const fetchedPresets = saveData.presets || [];
+        setAvailableModels(fetchedModels);
+        setAvailablePresets(fetchedPresets);
+        setModelCustomMode(fetchedModels.length === 0);
+        if (fetchedModels.length > 0 && !saveData.modelId) {
+          setModelIdDraft(String(fetchedModels[0].modelId));
+        } else {
+          setModelIdDraft(String(saveData.modelId || ''));
+        }
+        if (fetchedPresets.length > 0 && !saveData.presetId) {
+          setPresetIdDraft(String(fetchedPresets[0].id));
+        } else {
+          setPresetIdDraft(String(saveData.presetId || ''));
+        }
+        setShowModelPresetForm(true);
+      }
     } catch (err) {
-      const msg = err?.response?.data?.error?.message || 'Invalid CupidBot API key.';
+      const msg = err?.response?.data?.error?.message || `Invalid ${providerLabel} API key.`;
       setKeyError(msg);
       toast.error(msg);
     } finally {
       setKeySaving(false);
+    }
+  };
+
+  const saveModelPreset = async () => {
+    const mid = parseInt(modelIdDraft, 10);
+    const pid = parseInt(presetIdDraft, 10);
+    if (!Number.isFinite(mid) || !Number.isFinite(pid)) {
+      toast.error('Please enter valid numeric Model ID and Preset ID.');
+      return;
+    }
+    setModelPresetSaving(true);
+    try {
+      await updateCapitalbotModelPreset(mid, pid);
+      setKeyStatusByProvider((prev) => ({
+        ...prev,
+        capitalbot: { ...prev.capitalbot, modelId: mid, presetId: pid },
+      }));
+      setShowModelPresetForm(false);
+      toast.success(`CapitalBot model (${mid}) and preset (${pid}) saved.`);
+    } catch (err) {
+      toast.error(err?.response?.data?.error?.message || 'Failed to save model/preset');
+    } finally {
+      setModelPresetSaving(false);
     }
   };
 
@@ -189,10 +294,32 @@ export default function AiChat() {
     setKeyError(null);
     try {
       await deleteCupidbotKey();
-      setKeyStatus({ hasKey: false, isValid: false, isAdmin: keyStatus?.isAdmin });
+      setKeyStatusByProvider((prev) => ({
+        ...prev,
+        cupidbot: { hasKey: false, isValid: false, isAdmin: prev.cupidbot?.isAdmin || false },
+      }));
       toast.success('CupidBot API key removed.');
     } catch (err) {
       toast.error(err?.response?.data?.error?.message || 'Failed to remove API key');
+    } finally {
+      setKeySaving(false);
+    }
+  };
+
+  const removeCapitalbotKey = async () => {
+    setKeySaving(true);
+    setKeyError(null);
+    try {
+      await deleteCapitalbotKey();
+      setKeyStatusByProvider((prev) => ({
+        ...prev,
+        capitalbot: { hasKey: false, isValid: false, isAdmin: prev.capitalbot?.isAdmin || false },
+      }));
+      setShowModelPresetForm(false);
+      setModelCustomMode(false);
+      toast.success('CapitalBot license key removed.');
+    } catch (err) {
+      toast.error(err?.response?.data?.error?.message || 'Failed to remove license key');
     } finally {
       setKeySaving(false);
     }
@@ -340,58 +467,131 @@ export default function AiChat() {
           </button>
         </div>
 
-        {keyStatus && (
-          <div
-            className={`mb-4 rounded-lg border p-4 ${
-              keyStatus.isValid
-                ? 'border-emerald-500/30 bg-emerald-500/10 text-emerald-200'
-                : 'border-amber-500/30 bg-amber-500/10 text-amber-100'
+        {/* Tabs: Manage (toggles/keys) vs Tracking (activity analytics) */}
+        <div className="mb-5 flex gap-1 border-b border-white/10">
+          <button
+            type="button"
+            onClick={() => setActiveTab('manage')}
+            className={`flex items-center gap-2 border-b-2 px-4 py-2 text-sm font-medium transition-colors ${
+              activeTab === 'manage'
+                ? 'border-sky-500 text-sky-300'
+                : 'border-transparent text-gray-400 hover:text-gray-200'
             }`}
           >
-            <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
-              <div>
-                <p className="text-sm font-semibold">
-                  {keyStatus.isValid
-                    ? 'CupidBot API key is active.'
-                    : 'CupidBot API key required.'}
-                </p>
-                <p className="text-xs opacity-80">
-                  {keyStatus.isAdmin
-                    ? 'Admin account — using the server-configured key.'
-                    : keyStatus.hasKey
-                    ? 'Your saved key failed validation. Please re-enter a valid key.'
-                    : 'Paste your CupidBot API key below to unlock the AI auto-responder.'}
-                </p>
-              </div>
-              {keyStatus.isAdmin && keyStatus.configuredInEnv && (
-                <span className="rounded border border-emerald-500/40 bg-emerald-500/10 px-2 py-0.5 text-xs">
-                  ENV key in use
-                </span>
-              )}
-            </div>
+            <Bot className="h-4 w-4" />
+            Manage
+          </button>
+          <button
+            type="button"
+            onClick={() => setActiveTab('tracking')}
+            className={`flex items-center gap-2 border-b-2 px-4 py-2 text-sm font-medium transition-colors ${
+              activeTab === 'tracking'
+                ? 'border-sky-500 text-sky-300'
+                : 'border-transparent text-gray-400 hover:text-gray-200'
+            }`}
+          >
+            <Activity className="h-4 w-4" />
+            Tracking
+          </button>
+        </div>
 
-            {!keyStatus.isAdmin && (
+        {activeTab === 'tracking' && <AiChatTracking />}
+
+        {activeTab === 'manage' && (
+        <div>
+        <div className="mb-4 flex gap-2">
+          {AI_PROVIDERS.map((p) => (
+            <button
+              key={p.id}
+              type="button"
+              onClick={() => { setActiveKeyProvider(p.id); setKeyDraft(''); setKeyError(null); setShowModelPresetForm(false); setModelCustomMode(false); }}
+              className={`flex-1 rounded-lg border px-4 py-2 text-left transition-colors ${
+                activeKeyProvider === p.id
+                  ? 'border-sky-500/50 bg-sky-500/10 text-sky-200'
+                  : 'border-white/5 bg-dark-900 text-gray-400 hover:border-white/10 hover:text-gray-200'
+              }`}
+            >
+              <span className="text-sm font-semibold">{p.label}</span>
+              <span className="block text-xs opacity-70">{p.desc}</span>
+            </button>
+          ))}
+        </div>
+
+        {(() => {
+          const ks = keyStatusByProvider[activeKeyProvider];
+          const providerLabel = activeKeyProvider === 'cupidbot' ? 'CupidBot' : 'CapitalBot';
+          return ks && (
+            <div
+              className={`mb-4 rounded-lg border p-4 ${
+                ks.isValid
+                  ? 'border-emerald-500/30 bg-emerald-500/10 text-emerald-200'
+                  : 'border-amber-500/30 bg-amber-500/10 text-amber-100'
+              }`}
+            >
+              <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+                <div>
+                  <p className="text-sm font-semibold">
+                    {ks.isValid
+                      ? `${providerLabel} API key is active.`
+                      : `${providerLabel} API key required.`}
+                  </p>
+                  <p className="text-xs opacity-80">
+                    {ks.hasKey
+                      ? 'Your saved key failed validation. Please re-enter a valid key.'
+                      : `Paste your ${providerLabel} API key below to unlock the AI auto-responder.`}
+                  </p>
+                  {ks.isValid && activeKeyProvider === 'capitalbot' && ks.modelId != null && ks.presetId != null && (
+                    <p className="mt-1 text-xs text-emerald-300/70">
+                      Model: {ks.modelId} &middot; Preset: {ks.presetId}
+                    </p>
+                  )}
+                </div>
+                {ks.isValid && activeKeyProvider === 'capitalbot' && ks.modelId != null && ks.presetId != null && (
+                  <button
+                    type="button"
+                    onClick={async () => {
+                      setModelIdDraft(String(ks.modelId));
+                      setPresetIdDraft(String(ks.presetId));
+                      try {
+                        const modelsRes = await getMyCapitalbotModels();
+                        const body = modelsRes?.data;
+                        if (body?.success && body?.data?.data) {
+                          const d = body.data.data;
+                          if (Array.isArray(d.models)) setAvailableModels(d.models);
+                          if (Array.isArray(d.presets)) setAvailablePresets(d.presets);
+                          setModelCustomMode(!d.models?.length);
+                        }
+                      } catch (_) {}
+                      setShowModelPresetForm(true);
+                    }}
+                    className="rounded-md border border-white/10 px-3 py-1.5 text-xs hover:bg-white/5"
+                  >
+                    Change Config
+                  </button>
+                )}
+              </div>
+
               <div className="mt-3 flex flex-col gap-2 sm:flex-row">
                 <input
                   type="password"
                   value={keyDraft}
                   onChange={(e) => setKeyDraft(e.target.value)}
-                  placeholder="Paste your CupidBot API key"
+                  placeholder={`Paste your ${providerLabel} API key`}
                   className="flex-1 rounded-md border border-white/10 bg-dark-900 px-3 py-2 text-sm placeholder:text-gray-500 focus:border-sky-500 focus:outline-none"
                   disabled={keySaving}
                 />
                 <button
                   type="button"
-                  onClick={saveCupidbotKey}
+                  onClick={saveActiveProviderKey}
                   disabled={keySaving || !keyDraft.trim()}
                   className="rounded-md bg-sky-500 px-3 py-2 text-sm font-medium text-white hover:bg-sky-400 disabled:opacity-50"
                 >
                   {keySaving ? 'Validating…' : 'Save & Validate'}
                 </button>
-                {keyStatus.hasKey && (
+                {ks.hasKey && (
                   <button
                     type="button"
-                    onClick={removeCupidbotKey}
+                    onClick={activeKeyProvider === 'cupidbot' ? removeCupidbotKey : removeCapitalbotKey}
                     disabled={keySaving}
                     className="rounded-md border border-white/10 px-3 py-2 text-sm hover:bg-white/5 disabled:opacity-50"
                   >
@@ -399,12 +599,93 @@ export default function AiChat() {
                   </button>
                 )}
               </div>
-            )}
-            {keyError && (
-              <p className="mt-2 text-xs text-red-300">{keyError}</p>
-            )}
-          </div>
-        )}
+              {keyError && (
+                <p className="mt-2 text-xs text-red-300">{keyError}</p>
+              )}
+
+              {activeKeyProvider === 'capitalbot' && showModelPresetForm && (
+                <div className="mt-4 border-t border-white/10 pt-4">
+                  <p className="mb-2 text-sm font-semibold text-gray-200">
+                    Select Model & Preset
+                  </p>
+                  <p className="mb-3 text-xs text-gray-400">
+                    Choose the AI model and conversation preset for your license key.
+                  </p>
+                  <div className="flex flex-col gap-3 sm:flex-row">
+                    {modelCustomMode ? (
+                      <input
+                        type="text"
+                        value={modelIdDraft}
+                        onChange={(e) => setModelIdDraft(e.target.value)}
+                        placeholder="Enter Model ID manually"
+                        className="flex-1 rounded-md border border-white/10 bg-dark-900 px-3 py-2 text-sm placeholder:text-gray-500 focus:border-sky-500 focus:outline-none"
+                        disabled={modelPresetSaving}
+                      />
+                    ) : (
+                      <select
+                        value={modelIdDraft}
+                        onChange={(e) => {
+                          if (e.target.value === '__custom__') {
+                            setModelCustomMode(true);
+                            setModelIdDraft('');
+                          } else {
+                            setModelIdDraft(e.target.value);
+                          }
+                        }}
+                        className="flex-1 rounded-md border border-white/10 bg-dark-900 px-3 py-2 text-sm text-gray-200 focus:border-sky-500 focus:outline-none"
+                        disabled={modelPresetSaving}
+                      >
+                        {availableModels.length === 0 ? (
+                          <option value="">No models from API</option>
+                        ) : (
+                          availableModels.map((m) => (
+                            <option key={m.modelId} value={String(m.modelId)}>
+                              {m.name} (ID: {m.modelId})
+                            </option>
+                          ))
+                        )}
+                        <option value="__custom__">Custom…</option>
+                      </select>
+                    )}
+                    <select
+                      value={presetIdDraft}
+                      onChange={(e) => setPresetIdDraft(e.target.value)}
+                      className="flex-1 rounded-md border border-white/10 bg-dark-900 px-3 py-2 text-sm text-gray-200 focus:border-sky-500 focus:outline-none"
+                      disabled={modelPresetSaving || availablePresets.length === 0}
+                    >
+                      {availablePresets.length === 0 ? (
+                        <option value="">No presets available</option>
+                      ) : (
+                        availablePresets.map((p) => (
+                          <option key={p.id} value={String(p.id)}>
+                            {p.name} (ID: {p.id})
+                          </option>
+                        ))
+                      )}
+                    </select>
+                    <button
+                      type="button"
+                      onClick={saveModelPreset}
+                      disabled={modelPresetSaving || !modelIdDraft || !presetIdDraft}
+                      className="rounded-md bg-emerald-600 px-4 py-2 text-sm font-medium text-white hover:bg-emerald-500 disabled:opacity-50"
+                    >
+                      {modelPresetSaving ? 'Saving…' : 'Save Config'}
+                    </button>
+                  </div>
+                  {modelCustomMode && (
+                    <button
+                      type="button"
+                      onClick={() => { setModelCustomMode(false); setModelIdDraft(availableModels.length > 0 ? String(availableModels[0].modelId) : ''); }}
+                      className="mt-2 text-xs text-sky-400 hover:text-sky-300"
+                    >
+                      Back to dropdown
+                    </button>
+                  )}
+                </div>
+              )}
+            </div>
+          );
+        })()}
 
         {error && (
           <div className="mb-4 flex items-center gap-2 rounded-md border border-red-500/30 bg-red-500/10 p-4 text-red-300">
@@ -471,6 +752,39 @@ export default function AiChat() {
                       <span className="text-sm font-medium">
                         {settings.enabled ? 'AI ON' : 'AI OFF'}
                       </span>
+                      <select
+                        value={settings.config?.provider || 'cupidbot'}
+                        onChange={async (e) => {
+                          const newProvider = e.target.value;
+                          const newConfig = { ...settings.config, provider: newProvider };
+                          setSettingsMap((prev) => ({
+                            ...prev,
+                            [s.id]: { ...prev[s.id], config: newConfig },
+                          }));
+                          if (settings.enabled) {
+                            try {
+                              const { data: resData } = await updateAiSessionSettings(s.id, {
+                                enabled: true,
+                                config: newConfig,
+                              });
+                              if (resData?.data?.config) {
+                                setSettingsMap((prev) => ({
+                                  ...prev,
+                                  [s.id]: { ...prev[s.id], config: resData.data.config },
+                                }));
+                              }
+                              toast.success(`Switched to ${newProvider === 'cupidbot' ? 'CupidBot' : 'CapitalBot'} for this session`);
+                            } catch (err) {
+                              toast.error('Failed to update provider');
+                            }
+                          }
+                        }}
+                        className="rounded-md border border-white/10 bg-dark-900 px-2 py-1 text-xs text-gray-300 focus:border-sky-500 focus:outline-none"
+                        onClick={(e) => e.stopPropagation()}
+                      >
+                        <option value="cupidbot">CupidBot</option>
+                        <option value="capitalbot">CapitalBot</option>
+                      </select>
                       <button
                         type="button"
                         onClick={() => expandSession(s.id)}
@@ -637,6 +951,8 @@ export default function AiChat() {
               );
             })}
           </div>
+        )}
+        </div>
         )}
       </div>
     </div>

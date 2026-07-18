@@ -235,6 +235,124 @@ const messageController = {
   }),
 
   /**
+   * Sequential-failover bulk send.
+   *
+   * Sends one message to every target in `targetList` using ONE session
+   * at a time, in the ORDER `sessionIds` were given. When Telegram limits
+   * the active session (rate limit) or refuses it for mutual-contact /
+   * privacy reasons, the runner switches to the next session and resumes
+   * from the exact target it stopped at. Target-not-found errors skip just
+   * that target and keep the same session.
+   *
+   * Expects req.body: {
+   *   sessionIds | sessionListId, targetList, message, messageType?,
+   *   delayMin?, delayMax?, messageOptions?, sourceType?, sourceId?,
+   *   trackReplies?, replyWindowHours?, async?
+   * }
+   */
+  sendFailover: asyncHandler(async (req, res) => {
+    const userId = req.user.id;
+    const {
+      sessionIds: rawSessionIds,
+      targetList,
+      message,
+      messageType,
+      delayMin,
+      delayMax,
+      messageOptions,
+      sourceType,
+      sourceId,
+      trackReplies,
+      replyWindowHours,
+      async,
+    } = req.body;
+
+    // Preserve operator order — failover hands off session #1 -> #2 -> …
+    const sessionIds = await resolveSessionIdsFromRequest(req, rawSessionIds || []);
+    if (!Array.isArray(sessionIds) || sessionIds.length === 0) {
+      throw new AppError(
+        'sessionIds array (or a non-empty sessionListId) is required',
+        400,
+        'NO_SESSIONS'
+      );
+    }
+    if (!targetList || !Array.isArray(targetList) || targetList.length === 0) {
+      throw new AppError('targetList is required and must not be empty', 400, 'EMPTY_TARGET_LIST');
+    }
+    if (!message || message.trim().length === 0) {
+      throw new AppError('message content is required', 400, 'EMPTY_MESSAGE');
+    }
+
+    const params = {
+      sessionIds,
+      targetList,
+      message: message.trim(),
+      messageType: messageType || 'text',
+      delayMin: delayMin != null ? parseInt(delayMin, 10) : undefined,
+      delayMax: delayMax != null ? parseInt(delayMax, 10) : undefined,
+      messageOptions: typeof messageOptions === 'string' ? JSON.parse(messageOptions) : (messageOptions || {}),
+      sourceType: sourceType || 'manual',
+      sourceId: sourceId != null ? parseInt(sourceId, 10) : undefined,
+      trackReplies: trackReplies === false ? false : true,
+      replyWindowHours: replyWindowHours != null ? parseInt(replyWindowHours, 10) : 24,
+    };
+
+    // Failover jobs can run long; default to async so the HTTP request
+    // returns immediately and the UI polls job progress.
+    if (async === false || async === 'false') {
+      const result = await messageService.sendFailoverMessage(params, userId);
+      return res.status(200).json({ success: true, data: result });
+    }
+
+    const queueJob = await messageQueue.addJob({ type: 'failover', params, userId });
+
+    await reportService.logActivity(
+      userId,
+      'message_bulk_start',
+      'messaging_job',
+      null,
+      {
+        queueJobId: queueJob.id,
+        mode: 'failover',
+        sessionCount: sessionIds.length,
+        targetCount: targetList.length,
+      }
+    );
+
+    logger.info(`Failover message job queued by user ${userId}`, {
+      queueJobId: queueJob.id,
+      sessionCount: sessionIds.length,
+      targetCount: targetList.length,
+    });
+
+    return res.status(202).json({
+      success: true,
+      data: {
+        queueJobId: queueJob.id,
+        status: 'queued',
+        mode: 'failover',
+        totalTargets: targetList.length,
+        sessionCount: sessionIds.length,
+      },
+    });
+  }),
+
+  /**
+   * Per-recipient reply breakdown for a finished send job (the job-history
+   * dropdown: "sent to user 1 — not replied", "sent to user 2 — replied").
+   */
+  getJobReplyDetails: asyncHandler(async (req, res) => {
+    const userId = req.user.id;
+    const jobId = parseInt(req.params.id, 10);
+    if (!Number.isFinite(jobId)) {
+      throw new AppError('Invalid job id', 400, 'BAD_JOB_ID');
+    }
+    const replyTrackingService = require('../services/replyTrackingService');
+    const data = await replyTrackingService.getJobReplyDetails(jobId, userId);
+    return res.status(200).json({ success: true, data });
+  }),
+
+  /**
    * Send a message to a Telegram group or channel.
    *
    * Expects req.body: { sessionId, groupId, message }

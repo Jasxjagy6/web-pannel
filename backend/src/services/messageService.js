@@ -206,6 +206,113 @@ function isFatalSessionError(errorMessage) {
   return fatalPatterns.some((p) => errorMessage.includes(p));
 }
 
+/**
+ * Classify a send error for the SEQUENTIAL FAILOVER runner.
+ *
+ * The operator's rule (see feature/list-adaptive-failover):
+ *
+ *   - When the CURRENT session gets rate-limited by Telegram
+ *     (PEER_FLOOD / FLOOD_WAIT / SLOWMODE) or is refused because the
+ *     account may now only message mutual contacts / the peer's privacy
+ *     blocks strangers (USER_NOT_MUTUAL_CONTACT / USER_PRIVACY_RESTRICTED
+ *     / YOU_BLOCKED_USER / CHAT_WRITE_FORBIDDEN / "can't write to this
+ *     user") => the SESSION is exhausted for this run. Switch to the next
+ *     session and RE-TRY THE SAME TARGET (resume from where we stopped).
+ *
+ *   - When the session itself is dead (auth revoked / deactivated) => the
+ *     session is exhausted too; switch and retry the same target.
+ *
+ *   - When the error is TARGET-SIDE (username/id not found, invalid,
+ *     deactivated target, bot, phone not found) => SKIP just that target
+ *     and keep using the SAME session.
+ *
+ *   - Anything else (transient / unknown) => skip the target but do NOT
+ *     retire the session (a genuine per-session problem will resurface as
+ *     a limit error soon enough).
+ *
+ * @param {string} errorMessage - raw error .message
+ * @param {string} [errorCode]  - enriched `.code` from _handleTelegramError
+ * @returns {{ action: 'switch_session'|'skip_target', reason: string, limited: boolean }}
+ */
+function classifyFailoverError(errorMessage, errorCode) {
+  const msg = String(errorMessage || '');
+  const code = String(errorCode || '');
+  const hay = (code + ' ' + msg).toUpperCase();
+
+  const has = (needle) => hay.includes(needle);
+
+  // --- SESSION LIMITED / MUTUAL-CONTACTS-ONLY -> switch session, resume same target ---
+  // Telegram rate-limits and "you may only message contacts / peer
+  // privacy forbids strangers" signals. These mean THIS account cannot
+  // keep messaging the list, so we hand off to the next session and
+  // retry the very target that triggered it.
+  const SESSION_LIMIT_SIGNALS = [
+    'PEER_FLOOD',            // account flagged for spam / mass DMs
+    'FLOOD_WAIT',            // rate limited
+    'FLOOD_PREMIUM_WAIT',
+    'SLOWMODE_WAIT',
+    'USER_NOT_MUTUAL_CONTACT', // can only send to mutual contacts
+    'USER_PRIVACY_RESTRICTED',
+    'PRIVACY_RESTRICTED',
+    'YOU_BLOCKED_USER',
+    'USER_IS_BLOCKED',
+    'CHAT_WRITE_FORBIDDEN',
+    'MESSAGE_NOT_ALLOWED',
+    "CAN'T WRITE",
+    'CAN NOT SEND',
+    'CANNOT SEND',
+    'CAN ONLY SEND MESSAGES TO MUTUAL',
+  ];
+  for (const sig of SESSION_LIMIT_SIGNALS) {
+    if (has(sig)) {
+      return { action: 'switch_session', reason: code || sig, limited: true };
+    }
+  }
+
+  // --- SESSION DEAD -> switch session, resume same target ---
+  const SESSION_DEAD_SIGNALS = [
+    'AUTH_KEY_UNREGISTERED',
+    'AUTH_KEY_DUPLICATED',
+    'SESSION_REVOKED',
+    'SESSION_EXPIRED',
+    'USER_DEACTIVATED', // NOTE: our OWN account (session) — see target check below
+  ];
+  // USER_DEACTIVATED is ambiguous: INPUT_USER_DEACTIVATED is the TARGET,
+  // plain USER_DEACTIVATED is our session. Disambiguate before matching.
+  if (has('INPUT_USER_DEACTIVATED')) {
+    return { action: 'skip_target', reason: 'INPUT_USER_DEACTIVATED', limited: false };
+  }
+  for (const sig of SESSION_DEAD_SIGNALS) {
+    if (has(sig)) {
+      return { action: 'switch_session', reason: code || sig, limited: false };
+    }
+  }
+
+  // --- TARGET NOT FOUND / INVALID -> skip target, keep session ---
+  const TARGET_SKIP_SIGNALS = [
+    'USERNAME_NOT_OCCUPIED',
+    'USERNAME_INVALID',
+    'USER_ID_INVALID',
+    'PEER_ID_INVALID',
+    'CHAT_ID_INVALID',
+    'PHONE_NOT_OCCUPIED',
+    'CONTACT_ID_INVALID',
+    'BOT_USER_INVALID',
+    'USER_IS_BOT',
+    'COULD NOT RESOLVE',
+    'COULD NOT FIND',
+    'NO USER HAS',
+  ];
+  for (const sig of TARGET_SKIP_SIGNALS) {
+    if (has(sig)) {
+      return { action: 'skip_target', reason: code || sig, limited: false };
+    }
+  }
+
+  // Default: skip the target but keep the session running.
+  return { action: 'skip_target', reason: code || 'UNKNOWN', limited: false };
+}
+
 // =========================================================================
 // Distribution Engine
 // =========================================================================
@@ -1148,6 +1255,358 @@ class MessageService {
     }
   }
 
+
+  // =========================================================================
+  // Sequential Failover Messaging
+  // =========================================================================
+
+  /**
+   * Send one message to every target in a list using ONE session at a
+   * time, with automatic hand-off between sessions.
+   *
+   * Behaviour (operator spec):
+   *   - Session #1 walks the list top-to-bottom.
+   *   - If Telegram limits that session (PEER_FLOOD / FLOOD_WAIT) or
+   *     refuses because the account can now only message mutual contacts
+   *     / peer privacy blocks strangers, the runner RETIRES that session
+   *     and continues with the NEXT session FROM THE SAME TARGET — i.e.
+   *     if session #1 died after 10 sends, session #2 starts at target 11
+   *     (re-attempting the target that triggered the limit first).
+   *   - If the error is target-side (username / id not found or invalid,
+   *     target deactivated, bot), that ONE target is SKIPPED and the SAME
+   *     session keeps going.
+   *   - When the list is exhausted or all sessions are used up, the job
+   *     finishes and a 24-hour reply-tracking pass is scheduled.
+   *
+   * Resumable: progress (cursor + retired sessions) is persisted to
+   * `messaging_jobs.platform_state` after every target so a crash can be
+   * resumed, and the UI can poll live progress.
+   *
+   * @param {object} params
+   * @param {Array<number|string>} params.sessionIds - ordered session pool
+   * @param {Array<object|string>} params.targetList - list-item objects or raw ids
+   * @param {string} params.message
+   * @param {string} [params.messageType='text']
+   * @param {number} [params.delayMin] - ms between sends (same session)
+   * @param {number} [params.delayMax]
+   * @param {object} [params.messageOptions]
+   * @param {string} [params.sourceType]
+   * @param {number} [params.sourceId]
+   * @param {boolean} [params.trackReplies=true]
+   * @param {number}  [params.replyWindowHours=24]
+   * @param {number|string} userId
+   */
+  async sendFailoverMessage(params, userId) {
+    const {
+      sessionIds,
+      message,
+      messageType = 'text',
+      delayMin = DEFAULT_DELAY_MIN,
+      delayMax = DEFAULT_DELAY_MAX,
+      messageOptions = {},
+      sourceType = 'manual',
+      sourceId = null,
+      trackReplies = true,
+      replyWindowHours = 24,
+    } = params;
+
+    let targetList = params.targetList;
+
+    if (!sessionIds || sessionIds.length === 0) {
+      throw new AppError('At least one session ID is required', 400, 'NO_SESSIONS');
+    }
+    if (!targetList || targetList.length === 0) {
+      throw new AppError('Target list cannot be empty', 400, 'EMPTY_TARGET_LIST');
+    }
+    if (!message || message.trim().length === 0) {
+      throw new AppError('Message content is required', 400, 'EMPTY_MESSAGE');
+    }
+
+    // Verify sessions and PRESERVE the operator's ordering — failover is
+    // sequential, so session order is meaningful (unlike bulk rotation).
+    const verified = await this._verifyMultipleSessionsOwnership(sessionIds, userId);
+    const verifiedSet = new Set(verified.map((s) => String(s.id)));
+    const orderedSessionIds = sessionIds
+      .map((s) => String(s))
+      .filter((s) => verifiedSet.has(s));
+
+    if (orderedSessionIds.length === 0) {
+      throw new AppError('No valid sessions found for this user', 404, 'NO_VALID_SESSIONS');
+    }
+
+    // Build rich target descriptors so we can address each one correctly
+    // (numeric id -> id, alpha -> @username) AND keep a label + resolved
+    // peer id for reply tracking. `normalizeTargetId` already encodes the
+    // shape decision; we keep the original object alongside it.
+    const targets = [];
+    for (const t of targetList) {
+      const addr = normalizeTargetId(t);
+      if (!addr) continue;
+      const obj = (t && typeof t === 'object') ? t : {};
+      const rawPeer =
+        obj.telegram_id ?? obj.telegramId ?? obj.id ?? obj.user_id ?? null;
+      const peerId = rawPeer != null && /^-?\d+$/.test(String(rawPeer).trim())
+        ? String(rawPeer).trim()
+        : (/^-?\d+$/.test(addr) ? addr : null);
+      const label =
+        (obj.username && `@${String(obj.username).replace(/^@+/, '')}`) ||
+        [obj.first_name, obj.last_name].filter(Boolean).join(' ').trim() ||
+        addr;
+      targets.push({
+        addr,
+        peerId,
+        label,
+        accessHash: obj.access_hash ?? obj.accessHash ?? null,
+      });
+    }
+
+    if (targets.length === 0) {
+      throw new AppError('No valid targets in the target list', 400, 'NO_VALID_TARGETS');
+    }
+
+    // Persist the job.
+    const jobResult = await pool.query(
+      `INSERT INTO messaging_jobs (
+         user_id, session_id, job_type, target_list, message_content,
+         message_type, status, total_count, sent_count, failed_count,
+         skipped_count, options, platform_state, created_at
+       ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,0,0,0,$9,$10, NOW())
+       RETURNING id`,
+      [
+        userId,
+        Number(orderedSessionIds[0]),
+        'failover',
+        JSON.stringify(targets.map((t) => t.addr)),
+        message,
+        messageType,
+        'running',
+        targets.length,
+        JSON.stringify({
+          sessionIds: orderedSessionIds,
+          delayMin,
+          delayMax,
+          messageOptions,
+          sourceType,
+          sourceId,
+          trackReplies,
+          replyWindowHours,
+        }),
+        JSON.stringify({
+          mode: 'failover',
+          cursor: 0,
+          activeSessionIndex: 0,
+          retiredSessions: [],
+        }),
+      ]
+    );
+    const jobId = jobResult.rows[0].id;
+
+    logger.info(`Failover message job ${jobId} started`, {
+      userId,
+      sessions: orderedSessionIds.length,
+      targets: targets.length,
+    });
+
+    const result = await this._runFailover(jobId, orderedSessionIds, targets, {
+      message,
+      messageType,
+      delayMin,
+      delayMax,
+      messageOptions,
+    });
+
+    // Seed + schedule 24h reply tracking (best-effort; never fails the send).
+    if (trackReplies) {
+      try {
+        const replyTracking = require('./replyTrackingService');
+        await replyTracking.initForJob(jobId, {
+          windowHours: replyWindowHours,
+        });
+      } catch (err) {
+        logger.warn(`Failed to init reply tracking for job ${jobId}: ${err.message}`);
+      }
+    }
+
+    return {
+      jobId,
+      status: 'completed',
+      totalTargets: targets.length,
+      ...result,
+    };
+  }
+
+  /**
+   * The failover loop itself. Extracted so it can be reused by a resume
+   * path. Mutates job counters + platform_state as it goes.
+   *
+   * @private
+   */
+  async _runFailover(jobId, sessionIds, targets, opts) {
+    const { message, messageType, delayMin, delayMax, messageOptions } = opts;
+
+    let sent = 0;
+    let failed = 0;
+    let skipped = 0;
+    let sessionIndex = 0;
+    const retired = new Set();
+
+    const logRows = [];
+    const flushLogs = async () => {
+      if (logRows.length === 0) return;
+      const values = [];
+      const placeholders = [];
+      let p = 1;
+      for (const r of logRows) {
+        placeholders.push(`($${p}, $${p + 1}, $${p + 2}, $${p + 3}, NOW())`);
+        values.push(r.jobId, r.sessionId, r.targetId, r.status);
+        p += 4;
+      }
+      await pool.query(
+        `INSERT INTO message_logs (job_id, session_id, target_id, status, sent_at)
+         VALUES ${placeholders.join(', ')}`,
+        values
+      ).catch((e) => logger.warn(`failover message_logs insert failed: ${e.message}`));
+      logRows.length = 0;
+    };
+
+    const persistState = async (cursor) => {
+      await pool.query(
+        `UPDATE messaging_jobs
+            SET sent_count = $2, failed_count = $3, skipped_count = $4,
+                platform_state = $5
+          WHERE id = $1`,
+        [
+          jobId, sent, failed, skipped,
+          JSON.stringify({
+            mode: 'failover',
+            cursor,
+            activeSessionIndex: sessionIndex,
+            retiredSessions: [...retired],
+          }),
+        ]
+      ).catch((e) => logger.warn(`failover state persist failed: ${e.message}`));
+      await this._notifyProgress(jobId, {
+        job_id: jobId, status: 'running',
+        sent, failed, skipped, total: targets.length,
+      });
+    };
+
+    const isCancelled = async () => {
+      try {
+        const r = await pool.query('SELECT status FROM messaging_jobs WHERE id = $1', [jobId]);
+        return r.rows[0]?.status === 'cancelled';
+      } catch { return false; }
+    };
+
+    // Walk the list with a cursor. On a session-limit error we DON'T
+    // advance the cursor — we switch sessions and retry the same target.
+    let i = 0;
+    while (i < targets.length) {
+      if (await isCancelled()) {
+        for (let j = i; j < targets.length; j++) {
+          skipped++;
+          logRows.push({ jobId, sessionId: null, targetId: targets[j].addr, status: 'skipped' });
+        }
+        break;
+      }
+
+      // Find the next live session (in order).
+      while (sessionIndex < sessionIds.length && retired.has(sessionIds[sessionIndex])) {
+        sessionIndex++;
+      }
+      if (sessionIndex >= sessionIds.length) {
+        // No sessions left — everything remaining is skipped.
+        for (let j = i; j < targets.length; j++) {
+          skipped++;
+          logRows.push({ jobId, sessionId: null, targetId: targets[j].addr, status: 'skipped' });
+        }
+        logger.warn(`Failover job ${jobId}: all sessions exhausted at target ${i}/${targets.length}`);
+        break;
+      }
+
+      const sessionId = sessionIds[sessionIndex];
+      const target = targets[i];
+
+      try {
+        const sendOpts = { ...messageOptions };
+        if (target.accessHash != null) sendOpts.accessHash = target.accessHash;
+        await telegramService.sendMessage(sessionId, target.addr, message, sendOpts);
+
+        sent++;
+        logRows.push({ jobId, sessionId: Number(sessionId), targetId: target.addr, status: 'sent' });
+
+        // Record who we messaged (for reply tracking) — upsert per target.
+        await pool.query(
+          `INSERT INTO message_reply_tracking
+             (job_id, session_id, target_id, peer_id, target_label, sent_status, sent_at)
+           VALUES ($1,$2,$3,$4,$5,'sent', NOW())
+           ON CONFLICT (job_id, target_id) DO UPDATE
+             SET session_id = EXCLUDED.session_id,
+                 peer_id = COALESCE(EXCLUDED.peer_id, message_reply_tracking.peer_id),
+                 target_label = EXCLUDED.target_label,
+                 sent_status = 'sent',
+                 sent_at = NOW()`,
+          [jobId, Number(sessionId), target.addr,
+           target.peerId ? String(target.peerId) : null, target.label]
+        ).catch((e) => logger.warn(`reply-tracking seed failed: ${e.message}`));
+
+        i++; // advance to next target
+
+        // Human-like delay between sends on the same session.
+        if (i < targets.length) {
+          await sleep(randomInt(delayMin, delayMax));
+        }
+      } catch (err) {
+        const raw = err && err.message ? err.message : String(err);
+        const code = err && err.code ? err.code : null;
+        const decision = classifyFailoverError(raw, code);
+
+        if (decision.action === 'switch_session') {
+          // Retire this session and RETRY THE SAME TARGET on the next one.
+          retired.add(sessionId);
+          logger.warn(
+            `Failover job ${jobId}: session ${sessionId} retired (${decision.reason}) ` +
+            `at target ${i + 1}/${targets.length} — handing off, resuming from this target`
+          );
+          logRows.push({
+            jobId, sessionId: Number(sessionId), targetId: target.addr,
+            status: 'session_limited',
+          });
+          sessionIndex++; // move to next session; cursor `i` unchanged
+        } else {
+          // Target-side problem: skip just this target, keep the session.
+          failed++;
+          logger.info(
+            `Failover job ${jobId}: skipping target ${target.addr} (${decision.reason}) — session kept`
+          );
+          logRows.push({
+            jobId, sessionId: Number(sessionId), targetId: target.addr,
+            status: 'failed',
+          });
+          i++;
+        }
+      }
+
+      if (logRows.length >= LOG_BATCH_SIZE) await flushLogs();
+      if ((sent + failed + skipped) % 10 === 0) await persistState(i);
+    }
+
+    await flushLogs();
+    await persistState(i);
+
+    await pool.query(
+      `UPDATE messaging_jobs
+          SET status = 'completed', sent_count = $2, failed_count = $3,
+              skipped_count = $4, completed_at = NOW()
+        WHERE id = $1`,
+      [jobId, sent, failed, skipped]
+    );
+
+    logger.info(`Failover job ${jobId} complete: ${sent} sent, ${failed} failed, ${skipped} skipped`);
+    return { sent, failed, skipped, sessionsUsed: sessionIndex + 1 - retired.size >= 0 ? Math.min(sessionIndex + 1, sessionIds.length) : sessionIds.length };
+  }
+
+
   // =========================================================================
   // Group Messaging
   // =========================================================================
@@ -1447,6 +1906,7 @@ class MessageService {
               mj.message_content, mj.media_path, mj.status,
               mj.total_count, mj.sent_count, mj.failed_count, mj.skipped_count,
               mj.target_list, mj.options, mj.created_at, mj.completed_at,
+              mj.replied_count, mj.reply_tracking_status, mj.reply_tracking_until,
               s.phone as session_phone
        FROM messaging_jobs mj
        JOIN sessions s ON mj.session_id = s.id
@@ -1499,6 +1959,9 @@ class MessageService {
         options: parseJson(row.options),
         createdAt: row.created_at,
         completedAt: row.completed_at,
+        repliedCount: row.replied_count || 0,
+        replyTrackingStatus: row.reply_tracking_status || null,
+        replyTrackingUntil: row.reply_tracking_until || null,
       };
     });
 

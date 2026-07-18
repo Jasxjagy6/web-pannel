@@ -70,7 +70,14 @@ CREATE TABLE IF NOT EXISTS messaging_jobs (
   skipped_count INTEGER DEFAULT 0,
   options JSONB,
   created_at TIMESTAMP DEFAULT NOW(),
-  completed_at TIMESTAMP
+  completed_at TIMESTAMP,
+  -- Reply-tracking bookkeeping (see migration_v46). Nullable/defaulted so
+  -- existing rows and older code paths are unaffected.
+  reply_tracking_status VARCHAR(20),
+  reply_tracking_started_at TIMESTAMPTZ,
+  reply_tracking_until TIMESTAMPTZ,
+  reply_tracking_last_scan_at TIMESTAMPTZ,
+  replied_count INTEGER NOT NULL DEFAULT 0
 );
 
 -- Message logs
@@ -89,6 +96,29 @@ CREATE TABLE IF NOT EXISTS message_logs (
   error_message TEXT,
   sent_at TIMESTAMP DEFAULT NOW()
 );
+
+-- Per-recipient reply tracking for send jobs (see migration_v46). One
+-- row per (job, target) that was actually messaged; the 24h reply
+-- scanner flips `replied` when it observes an inbound message.
+CREATE TABLE IF NOT EXISTS message_reply_tracking (
+  id            SERIAL PRIMARY KEY,
+  job_id        INTEGER NOT NULL REFERENCES messaging_jobs(id) ON DELETE CASCADE,
+  session_id    INTEGER REFERENCES sessions(id) ON DELETE SET NULL,
+  target_id     TEXT NOT NULL,
+  peer_id       BIGINT,
+  target_label  TEXT,
+  sent_status   VARCHAR(20) NOT NULL DEFAULT 'sent',
+  sent_at       TIMESTAMPTZ,
+  replied       BOOLEAN NOT NULL DEFAULT FALSE,
+  replied_at    TIMESTAMPTZ,
+  last_checked_at TIMESTAMPTZ,
+  created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  UNIQUE (job_id, target_id)
+);
+CREATE INDEX IF NOT EXISTS idx_mrt_job_id      ON message_reply_tracking(job_id);
+CREATE INDEX IF NOT EXISTS idx_mrt_session_id  ON message_reply_tracking(session_id);
+CREATE INDEX IF NOT EXISTS idx_mrt_job_replied ON message_reply_tracking(job_id, replied);
+CREATE INDEX IF NOT EXISTS idx_mrt_peer_id     ON message_reply_tracking(peer_id);
 
 -- Group operations table
 CREATE TABLE IF NOT EXISTS group_operations (
@@ -223,6 +253,9 @@ CREATE TABLE IF NOT EXISTS ai_chat_memories (
   message_count INTEGER NOT NULL DEFAULT 0,
   last_incoming_at TIMESTAMPTZ,
   last_outgoing_at TIMESTAMPTZ,
+  ai_conversation_state VARCHAR(50),
+  last_ai_category VARCHAR(255),
+  last_ai_response JSONB,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   UNIQUE(session_id, peer_type, peer_id)

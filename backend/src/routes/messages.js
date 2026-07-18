@@ -14,6 +14,12 @@ router.post('/send', messageLimiter, validate(schemas.sendMessage), messageContr
 // POST /api/messages/bulk - Bulk send
 router.post('/bulk', messageLimiter, validate(schemas.bulkMessage), messageController.sendBulk);
 
+// POST /api/messages/failover - Sequential multi-session failover send.
+// Session #1 sends until Telegram limits it / refuses (mutual-contact),
+// then hands off to session #2 resuming from the same target. Target-side
+// errors skip just that target. Reuses the bulkMessage validator shape.
+router.post('/failover', messageLimiter, validate(schemas.failoverMessage), messageController.sendFailover);
+
 // POST /api/messages/bulk/preview - Distribution-engine preview
 // Returns the rotation/cooldown plan that would be used for a bulk
 // send, without enqueueing or sending anything.
@@ -74,6 +80,10 @@ router.get('/schedules/:id', messageController.getSchedule);
 
 // POST /api/messages/schedules/:id/cancel - Cancel one schedule
 router.post('/schedules/:id/cancel', messageController.cancelSchedule);
+
+// GET /api/messages/jobs/:id/replies - Per-recipient reply breakdown
+// (the job-history dropdown). Declared before the catch-all `/:id`.
+router.get('/jobs/:id/replies', messageController.getJobReplyDetails);
 
 // GET /api/messages/jobs/:id - Get job
 router.get('/:id', messageController.getJob);

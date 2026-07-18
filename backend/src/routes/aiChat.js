@@ -24,9 +24,25 @@ router.delete('/sessions/:id/ai-chats/:peerType/:peerId/memory', controller.clea
 
 router.get('/sessions/:id/ai-logs', controller.listLogs);
 
+// AI activity tracking (analytics over the existing ai_response_logs audit trail)
+router.get('/tracking/overview', controller.getTrackingOverview);
+router.get('/sessions/:id/tracking/conversations', controller.listTrackedConversations);
+router.get(
+  '/sessions/:id/tracking/conversations/:peerType/:peerId',
+  controller.getConversationTranscript
+);
+
 // CupidBot API key management
 router.get('/cupidbot-key', controller.getCupidbotKey);
 router.post('/cupidbot-key', controller.setCupidbotKey);
 router.delete('/cupidbot-key', controller.deleteCupidbotKey);
+
+// CapitalBot API key management
+router.get('/capitalbot-key', controller.getCapitalbotKey);
+router.post('/capitalbot-key', controller.setCapitalbotKey);
+router.patch('/capitalbot-model-preset', controller.updateCapitalbotModelPreset);
+router.get('/capitalbot-my-models', controller.getMyCapitalbotModels);
+router.post('/capitalbot-models', controller.fetchCapitalbotModels);
+router.delete('/capitalbot-key', controller.deleteCapitalbotKey);
 
 module.exports = router;

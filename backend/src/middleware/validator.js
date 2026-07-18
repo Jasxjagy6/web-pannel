@@ -106,6 +106,42 @@ const schemas = {
     itemDelayMsMax: Joi.number().integer().min(0).max(600000).optional(),
   }).or('sessionIds', 'sessionListId'),
 
+  // Sequential-failover bulk send.
+  // Same target/session shape as bulkMessage, but with failover-specific
+  // knobs. delayMin/delayMax are in MILLISECONDS here (gap between sends on
+  // the same session), so the bounds are wider than bulkMessage's seconds.
+  failoverMessage: Joi.object({
+    sessionIds: Joi.array().items(Joi.number().integer().positive()).min(1).optional(),
+    sessionListId: Joi.alternatives().try(Joi.number().integer().positive(), Joi.string()).optional(),
+    targetList: Joi.array().items(
+      Joi.alternatives().try(
+        Joi.string(),
+        Joi.number(),
+        Joi.object({
+          telegram_id: Joi.alternatives().try(Joi.string(), Joi.number()).allow(null, ''),
+          telegramId: Joi.alternatives().try(Joi.string(), Joi.number()).allow(null, ''),
+          id: Joi.alternatives().try(Joi.string(), Joi.number()).allow(null, ''),
+          username: Joi.string().allow(null, ''),
+          first_name: Joi.string().allow(null, ''),
+          last_name: Joi.string().allow(null, ''),
+          phone: Joi.string().allow(null, ''),
+          access_hash: Joi.alternatives().try(Joi.string(), Joi.number()).allow(null, ''),
+          accessHash: Joi.alternatives().try(Joi.string(), Joi.number()).allow(null, ''),
+        }).unknown(true)
+      )
+    ).min(1).required(),
+    message: Joi.string().max(4096).required(),
+    messageType: Joi.string().valid('text', 'html', 'markdown').default('text'),
+    delayMin: Joi.number().integer().min(0).max(600000).optional(),
+    delayMax: Joi.number().integer().min(0).max(600000).optional(),
+    messageOptions: Joi.alternatives().try(Joi.object().unknown(true), Joi.string()).optional(),
+    sourceType: Joi.string().valid('manual', 'list').default('manual'),
+    sourceId: Joi.number().integer().positive().optional(),
+    trackReplies: Joi.alternatives().try(Joi.boolean(), Joi.string()).optional(),
+    replyWindowHours: Joi.number().integer().min(1).max(168).optional(),
+    async: Joi.alternatives().try(Joi.boolean(), Joi.string()).optional(),
+  }).or('sessionIds', 'sessionListId'),
+
   // Single-User Mass DM
   // ---------------------------------------------------------------
   // Operator picks 1..3 target users (username / @username / numeric

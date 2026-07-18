@@ -665,6 +665,63 @@ function parseJsonContent(content) {
  * @returns {Array<{ telegram_id?: string, username?: string|null, first_name?: null, last_name?: null, phone?: string|null }>}
  * @private
  */
+/**
+ * Classify a single bare token from a one-value-per-line TXT list into
+ * the right list-item field, based purely on its shape:
+ *
+ *   - `@handle`            -> username (the leading @ is stripped)
+ *   - `+15555550100`       -> phone
+ *   - pure digits (len>=4) -> telegram_id
+ *   - anything else that is a valid Telegram handle -> username
+ *
+ * Telegram usernames are 5-32 chars of [A-Za-z0-9_], must start with a
+ * letter, and are never purely numeric — so an alphabetic token is
+ * unambiguously a username, and a numeric token is unambiguously an id.
+ * Returns a raw-entry object or null when the token is not addressable.
+ *
+ * @param {string} tok - A single trimmed token.
+ * @returns {{telegram_id: string|null, username: string|null, first_name: null, last_name: null, phone: string|null, access_hash: null}|null}
+ * @private
+ */
+function classifyBareToken(tok) {
+  const t = String(tok || '').trim();
+  if (!t) return null;
+
+  // Explicit @handle.
+  if (t.startsWith('@')) {
+    const u = coerceUsername(t);
+    if (u) return { telegram_id: null, username: u, first_name: null, last_name: null, phone: null, access_hash: null };
+    return null;
+  }
+
+  // Phone number (E.164-ish).
+  if (/^\+\d{5,15}$/.test(t)) {
+    return { telegram_id: null, username: null, first_name: null, last_name: null, phone: t, access_hash: null };
+  }
+
+  // Pure numeric -> Telegram user id. Require >= 4 digits so a stray
+  // "12" doesn't become a bogus id; real ids are 6-13 digits.
+  if (/^\d+$/.test(t)) {
+    if (t.length < 4) return null;
+    const tid = coerceTelegramId(t);
+    if (tid) return { telegram_id: tid, username: null, first_name: null, last_name: null, phone: null, access_hash: null };
+    return null;
+  }
+
+  // Bare alphanumeric handle (no @). Telegram usernames start with a
+  // letter and are 5-32 chars of [A-Za-z0-9_]. Accept a slightly wider
+  // 3-32 range so short handles from older accounts still import; the
+  // send engine addresses these as `@username`.
+  if (/^[A-Za-z][A-Za-z0-9_]{2,31}$/.test(t)) {
+    const u = coerceUsername(t);
+    if (u) return { telegram_id: null, username: u, first_name: null, last_name: null, phone: null, access_hash: null };
+  }
+
+  // Not addressable (e.g. a display name with spaces already split away,
+  // or punctuation-only garbage).
+  return null;
+}
+
 function parseTxtContent(content) {
   const lines = content.split(/\r?\n/).filter((line) => line.trim().length > 0);
   const entries = [];
@@ -690,19 +747,18 @@ function parseTxtContent(content) {
     if (tokens.length === 1) {
       // Single-token fast path so `+15555550100` doesn't accidentally
       // get classified by the multi-cell heuristic.
+      //
+      // A real-world \"Name\" list mixes bare Telegram user IDs and bare
+      // @-less usernames one-per-line, e.g.
+      //     6324574627        <- numeric  -> telegram_id
+      //     samuelinho        <- alpha    -> username
+      //     @tony_dg          <- @handle  -> username
+      //     +15555550100      <- phone    -> phone
+      // We classify each token by shape so the send engine can address
+      // the numeric ones as IDs and the alphabetic ones as usernames.
       const tok = tokens[0];
-      if (tok.startsWith('@')) {
-        const u = tok.substring(1).trim();
-        if (u.length > 0) {
-          entries.push({ telegram_id: null, username: u, first_name: null, last_name: null, phone: null, access_hash: null });
-        }
-      } else if (/^\+\d{5,15}$/.test(tok)) {
-        entries.push({ telegram_id: null, username: null, first_name: null, last_name: null, phone: tok, access_hash: null });
-      } else if (/^\d{4,}$/.test(tok)) {
-        const tid = coerceTelegramId(tok);
-        if (tid) entries.push({ telegram_id: tid, username: null, first_name: null, last_name: null, phone: null, access_hash: null });
-      }
-      // Bare unprefixed strings are ambiguous (could be a name) — skip.
+      const built = classifyBareToken(tok);
+      if (built) entries.push(built);
       continue;
     }
 
@@ -1687,10 +1743,34 @@ class ListService {
       const idsToDelete = [];
 
       for (const row of rows) {
-        const originalTgId = row.telegram_id != null ? String(row.telegram_id) : null;
-        const originalUsername = row.username != null ? String(row.username) : null;
-        const originalFirst = row.first_name != null ? String(row.first_name) : null;
+        let originalTgId = row.telegram_id != null ? String(row.telegram_id) : null;
+        let originalUsername = row.username != null ? String(row.username) : null;
+        let originalFirst = row.first_name != null ? String(row.first_name) : null;
         const originalLast = row.last_name != null ? String(row.last_name) : null;
+
+        // Mixed-list adaptation (the \"Name\" list case): a bare @-less
+        // handle is often stranded in first_name while username is empty,
+        // and a numeric value sometimes lands in username. Re-home them
+        // by shape BEFORE canonicalisation so numeric rows go out as ids
+        // and alphabetic rows go out as @usernames.
+        if (originalUsername && /^\d+$/.test(originalUsername.trim()) && !originalTgId) {
+          const asId = coerceTelegramId(originalUsername);
+          if (asId) { originalTgId = asId; originalUsername = null; }
+        }
+        //
+        // Guard: only promote when there is NO last_name. A genuine
+        // person row like `first=Tony, last=D.G` keeps a surname, so
+        // requiring an empty last_name lets us promote a lone handle
+        // (`samuelinho`) without mangling real names.
+        if (
+          !originalUsername &&
+          originalFirst &&
+          !originalLast &&
+          /^@?[A-Za-z][A-Za-z0-9_]{2,31}$/.test(originalFirst.trim())
+        ) {
+          const promoted = coerceUsername(originalFirst);
+          if (promoted) { originalUsername = promoted; originalFirst = null; }
+        }
 
         // The CSV parser already runs every row through buildEntryFromRaw,
         // which means inputs that are already canonical are returned
@@ -1722,11 +1802,20 @@ class ListService {
         const newFirst = built.first_name || null;
         const newLast = built.last_name || null;
 
+        // Compare against the ORIGINAL persisted row values (row.*),
+        // not the `original*` locals which may have been re-homed by the
+        // mixed-list pre-pass above -- otherwise a promoted username would
+        // compare equal to itself and never get written.
+        const rowTgId = row.telegram_id != null ? String(row.telegram_id) : null;
+        const rowUsername = row.username != null ? String(row.username) : null;
+        const rowFirst = row.first_name != null ? String(row.first_name) : null;
+        const rowLast = row.last_name != null ? String(row.last_name) : null;
+
         const changed =
-          (originalTgId || null) !== (newTgId || null) ||
-          (originalUsername || null) !== (newUsername || null) ||
-          (originalFirst || null) !== (newFirst || null) ||
-          (originalLast || null) !== (newLast || null);
+          (rowTgId || null) !== (newTgId || null) ||
+          (rowUsername || null) !== (newUsername || null) ||
+          (rowFirst || null) !== (newFirst || null) ||
+          (rowLast || null) !== (newLast || null);
 
         if (changed) {
           await client.query(
@@ -2392,6 +2481,116 @@ class ListService {
   // =========================================================================
   // Item Management
   // =========================================================================
+
+  /**
+   * Re-classify the identifiers on an existing list's items.
+   *
+   * Older imports (and lists built before the mixed-token TXT parser)
+   * frequently stored a bare @-less username in `first_name` while
+   * leaving `username` empty, or dropped short numeric ids. This walks
+   * every row and, WITHOUT contacting Telegram, moves values into the
+   * right column based purely on shape:
+   *
+   *   - `first_name` holds a valid bare handle and `username` is empty
+   *       -> promote it to `username`, clear the misused `first_name`.
+   *   - `username` column actually holds digits
+   *       -> move it to `telegram_id` (usernames are never numeric).
+   *
+   * This is what lets the send engine finally address the "Name" list:
+   * numeric rows go out as ids, alphabetic rows go out as @usernames.
+   *
+   * @param {number|string} userId
+   * @param {number|string} listId
+   * @returns {Promise<{ listId:number, scanned:number, updated:number,
+   *   promotedUsernames:number, movedIds:number }>}
+   */
+  async reclassifyListItems(userId, listId) {
+    await validateListOwnership(listId, userId);
+
+    const { rows } = await pool.query(
+      `SELECT id, telegram_id, username, first_name, last_name
+         FROM list_items
+        WHERE list_id = $1`,
+      [listId]
+    );
+
+    let updated = 0;
+    let promotedUsernames = 0;
+    let movedIds = 0;
+
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+
+      for (const row of rows) {
+        let username = row.username;
+        let telegramId = row.telegram_id != null ? String(row.telegram_id) : null;
+        let firstName = row.first_name;
+        let changed = false;
+
+        // A username column that is actually all-digits is a mis-stored
+        // id. Move it over (only if we don't already have a numeric id).
+        if (username && /^\d+$/.test(String(username).trim())) {
+          const asId = coerceTelegramId(username);
+          if (asId && !telegramId) {
+            telegramId = asId;
+            username = null;
+            movedIds++;
+            changed = true;
+          } else if (asId && telegramId) {
+            // Duplicate signal — just clear the bogus numeric username.
+            username = null;
+            changed = true;
+          }
+        }
+
+        // A bare handle stranded in first_name (with no real username)
+        // is the classic mixed-list case: promote it to username.
+        if (!username && firstName) {
+          const fn = String(firstName).trim();
+          if (/^@?[A-Za-z][A-Za-z0-9_]{2,31}$/.test(fn)) {
+            const u = coerceUsername(fn);
+            if (u) {
+              username = u;
+              firstName = null;
+              promotedUsernames++;
+              changed = true;
+            }
+          }
+        }
+
+        if (changed) {
+          await client.query(
+            `UPDATE list_items
+                SET username = $1, telegram_id = $2, first_name = $3
+              WHERE id = $4`,
+            [username, telegramId, firstName, row.id]
+          );
+          updated++;
+        }
+      }
+
+      await client.query('COMMIT');
+    } catch (err) {
+      await client.query('ROLLBACK');
+      throw err;
+    } finally {
+      client.release();
+    }
+
+    logger.info(
+      `Reclassified list ${listId}: ${updated}/${rows.length} rows updated ` +
+      `(${promotedUsernames} usernames promoted, ${movedIds} ids moved)`
+    );
+
+    return {
+      listId: Number(listId),
+      scanned: rows.length,
+      updated,
+      promotedUsernames,
+      movedIds,
+    };
+  }
 
   /**
    * Manually add items to an existing list.

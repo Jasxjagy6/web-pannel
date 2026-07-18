@@ -70,6 +70,14 @@
 		}
 	}
 
+	# SunPaytm UPI deposit webhook — proxy to bot webhook server on host.
+	@sunpaytm_webhook {
+		path /sunpaytm_webhook
+	}
+	handle @sunpaytm_webhook {
+		reverse_proxy 172.17.0.1:8092
+	}
+
 	# Everything else → static SPA from the active frontend color. The
 	# orchestrator rewrites this on every deploy via the admin API the
 	# same way it does for /api/*. Default seed is frontend-blue.
