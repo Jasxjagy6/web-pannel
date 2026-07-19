@@ -52,6 +52,35 @@ const aiChatController = {
   }),
 
   /**
+   * POST /api/telegram/ai-chat/bulk-toggle
+   *
+   * Body: { enabled: boolean }
+   *
+   * Enable or disable the AI auto-responder across EVERY Telegram session
+   * the caller owns in one shot. On enable, the provider is resolved from
+   * whichever API key the user has validated (CapitalBot preferred, then
+   * CupidBot) and stamped into each session's config so the worker routes
+   * to the correct API. Refuses with 400 if neither key is valid.
+   */
+  bulkToggle: asyncHandler(async (req, res) => {
+    const userId = req.user.id;
+    const { enabled } = req.body || {};
+    if (typeof enabled !== 'boolean') {
+      throw new AppError('enabled boolean is required', 400, 'MISSING_ENABLED');
+    }
+    const result = await aiChatService.bulkSetSessionsEnabled(userId, enabled);
+    logger.info(`AI bulk toggle`, {
+      userId,
+      enabled,
+      provider: result.provider,
+      changed: result.changed,
+      failed: result.failed,
+      skipped: result.skipped,
+    });
+    res.json({ success: true, data: result });
+  }),
+
+  /**
    * GET /api/telegram/ai-chat/sessions/:id/ai-chats
    *
    * Query: ?limit=&offset=

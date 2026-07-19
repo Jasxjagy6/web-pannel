@@ -25,6 +25,8 @@ import {
   User as UserIcon,
   Database,
   Activity,
+  Power,
+  PowerOff,
 } from 'lucide-react';
 import { listClientSessions, getClientDialogs } from '../api/telegramClient';
 import {
@@ -44,6 +46,7 @@ import {
   getMyCapitalbotModels,
   deleteCapitalbotKey,
   seedAiChatMemory,
+  bulkToggleAiSessions,
 } from '../api/aiChat';
 import { usePlatform } from '../context/PlatformContext';
 import { useToast } from '../components/common/Toast';
@@ -100,6 +103,7 @@ export default function AiChat() {
   const [chatSettingsMap, setChatSettingsMap] = useState({});
   const [logsMap, setLogsMap] = useState({});
   const [togglingId, setTogglingId] = useState(null);
+  const [bulkToggling, setBulkToggling] = useState(false);
   const [chatToggling, setChatToggling] = useState(null);
   const [clearing, setClearing] = useState(null);
   const [seeding, setSeeding] = useState(null);
@@ -175,6 +179,50 @@ export default function AiChat() {
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isTelegram]);
+
+  // Enable/disable AI for EVERY Telegram session at once. On enable the
+  // backend resolves the provider from whichever key the user has
+  // validated (CapitalBot preferred, else CupidBot) and stamps it into
+  // each session's config, then re-fetches all settings so the per-row
+  // toggles reflect the new state.
+  const handleBulkToggle = async (enabled) => {
+    // Guard: on enable, make sure at least one provider key is valid so we
+    // can give a precise error instead of a generic backend refusal.
+    if (enabled) {
+      const cupidOk = keyStatusByProvider.cupidbot?.isValid;
+      const capitalOk = keyStatusByProvider.capitalbot?.isValid;
+      if (!cupidOk && !capitalOk) {
+        toast.error('Add and validate a CupidBot or CapitalBot API key before enabling AI for all sessions.');
+        return;
+      }
+    }
+    setBulkToggling(true);
+    try {
+      const { data } = await bulkToggleAiSessions(enabled);
+      const d = data?.data || {};
+      const providerLabel = d.provider === 'capitalbot' ? 'CapitalBot' : d.provider === 'cupidbot' ? 'CupidBot' : '';
+      if (enabled) {
+        const parts = [`AI enabled on ${d.changed} session${d.changed === 1 ? '' : 's'}`];
+        if (providerLabel) parts.push(`via ${providerLabel}`);
+        if (d.skipped) parts.push(`· ${d.skipped} skipped (not logged in)`);
+        if (d.failed) parts.push(`· ${d.failed} failed`);
+        toast.success(parts.join(' '));
+      } else {
+        const parts = [`AI disabled on ${d.changed} session${d.changed === 1 ? '' : 's'}`];
+        if (d.failed) parts.push(`· ${d.failed} failed`);
+        toast.success(parts.join(' '));
+      }
+      await loadSessions();
+    } catch (err) {
+      toast.error(
+        err?.response?.data?.error?.message ||
+        err?.response?.data?.error ||
+        'Failed to bulk-update AI settings'
+      );
+    } finally {
+      setBulkToggling(false);
+    }
+  };
 
   const toggleSession = async (sessionId) => {
     const current = settingsMap[sessionId] || { enabled: false, config: {} };
@@ -686,6 +734,45 @@ export default function AiChat() {
             </div>
           );
         })()}
+
+        {/* Bulk on/off for EVERY Telegram session at once. On enable the
+            backend routes to whichever provider key the user has validated
+            (CapitalBot preferred, else CupidBot). */}
+        <div className="mb-4 flex flex-col gap-3 rounded-lg border border-white/5 bg-dark-900 p-4 sm:flex-row sm:items-center sm:justify-between">
+          <div>
+            <p className="text-sm font-semibold text-gray-200">All sessions</p>
+            <p className="text-xs text-gray-500">
+              Turn the AI auto-responder on or off for every Telegram session
+              in one click. Enabling uses your active key
+              {keyStatusByProvider.capitalbot?.isValid
+                ? ' (CapitalBot)'
+                : keyStatusByProvider.cupidbot?.isValid
+                ? ' (CupidBot)'
+                : ''}
+              .
+            </p>
+          </div>
+          <div className="flex items-center gap-2">
+            <button
+              type="button"
+              onClick={() => handleBulkToggle(true)}
+              disabled={bulkToggling}
+              className="flex items-center gap-2 rounded-md bg-emerald-500/15 border border-emerald-500/30 px-3 py-2 text-sm font-medium text-emerald-300 hover:bg-emerald-500/25 disabled:opacity-50"
+            >
+              {bulkToggling ? <Loader2 className="h-4 w-4 animate-spin" /> : <Power className="h-4 w-4" />}
+              Enable All
+            </button>
+            <button
+              type="button"
+              onClick={() => handleBulkToggle(false)}
+              disabled={bulkToggling}
+              className="flex items-center gap-2 rounded-md bg-amber-500/15 border border-amber-500/30 px-3 py-2 text-sm font-medium text-amber-300 hover:bg-amber-500/25 disabled:opacity-50"
+            >
+              {bulkToggling ? <Loader2 className="h-4 w-4 animate-spin" /> : <PowerOff className="h-4 w-4" />}
+              Disable All
+            </button>
+          </div>
+        </div>
 
         {error && (
           <div className="mb-4 flex items-center gap-2 rounded-md border border-red-500/30 bg-red-500/10 p-4 text-red-300">
