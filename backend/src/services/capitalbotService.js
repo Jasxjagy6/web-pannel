@@ -11,6 +11,19 @@ const DEFAULT_MODEL_ID = parseInt(process.env.CAPITALBOT_MODEL_ID || '43', 10);
 const DEFAULT_PRESET_ID = parseInt(process.env.CAPITALBOT_PRESET_ID || '88', 10);
 const MAX_RETRIES = 3;
 
+// CapitalBot hard-rejects any request whose `chatHistory` array is longer
+// than 60 with HTTP 413 ("chatHistory exceeds limit. Maximum accepted is
+// 60."). Before this cap, ANY chat that accumulated >60 stored messages
+// failed on every retry FOREVER — so the AI silently stopped replying to
+// exactly the busiest conversations while short chats kept working. We
+// send only the most recent N (default 55, a little headroom under 60)
+// messages; older context is dropped from the API call but kept in our
+// own per-chat memory. Configurable via CAPITALBOT_MAX_CHAT_HISTORY.
+const MAX_CHAT_HISTORY = Math.max(
+  1,
+  Math.min(60, parseInt(process.env.CAPITALBOT_MAX_CHAT_HISTORY || '55', 10))
+);
+
 const ENV_KEY_CACHE_TTL_MS = 5 * 60 * 1000;
 const _envKeyCache = { value: null, expiresAt: 0 };
 
@@ -198,7 +211,15 @@ class CapitalBotService {
   _buildChatHistory(messages) {
     if (!Array.isArray(messages) || messages.length === 0) return [];
 
-    return messages.map((m) => ({
+    // Keep only the most recent MAX_CHAT_HISTORY messages. `messages` is
+    // ordered oldest -> newest, so slice(-N) keeps the freshest context and
+    // stays under CapitalBot's hard 60-message ceiling (HTTP 413 otherwise).
+    const bounded =
+      messages.length > MAX_CHAT_HISTORY
+        ? messages.slice(-MAX_CHAT_HISTORY)
+        : messages;
+
+    return bounded.map((m) => ({
       role: m.isIncoming ? 'user' : 'assistant',
       content: m.msg || '',
       timestamp: Math.floor((m.timestamp || Date.now()) / 1000),
@@ -223,6 +244,17 @@ class CapitalBotService {
     const userModelId = accessToken.modelId;
     const userPresetId = accessToken.presetId;
 
+    // Per-conversation identity. CapitalBot keys its server-side state by
+    // (accountId, useridentifier), so this MUST be unique per recipient and
+    // MUST NOT be empty — an empty identifier would collapse every chat on
+    // this account into one shared context and leak one user's history into
+    // another's replies. Fall back to an accountId-scoped peer key if the
+    // caller somehow didn't supply a recipient id.
+    const rawUserIdent = String(
+      recipient.id || recipient.useridentifier || recipient.peerId || ''
+    ).trim();
+    const useridentifier = rawUserIdent || `acct${accountID}_unknown`;
+
     const body = {
       licensekey: licenseKey,
       modelId: userModelId ?? overrides.modelId ?? DEFAULT_MODEL_ID,
@@ -231,7 +263,7 @@ class CapitalBotService {
       platform: overrides.platform || 'Telegram',
       conversationSource: overrides.conversationSource || 'Telegram',
       userInfos: {
-        useridentifier: String(recipient.id || recipient.useridentifier || ''),
+        useridentifier,
       },
       chatHistory,
     };
@@ -331,6 +363,12 @@ class CapitalBotService {
       } catch (err) {
         lastErr = err;
         logger.warn(`CapitalBot request failed (attempt ${attempt + 1}/${MAX_RETRIES}): ${err.message}`);
+        // Client errors (4xx other than 429) are deterministic — retrying
+        // the identical payload just wastes time and hammers the API, so
+        // fail fast. Only 429 / 5xx / network errors are worth a retry.
+        if (err.statusCode && err.statusCode >= 400 && err.statusCode < 500 && err.statusCode !== 429) {
+          break;
+        }
         if (attempt < MAX_RETRIES - 1) {
           await sleep(1000 * Math.pow(2, attempt));
         }
