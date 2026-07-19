@@ -127,6 +127,11 @@ class AiChatService {
       return { handled: false, reason: 'bad_peer' };
     }
 
+    // Telegram service account (login codes, security alerts). Never reply.
+    if (Number(peerId) === 777000) {
+      return { handled: false, reason: 'service_account' };
+    }
+
     const sessionSettings = await this.getSessionSettings(sid);
     logger.info(`AI: sessionSettings enabled=${sessionSettings?.enabled}`);
     if (!sessionSettings.enabled) {
@@ -411,6 +416,20 @@ class AiChatService {
         });
       }
       throw dbErr;
+    }
+
+    // When AI is turned ON for this session, kick off a one-off catch-up
+    // sweep so it answers personal DMs that were already pending (unreplied,
+    // <=24h old) BEFORE the operator enabled AI. Fire-and-forget so the
+    // enable request returns immediately; the sweep only ENQUEUES replies
+    // (the AI worker sends them) and skips any chat already answered, so it
+    // never disturbs chats the live listener is already handling.
+    if (enabled) {
+      try {
+        require('./aiCatchupService').scheduleSessionSweep(sid, userId);
+      } catch (e) {
+        logger.debug(`aiCatchup schedule skipped for ${sid}: ${e.message}`);
+      }
     }
 
     return { sessionId: sid, enabled: !!enabled, config: cfg, attached };

@@ -256,11 +256,17 @@ function classifyFailoverError(errorMessage, errorCode) {
     return { action: 'switch_session', reason: 'FLOOD_WAIT', limited: true };
   }
 
-  // --- SESSION LIMITED / MUTUAL-CONTACTS-ONLY -> switch session, resume same target ---
-  // Telegram rate-limits and "you may only message contacts / peer
-  // privacy forbids strangers" signals. These mean THIS account cannot
-  // keep messaging the list, so we hand off to the next session and
-  // retry the very target that triggered it.
+  // --- SESSION LIMITED -> switch session, resume same target ---
+  // ONLY genuine ACCOUNT-WIDE throttles belong here: the account itself is
+  // rate-limited/flagged, so it cannot keep messaging ANY target and we
+  // hand off to the next session, retrying the same target on it.
+  //
+  // IMPORTANT: per-TARGET refusals (privacy, not-a-mutual-contact, blocked,
+  // write-forbidden) were previously — and wrongly — in this list. That
+  // made ONE privacy-restricted recipient retire a perfectly healthy
+  // session; a handful of such recipients burned through every session and
+  // the runner skipped the entire rest of the list. Those now live in
+  // TARGET_SKIP_SIGNALS below (skip the target, keep the session).
   const SESSION_LIMIT_SIGNALS = [
     'PEER_FLOOD',            // account flagged for spam / mass DMs
     'FLOOD_WAIT',            // rate limited
@@ -268,17 +274,6 @@ function classifyFailoverError(errorMessage, errorCode) {
     'FLOODWAIT',             // some layers omit the underscore
     'SLOWMODE_WAIT',
     'TOO MANY REQUESTS',
-    'USER_NOT_MUTUAL_CONTACT', // can only send to mutual contacts
-    'USER_PRIVACY_RESTRICTED',
-    'PRIVACY_RESTRICTED',
-    'YOU_BLOCKED_USER',
-    'USER_IS_BLOCKED',
-    'CHAT_WRITE_FORBIDDEN',
-    'MESSAGE_NOT_ALLOWED',
-    "CAN'T WRITE",
-    'CAN NOT SEND',
-    'CANNOT SEND',
-    'CAN ONLY SEND MESSAGES TO MUTUAL',
   ];
   for (const sig of SESSION_LIMIT_SIGNALS) {
     if (has(sig)) {
@@ -319,6 +314,19 @@ function classifyFailoverError(errorMessage, errorCode) {
     'COULD NOT RESOLVE',
     'COULD NOT FIND',
     'NO USER HAS',
+    // Per-TARGET refusals — THIS recipient can't be messaged, but the
+    // session is perfectly fine and must keep going down the list.
+    'USER_NOT_MUTUAL_CONTACT', // recipient only accepts mutual contacts
+    'USER_PRIVACY_RESTRICTED', // recipient's privacy blocks strangers
+    'PRIVACY_RESTRICTED',
+    'YOU_BLOCKED_USER',        // this account blocked the recipient
+    'USER_IS_BLOCKED',         // recipient blocked this account
+    'CHAT_WRITE_FORBIDDEN',    // cannot write to this specific peer
+    'MESSAGE_NOT_ALLOWED',
+    "CAN'T WRITE",
+    'CAN NOT SEND',
+    'CANNOT SEND',
+    'CAN ONLY SEND MESSAGES TO MUTUAL',
   ];
   for (const sig of TARGET_SKIP_SIGNALS) {
     if (has(sig)) {
