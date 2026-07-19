@@ -169,3 +169,14 @@ export const downloadCloneExportZip = async (jobId) => {
   a.remove();
   setTimeout(() => URL.revokeObjectURL(url), 1000);
 };
+
+// ── Session profile sync ──────────────────────────────────────────
+// Refresh the live Telegram display details (firstName, lastName,
+// username, bio, premium/verified) from Telegram and rewrite
+// sessions.account_info / sessions.username. Read-only.
+
+export const syncSessionProfile = (id) =>
+  api.post(`/sessions/${id}/sync-profile`);
+
+export const syncAllSessionProfiles = (payload = {}) =>
+  api.post('/sessions/sync-profiles', payload);

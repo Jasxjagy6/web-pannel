@@ -64,6 +64,9 @@ router.get('/stats', sessionController.getSessionStats);
 // POST /api/sessions/bulk-delete - Bulk delete
 router.post('/bulk-delete', sessionController.bulkDeleteSessions);
 
+// POST /api/sessions/sync-profiles — batch-sync every logged-in session's profile
+router.post('/sync-profiles', sessionController.syncAllSessionProfiles);
+
 // GET /api/sessions/:id - Get session
 router.get('/:id', sessionController.getSession);
 
@@ -81,6 +84,11 @@ router.post('/:id/logout', sessionController.logoutSession);
 // session file or its newest backup, runs getMe, flips the row back
 // to active if the auth key is still good).
 router.post('/:id/recover', sessionController.recoverSession);
+
+// POST /api/sessions/:id/sync-profile — refresh live Telegram profile
+// (firstName, lastName, username, bio, premium/verified) and rewrite
+// sessions.account_info / sessions.username. Read-only against Telegram.
+router.post('/:id/sync-profile', sessionController.syncSessionProfile);
 
 // GET /api/sessions/:id/status - Check status
 router.get('/:id/status', sessionController.checkSessionStatus);
