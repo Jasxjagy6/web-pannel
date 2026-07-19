@@ -62,6 +62,8 @@ const schemas = {
     // legacy required-array contract.
     sessionIds: Joi.array().items(Joi.number().integer().positive()).min(1).optional(),
     sessionListId: Joi.alternatives().try(Joi.number().integer().positive(), Joi.string()).optional(),
+    // Plural: target multiple session lists at once (unioned server-side).
+    sessionListIds: Joi.array().items(Joi.alternatives().try(Joi.number().integer().positive(), Joi.string())).min(1).optional(),
     targetList: Joi.array().items(
       Joi.alternatives().try(
         Joi.string(),
@@ -104,7 +106,7 @@ const schemas = {
     cooldownSecMax: Joi.number().integer().min(0).max(1800).optional(),
     itemDelayMsMin: Joi.number().integer().min(0).max(600000).optional(),
     itemDelayMsMax: Joi.number().integer().min(0).max(600000).optional(),
-  }).or('sessionIds', 'sessionListId'),
+  }).or('sessionIds', 'sessionListId', 'sessionListIds'),
 
   // Sequential-failover bulk send.
   // Same target/session shape as bulkMessage, but with failover-specific
@@ -113,6 +115,8 @@ const schemas = {
   failoverMessage: Joi.object({
     sessionIds: Joi.array().items(Joi.number().integer().positive()).min(1).optional(),
     sessionListId: Joi.alternatives().try(Joi.number().integer().positive(), Joi.string()).optional(),
+    // Plural: target multiple session lists at once (unioned server-side).
+    sessionListIds: Joi.array().items(Joi.alternatives().try(Joi.number().integer().positive(), Joi.string())).min(1).optional(),
     targetList: Joi.array().items(
       Joi.alternatives().try(
         Joi.string(),
@@ -140,7 +144,7 @@ const schemas = {
     trackReplies: Joi.alternatives().try(Joi.boolean(), Joi.string()).optional(),
     replyWindowHours: Joi.number().integer().min(1).max(168).optional(),
     async: Joi.alternatives().try(Joi.boolean(), Joi.string()).optional(),
-  }).or('sessionIds', 'sessionListId'),
+  }).or('sessionIds', 'sessionListId', 'sessionListIds'),
 
   // Single-User Mass DM
   // ---------------------------------------------------------------
@@ -154,6 +158,8 @@ const schemas = {
   singleUserMassDm: Joi.object({
     sessionIds: Joi.array().items(Joi.number().integer().positive()).min(1).optional(),
     sessionListId: Joi.alternatives().try(Joi.number().integer().positive(), Joi.string()).optional(),
+    // Plural: target multiple session lists at once (unioned server-side).
+    sessionListIds: Joi.array().items(Joi.alternatives().try(Joi.number().integer().positive(), Joi.string())).min(1).optional(),
     // Targets: 1..3 strings (username, @username or numeric id).
     targets: Joi.array().items(Joi.string().trim().min(1).max(64)).min(1).max(3).required(),
     message: Joi.string().min(1).max(4096).required(),
@@ -162,7 +168,7 @@ const schemas = {
     // composition usable while preventing 0-second runaway loops.
     delaySeconds: Joi.number().integer().min(1).max(120).default(3),
     async: Joi.alternatives().try(Joi.boolean(), Joi.string()).optional(),
-  }).or('sessionIds', 'sessionListId'),
+  }).or('sessionIds', 'sessionListId', 'sessionListIds'),
 
   addMembersToGroup: Joi.object({
     // New multi-session mode
@@ -171,6 +177,8 @@ const schemas = {
     sessionId: Joi.number().integer().positive().optional(),
     // The frontend may also resolve sessions via a saved session list.
     sessionListId: Joi.alternatives().try(Joi.number().integer().positive(), Joi.string()).optional(),
+    // Plural: target multiple session lists at once (unioned server-side).
+    sessionListIds: Joi.array().items(Joi.alternatives().try(Joi.number().integer().positive(), Joi.string())).min(1).optional(),
     // New multi-target mode
     targetIds: Joi.array().items(Joi.string()).min(1).optional(),
     // Old single-target mode (backward compat)
@@ -228,7 +236,7 @@ const schemas = {
     // Optional list_id (for persisting status back into list_items).
     listId: Joi.alternatives().try(Joi.number().integer().positive(), Joi.string()).optional(),
   })
-    .or('sessionIds', 'sessionId', 'sessionListId')
+    .or('sessionIds', 'sessionId', 'sessionListId', 'sessionListIds')
     .or('targetIds', 'targetGroupId'),
 
   // Either sessionIds (explicit) OR sessionListId (resolved server-side
@@ -239,10 +247,11 @@ const schemas = {
   joinLeaveChannels: Joi.object({
     sessionIds: Joi.array().items(Joi.number().integer().positive()).min(1).optional(),
     sessionListId: Joi.alternatives(Joi.number().integer().positive(), Joi.string()).optional(),
+    sessionListIds: Joi.array().items(Joi.alternatives(Joi.number().integer().positive(), Joi.string())).min(1).optional(),
     session_list_id: Joi.alternatives(Joi.number().integer().positive(), Joi.string()).optional(),
     targetIds: Joi.array().items(Joi.string()).min(1).required(),
     targetType: Joi.string().valid('group', 'channel').default('group'),
-  }).or('sessionIds', 'sessionListId', 'session_list_id'),
+  }).or('sessionIds', 'sessionListId', 'sessionListIds', 'session_list_id'),
 
   twoFACheck: Joi.object({
     sessionId: Joi.number().integer().positive().required(),
