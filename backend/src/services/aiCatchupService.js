@@ -94,6 +94,9 @@ async function sweepSession(sessionId, userId) {
 
     const peerId = entity.id ? Number(entity.id) : null;
     if (!peerId) continue;
+    // 777000 is Telegram's own service account (login codes, security
+    // alerts). Never AI-reply to it.
+    if (peerId === 777000) continue;
 
     const last = dlg.message;
     if (!last) continue;

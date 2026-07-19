@@ -129,6 +129,13 @@ class AiChatService {
       return { handled: false, reason: 'bad_peer' };
     }
 
+    // 777000 is Telegram's service account (login codes, security alerts).
+    // The AI must never reply to it.
+    if (Number(peerId) === 777000) {
+      logger.info(`AI: skipping Telegram service account 777000 for session ${sid}`);
+      return { handled: false, reason: 'service_account' };
+    }
+
     const sessionSettings = await this.getSessionSettings(sid);
     logger.info(`AI: sessionSettings enabled=${sessionSettings?.enabled}`);
     if (!sessionSettings.enabled) {
