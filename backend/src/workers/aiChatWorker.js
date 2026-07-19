@@ -39,6 +39,11 @@ const DEFAULT_MEMORY_LIMIT = parseInt(process.env.AI_MEMORY_MESSAGE_LIMIT || '10
 
 const QUEUE_NAME = 'ai-chat-jobs';
 
+// Per-(session,peer) in-process mutex chain. Guarantees at most one
+// in-flight AI generation per conversation so CapitalBot never sees two
+// concurrent requests for the same useridentifier.
+const _peerLocks = new Map();
+
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -80,15 +85,46 @@ async function processGenerateReply(job) {
   const provider = (config.provider || config.aiProvider || 'cupidbot').toLowerCase();
   const aiService = provider === 'capitalbot' ? capitalbotService : cupidbotService;
 
+  // Serialize all jobs for the same (session, peer) so we never fire two
+  // concurrent CapitalBot requests for one useridentifier — that is what
+  // triggers the "Request in progress" / "Duplicate request" 429s. The
+  // BullMQ worker runs in a single process, so an in-memory per-peer lock
+  // is sufficient and far simpler than a distributed lock.
+  const lockKey = `${sid}:${peerType}:${pid}`;
+  const prev = _peerLocks.get(lockKey) || Promise.resolve();
+  let release;
+  // `mine` resolves when THIS job releases the lock. The map tail becomes
+  // a promise that resolves only after prev AND mine settle, so the next
+  // job for this peer waits for us. We store that chained tail so the
+  // cleanup check below can tell whether we are still the tail.
+  const mine = new Promise((res) => { release = res; });
+  const tail = prev.then(() => mine);
+  _peerLocks.set(lockKey, tail);
+  await prev; // wait for any in-flight job for this peer to finish
+
   try {
-    // Use conversation state from aiChatService
-    const lastExchange = conversationState?.lastExchange || { lastIncoming: null, lastOutgoing: null };
+    // Re-read the FRESHEST conversation state from memory at run time.
+    // Jobs are enqueued with a short delay and de-duplicated by message id,
+    // so by the time we run, a burst of rapid messages from the user has
+    // usually settled — refetching here means one reply covers all of them
+    // instead of replying to a stale mid-burst snapshot.
+    let liveState = conversationState;
+    try {
+      const fresh = await aiMemoryService.getConversationState(
+        sid, peerType, pid, config.memoryMessageLimit
+      );
+      if (fresh) liveState = fresh;
+    } catch (stateErr) {
+      logger.warn(`AI Worker: memory refetch failed for ${lockKey}, using job snapshot: ${stateErr.message}`);
+    }
+
+    const lastExchange = liveState?.lastExchange || { lastIncoming: null, lastOutgoing: null };
 
     // CapitalBot uses full chat history (API handles state internally)
     // CupidBot only needs unconfirmed AI msgs + new incoming msgs
     const messagesForAI = provider === 'capitalbot'
-      ? (conversationState?.allRecent || conversationState?.messages || [])
-      : (conversationState?.messages || []);
+      ? (liveState?.allRecent || liveState?.messages || [])
+      : (liveState?.messages || []);
 
     // Follow-up handling differs per provider:
     // CupidBot requires explicit isFollowUp flag; CapitalBot auto-detects from chatHistory roles
@@ -219,6 +255,11 @@ async function processGenerateReply(job) {
 
     logger.warn(`AI chat job failed for session ${sid}: ${err.message}`);
     throw err;
+  } finally {
+    // Release the per-peer lock and clean up the map entry if we're the
+    // tail of the chain (avoids unbounded growth).
+    release();
+    if (_peerLocks.get(lockKey) === tail) _peerLocks.delete(lockKey);
   }
 }
 

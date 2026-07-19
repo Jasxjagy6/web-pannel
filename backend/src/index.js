@@ -668,6 +668,21 @@ async function start() {
       logger.warn(`aiChatWorker.start failed: ${err.message}`);
     }
 
+    // 7d-bis. Boot the AI catch-up sweeper. On startup (after sessions
+    //     restore) and then periodically, it finds DMs that are still
+    //     awaiting a reply — including everything that piled up while the
+    //     process was down or before AI was enabled — and drives the AI to
+    //     answer them. This is what makes a fresh deploy reply to all
+    //     previously-pending chats across every session. It also
+    //     repopulates the GramJS entity cache via getDialogs(), fixing the
+    //     "Could not find the input entity" send failures.
+    try {
+      const aiCatchupService = require('./services/aiCatchupService');
+      aiCatchupService.start();
+    } catch (err) {
+      logger.warn(`aiCatchupService.start failed: ${err.message}`);
+    }
+
     // 7e. AI response log retention sweeper (daily).
     try {
       const aiChatService = require('./services/aiChatService');

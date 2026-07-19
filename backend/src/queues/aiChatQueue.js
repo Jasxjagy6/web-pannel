@@ -42,9 +42,9 @@ class AiChatQueue {
     logger.info('AI chat queue initialized');
   }
 
-  async add(name, data) {
+  async add(name, data, opts = {}) {
     if (!this.initialized) await this.initialize();
-    const job = await this.queue.add(name, data);
+    const job = await this.queue.add(name, data, opts);
     logger.debug(`AI chat job added`, { jobId: job.id, sessionId: data.sessionId });
     return job;
   }

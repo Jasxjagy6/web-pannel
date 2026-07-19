@@ -231,6 +231,20 @@ class AiChatService {
     const confirmedMessages = await this._getConfirmedMessageIds(sid, peerType, peerId);
 
     logger.info(`AI: enqueuing job for session ${sid} peer ${peerType}:${peerId}, messagesForCupidBot=${conversationState.messages.length}`);
+    // De-dup + de-burst:
+    //  - jobId keyed by the exact incoming telegram message id so the SAME
+    //    message can never enqueue twice (live listener + catch-up sweep, a
+    //    BullMQ retry, or two dialog scans all collapse to one job). BullMQ
+    //    refuses a duplicate jobId while one is waiting/active/recently
+    //    completed, which is exactly what we want.
+    //  - a short delay lets rapid consecutive messages from the same user
+    //    settle; the worker re-reads the freshest memory at run time, so a
+    //    burst of quick texts produces one reply covering all of them
+    //    instead of concurrent CapitalBot calls (the "Request in progress"
+    //    429).
+    const incomingTgId = memoryItem?.telegramMessageId ?? memoryItem?.id ?? Date.now();
+    const jobId = `ai:${sid}:${peerType}:${peerId}:${incomingTgId}`;
+    const enqueueDelayMs = parseInt(process.env.AI_ENQUEUE_DELAY_MS || '1500', 10);
     await aiChatQueue.add('generate-reply', {
       sessionId: sid,
       userId,
@@ -245,7 +259,7 @@ class AiChatService {
       },
       confirmedMessageIds: confirmedMessages,
       botProfile,
-    });
+    }, { jobId, delay: enqueueDelayMs });
 
     logger.info(`AI: job enqueued — returning handled:true`);
     return { handled: true };

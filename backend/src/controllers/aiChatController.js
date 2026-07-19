@@ -62,6 +62,24 @@ const aiChatController = {
    * CupidBot) and stamped into each session's config so the worker routes
    * to the correct API. Refuses with 400 if neither key is valid.
    */
+  /**
+   * POST /api/telegram/ai-chat/catchup-now
+   *
+   * Manually trigger a catch-up sweep across every AI-enabled + logged-in
+   * session: find DMs still awaiting a reply and enqueue AI responses.
+   * Returns the sweep summary (sessions scanned + total enqueued).
+   */
+  catchupNow: asyncHandler(async (req, res) => {
+    const aiCatchupService = require('../services/aiCatchupService');
+    const result = await aiCatchupService.runSweep();
+    logger.info('AI catch-up sweep triggered manually', {
+      userId: req.user.id,
+      sessions: result.sessions,
+      enqueued: result.enqueued,
+    });
+    res.json({ success: true, data: { sessions: result.sessions, enqueued: result.enqueued } });
+  }),
+
   bulkToggle: asyncHandler(async (req, res) => {
     const userId = req.user.id;
     const { enabled } = req.body || {};
