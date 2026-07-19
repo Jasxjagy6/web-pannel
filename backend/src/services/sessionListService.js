@@ -398,11 +398,37 @@ async function setSessions({ userId, listId, sessionIds }) {
 }
 
 /**
- * Resolve `{ sessionIds, sessionListId }` to a concrete array of
- * session ids, owned by the caller and on the given platform.
+ * Expand ONE session list to its member session ids (platform-checked,
+ * ownership-checked). Throws on an empty/foreign/invalid list.
+ * @returns {Promise<number[]>}
+ * @private
+ */
+async function _resolveOneList({ userId, platform, listId, includeAll }) {
+  const id = Number(listId);
+  if (!Number.isFinite(id) || id <= 0) {
+    throw new AppError('Invalid sessionListId', 400, 'INVALID_LIST_ID');
+  }
+  const list = await getList({ userId, listId: id });
+  if (platform && list.platform !== _normPlatform(platform)) {
+    throw new AppError(
+      `Session list ${id} belongs to platform '${list.platform}', not '${platform}'`,
+      400,
+      'PLATFORM_MISMATCH'
+    );
+  }
+  const rows = await getListSessions({ userId, listId: id, includeAll });
+  const ids = rows.map((r) => Number(r.id));
+  return { name: list.name, ids };
+}
+
+/**
+ * Resolve `{ sessionIds, sessionListId, sessionListIds }` to a concrete
+ * array of session ids, owned by the caller and on the given platform.
  *
- * - If `sessionListId` is provided, expand to that list's members
- *   (filtered to active, logged-in sessions when `includeAll` is false).
+ * - If `sessionListIds` (array) and/or `sessionListId` (single) is
+ *   provided, expand EVERY referenced list and return the UNION of their
+ *   members, de-duplicated and order-preserved (first occurrence wins).
+ *   A single session that belongs to two selected lists is messaged once.
  * - Otherwise return `sessionIds` unchanged after a quick ownership check.
  *
  * @returns {Promise<number[]>}
@@ -412,32 +438,53 @@ async function resolveSessionIds({
   platform,
   sessionIds,
   sessionListId,
+  sessionListIds,
   includeAll = false,
 }) {
-  if (sessionListId != null && sessionListId !== '') {
-    const id = Number(sessionListId);
-    if (!Number.isFinite(id) || id <= 0) {
-      throw new AppError('Invalid sessionListId', 400, 'INVALID_LIST_ID');
+  // Gather every requested list id (singular + plural), de-duplicated,
+  // preserving the order the operator picked them in.
+  const listIds = [];
+  const seenList = new Set();
+  const pushListId = (v) => {
+    if (v == null || v === '') return;
+    const n = Number(v);
+    if (!Number.isFinite(n) || n <= 0) return;
+    if (seenList.has(n)) return;
+    seenList.add(n);
+    listIds.push(n);
+  };
+  if (Array.isArray(sessionListIds)) sessionListIds.forEach(pushListId);
+  pushListId(sessionListId);
+
+  if (listIds.length > 0) {
+    const union = [];
+    const seen = new Set();
+    const emptyNames = [];
+    for (const id of listIds) {
+      // eslint-disable-next-line no-await-in-loop
+      const { name, ids } = await _resolveOneList({ userId, platform, listId: id, includeAll });
+      if (ids.length === 0) {
+        emptyNames.push(name || `#${id}`);
+        continue;
+      }
+      for (const sid of ids) {
+        if (!seen.has(sid)) {
+          seen.add(sid);
+          union.push(sid);
+        }
+      }
     }
-    const list = await getList({ userId, listId: id });
-    if (platform && list.platform !== _normPlatform(platform)) {
+    if (union.length === 0) {
       throw new AppError(
-        `Session list ${id} belongs to platform '${list.platform}', not '${platform}'`,
-        400,
-        'PLATFORM_MISMATCH'
-      );
-    }
-    const rows = await getListSessions({ userId, listId: id, includeAll });
-    const ids = rows.map((r) => Number(r.id));
-    if (ids.length === 0) {
-      throw new AppError(
-        `Session list "${list.name}" has no active sessions`,
+        `The selected session list(s) have no active sessions` +
+          (emptyNames.length ? `: ${emptyNames.join(', ')}` : ''),
         400,
         'EMPTY_SESSION_LIST'
       );
     }
-    return ids;
+    return union;
   }
+
   // No list → trust caller's sessionIds. (Ownership is enforced by the
   // downstream service when it loads the rows.)
   if (!Array.isArray(sessionIds) || sessionIds.length === 0) return [];

@@ -44,9 +44,34 @@ export default function SessionListSwitcher({
   onModeChange,
   selectedSessionListId,
   onSelectedSessionListIdChange,
+  // Multi-select: when `multiple` is true the parent owns an array of
+  // selected list ids. Backward compatible — if these are omitted the
+  // component behaves as the original single-select picker.
+  multiple = false,
+  selectedSessionListIds,
+  onSelectedSessionListIdsChange,
   className = '',
   disabled = false,
 }) {
+  // Normalized array of currently-selected list ids, whether the parent
+  // drives us in single or multiple mode.
+  const selectedIds = multiple
+    ? (Array.isArray(selectedSessionListIds) ? selectedSessionListIds.map(Number) : [])
+    : (selectedSessionListId != null && selectedSessionListId !== ''
+        ? [Number(selectedSessionListId)]
+        : []);
+  const isListSelected = (id) => selectedIds.includes(Number(id));
+  const toggleList = (id) => {
+    const n = Number(id);
+    if (multiple) {
+      const next = isListSelected(n)
+        ? selectedIds.filter((x) => x !== n)
+        : [...selectedIds, n];
+      if (onSelectedSessionListIdsChange) onSelectedSessionListIdsChange(next);
+    } else if (onSelectedSessionListIdChange) {
+      onSelectedSessionListIdChange(n);
+    }
+  };
   const [lists, setLists] = useState([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
@@ -97,14 +122,26 @@ export default function SessionListSwitcher({
     }
   }, []);
 
-  // Lazy-load members for the currently selected list once.
+  // Lazy-load members for every selected list once.
   useEffect(() => {
     if (mode !== 'list') return;
-    if (!selectedSessionListId) return;
-    const id = Number(selectedSessionListId);
-    if (memberCache[id]) return;
-    fetchMembers(id);
-  }, [mode, selectedSessionListId, memberCache, fetchMembers]);
+    for (const id of selectedIds) {
+      if (!memberCache[id]) fetchMembers(id);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [mode, JSON.stringify(selectedIds), memberCache, fetchMembers]);
+
+  // Total unique sessions across all selected lists (for the summary).
+  const uniqueSelectedCount = useMemo(() => {
+    const set = new Set();
+    for (const id of selectedIds) {
+      const m = memberCache[id];
+      if (m && Array.isArray(m.sessions)) {
+        for (const s of m.sessions) set.add(Number(s.id));
+      }
+    }
+    return set.size;
+  }, [JSON.stringify(selectedIds), memberCache]);
 
   const filteredLists = useMemo(() => {
     if (!search) return lists;
@@ -154,7 +191,7 @@ export default function SessionListSwitcher({
           aria-pressed={mode === 'list'}
         >
           <Layers className="w-3.5 h-3.5" />
-          Use session list
+          {multiple ? 'Use session lists' : 'Use session list'}
         </button>
       </div>
 
@@ -211,7 +248,7 @@ export default function SessionListSwitcher({
             ) : (
               <ul className="divide-y divide-white/5">
                 {filteredLists.map((list) => {
-                  const isSelected = Number(list.id) === Number(selectedSessionListId);
+                  const isSelected = isListSelected(list.id);
                   const initials = (list.name || 'L').slice(0, 2).toUpperCase();
                   return (
                     <li key={list.id}>
@@ -219,9 +256,7 @@ export default function SessionListSwitcher({
                         type="button"
                         disabled={disabled}
                         onClick={() => {
-                          if (onSelectedSessionListIdChange) {
-                            onSelectedSessionListIdChange(Number(list.id));
-                          }
+                          toggleList(list.id);
                           setPreviewOpen(true);
                         }}
                         className={`w-full text-left flex items-center gap-3 px-3 py-2.5 transition ${
@@ -264,7 +299,7 @@ export default function SessionListSwitcher({
                           {isSelected ? (
                             <CheckCircle2 className="w-5 h-5 text-primary-400" />
                           ) : (
-                            <span className="w-5 h-5 rounded-full border border-white/15" />
+                            <span className={`w-5 h-5 border border-white/15 ${multiple ? 'rounded-md' : 'rounded-full'}`} />
                           )}
                         </div>
                       </button>
@@ -275,8 +310,8 @@ export default function SessionListSwitcher({
             )}
           </div>
 
-          {/* Preview drawer for the currently-chosen list */}
-          {selectedList && (
+          {/* Preview drawer for the chosen list(s) */}
+          {selectedIds.length > 0 && (
             <div className="border-t border-white/5">
               <button
                 type="button"
@@ -285,11 +320,20 @@ export default function SessionListSwitcher({
               >
                 <span className="flex items-center gap-1.5">
                   <ListChecks className="w-3.5 h-3.5" />
-                  {previewOpen ? 'Hide' : 'Show'} sessions in&nbsp;
-                  <span className="font-medium text-white">{selectedList.name}</span>
-                  <span className="text-gray-500">
-                    · {selectedMembers?.sessions?.length ?? selectedList.session_count}
-                  </span>
+                  {previewOpen ? 'Hide' : 'Show'}{' '}
+                  {multiple ? (
+                    <>
+                      <span className="font-medium text-white">{selectedIds.length}</span>
+                      &nbsp;list{selectedIds.length === 1 ? '' : 's'} selected
+                      <span className="text-gray-500">· {uniqueSelectedCount} session{uniqueSelectedCount === 1 ? '' : 's'}</span>
+                    </>
+                  ) : (
+                    <>
+                      sessions in&nbsp;
+                      <span className="font-medium text-white">{selectedList?.name}</span>
+                      <span className="text-gray-500">· {selectedMembers?.sessions?.length ?? selectedList?.session_count}</span>
+                    </>
+                  )}
                 </span>
                 {previewOpen ? (
                   <ChevronUp className="w-4 h-4" />
@@ -298,11 +342,26 @@ export default function SessionListSwitcher({
                 )}
               </button>
               {previewOpen && (
-                <SessionPreview
-                  list={selectedList}
-                  members={selectedMembers}
-                  onRetry={() => fetchMembers(Number(selectedList.id))}
-                />
+                <div>
+                  {selectedIds.map((id) => {
+                    const list = lists.find((l) => Number(l.id) === Number(id));
+                    if (!list) return null;
+                    return (
+                      <div key={id}>
+                        {multiple && (
+                          <div className="px-3 py-1.5 text-[11px] font-medium text-primary-300 bg-primary-500/5 border-t border-white/5">
+                            {list.name}
+                          </div>
+                        )}
+                        <SessionPreview
+                          list={list}
+                          members={memberCache[Number(id)]}
+                          onRetry={() => fetchMembers(Number(id))}
+                        />
+                      </div>
+                    );
+                  })}
+                </div>
               )}
             </div>
           )}

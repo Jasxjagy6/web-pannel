@@ -233,6 +233,8 @@ function DistributionSettings({
   setSessionPickMode,
   selectedSessionListId = '',
   setSelectedSessionListId,
+  selectedSessionListIds = [],
+  setSelectedSessionListIds,
 }) {
   const [showSessionDropdown, setShowSessionDropdown] = useState(false);
   const dropdownRef = useRef(null);
@@ -362,8 +364,9 @@ function DistributionSettings({
           <SessionListSwitcher
             mode={sessionPickMode}
             onModeChange={setSessionPickMode}
-            selectedSessionListId={selectedSessionListId}
-            onSelectedSessionListIdChange={setSelectedSessionListId}
+            multiple
+            selectedSessionListIds={selectedSessionListIds}
+            onSelectedSessionListIdsChange={setSelectedSessionListIds}
           />
         )}
 
@@ -843,6 +846,9 @@ export default function Messaging() {
   // active members of that list at request time.
   const [sessionPickMode, setSessionPickMode] = useState('sessions');
   const [selectedSessionListId, setSelectedSessionListId] = useState('');
+  // Multiple session lists can be selected at once; their members are
+  // unioned (deduped) server-side by resolveSessionIdsFromRequest.
+  const [selectedSessionListIds, setSelectedSessionListIds] = useState([]);
   const [delayMin, setDelayMin] = useState(2);
   const [delayMax, setDelayMax] = useState(5);
   const [msgsPerSession, setMsgsPerSession] = useState('');
@@ -1045,9 +1051,9 @@ export default function Messaging() {
   }, [targetMode, selectedList, targetIds, targetLists]);
 
   const distSessionIds = useMemo(() => {
-    if (sessionPickMode === 'list' && selectedSessionListId) return [];
+    if (sessionPickMode === 'list' && selectedSessionListIds.length > 0) return [];
     return Array.from(selectedSessionIds).map(String);
-  }, [sessionPickMode, selectedSessionListId, selectedSessionIds]);
+  }, [sessionPickMode, selectedSessionListIds, selectedSessionIds]);
 
   // When the operator picked a saved session list, the preview still
   // needs SOMETHING to plan against. The backend's `previewBulk`
@@ -1056,19 +1062,19 @@ export default function Messaging() {
   // endpoint already supports. Previously the effect below bailed on
   // empty `distSessionIds` and the operator's preview pane stayed
   // blank.
-  const distSessionListId = useMemo(
+  const distSessionListIds = useMemo(
     () =>
-      sessionPickMode === 'list' && selectedSessionListId
-        ? Number(selectedSessionListId)
-        : null,
-    [sessionPickMode, selectedSessionListId]
+      sessionPickMode === 'list' && selectedSessionListIds.length > 0
+        ? selectedSessionListIds.map(Number)
+        : [],
+    [sessionPickMode, selectedSessionListIds]
   );
 
   // Debounced dry-run for the bulk-message distribution plan.
   useEffect(() => {
     const seq = ++distSeq.current;
     const haveSessionSource =
-      distSessionIds.length > 0 || distSessionListId != null;
+      distSessionIds.length > 0 || distSessionListIds.length > 0;
     if (distTargetCount <= 0 || !haveSessionSource) {
       setDistPlan(null);
       setDistError(null);
@@ -1083,8 +1089,8 @@ export default function Messaging() {
           targetCount: distTargetCount,
           mode: distribution.mode || 'auto',
         };
-        if (distSessionListId != null) {
-          body.sessionListId = distSessionListId;
+        if (distSessionListIds.length > 0) {
+          body.sessionListIds = distSessionListIds;
         } else {
           body.sessionIds = distSessionIds;
         }
@@ -1107,7 +1113,7 @@ export default function Messaging() {
       }
     }, 350);
     return () => clearTimeout(handle);
-  }, [distTargetCount, distSessionIds, distSessionListId, distribution]);
+  }, [distTargetCount, distSessionIds, distSessionListIds, distribution]);
 
   // --- Actions ---
   const handleBulkSend = async () => {
@@ -1120,13 +1126,13 @@ export default function Messaging() {
       showError('Message exceeds maximum length.', 'Validation Error');
       return;
     }
-    const usingSessionList = sessionPickMode === 'list' && selectedSessionListId;
+    const usingSessionList = sessionPickMode === 'list' && selectedSessionListIds.length > 0;
     if (!usingSessionList && selectedSessionIds.size === 0) {
       showError('Please select at least one session (or pick a session list).', 'Validation Error');
       return;
     }
-    if (sessionPickMode === 'list' && !selectedSessionListId) {
-      showError('Please pick a session list.', 'Validation Error');
+    if (sessionPickMode === 'list' && selectedSessionListIds.length === 0) {
+      showError('Please pick at least one session list.', 'Validation Error');
       return;
     }
     if (targetMode === 'list' && !selectedList) {
@@ -1150,8 +1156,8 @@ export default function Messaging() {
         delayMax,
         async: false,
       };
-      if (sessionPickMode === 'list' && selectedSessionListId) {
-        payload.sessionListId = Number(selectedSessionListId);
+      if (sessionPickMode === 'list' && selectedSessionListIds.length > 0) {
+        payload.sessionListIds = selectedSessionListIds.map(Number);
       } else {
         payload.sessionIds = Array.from(selectedSessionIds);
       }
@@ -1226,7 +1232,7 @@ export default function Messaging() {
           replyWindowHours: 24,
           async: true,
         };
-        if (payload.sessionListId) failoverPayload.sessionListId = payload.sessionListId;
+        if (payload.sessionListIds) failoverPayload.sessionListIds = payload.sessionListIds;
         if (payload.sessionIds) failoverPayload.sessionIds = payload.sessionIds;
 
         const fRes = await sendFailover(failoverPayload);
@@ -1513,6 +1519,8 @@ export default function Messaging() {
           setSessionPickMode={setSessionPickMode}
           selectedSessionListId={selectedSessionListId}
           setSelectedSessionListId={setSelectedSessionListId}
+          selectedSessionListIds={selectedSessionListIds}
+          setSelectedSessionListIds={setSelectedSessionListIds}
         />
       </div>
 
