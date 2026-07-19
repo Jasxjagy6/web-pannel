@@ -32,8 +32,10 @@ const DEFAULT_CONFIG = {
   allowGroups: false,
   allowChannels: false,
   skipBots: true,
-  // AI provider selection: 'cupidbot' or 'capitalbot'
-  provider: 'cupidbot',
+  // AI provider selection: 'cupidbot' or 'capitalbot'.
+  // Default is capitalbot — this panel runs on CapitalBot license keys;
+  // CupidBot is only used if a session is explicitly switched to it.
+  provider: 'capitalbot',
   cupidbot: {
     app: 'telegram',
     isAPI: true,

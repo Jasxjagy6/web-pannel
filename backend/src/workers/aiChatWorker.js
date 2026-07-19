@@ -81,8 +81,9 @@ async function processGenerateReply(job) {
     confirmed_ai_message_ids: [],
   };
 
-  // Select AI provider from config (default: cupidbot for backward compatibility)
-  const provider = (config.provider || config.aiProvider || 'cupidbot').toLowerCase();
+  // Select AI provider from config. Default is capitalbot — this panel
+  // runs on CapitalBot; a session only uses CupidBot when explicitly set.
+  const provider = (config.provider || config.aiProvider || 'capitalbot').toLowerCase();
   const aiService = provider === 'capitalbot' ? capitalbotService : cupidbotService;
 
   // Serialize all jobs for the same (session, peer) so we never fire two
