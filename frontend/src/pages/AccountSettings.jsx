@@ -20,6 +20,7 @@ import {
   Image as ImageIcon,
   Plus,
   AlertCircle,
+  Clapperboard,
 } from 'lucide-react';
 import { useToast } from '../components/common/Toast';
 import { listSessions } from '../api/sessions';
@@ -33,6 +34,7 @@ import { parseApiError } from '../utils/formatters';
 import SessionListSwitcher from '../components/common/SessionListSwitcher';
 import AccountRandomizePanel from '../components/settings/AccountRandomizePanel';
 import AccountProfileListPanel from '../components/settings/AccountProfileListPanel';
+import AccountStoryPanel from '../components/settings/AccountStoryPanel';
 
 export default function AccountSettings() {
   const { showSuccess, showError } = useToast();
@@ -1547,9 +1549,34 @@ export default function AccountSettings() {
           <ListChecks className="w-4 h-4" />
           Profile List
         </button>
+        <button
+          type="button"
+          onClick={() => setMode('story')}
+          className={`inline-flex items-center gap-2 rounded-lg px-4 py-2 text-sm font-medium transition ${
+            mode === 'story'
+              ? 'bg-primary-500/20 text-primary-200 border border-primary-500/30'
+              : 'text-gray-400 hover:text-gray-200'
+          }`}
+        >
+          <Clapperboard className="w-4 h-4" />
+          Story
+        </button>
       </div>
 
-      {mode === 'profileList' ? (
+      {mode === 'story' ? (
+        <div className="grid grid-cols-1 xl:grid-cols-2 gap-6">
+          <div className="space-y-6">
+            <AccountStoryPanel
+              selectedSessions={selectedSessionObjects}
+              sessionPickMode={sessionPickMode}
+              selectedSessionListId={selectedSessionListId}
+              showSuccess={showSuccess}
+              showError={showError}
+            />
+          </div>
+          <div className="space-y-6">{renderSessionPicker()}</div>
+        </div>
+      ) : mode === 'profileList' ? (
         <div className="grid grid-cols-1 xl:grid-cols-2 gap-6">
           <div className="space-y-6">
             <AccountProfileListPanel

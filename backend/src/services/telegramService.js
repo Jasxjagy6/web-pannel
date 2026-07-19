@@ -2505,6 +2505,186 @@ class TelegramService {
   }
 
   /**
+   * Whether this session's account can post a Telegram Story right now.
+   *
+   * Stories are a Premium feature, so non-Premium accounts return false.
+   * We ask Telegram directly via stories.CanSendStory (authoritative,
+   * unlike the cached account_info.isPremium flag which can be stale).
+   * Returns { ok: boolean, reason: string|null }.
+   *
+   * @param {string|number} sessionId
+   * @returns {Promise<{ ok: boolean, reason: string|null }>}
+   */
+  async canSendStory(sessionId) {
+    await this._ensureConnected(sessionId);
+    const client = this.clients.get(String(sessionId)).client;
+    try {
+      const res = await client.invoke(
+        new Api.stories.CanSendStory({ peer: 'me' })
+      );
+      // CanSendStory returns a Bool (true) when allowed; Telegram raises an
+      // RPCError (e.g. PREMIUM_ACCOUNT_REQUIRED, STORIES_TOO_MUCH) otherwise.
+      return { ok: res === true || !!res, reason: null };
+    } catch (err) {
+      const msg = (err && err.message) || String(err);
+      let reason = 'cannot_send';
+      if (/PREMIUM/i.test(msg)) reason = 'not_premium';
+      else if (/STORIES_TOO_MUCH|STORY_SEND_FLOOD/i.test(msg)) reason = 'limit_reached';
+      logger.info(`canSendStory: session ${sessionId} cannot post a story (${reason}): ${msg}`);
+      return { ok: false, reason };
+    }
+  }
+
+  /**
+   * Post a Telegram Story (photo or video) from this session's own account.
+   *
+   * @param {string|number} sessionId
+   * @param {object} opts
+   * @param {string} opts.filePath     - Absolute path to the media on disk.
+   * @param {'photo'|'video'} opts.mediaType
+   * @param {string} [opts.fileName]
+   * @param {string} [opts.caption]    - Optional caption text.
+   * @param {string} [opts.linkUrl]    - Optional link appended + hyperlinked.
+   * @param {'everyone'|'contacts'|'close_friends'} [opts.privacy='everyone']
+   * @param {number} [opts.periodSeconds=86400] - Story lifetime (6h/12h/24h/48h).
+   * @param {boolean} [opts.pinToProfile=false]
+   * @returns {Promise<{ storyId: number|null }>}
+   */
+  async sendStory(sessionId, opts = {}) {
+    await this._ensureConnected(sessionId);
+    const fs = require('fs');
+    const path = require('path');
+    const { CustomFile } = require('telegram/client/uploads');
+
+    const {
+      filePath,
+      mediaType = 'photo',
+      fileName,
+      caption = '',
+      linkUrl = '',
+      privacy = 'everyone',
+      periodSeconds = 86400,
+      pinToProfile = false,
+    } = opts;
+
+    if (!filePath || !fs.existsSync(filePath)) {
+      throw new Error(`Story media file not found: ${filePath}`);
+    }
+
+    const client = this.clients.get(String(sessionId)).client;
+    const stat = fs.statSync(filePath);
+    const name = fileName || path.basename(filePath) || `story-${Date.now()}`;
+
+    // Build the caption + a tappable link entity. Telegram caps story
+    // captions at 2048 chars; we keep it simple and append the URL on its
+    // own line when a link is supplied, hyperlinking that exact substring
+    // via MessageEntityTextUrl so it renders as a tappable link.
+    let text = String(caption || '');
+    const entities = [];
+    const link = String(linkUrl || '').trim();
+    if (link) {
+      const sep = text.length ? '\n' : '';
+      const offset = [...(text + sep)].length; // UTF-16-ish offset base
+      text = text + sep + link;
+      entities.push(
+        new Api.MessageEntityTextUrl({
+          offset,
+          length: [...link].length,
+          url: link,
+        })
+      );
+    }
+    if (text.length > 2048) text = text.slice(0, 2048);
+
+    // Privacy rules.
+    let privacyRules;
+    if (privacy === 'contacts') {
+      privacyRules = [new Api.InputPrivacyValueAllowContacts()];
+    } else if (privacy === 'close_friends') {
+      privacyRules = [new Api.InputPrivacyValueAllowCloseFriends()];
+    } else {
+      privacyRules = [new Api.InputPrivacyValueAllowAll()];
+    }
+
+    // Clamp period to Telegram's allowed set.
+    const ALLOWED_PERIODS = [6 * 3600, 12 * 3600, 24 * 3600, 48 * 3600];
+    const period = ALLOWED_PERIODS.includes(Number(periodSeconds))
+      ? Number(periodSeconds)
+      : 86400;
+
+    const result = await this._withFloodRetry(sessionId, async () => {
+      const inputFile = await client.uploadFile({
+        file: new CustomFile(name, stat.size, filePath),
+        workers: 1,
+      });
+
+      let media;
+      if (mediaType === 'video') {
+        media = new Api.InputMediaUploadedDocument({
+          file: inputFile,
+          mimeType: 'video/mp4',
+          attributes: [
+            new Api.DocumentAttributeVideo({
+              supportsStreaming: true,
+              duration: 0,
+              w: 720,
+              h: 1280,
+            }),
+          ],
+        });
+      } else {
+        media = new Api.InputMediaUploadedPhoto({ file: inputFile });
+      }
+
+      return await client.invoke(
+        new Api.stories.SendStory({
+          peer: 'me',
+          media,
+          privacyRules,
+          randomId: this._randomBigInt(),
+          period,
+          caption: text || undefined,
+          entities: entities.length ? entities : undefined,
+          pinned: pinToProfile || undefined,
+        })
+      );
+    });
+
+    const storyId = this._extractStoryId(result);
+    logger.info(`Story posted for session ${sessionId}`, { storyId, mediaType, privacy, period });
+    return { storyId };
+  }
+
+  /**
+   * Generate a random 64-bit BigInt for use as an MTProto randomId.
+   * @returns {BigInt}
+   * @private
+   */
+  _randomBigInt() {
+    const crypto = require('crypto');
+    const buf = crypto.randomBytes(8);
+    return buf.readBigInt64LE(0);
+  }
+
+  /**
+   * Best-effort extraction of the new story id from a stories.SendStory
+   * Updates response. Returns null if the shape is unexpected.
+   * @private
+   */
+  _extractStoryId(updates) {
+    try {
+      const list = updates && Array.isArray(updates.updates) ? updates.updates : [];
+      for (const u of list) {
+        if (u && u.className === 'UpdateStory' && u.story && u.story.id != null) {
+          return Number(u.story.id);
+        }
+        if (u && u.story && u.story.id != null) return Number(u.story.id);
+      }
+    } catch { /* ignore */ }
+    return null;
+  }
+
+  /**
    * Pull the `photo.id` (as a BigInt) out of a `photos.UploadProfilePhoto`
    * MTProto response. Returns null if the shape is unexpected.
    *
