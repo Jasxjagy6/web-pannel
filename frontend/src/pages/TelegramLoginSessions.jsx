@@ -250,8 +250,9 @@ export default function TelegramLoginSessions() {
         try { w.focus(); } catch (_) { /* ignore */ }
       }
     } catch (err) {
+      const e = err?.response?.data?.error;
       toast?.error?.(
-        err?.response?.data?.error ||
+        (typeof e === 'string' ? e : e?.message) ||
           err?.message ||
           'Failed to connect this session.'
       );

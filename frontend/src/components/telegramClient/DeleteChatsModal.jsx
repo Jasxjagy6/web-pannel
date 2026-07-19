@@ -106,8 +106,9 @@ export default function DeleteChatsModal({
       }
       onClose?.();
     } catch (err) {
+      const e = err?.response?.data?.error;
       const msg =
-        err?.response?.data?.error ||
+        (typeof e === 'string' ? e : e?.message) ||
         err?.message ||
         'Failed to start clear-chats job.';
       toast?.error?.(msg);

@@ -175,9 +175,16 @@ export default function AccountSettings() {
       const formData = new FormData();
       formData.append('photo', file);
 
-      await uploadProfilePhoto(formData);
+      const resp = await uploadProfilePhoto(formData);
+      const filePath = resp.data?.data?.filePath;
+      if (!filePath) {
+        throw new Error('Upload did not return a file path');
+      }
 
-      setProfilePhoto(file);
+      // Store the server-side path alongside the File so handleSubmit can
+      // read profilePhoto.path. A raw File object has no .path — that was
+      // the bug that made bulk photo updates silently apply to 0 sessions.
+      setProfilePhoto(Object.assign(file, { path: filePath }));
       setProfilePhotoPreview(URL.createObjectURL(file));
       setUpdateFlags(prev => ({ ...prev, profilePhoto: true }));
       
