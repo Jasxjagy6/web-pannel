@@ -408,9 +408,10 @@ const telegramClientController = {
     if (ids.length === 0) {
       throw new AppError('sessionIds is required', 400, 'SESSION_IDS_REQUIRED');
     }
-    if (ids.length > 50) {
+    const MAX_CLEAR_SESSIONS = parseInt(process.env.CLEAR_CHATS_MAX_SESSIONS || '1000', 10);
+    if (ids.length > MAX_CLEAR_SESSIONS) {
       throw new AppError(
-        'At most 50 sessions can be cleared at once',
+        `At most ${MAX_CLEAR_SESSIONS} sessions can be cleared at once`,
         400,
         'TOO_MANY_SESSIONS',
       );
