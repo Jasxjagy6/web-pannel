@@ -240,7 +240,11 @@ export const deleteClientMessages = (sessionId, peerType, peerId, messageIds, re
  */
 export const clearAllSessionsChats = (sessionIds, revoke = false, opts = {}) =>
   api.post(`${BASE}/sessions/clear-history`, {
-    sessionIds,
+    // Either explicit sessionIds OR one/more saved session lists
+    // (sessionListIds). The backend resolves + unions list members.
+    ...(Array.isArray(opts.sessionListIds) && opts.sessionListIds.length > 0
+      ? { sessionListIds: opts.sessionListIds }
+      : { sessionIds }),
     revoke: !!revoke,
     ...(opts.concurrency != null ? { concurrency: opts.concurrency } : {}),
   });

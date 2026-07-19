@@ -19,10 +19,11 @@
  */
 
 import React, { useEffect, useMemo, useRef, useState } from 'react';
-import { AlertTriangle, History, Loader2, Trash2 } from 'lucide-react';
+import { AlertTriangle, History, Loader2, Trash2, Users, Layers } from 'lucide-react';
 import { Modal } from '../common/Modal';
 import { clearAllSessionsChats } from '../../api/telegramClient';
 import { useToast } from '../common/Toast';
+import SessionListSwitcher from '../common/SessionListSwitcher';
 
 function _displayName(s) {
   if (!s) return 'Session';
@@ -57,6 +58,10 @@ export default function DeleteChatsModal({
 
   const [revoke, setRevoke] = useState(false);
   const [submitting, setSubmitting] = useState(false);
+  // Source of sessions to clear: the checkbox selection from the page
+  // ('sessions'), or one/more saved session lists ('list').
+  const [sourceMode, setSourceMode] = useState('sessions');
+  const [selectedListIds, setSelectedListIds] = useState([]);
 
   // Reset the modal whenever it is reopened.
   const prevOpenRef = useRef(false);
@@ -64,6 +69,8 @@ export default function DeleteChatsModal({
     if (isOpen && !prevOpenRef.current) {
       setRevoke(false);
       setSubmitting(false);
+      setSourceMode('sessions');
+      setSelectedListIds([]);
     }
     prevOpenRef.current = isOpen;
   }, [isOpen]);
@@ -73,16 +80,26 @@ export default function DeleteChatsModal({
     [sessions],
   );
 
+  const usingLists = sourceMode === 'list';
+  // Whether the confirm button can fire.
+  const canSubmit = usingLists
+    ? selectedListIds.length > 0
+    : sessionIds.length > 0;
+
   const handleConfirm = async () => {
-    if (sessionIds.length === 0 || submitting) return;
+    if (!canSubmit || submitting) return;
     setSubmitting(true);
     try {
-      const { data } = await clearAllSessionsChats(sessionIds, revoke);
+      const { data } = usingLists
+        ? await clearAllSessionsChats([], revoke, { sessionListIds: selectedListIds })
+        : await clearAllSessionsChats(sessionIds, revoke);
       const payload = data?.data || data;
       const jobId = payload?.jobId;
       const job = payload?.job;
       toast?.success?.(
-        `Job started for ${sessionIds.length} session${sessionIds.length === 1 ? '' : 's'}. Track progress in History.`,
+        usingLists
+          ? `Job started for ${selectedListIds.length} session list${selectedListIds.length === 1 ? '' : 's'}. Track progress in History.`
+          : `Job started for ${sessionIds.length} session${sessionIds.length === 1 ? '' : 's'}. Track progress in History.`,
       );
       if (typeof onJobCreated === 'function') {
         onJobCreated({ jobId, job });
@@ -111,7 +128,7 @@ export default function DeleteChatsModal({
       <button
         type="button"
         onClick={handleConfirm}
-        disabled={submitting || sessionIds.length === 0}
+        disabled={submitting || !canSubmit}
         className="inline-flex items-center gap-2 rounded-md bg-red-600 px-3 py-1.5 text-sm font-semibold text-white hover:bg-red-500 disabled:cursor-not-allowed disabled:bg-red-600/40"
       >
         {submitting ? (
@@ -140,17 +157,16 @@ export default function DeleteChatsModal({
             <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-red-300" />
             <div>
               <p className="font-medium text-red-200">
-                This wipes every dialog from the selected session
-                {sessionIds.length === 1 ? '' : 's'}: private chats are
-                cleared, bots are removed and blocked, and groups and
-                channels are left (or deleted if the account is the
+                This wipes every dialog from the targeted sessions: private
+                chats are cleared, bots are removed and blocked, and groups
+                and channels are left (or deleted if the account is the
                 owner).
               </p>
               <p className="mt-1 text-red-300/80">
-                The action runs across {sessionIds.length} session
-                {sessionIds.length === 1 ? '' : 's'} in parallel and
-                processes each session&apos;s dialogs concurrently. This
-                cannot be undone.
+                {usingLists
+                  ? `The selected session list${selectedListIds.length === 1 ? '' : 's'} will be expanded to their member sessions and processed in parallel. `
+                  : `The action runs across ${sessionIds.length} session${sessionIds.length === 1 ? '' : 's'} in parallel and processes each session's dialogs concurrently. `}
+                This cannot be undone.
               </p>
             </div>
           </div>
@@ -225,16 +241,67 @@ export default function DeleteChatsModal({
           </label>
         </fieldset>
 
+        {/* Source: the checkbox selection, or saved session list(s). */}
         <div>
           <h3 className="mb-2 text-xs font-semibold uppercase tracking-wider text-gray-400">
-            Selected session{sessionIds.length === 1 ? '' : 's'} (
-            {sessionIds.length})
+            Apply to
           </h3>
-          <ul className="max-h-72 space-y-2 overflow-y-auto pr-1">
-            {sessions.map((s) => (
-              <_SessionRow key={s.id} session={s} />
-            ))}
-          </ul>
+          <div className="mb-3 grid grid-cols-2 gap-2 rounded-xl border border-white/10 bg-dark-900 p-1">
+            <button
+              type="button"
+              disabled={submitting}
+              onClick={() => setSourceMode('sessions')}
+              className={`flex items-center justify-center gap-1.5 rounded-lg px-3 py-2 text-sm font-medium transition ${
+                !usingLists
+                  ? 'bg-primary-500/15 text-primary-300 ring-1 ring-primary-500/40'
+                  : 'text-gray-400 hover:text-white hover:bg-white/5'
+              }`}
+            >
+              <Users className="h-3.5 w-3.5" />
+              Selected sessions{sessionIds.length ? ` (${sessionIds.length})` : ''}
+            </button>
+            <button
+              type="button"
+              disabled={submitting}
+              onClick={() => setSourceMode('list')}
+              className={`flex items-center justify-center gap-1.5 rounded-lg px-3 py-2 text-sm font-medium transition ${
+                usingLists
+                  ? 'bg-primary-500/15 text-primary-300 ring-1 ring-primary-500/40'
+                  : 'text-gray-400 hover:text-white hover:bg-white/5'
+              }`}
+            >
+              <Layers className="h-3.5 w-3.5" />
+              Session lists
+            </button>
+          </div>
+
+          {usingLists ? (
+            <>
+              <SessionListSwitcher
+                mode="list"
+                onModeChange={() => {}}
+                multiple
+                selectedSessionListIds={selectedListIds}
+                onSelectedSessionListIdsChange={setSelectedListIds}
+                disabled={submitting}
+              />
+              <p className="mt-2 text-[11px] text-gray-500">
+                Members of the selected list{selectedListIds.length === 1 ? '' : 's'} are
+                combined and de-duplicated. A maximum of 50 sessions can be cleared per job.
+              </p>
+            </>
+          ) : sessions.length === 0 ? (
+            <p className="rounded-lg border border-white/10 bg-dark-900/60 px-3 py-3 text-xs text-gray-400">
+              No sessions selected. Tick sessions on the Sessions tab, or switch to
+              <span className="font-medium text-gray-200"> Session lists</span> above.
+            </p>
+          ) : (
+            <ul className="max-h-72 space-y-2 overflow-y-auto pr-1">
+              {sessions.map((s) => (
+                <_SessionRow key={s.id} session={s} />
+              ))}
+            </ul>
+          )}
         </div>
       </div>
     </Modal>
