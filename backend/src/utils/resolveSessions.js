@@ -24,12 +24,20 @@ const sessionListService = require('../services/sessionListService');
 async function resolveSessionIdsFromRequest(req, fallbackSessionIds = [], opts = {}) {
   const body = req && req.body ? req.body : {};
   const listId = body.sessionListId ?? body.session_list_id;
-  if (listId != null && listId !== '') {
+  // New: accept a plural `sessionListIds` array so callers can target
+  // several session lists at once. The resolver unions + de-dupes members
+  // across every referenced list. Backward compatible with `sessionListId`.
+  const listIds = body.sessionListIds ?? body.session_list_ids;
+  const hasList =
+    (Array.isArray(listIds) && listIds.length > 0) ||
+    (listId != null && listId !== '');
+  if (hasList) {
     return sessionListService.resolveSessionIds({
       userId: req.user && req.user.id,
       platform: req.platform,
       sessionIds: [],
       sessionListId: listId,
+      sessionListIds: Array.isArray(listIds) ? listIds : undefined,
       includeAll: !!opts.includeAll,
     });
   }
