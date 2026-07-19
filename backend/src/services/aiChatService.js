@@ -158,7 +158,15 @@ class AiChatService {
     // Bot check: msg.fromId doesn't have bot, but event.getSender() fails for unknown
     // entities. We use msg.fromId.bot if available, else skip.
     const title = tcService._entityTitle(chat || msg.fromId) || '';
-    const username = (chat || msg.fromId).username || 'john_smith2';
+    // Real Telegram @username or '' — do NOT fabricate one. CapitalBot
+    // matches ignore-lists and internal-account detection against
+    // userInfos.username (case-insensitive), so a hardcoded placeholder
+    // would (a) make every username-less user share one identity in
+    // CapitalBot's stats and (b) silently drop ALL of them the moment
+    // that placeholder ever lands on an ignore list. Empty is safe:
+    // username is an optional field and is omitted from the payload below
+    // when blank.
+    const username = (chat || msg.fromId).username || '';
 
     // Bot check: use msg.fromId. For DMs, this is a PeerUser with userId.
     // If getSender() returns a User with bot, check it.
