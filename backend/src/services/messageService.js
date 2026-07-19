@@ -241,6 +241,21 @@ function classifyFailoverError(errorMessage, errorCode) {
 
   const has = (needle) => hay.includes(needle);
 
+  // GramJS surfaces flood waits as a plain-English message
+  // "A wait of N seconds is required (caused by ...)" — it does NOT contain
+  // the literal token "FLOOD_WAIT". If we don't catch this wording the
+  // runner misreads a flooded account as a per-target failure, keeps the
+  // same dead session, and burns the ENTIRE list failing every target
+  // (exactly what happened on job 23: one session flood-waited on
+  // ResolveUsername, 99/100 "failed", never switched). Treat any
+  // "wait of N seconds" / "SECONDS IS REQUIRED" as a session-limit signal
+  // so we retire the session and resume the same target on the next one.
+  const FLOOD_WAIT_WORDING =
+    /A WAIT OF \d+ SECONDS/.test(hay) || /SECONDS IS REQUIRED/.test(hay);
+  if (FLOOD_WAIT_WORDING) {
+    return { action: 'switch_session', reason: 'FLOOD_WAIT', limited: true };
+  }
+
   // --- SESSION LIMITED / MUTUAL-CONTACTS-ONLY -> switch session, resume same target ---
   // Telegram rate-limits and "you may only message contacts / peer
   // privacy forbids strangers" signals. These mean THIS account cannot
@@ -250,7 +265,9 @@ function classifyFailoverError(errorMessage, errorCode) {
     'PEER_FLOOD',            // account flagged for spam / mass DMs
     'FLOOD_WAIT',            // rate limited
     'FLOOD_PREMIUM_WAIT',
+    'FLOODWAIT',             // some layers omit the underscore
     'SLOWMODE_WAIT',
+    'TOO MANY REQUESTS',
     'USER_NOT_MUTUAL_CONTACT', // can only send to mutual contacts
     'USER_PRIVACY_RESTRICTED',
     'PRIVACY_RESTRICTED',
@@ -1315,6 +1332,36 @@ class MessageService {
     if (!sessionIds || sessionIds.length === 0) {
       throw new AppError('At least one session ID is required', 400, 'NO_SESSIONS');
     }
+
+    // When the send is backed by a saved list, ALWAYS reload the full set
+    // of items server-side from the DB. The frontend fetches list items
+    // through the paginated /lists/:id/items endpoint, which hard-caps at
+    // 100 rows (applyPagination), so trusting the client-supplied
+    // targetList silently truncates a 534-item list down to 100. Loading
+    // here guarantees every target in the list is sent to.
+    if (sourceType === 'list' && sourceId != null) {
+      try {
+        const { rows } = await pool.query(
+          `SELECT telegram_id, username, first_name, last_name, phone, access_hash
+             FROM list_items WHERE list_id = $1 ORDER BY id ASC`,
+          [Number(sourceId)]
+        );
+        if (rows.length > 0) {
+          targetList = rows.map((r) => ({
+            telegram_id: r.telegram_id,
+            username: r.username,
+            first_name: r.first_name,
+            last_name: r.last_name,
+            phone: r.phone,
+            access_hash: r.access_hash,
+          }));
+          logger.info(`Failover: loaded full list ${sourceId} server-side (${targetList.length} items)`);
+        }
+      } catch (err) {
+        logger.warn(`Failover: full-list load for ${sourceId} failed, using client targetList: ${err.message}`);
+      }
+    }
+
     if (!targetList || targetList.length === 0) {
       throw new AppError('Target list cannot be empty', 400, 'EMPTY_TARGET_LIST');
     }
@@ -1457,12 +1504,12 @@ class MessageService {
       const placeholders = [];
       let p = 1;
       for (const r of logRows) {
-        placeholders.push(`($${p}, $${p + 1}, $${p + 2}, $${p + 3}, NOW())`);
-        values.push(r.jobId, r.sessionId, r.targetId, r.status);
-        p += 4;
+        placeholders.push(`($${p}, $${p + 1}, $${p + 2}, $${p + 3}, $${p + 4}, NOW())`);
+        values.push(r.jobId, r.sessionId, r.targetId, r.status, r.error || null);
+        p += 5;
       }
       await pool.query(
-        `INSERT INTO message_logs (job_id, session_id, target_id, status, sent_at)
+        `INSERT INTO message_logs (job_id, session_id, target_id, status, error_message, sent_at)
          VALUES ${placeholders.join(', ')}`,
         values
       ).catch((e) => logger.warn(`failover message_logs insert failed: ${e.message}`));
@@ -1492,6 +1539,15 @@ class MessageService {
     };
 
     const isCancelled = async () => {
+      // Fast path: the Redis cancel token is set synchronously by
+      // cancelJob() the instant the operator clicks Cancel, so we see it
+      // without waiting for the DB. Fall back to the DB status flag.
+      try {
+        if (redisClient && redisClient.isReady) {
+          const tok = await redisClient.get(`message:cancel:${jobId}`);
+          if (tok) return true;
+        }
+      } catch { /* ignore redis errors, fall through to DB */ }
       try {
         const r = await pool.query('SELECT status FROM messaging_jobs WHERE id = $1', [jobId]);
         return r.rows[0]?.status === 'cancelled';
@@ -1570,7 +1626,7 @@ class MessageService {
           );
           logRows.push({
             jobId, sessionId: Number(sessionId), targetId: target.addr,
-            status: 'session_limited',
+            status: 'session_limited', error: `${decision.reason}: ${raw.slice(0, 200)}`,
           });
           sessionIndex++; // move to next session; cursor `i` unchanged
         } else {
@@ -1581,7 +1637,7 @@ class MessageService {
           );
           logRows.push({
             jobId, sessionId: Number(sessionId), targetId: target.addr,
-            status: 'failed',
+            status: 'failed', error: `${decision.reason}: ${raw.slice(0, 200)}`,
           });
           i++;
         }
@@ -1594,15 +1650,21 @@ class MessageService {
     await flushLogs();
     await persistState(i);
 
+    // Preserve a 'cancelled' status. The loop breaks early on cancel, but
+    // if we blindly wrote 'completed' here we'd stomp the cancellation the
+    // operator just requested (the job would flip back to completed in the
+    // UI). Only mark completed when the job wasn't cancelled.
+    const cancelledNow = await isCancelled();
+    const finalStatus = cancelledNow ? 'cancelled' : 'completed';
     await pool.query(
       `UPDATE messaging_jobs
-          SET status = 'completed', sent_count = $2, failed_count = $3,
+          SET status = $5, sent_count = $2, failed_count = $3,
               skipped_count = $4, completed_at = NOW()
         WHERE id = $1`,
-      [jobId, sent, failed, skipped]
+      [jobId, sent, failed, skipped, finalStatus]
     );
 
-    logger.info(`Failover job ${jobId} complete: ${sent} sent, ${failed} failed, ${skipped} skipped`);
+    logger.info(`Failover job ${jobId} ${finalStatus}: ${sent} sent, ${failed} failed, ${skipped} skipped`);
     return { sent, failed, skipped, sessionsUsed: sessionIndex + 1 - retired.size >= 0 ? Math.min(sessionIndex + 1, sessionIds.length) : sessionIds.length };
   }
 
