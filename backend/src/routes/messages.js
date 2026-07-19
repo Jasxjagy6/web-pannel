@@ -1,6 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const messageController = require('../controllers/messageController');
+const { getJobSessionBreakdown } = require('../controllers/messageController_sessionBreakdown');
 const { authenticate, requireApproved } = require('../middleware/auth');
 const { messageLimiter } = require('../middleware/rateLimiter');
 const { validate, schemas } = require('../middleware/validator');
@@ -84,6 +85,9 @@ router.post('/schedules/:id/cancel', messageController.cancelSchedule);
 // GET /api/messages/jobs/:id/replies - Per-recipient reply breakdown
 // (the job-history dropdown). Declared before the catch-all `/:id`.
 router.get('/jobs/:id/replies', messageController.getJobReplyDetails);
+
+// GET /api/messages/jobs/:id/session-breakdown - Per-session send breakdown
+router.get('/jobs/:id/session-breakdown', getJobSessionBreakdown);
 
 // GET /api/messages/jobs/:id - Get job
 router.get('/:id', messageController.getJob);

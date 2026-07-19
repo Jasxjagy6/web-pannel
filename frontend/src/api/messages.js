@@ -72,3 +72,7 @@ export const sendFailover = (data) => api.post('/messages/failover', data);
 // Per-recipient reply breakdown for a finished send job (job-history
 // dropdown: "sent to user 1 — not replied", "sent to user 2 — replied").
 export const getJobReplyDetails = (id) => api.get(`/messages/jobs/${id}/replies`);
+
+// Per-session send breakdown: how many sessions were used (sent ≥1 successful
+// DM) out of total provided, and how many successful DMs each session sent.
+export const getJobSessionBreakdown = (id) => api.get(`/messages/jobs/${id}/session-breakdown`);

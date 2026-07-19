@@ -24,6 +24,7 @@ import MessageSchedulesTab from './MessageSchedulesTab';
 import MessageSingleUserTab from './MessageSingleUserTab';
 import MessageSingleUserHistoryTab from './MessageSingleUserHistoryTab';
 import MessageReplyDetails from './MessageReplyDetails';
+import MessageSessionBreakdown from './MessageSessionBreakdown';
 import {
   Send,
   Loader2,
@@ -1848,8 +1849,9 @@ export default function Messaging() {
                       </tr>
                       {isExpanded && (
                         <tr className="bg-dark-900/40">
-                          <td colSpan={8} className="px-4 py-3">
+                          <td colSpan={8} className="px-4 py-3 space-y-3">
                             <MessageReplyDetails jobId={job.id} />
+                            <MessageSessionBreakdown jobId={job.id} />
                           </td>
                         </tr>
                       )}

@@ -21,6 +21,7 @@ import StatusBadge from '../components/common/StatusBadge';
 import SessionCloneExportModal from '../components/common/SessionCloneExportModal';
 import SessionBulkLoginModal from '../components/common/SessionBulkLoginModal';
 import SessionBulkAuthPurgeModal from '../components/common/SessionBulkAuthPurgeModal';
+import SpamAppealModal from '../components/common/SpamAppealModal';
 import {
   CloudArrowUpIcon,
   MagnifyingGlassIcon,
@@ -58,6 +59,7 @@ import {
   LifeBuoy,
   ShieldAlert,
   ShieldOff,
+  MessageSquare,
 } from 'lucide-react';
 
 // --- Helper: format file size ---
@@ -921,6 +923,8 @@ export default function Sessions() {
   const [bulkLoginSelection, setBulkLoginSelection] = useState([]);
   const [authPurgeOpen, setAuthPurgeOpen] = useState(false);
   const [authPurgeSelection, setAuthPurgeSelection] = useState([]);
+  const [appealOpen, setAppealOpen] = useState(false);
+  const [appealSelection, setAppealSelection] = useState([]);
 
   // The Sessions tab lists every uploaded row in one shot — operators
   // routinely upload hundreds at a time and have asked for "no limit, list
@@ -1221,6 +1225,19 @@ export default function Sessions() {
     setAuthPurgeOpen(true);
   };
 
+  // Appeal restrictions via @SpamBot for the selected sessions.
+  const handleSpamAppeal = () => {
+    if (selectedIds.size === 0) return;
+    const ids = Array.from(selectedIds);
+    setAppealSelection(
+      ids
+        .map((id) => sessions.find((s) => s.id === id))
+        .filter(Boolean)
+        .map((s) => ({ id: s.id, phone: s.phone }))
+    );
+    setAppealOpen(true);
+  };
+
   const handleBulkLogout = async () => {
     if (selectedIds.size === 0) return;
     showInfo(`Logging out ${selectedIds.size} session(s)...`, 'Bulk Logout');
@@ -1514,6 +1531,15 @@ export default function Sessions() {
             >
               <ShieldOff className="w-3.5 h-3.5" />
               Terminate Other Sessions
+            </button>
+            <button
+              onClick={handleSpamAppeal}
+              disabled={uploading}
+              className="flex items-center gap-1.5 rounded-lg bg-primary-600/20 border border-primary-500/30 px-3 py-1.5 text-sm font-medium text-primary-300 hover:bg-primary-600/30 transition disabled:opacity-50"
+              title="For each selected session, message @SpamBot; if the account is restricted, automatically press the appeal button and submit an appeal."
+            >
+              <MessageSquare className="w-3.5 h-3.5" />
+              Appeal (@SpamBot)
             </button>
             <button
               onClick={handleBulkDelete}
@@ -1977,6 +2003,12 @@ export default function Sessions() {
           // UI without the operator having to manually refresh.
           fetchSessions();
         }}
+      />
+
+      <SpamAppealModal
+        isOpen={appealOpen}
+        onClose={() => setAppealOpen(false)}
+        selectedSessions={appealSelection}
       />
 
       <SessionBulkAuthPurgeModal

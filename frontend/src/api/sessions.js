@@ -155,6 +155,16 @@ export const getBulkAuthPurgeStatus = (jobId) =>
 export const cancelBulkAuthPurge = (jobId) =>
   api.post(`/sessions/bulk-auth-purge/${jobId}/cancel`);
 
+// @SpamBot appeal job. Accepts { sessionIds } or { sessionListIds }.
+export const startSpamAppeal = (payload) =>
+  api.post('/sessions/spam-appeal/start', payload);
+
+export const getSpamAppealStatus = (jobId) =>
+  api.get(`/sessions/spam-appeal/${jobId}/status`);
+
+export const cancelSpamAppeal = (jobId) =>
+  api.post(`/sessions/spam-appeal/${jobId}/cancel`);
+
 export const downloadCloneExportZip = async (jobId) => {
   const response = await api.get(`/sessions/clone-export/${jobId}/download`, {
     responseType: 'blob',
