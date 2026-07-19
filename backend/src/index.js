@@ -30,6 +30,7 @@ const proxyRoutes = require('./routes/proxies');
 const userProxyRoutes = require('./routes/userProxies');
 const antiDetectRoutes = require('./routes/antiDetect');
 const privacyRoutes = require('./routes/privacy');
+const storyRoutes = require('./routes/stories');
 const loginEmailRoutes = require('./routes/loginEmail');
 const adminRoutes = require('./routes/admin');
 const billingRoutes = require('./routes/billing');
@@ -175,6 +176,7 @@ const PLATFORM_ROUTERS = [
   ['/privacy', privacyRoutes],
   ['/login-email', loginEmailRoutes],
   ['/session-lists',    sessionListRoutes],
+  ['/stories',          storyRoutes],
 ];
 
 for (const [mountPath, router] of PLATFORM_ROUTERS) {
@@ -566,6 +568,16 @@ async function start() {
       privacyJobWorker.startPrivacyJobWorker();
     } catch (err) {
       logger.warn(`privacyJobWorker.start failed: ${err.message}`);
+    }
+
+    // 5b. Boot the Story job worker. Drains queued story_jobs and posts
+    //     the uploaded photo/video as a Telegram Story on each selected
+    //     Premium session (skipping non-Premium / ineligible accounts).
+    try {
+      const storyJobWorker = require('./services/storyJobWorker');
+      storyJobWorker.startStoryJobWorker();
+    } catch (err) {
+      logger.warn(`storyJobWorker.start failed: ${err.message}`);
     }
 
     // 6. Boot the Instagram session warm-up scheduler. Every minute it
