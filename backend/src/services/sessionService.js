@@ -3098,23 +3098,30 @@ class SessionService {
           }
           if (!wasActive) revived++;
 
-          // AI auto-responder: the reconnect path above may rebuild the
-          // GramJS client (proxy fallback, stale socket swap, etc.).
-          // When that happens the old event handlers are lost, but
-          // aiSessionManager still thinks it is attached because its Map
-          // holds the unsubscribe function for the old client.  Use
-          // reattach() so the stale reference is dropped and a fresh
-          // listener is registered against the current client.
+          // AI auto-responder: keep the listener alive WITHOUT churning.
+          // ensureAttached() is a no-op when the listener is already
+          // attached to the current client (the common case), and only
+          // re-binds when the client was actually rebuilt (proxy swap,
+          // socket revive) or the listener is missing. The old code called
+          // reattach() unconditionally every heartbeat (~60s), which
+          // detached the working listener each cycle and dropped any
+          // message that landed in the gap — the "AI randomly stops for
+          // some accounts" bug.
           try {
             const aiSessionManager = require('./aiSessionManager');
             const aiChatService = require('./aiChatService');
             const aiSettings = await aiChatService.getSessionSettings(row.id);
             if (aiSettings.enabled) {
-              await aiSessionManager.reattach(String(row.id));
+              const r = await aiSessionManager.ensureAttached(String(row.id));
+              if (r && r.action === 'reattached') {
+                logger.info(
+                  `AI listener re-bound for session ${row.id} (${r.reason || 'client changed'})`
+                );
+              }
             }
           } catch (aiErr) {
             logger.warn(
-              `AI listener reattach failed during heartbeat for session ${row.id}: ${aiErr.message}`
+              `AI listener ensureAttached failed during heartbeat for session ${row.id}: ${aiErr.message}`
             );
           }
 
