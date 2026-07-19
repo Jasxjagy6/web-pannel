@@ -244,16 +244,25 @@ class CapitalBotService {
     const userModelId = accessToken.modelId;
     const userPresetId = accessToken.presetId;
 
-    // Per-conversation identity. CapitalBot keys its server-side state by
-    // (accountId, useridentifier), so this MUST be unique per recipient and
-    // MUST NOT be empty — an empty identifier would collapse every chat on
-    // this account into one shared context and leak one user's history into
-    // another's replies. Fall back to an accountId-scoped peer key if the
-    // caller somehow didn't supply a recipient id.
-    const rawUserIdent = String(
+    // Per-conversation identity. CapitalBot keys its engagement/lead
+    // state by `useridentifier` and dedups leads ACROSS every account on
+    // the same license: if we send the bare Telegram peer id, then the
+    // moment ONE session replies to a user CapitalBot marks that user as
+    // `messagedAlready` (engagedBy: <that account>), and every OTHER
+    // session that talks to the same user gets `messaged_already` →
+    // not_our_turn → silence. In this panel the same lead legitimately
+    // DMs many of our sessions and each session must answer independently,
+    // so we namespace the identifier with the account/session id. That
+    // makes (session 211 ↔ user X) and (session 213 ↔ user X) two
+    // distinct CapitalBot leads instead of one shared, first-come-locked
+    // lead. It MUST also be non-empty — an empty identifier would collapse
+    // every chat on an account into one context and leak history between
+    // users.
+    const rawPeerId = String(
       recipient.id || recipient.useridentifier || recipient.peerId || ''
     ).trim();
-    const useridentifier = rawUserIdent || `acct${accountID}_unknown`;
+    const peerPart = rawPeerId || 'unknown';
+    const useridentifier = `acct${accountID}_${peerPart}`;
 
     const body = {
       licensekey: licenseKey,
@@ -395,6 +404,13 @@ class CapitalBotService {
     return {
       category,
       isGhosting: category && ['underage', 'timewaste', 'tier_filtered', 'gender_filtered', 'ppv_exhausted'].includes(category),
+      // `messaged_already` used to fire constantly because every session
+      // shared one CapitalBot lead per Telegram user (see the
+      // useridentifier note in generateReply). Now that the identifier is
+      // namespaced per account/session, each session owns its own lead and
+      // this category should effectively never appear for our normal
+      // multi-session fan-in. It's kept here so that if CapitalBot ever
+      // does legitimately return it, we still stop rather than spam.
       isNotOurTurn: category && ['messaged_already', 'internal_account', 'ignored', 'chat_cooldown', 'ai_credit_over'].includes(category),
       reason: category ? interventionReasons[category] || null : null,
     };
