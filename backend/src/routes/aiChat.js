@@ -17,6 +17,9 @@ router.use(generalLimiter);
 router.get('/sessions/:id/ai-settings', controller.getSessionSettings);
 router.patch('/sessions/:id/ai-settings', controller.updateSessionSettings);
 
+// Bulk enable/disable AI across every Telegram session the caller owns.
+router.post('/bulk-toggle', controller.bulkToggle);
+
 router.get('/sessions/:id/ai-chats', controller.listChatSettings);
 router.patch('/sessions/:id/ai-chats/:peerType/:peerId', controller.updateChatSettings);
 router.post('/sessions/:id/ai-chats/:peerType/:peerId/seed', controller.seedChatMemory);

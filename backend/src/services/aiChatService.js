@@ -409,6 +409,132 @@ class AiChatService {
   }
 
   /**
+   * Resolve which AI provider a user should use for a bulk enable, based
+   * on which API key they have configured AND validated.
+   *
+   * Preference order when both are valid: CapitalBot, then CupidBot.
+   * Returns null when neither key is valid — the caller refuses to enable.
+   *
+   * @param {number|string} userId
+   * @returns {Promise<'capitalbot'|'cupidbot'|null>}
+   */
+  async resolveActiveProvider(userId) {
+    // Lazy-require the provider services to avoid any module-load cycles.
+    const cupidbotService = require('./cupidbotService');
+    const capitalbotService = require('./capitalbotService');
+
+    let capitalValid = false;
+    let cupidValid = false;
+    try {
+      const cap = await capitalbotService.getAccessToken(userId);
+      capitalValid = !!cap?.isValid;
+    } catch {
+      capitalValid = false;
+    }
+    try {
+      const cup = await cupidbotService.getAccessToken(userId);
+      cupidValid = !!cup?.isValid;
+    } catch {
+      cupidValid = false;
+    }
+
+    if (capitalValid) return 'capitalbot';
+    if (cupidValid) return 'cupidbot';
+    return null;
+  }
+
+  /**
+   * Bulk enable/disable AI across every Telegram session owned by the user.
+   *
+   * - OFF: disables AI on all sessions (detaches listeners, flips DB rows).
+   * - ON:  resolves the user's configured provider (capitalbot if its key
+   *        is valid, else cupidbot) and enables every logged-in session
+   *        with that provider stamped into each session's config, so the
+   *        worker routes to the right API. Refuses (throws) if neither key
+   *        is valid.
+   *
+   * Each session's OTHER config keys are preserved; only provider is
+   * (re)written on enable. Runs sequentially to avoid a thundering herd of
+   * GramJS listener attaches. Per-session failures are collected rather
+   * than aborting the whole batch.
+   *
+   * @param {number|string} userId
+   * @param {boolean} enabled
+   * @returns {Promise<object>}
+   */
+  async bulkSetSessionsEnabled(userId, enabled) {
+    let provider = null;
+    if (enabled) {
+      provider = await this.resolveActiveProvider(userId);
+      if (!provider) {
+        throw new AppError(
+          'No valid AI API key configured. Add and validate a CupidBot or CapitalBot key first.',
+          400,
+          'NO_VALID_AI_KEY'
+        );
+      }
+    }
+
+    // Every Telegram session this user owns.
+    const { rows } = await pool.query(
+      `SELECT id, is_logged_in FROM sessions
+        WHERE user_id = $1 AND platform = 'telegram'
+        ORDER BY id`,
+      [userId]
+    );
+
+    const results = [];
+    let changed = 0;
+    let failed = 0;
+    let skipped = 0;
+
+    for (const row of rows) {
+      const sid = Number(row.id);
+
+      // Can't attach a listener to a session that isn't logged in, so
+      // skip those on enable. On disable we still process them so any
+      // stale enabled row is cleared.
+      if (enabled && !row.is_logged_in) {
+        skipped++;
+        results.push({ sessionId: sid, ok: false, reason: 'not_logged_in' });
+        continue;
+      }
+
+      try {
+        // Preserve existing per-session config; only (re)stamp provider
+        // on enable so the worker routes to the correct API.
+        const existing = await this.getSessionSettings(sid);
+        const cfg = { ...(existing.config || {}) };
+        if (enabled) cfg.provider = provider;
+
+        // eslint-disable-next-line no-await-in-loop
+        await this.setSessionEnabled(sid, userId, enabled, cfg);
+        changed++;
+        results.push({ sessionId: sid, ok: true, enabled });
+      } catch (err) {
+        failed++;
+        results.push({ sessionId: sid, ok: false, reason: err.message });
+        logger.warn(`bulkSetSessionsEnabled: session ${sid} failed: ${err.message}`);
+      }
+    }
+
+    logger.info(
+      `bulkSetSessionsEnabled user=${userId} enabled=${enabled} provider=${provider || '-'} ` +
+      `total=${rows.length} changed=${changed} failed=${failed} skipped=${skipped}`
+    );
+
+    return {
+      enabled: !!enabled,
+      provider,
+      total: rows.length,
+      changed,
+      failed,
+      skipped,
+      results,
+    };
+  }
+
+  /**
    * Fetch per-chat override, or null when no override exists.
    */
   async getChatSettings(sessionId, peerType, peerId) {

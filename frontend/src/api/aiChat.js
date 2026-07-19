@@ -14,6 +14,12 @@ export const getAiSessionSettings = (sessionId) =>
 export const updateAiSessionSettings = (sessionId, payload) =>
   api.patch(`${BASE}/sessions/${sessionId}/ai-settings`, payload);
 
+// Bulk enable/disable AI across every Telegram session the caller owns.
+// On enable the backend picks the provider from the user's validated key
+// (CapitalBot preferred, else CupidBot).
+export const bulkToggleAiSessions = (enabled) =>
+  api.post(`${BASE}/bulk-toggle`, { enabled });
+
 export const getAiChatSettings = (sessionId, params = {}) =>
   api.get(`${BASE}/sessions/${sessionId}/ai-chats`, { params });
 
