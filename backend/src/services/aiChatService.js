@@ -47,7 +47,13 @@ const DEFAULT_CONFIG = {
     presetId: 88,
     platform: 'Telegram',
     conversationSource: 'Telegram',
-    language: 'en',
+    // Default the AI to Italian for every chat (new + existing). Per the
+    // CapitalBot API, `language` is the forced response language ONLY when
+    // `detectLanguage` is false — so we pin both. Override per-session via
+    // ai_session_settings.config.capitalbot if a different language is ever
+    // needed.
+    language: 'Italian',
+    detectLanguage: false,
     audio: true,
     video: true,
     image: true,
