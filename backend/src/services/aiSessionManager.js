@@ -91,6 +91,11 @@ class AiSessionManager {
 
       this._sessions.set(sid, {
         handler,
+        // Keep a reference to the exact client the handler was bound to.
+        // If the heartbeat later rebuilds the GramJS client (proxy swap,
+        // socket revive), this lets us detect the stale binding and
+        // re-attach ONLY then — instead of churning every cycle.
+        client,
         pollFallback,
         method: 'realtime',
         attachedAt: Date.now(),
@@ -394,6 +399,55 @@ class AiSessionManager {
     const sid = String(sessionId);
     await this.detach(sid);
     return this.attach(sid);
+  }
+
+  /**
+   * Idempotently guarantee a live, correctly-bound listener for a session
+   * WITHOUT churning. This is what the heartbeat should call every cycle
+   * instead of reattach():
+   *
+   *   - Not attached at all        -> attach().
+   *   - Attached, but the handler is bound to a STALE client (the
+   *     heartbeat rebuilt the GramJS client via proxy-swap / socket
+   *     revive) -> reattach() to bind the fresh client.
+   *   - Attached to the CURRENT client -> no-op (this is the common case;
+   *     the previous code blindly reattached here, which detached the
+   *     working listener every ~60s and dropped any message that arrived
+   *     during the gap — the "AI randomly stops" bug).
+   *
+   * @param {string|number} sessionId
+   * @returns {Promise<{ ok: boolean, action: 'noop'|'attached'|'reattached', reason?: string }>}
+   */
+  async ensureAttached(sessionId) {
+    const sid = String(sessionId);
+    const data = this._sessions.get(sid);
+
+    // Not tracked → attach fresh.
+    if (!data) {
+      try {
+        await this.attach(sid);
+        return { ok: true, action: 'attached' };
+      } catch (err) {
+        return { ok: false, action: 'attached', reason: err.message };
+      }
+    }
+
+    // Tracked → check the binding is against the current client.
+    const entry = tgService.clients.get(sid);
+    const currentClient = entry && entry.client ? entry.client : null;
+    if (currentClient && data.client && data.client === currentClient) {
+      // Healthy and correctly bound — leave it completely alone.
+      return { ok: true, action: 'noop' };
+    }
+
+    // Either the client was rebuilt (stale binding) or we can't see a
+    // current client. Rebind to whatever the current client is.
+    try {
+      await this.reattach(sid);
+      return { ok: true, action: 'reattached', reason: 'client_rebuilt' };
+    } catch (err) {
+      return { ok: false, action: 'reattached', reason: err.message };
+    }
   }
 
   /**

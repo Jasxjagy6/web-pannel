@@ -152,24 +152,48 @@ async function processGenerateReply(job) {
       return { sent: false, reason: 'empty_reply' };
     }
 
-    // Send the message via Telegram
+    // Send the message via Telegram.
+    const doSend = () => tgService.sendMessage(
+      sessionId,
+      pid,
+      aiResponse.text,
+      { silent: false, accessHash: recipient?.accessHash || null }
+    );
     let sent;
     try {
-      sent = await tgService.sendMessage(
-        sessionId,
-        pid,
-        aiResponse.text,
-        { silent: false, accessHash: recipient?.accessHash || null }
-      );
+      sent = await doSend();
     } catch (sendErr) {
-      logger.warn(
-        `AI chat sendMessage failed for session ${sid} peer ${pid}: ${sendErr.message}. ` +
-        `${provider} response: ${JSON.stringify(aiResponse)}`
-      );
-      logRow.status = 'send_failed';
-      logRow.error_message = sendErr.message;
-      await _insertLog(logRow);
-      return { sent: false, reason: 'send_failed' };
+      // "Could not find the input entity" means this peer isn't in the
+      // session's GramJS entity cache (common for a brand-new incoming DM
+      // right after a restart, before any catch-up sweep warmed the
+      // cache). getDialogs() repopulates the entity cache; then the retry
+      // resolves. Only do this for the entity error — other send failures
+      // (privacy, flood, etc.) aren't fixed by a dialog scan.
+      const isEntityErr = /input entity|Could not find the input/i.test(sendErr.message || '');
+      let recovered = false;
+      if (isEntityErr) {
+        try {
+          const entry = tgService.clients.get(String(sid));
+          if (entry && entry.client) {
+            await entry.client.getDialogs({ limit: 200 });
+            sent = await doSend();
+            recovered = true;
+            logger.info(`AI Worker: recovered send for session ${sid} peer ${pid} after entity-cache warm`);
+          }
+        } catch (retryErr) {
+          logger.warn(`AI Worker: entity-warm retry failed for session ${sid} peer ${pid}: ${retryErr.message}`);
+        }
+      }
+      if (!recovered) {
+        logger.warn(
+          `AI chat sendMessage failed for session ${sid} peer ${pid}: ${sendErr.message}. ` +
+          `${provider} response: ${JSON.stringify(aiResponse)}`
+        );
+        logRow.status = 'send_failed';
+        logRow.error_message = sendErr.message;
+        await _insertLog(logRow);
+        return { sent: false, reason: 'send_failed' };
+      }
     }
 
     // Track the outgoing message ID for confirmation on next API call
