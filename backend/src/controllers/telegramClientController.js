@@ -14,6 +14,7 @@ const reportService = require('../services/reportService');
 const { AppError, asyncHandler } = require('../utils/errorHandler');
 const logger = require('../utils/logger');
 const { pool } = require('../config/database');
+const { resolveSessionIdsFromRequest } = require('../utils/resolveSessions');
 
 /**
  * Parse + validate (peerType, peerId) from request params. peerId is
@@ -364,7 +365,7 @@ const telegramClientController = {
    */
   clearAllChatsHistory: asyncHandler(async (req, res) => {
     const userId = req.user.id;
-    const sessionIds = Array.isArray(req.body?.sessionIds)
+    const explicitIds = Array.isArray(req.body?.sessionIds)
       ? req.body.sessionIds
       : [];
     const revoke = req.body?.revoke === true || req.body?.revoke === 'true';
@@ -372,20 +373,33 @@ const telegramClientController = {
       ? parseInt(req.body.concurrency, 10)
       : undefined;
 
-    if (sessionIds.length === 0) {
-      throw new AppError('sessionIds is required', 400, 'SESSION_IDS_REQUIRED');
+    // Session source: either an explicit sessionIds array, OR one/more
+    // saved session lists (sessionListIds / sessionListId). The shared
+    // resolver expands every referenced list to its active member ids and
+    // unions them; when only sessionIds are given it returns them as-is.
+    // This mirrors the multi-list selection used across the messaging flow.
+    const hasList =
+      (Array.isArray(req.body?.sessionListIds) && req.body.sessionListIds.length > 0) ||
+      (req.body?.sessionListId != null && req.body.sessionListId !== '');
+
+    let resolvedIds = [];
+    if (hasList) {
+      resolvedIds = await resolveSessionIdsFromRequest(req, []);
+    } else {
+      resolvedIds = explicitIds;
     }
-    if (sessionIds.length > 50) {
+
+    if (!Array.isArray(resolvedIds) || resolvedIds.length === 0) {
       throw new AppError(
-        'At most 50 sessions can be cleared at once',
+        'sessionIds or a non-empty session list is required',
         400,
-        'TOO_MANY_SESSIONS',
+        'SESSION_IDS_REQUIRED',
       );
     }
 
     const seen = new Set();
     const ids = [];
-    for (const raw of sessionIds) {
+    for (const raw of resolvedIds) {
       const id = String(raw || '').trim();
       if (!id || seen.has(id)) continue;
       seen.add(id);
@@ -393,6 +407,13 @@ const telegramClientController = {
     }
     if (ids.length === 0) {
       throw new AppError('sessionIds is required', 400, 'SESSION_IDS_REQUIRED');
+    }
+    if (ids.length > 50) {
+      throw new AppError(
+        'At most 50 sessions can be cleared at once',
+        400,
+        'TOO_MANY_SESSIONS',
+      );
     }
 
     // Pull per-session display info up front so the History card can
