@@ -4,6 +4,7 @@ const { pool } = require('../config/database');
 const { uploadDir } = require('../middleware/upload');
 const sessionService = require('../services/sessionService');
 const sessionCreationService = require('../services/sessionCreationService');
+const sessionProfileSyncService = require('../services/sessionProfileSyncService');
 const reportService = require('../services/reportService');
 const { AppError, asyncHandler } = require('../utils/errorHandler');
 const { decrypt } = require('../utils/crypto');
@@ -908,6 +909,41 @@ const sessionController = {
    * an empty string as "remove proxy". Validates URL shape so the worker
    * doesn't trip on bad input.
    */
+  // Profile syncing — refresh the live Telegram display details
+  // (firstName, lastName, username, bio, premium/verified flags) from
+  // Telegram and rewrite `sessions.account_info` / `sessions.username`.
+  // Read-only: never writes to the Telegram account.
+
+  syncSessionProfile: asyncHandler(async (req, res) => {
+    const sessionId = Number(req.params.id);
+    const userId = req.user.id;
+    const result = await sessionProfileSyncService.syncSession(sessionId, userId);
+    if (!result.ok) {
+      throw new AppError(result.reason || 'sync failed', 400, 'SYNC_FAILED');
+    }
+    res.json({
+      success: true,
+      data: {
+        changed: result.changed,
+        profile: result.profile,
+      },
+    });
+  }),
+
+  syncAllSessionProfiles: asyncHandler(async (req, res) => {
+    const userId = req.user.id;
+    const result = await sessionProfileSyncService.syncAllForUser(userId, req.body);
+    res.json({
+      success: true,
+      data: {
+        total: result.total,
+        synced: result.synced,
+        updated: result.updated,
+        failed: result.failed,
+      },
+    });
+  }),
+
   setSessionProxy: asyncHandler(async (req, res) => {
     if (!_isInstagram(req)) {
       throw new AppError(

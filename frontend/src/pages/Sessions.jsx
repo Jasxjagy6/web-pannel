@@ -10,6 +10,8 @@ import {
   bulkDeleteSessions,
   downloadSession,
   recoverSession,
+  syncSessionProfile,
+  syncAllSessionProfiles,
 } from '../api/sessions';
 import { sessionListsAPI } from '../api/sessionLists';
 import { parseApiError, formatRelativeTime, formatNumber } from '../utils/formatters';
@@ -52,6 +54,7 @@ import {
   FileText,
   AlertTriangle,
   Download,
+  RefreshCw,
   LifeBuoy,
   ShieldAlert,
   ShieldOff,
@@ -1118,6 +1121,44 @@ export default function Sessions() {
     }
   };
 
+  const handleSyncProfile = async (id) => {
+    setActionLoading((prev) => ({ ...prev, [id]: 'sync-profile' }));
+    try {
+      const resp = await syncSessionProfile(id);
+      if (resp.data?.data?.changed) {
+        showSuccess('Profile updated from Telegram.', 'Sync Profile');
+      } else {
+        showInfo('Profile is already up to date.', 'Sync Profile');
+      }
+      await fetchSessions();
+    } catch (err) {
+      showError(parseApiError(err), 'Sync Failed');
+    } finally {
+      setActionLoading((prev) => ({ ...prev, [id]: null }));
+    }
+  };
+
+  const handleSyncAllProfiles = async () => {
+    setActionLoading((prev) => ({ ...prev, _bulk_sync: true }));
+    try {
+      const resp = await syncAllSessionProfiles();
+      const d = resp.data?.data || {};
+      const msg = [
+        d.synced != null ? `Synced ${d.synced}` : '',
+        d.updated ? `${d.updated} updated` : '',
+        d.failed ? `${d.failed} failed` : '',
+      ]
+        .filter(Boolean)
+        .join(', ');
+      showSuccess(msg || 'All profiles synced.', 'Sync All Profiles');
+      await fetchSessions();
+    } catch (err) {
+      showError(parseApiError(err), 'Sync All Failed');
+    } finally {
+      setActionLoading((prev) => ({ ...prev, _bulk_sync: false }));
+    }
+  };
+
   const handleDelete = async (id) => {
     setActionLoading((prev) => ({ ...prev, [id]: 'delete' }));
     try {
@@ -1408,6 +1449,20 @@ export default function Sessions() {
               {status.charAt(0).toUpperCase() + status.slice(1)}
             </button>
           ))}
+          <div className="w-px h-6 bg-white/10 mx-1" />
+          <button
+            onClick={handleSyncAllProfiles}
+            disabled={loading || actionLoading._bulk_sync}
+            className="flex items-center gap-1.5 px-3 py-2 rounded-lg text-sm font-medium border transition bg-dark-900 border-white/10 text-gray-400 hover:text-white hover:border-white/20 disabled:opacity-50"
+            title="Fetch the latest Telegram profile (name, username, bio, premium, verified) for every logged-in session"
+          >
+            {actionLoading._bulk_sync ? (
+              <Loader2 className="w-3.5 h-3.5 animate-spin" />
+            ) : (
+              <RefreshCw className="w-3.5 h-3.5" />
+            )}
+            Sync All Profiles
+          </button>
         </div>
       </div>
 
@@ -1635,35 +1690,47 @@ export default function Sessions() {
                           >
                             <Download className="w-4 h-4" />
                           </button>
-                          {/*
-                            "Already logged in" is canonically tracked by the
-                            `is_logged_in` boolean, NOT by `status`. A session
-                            can be `is_logged_in=true` while `status` is
-                            transiently 'inactive' (e.g. between a heartbeat
-                            cycle), and we still must NOT offer to log in
-                            again — Telegram revokes the auth key when a
-                            second client connects with the same string.
+                            {/* "Already logged in" is canonically tracked by the
+                              `is_logged_in` boolean, NOT by `status`. A session
+                              can be `is_logged_in=true` while `status` is
+                              transiently 'inactive' (e.g. between a heartbeat
+                              cycle), and we still must NOT offer to log in
+                              again — Telegram revokes the auth key when a
+                              second client connects with the same string.
 
-                            The list API returns the field as `isLoggedIn`
-                            (camelCase) but several legacy callers still
-                            pass through the raw `is_logged_in`; check both
-                            so this works regardless of upstream shape.
-                          */}
+                              The list API returns the field as `isLoggedIn`
+                              (camelCase) but several legacy callers still
+                              pass through the raw `is_logged_in`; check both
+                              so this works regardless of upstream shape. */}
                           {session.isLoggedIn ||
                           session.is_logged_in ||
                           session.status?.toLowerCase() === 'active' ? (
-                            <button
-                              onClick={() => handleLogout(session.id)}
-                              disabled={isLoading === 'logout'}
-                              className="p-1.5 rounded-lg text-gray-400 hover:text-amber-400 hover:bg-amber-500/10 transition disabled:opacity-50"
-                              title="Logout"
-                            >
-                              {isLoading === 'logout' ? (
-                                <Loader2 className="w-4 h-4 animate-spin" />
-                              ) : (
-                                <LogOut className="w-4 h-4" />
-                              )}
-                            </button>
+                            <>
+                              <button
+                                onClick={() => handleSyncProfile(session.id)}
+                                disabled={isLoading === 'sync-profile'}
+                                className="p-1.5 rounded-lg text-gray-400 hover:text-cyan-400 hover:bg-cyan-500/10 transition disabled:opacity-50"
+                                title="Sync profile from Telegram (name, username, bio, premium, verified)"
+                              >
+                                {isLoading === 'sync-profile' ? (
+                                  <Loader2 className="w-4 h-4 animate-spin" />
+                                ) : (
+                                  <RefreshCw className="w-4 h-4" />
+                                )}
+                              </button>
+                              <button
+                                onClick={() => handleLogout(session.id)}
+                                disabled={isLoading === 'logout'}
+                                className="p-1.5 rounded-lg text-gray-400 hover:text-amber-400 hover:bg-amber-500/10 transition disabled:opacity-50"
+                                title="Logout"
+                              >
+                                {isLoading === 'logout' ? (
+                                  <Loader2 className="w-4 h-4 animate-spin" />
+                                ) : (
+                                  <LogOut className="w-4 h-4" />
+                                )}
+                              </button>
+                            </>
                           ) : session.status?.toLowerCase() === 'revoked' ? (
                             // Anti-revoke Phase 4 — Recover button replaces
                             // Login for revoked rows. We never let the user
