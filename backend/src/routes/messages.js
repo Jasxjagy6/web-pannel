@@ -21,6 +21,13 @@ router.post('/bulk', messageLimiter, validate(schemas.bulkMessage), messageContr
 // errors skip just that target. Reuses the bulkMessage validator shape.
 router.post('/failover', messageLimiter, validate(schemas.failoverMessage), messageController.sendFailover);
 
+// POST /api/messages/parallel - Parallel round-robin mass DM. Every
+// session works in parallel pulling the next target off a shared queue
+// (session 1 -> target 1, session 2 -> target 2, …). Invalid targets are
+// skipped so each session stays busy on DIFFERENT users. Finishes a big
+// list in minutes with safe per-account pacing. Reuses the failover shape.
+router.post('/parallel', messageLimiter, validate(schemas.failoverMessage), messageController.sendParallel);
+
 // POST /api/messages/bulk/preview - Distribution-engine preview
 // Returns the rotation/cooldown plan that would be used for a bulk
 // send, without enqueueing or sending anything.

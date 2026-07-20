@@ -69,6 +69,13 @@ export const cancelAllSchedules = () => api.post('/messages/schedules/cancel-all
 // ---------------------------------------------------------------------
 export const sendFailover = (data) => api.post('/messages/failover', data);
 
+// Parallel round-robin mass DM. Every session works in parallel pulling
+// the next target off a shared queue (session 1 -> target 1, session 2 ->
+// target 2, …); invalid targets are skipped so each session stays busy on
+// DIFFERENT users. Finishes a big list in minutes with safe pacing. Body
+// shape mirrors sendFailover.
+export const sendParallel = (data) => api.post('/messages/parallel', data);
+
 // Per-recipient reply breakdown for a finished send job (job-history
 // dropdown: "sent to user 1 — not replied", "sent to user 2 — replied").
 export const getJobReplyDetails = (id) => api.get(`/messages/jobs/${id}/replies`);

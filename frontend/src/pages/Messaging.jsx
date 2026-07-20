@@ -5,6 +5,7 @@ import { listSessions } from '../api/sessions';
 import {
   sendBulk,
   sendFailover,
+  sendParallel,
   getJobs,
   cancelJob,
   previewMessage,
@@ -1272,6 +1273,42 @@ export default function Messaging() {
         return;
       }
 
+      // Parallel round-robin: every session works in parallel, each pulling
+      // the next target off a shared queue. Invalid users are skipped so no
+      // session sits idle. Runs async and starts 24h reply tracking.
+      if (deliveryMode === 'parallel') {
+        const parallelPayload = {
+          message: payload.message,
+          messageType: payload.messageType,
+          targetList: payload.targetList,
+          sourceType: payload.sourceType,
+          sourceId: payload.sourceId,
+          // per-send delay WITHIN a session's burst (ms)
+          delayMin: Math.max(0, Number(delayMin) * 1000),
+          delayMax: Math.max(0, Number(delayMax) * 1000),
+          trackReplies,
+          replyWindowHours: 24,
+          async: true,
+        };
+        if (payload.sessionListIds) parallelPayload.sessionListIds = payload.sessionListIds;
+        if (payload.sessionIds) parallelPayload.sessionIds = payload.sessionIds;
+
+        const pRes = await sendParallel(parallelPayload);
+        const elapsedP = Date.now() - startTime;
+        await new Promise((r) => setTimeout(r, Math.max(0, minLoadingTime - elapsedP)));
+        const pData = pRes.data?.data || {};
+        showSuccess(
+          `Parallel send started across ${pData.sessionCount || (payload.sessionIds ? payload.sessionIds.length : 0)} session(s) ` +
+          `for ${pData.totalTargets || (payload.targetList ? payload.targetList.length : 0)} target(s). ` +
+          `Every session works at once — this finishes fast. Track progress in History.`,
+          'Parallel Send Started'
+        );
+        fetchActiveJobs();
+        fetchHistory();
+        setMessage('');
+        return;
+      }
+
       const response = await sendBulk(payload);
       const elapsed = Date.now() - startTime;
       const remaining = Math.max(0, minLoadingTime - elapsed);
@@ -1551,7 +1588,7 @@ export default function Messaging() {
           <Send className="h-4 w-4 text-primary-500" />
           <h3 className="text-sm font-semibold text-white">Delivery strategy</h3>
         </div>
-        <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
+        <div className="grid grid-cols-1 gap-2 sm:grid-cols-3">
           <button
             type="button"
             onClick={() => setDeliveryMode('distribute')}
@@ -1581,8 +1618,23 @@ export default function Messaging() {
               the next session resumes from the same user. Not-found users are skipped.
             </p>
           </button>
+          <button
+            type="button"
+            onClick={() => setDeliveryMode('parallel')}
+            className={`rounded-lg border p-3 text-left transition ${
+              deliveryMode === 'parallel'
+                ? 'border-primary-500/60 bg-primary-500/10'
+                : 'border-white/10 bg-dark-900 hover:border-white/20'
+            }`}
+          >
+            <p className="text-sm font-medium text-white">Parallel round-robin ⚡</p>
+            <p className="mt-0.5 text-xs text-gray-400">
+              Every session works at once, each taking the next user (session 1→user 1, session 2→user 2…).
+              Invalid users are skipped so no session sits idle. Fastest — finishes big lists in minutes.
+            </p>
+          </button>
         </div>
-        {deliveryMode === 'failover' && (
+        {(deliveryMode === 'failover' || deliveryMode === 'parallel') && (
           <label className="mt-3 flex items-center gap-2 text-xs text-gray-300">
             <input
               type="checkbox"
@@ -1597,7 +1649,7 @@ export default function Messaging() {
 
       {/* Distribution Visualization + Send Button */}
       {/* Distribution engine — auto/manual rotation+cooldown */}
-      <div className={`grid grid-cols-1 gap-4 lg:grid-cols-2 ${deliveryMode === 'failover' ? 'opacity-50 pointer-events-none' : ''}`}>
+      <div className={`grid grid-cols-1 gap-4 lg:grid-cols-2 ${deliveryMode !== 'distribute' ? 'opacity-50 pointer-events-none' : ''}`}>
         <DistributionControls
           value={distribution}
           onChange={setDistribution}
@@ -1646,7 +1698,11 @@ export default function Messaging() {
               ) : (
                 <>
                   <Send className="w-4 h-4" />
-                  {deliveryMode === 'failover' ? 'Start Failover Send' : 'Send Bulk Messages'}
+                  {deliveryMode === 'failover'
+                    ? 'Start Failover Send'
+                    : deliveryMode === 'parallel'
+                    ? 'Start Parallel Send ⚡'
+                    : 'Send Bulk Messages'}
                 </>
               )}
             </button>
