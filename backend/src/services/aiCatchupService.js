@@ -49,7 +49,7 @@ const DIALOG_LIMIT = parseInt(process.env.AI_CATCHUP_DIALOG_LIMIT || '200', 10);
 // listener attach + client connect settle first.
 const ENABLE_SWEEP_DELAY_MS = parseInt(process.env.AI_CATCHUP_ENABLE_DELAY_MS || '4000', 10);
 // Periodic safety sweep across all AI-enabled sessions.
-const PERIODIC_INTERVAL_MS = parseInt(process.env.AI_CATCHUP_INTERVAL_MS || '900000', 10); // 15m
+const PERIODIC_INTERVAL_MS = parseInt(process.env.AI_CATCHUP_INTERVAL_MS || '3600000', 10); // 60m
 
 const _inFlight = new Set();     // session ids currently being swept
 let _globalRunning = false;      // a full sweep is running
@@ -141,6 +141,29 @@ async function sweepSession(sessionId, userId) {
         }
       } catch (err) {
         logger.debug(`aiCatchup: memory check failed ${sid}/${peerId}: ${err.message}`);
+      }
+
+      // Skip peers that are PERMANENTLY UNREACHABLE. If a recent attempt for
+      // this (session, peer) already failed to send with PEER_ID_INVALID /
+      // "input entity", the peer's access_hash is stale and Telegram won't
+      // let us message this stranger — re-enqueuing every sweep just fails
+      // again and tanks the AI success rate. Skip it once we've seen it
+      // fail. (Live incoming messages are unaffected — they always carry a
+      // fresh, resolvable peer.)
+      try {
+        // eslint-disable-next-line no-await-in-loop
+        const { rows: fail } = await pool.query(
+          `SELECT 1 FROM ai_response_logs
+            WHERE session_id = $1 AND peer_id = $2
+              AND status = 'send_failed'
+              AND error_message ILIKE '%PEER_ID_INVALID%'
+              AND created_at > NOW() - INTERVAL '7 days'
+            LIMIT 1`,
+          [sid, peerId]
+        );
+        if (fail.length) continue; // known unreachable — don't retry
+      } catch (err) {
+        logger.debug(`aiCatchup: unreachable check failed ${sid}/${peerId}: ${err.message}`);
       }
 
       const accessHash = entity.accessHash != null ? String(entity.accessHash) : null;

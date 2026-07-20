@@ -147,6 +147,16 @@ async function processGenerateReply(job) {
     }
 
     if (!aiResponse.text) {
+      // CapitalBot returns empty content with converted=true when the user
+      // has AGREED to the CTA/conversion — the API intentionally stops
+      // sending messages. That is a SUCCESS, not a failed/empty reply, so
+      // log it distinctly instead of dragging down the no-reply rate.
+      if (aiResponse.didConvert) {
+        logRow.status = 'converted';
+        await _insertLog(logRow);
+        await _updateConversationState(sid, peerType, pid, 'converted', aiResponse.category);
+        return { sent: false, reason: 'converted', didConvert: true };
+      }
       logRow.status = 'no_reply';
       await _insertLog(logRow);
       return { sent: false, reason: 'empty_reply' };
@@ -169,19 +179,42 @@ async function processGenerateReply(job) {
       // cache). getDialogs() repopulates the entity cache; then the retry
       // resolves. Only do this for the entity error — other send failures
       // (privacy, flood, etc.) aren't fixed by a dialog scan.
-      const isEntityErr = /input entity|Could not find the input/i.test(sendErr.message || '');
+      // PEER_ID_INVALID is the same underlying problem as "input entity":
+      // the peer isn't resolvable from the session's cache. A getDialogs()
+      // warm fixes both, so retry once for either.
+      const isEntityErr = /input entity|Could not find the input|PEER_ID_INVALID|PEER_ID/i.test(sendErr.message || '');
       let recovered = false;
       if (isEntityErr) {
-        try {
-          const entry = tgService.clients.get(String(sid));
-          if (entry && entry.client) {
-            await entry.client.getDialogs({ limit: 200 });
+        const entry = tgService.clients.get(String(sid));
+        const client = entry && entry.client ? entry.client : null;
+        if (client) {
+          // Strategy 1: warm the entity cache with getDialogs, then retry
+          // via the normal send path.
+          try {
+            await client.getDialogs({ limit: 200 });
             sent = await doSend();
             recovered = true;
             logger.info(`AI Worker: recovered send for session ${sid} peer ${pid} after entity-cache warm`);
+          } catch (_) { /* fall through */ }
+
+          // Strategy 2: build the InputPeerUser directly from the peer id +
+          // the access_hash the catch-up captured from the dialog. This
+          // resolves peers that getDialogs didn't surface (older than the
+          // top-200 window) but for which we already hold a valid hash.
+          if (!recovered && recipient?.accessHash) {
+            try {
+              const { Api } = require('telegram');
+              const inputPeer = new Api.InputPeerUser({
+                userId: BigInt(pid),
+                accessHash: BigInt(String(recipient.accessHash)),
+              });
+              sent = await client.sendMessage(inputPeer, { message: aiResponse.text });
+              recovered = true;
+              logger.info(`AI Worker: recovered send for session ${sid} peer ${pid} via direct InputPeerUser`);
+            } catch (directErr) {
+              logger.warn(`AI Worker: direct-peer retry failed for session ${sid} peer ${pid}: ${directErr.message}`);
+            }
           }
-        } catch (retryErr) {
-          logger.warn(`AI Worker: entity-warm retry failed for session ${sid} peer ${pid}: ${retryErr.message}`);
         }
       }
       if (!recovered) {
@@ -189,6 +222,14 @@ async function processGenerateReply(job) {
           `AI chat sendMessage failed for session ${sid} peer ${pid}: ${sendErr.message}. ` +
           `${provider} response: ${JSON.stringify(aiResponse)}`
         );
+        // Distinguish an UNREACHABLE peer (stale access_hash — Telegram
+        // won't let us message this stranger, nothing we can do) from a
+        // genuine send failure. The AI itself worked; the peer is just not
+        // messageable. Logged as `send_failed` still records the reason but
+        // the error text carries PEER_ID_INVALID so dashboards can exclude
+        // it from the real failure rate. We keep the status as send_failed
+        // (unchanged schema) but the catch-up now skips these peers so they
+        // are not retried into the metric every sweep.
         logRow.status = 'send_failed';
         logRow.error_message = sendErr.message;
         await _insertLog(logRow);
