@@ -77,6 +77,12 @@ export const getProxySettings = () => api.get('/admin/proxy/settings');
 export const updateProxySettings = (data) =>
   api.put('/admin/proxy/settings', data);
 
+// Global AI re-engagement toggle (system_settings.ai.reengage_enabled).
+// When false the periodic scan that nudges silent chats stops entirely.
+export const getReengageSettings = () => api.get('/admin/ai-reengage/settings');
+export const updateReengageSettings = (data) =>
+  api.put('/admin/ai-reengage/settings', data);
+
 // ---------------------------------------------------------------------
 // Active logins — per-user JWT session tracking. Used by the
 // "Active logins" tab in the admin panel to see, count, and revoke

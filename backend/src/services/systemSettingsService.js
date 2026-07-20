@@ -24,6 +24,10 @@ const DEFAULTS = {
   // egresses directly from the VPS IP. Default true keeps existing
   // proxy-bound deployments unchanged.
   'proxy.global_enabled': true,
+
+  // Global AI re-engagement toggle. When false the periodic scan that
+  // sends follow-up nudges to silent chats is completely stopped.
+  'ai.reengage_enabled': true,
 };
 
 /**
@@ -119,12 +123,23 @@ function invalidate(key) {
   else cache.clear();
 }
 
+async function isReengageEnabled() {
+  const v = await getSetting('ai.reengage_enabled');
+  return v !== false;
+}
+
+async function getReengageConfig() {
+  return getSettings(['ai.reengage_enabled']);
+}
+
 module.exports = {
   getSetting,
   getSettings,
   getBillingConfig,
   isProxyGloballyEnabled,
   getProxyConfig,
+  isReengageEnabled,
+  getReengageConfig,
   setSettings,
   invalidate,
   DEFAULTS,

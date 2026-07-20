@@ -336,8 +336,9 @@ function JobCard({ job, defaultExpanded, nowMs, onCancel }) {
       await cancelClearChatsJob(job.id);
       if (typeof onCancel === 'function') onCancel(job.id);
     } catch (err) {
+      const e = err?.response?.data?.error;
       setCancelError(
-        err?.response?.data?.error
+        (typeof e === 'string' ? e : e?.message)
           || err?.message
           || 'Failed to cancel job.',
       );
@@ -526,8 +527,9 @@ export default function ClearChatsHistoryTab({ initialJob, autoExpandJobId }) {
       setJobs(list);
       setError(null);
     } catch (err) {
+      const e = err?.response?.data?.error;
       setError(
-        err?.response?.data?.error ||
+        (typeof e === 'string' ? e : e?.message) ||
           err?.message ||
           'Failed to load history.',
       );

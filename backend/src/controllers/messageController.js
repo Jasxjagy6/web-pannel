@@ -353,6 +353,109 @@ const messageController = {
   }),
 
   /**
+   * Export a job's recipients as a CSV download.
+   *
+   *   type=sent    — every target the DM succeeded on (message_logs
+   *                  status='sent'), enriched with peer_id / label when
+   *                  reply tracking captured it.
+   *   type=replied — targets who replied within the tracking window
+   *                  (message_reply_tracking replied=TRUE).
+   */
+  exportJobRecipients: asyncHandler(async (req, res) => {
+    const { pool } = require('../config/database');
+    const userId = req.user.id;
+    const jobId = parseInt(req.params.id, 10);
+    const type = (req.query.type || 'sent').toLowerCase();
+
+    if (!Number.isFinite(jobId)) {
+      throw new AppError('Invalid job id', 400, 'BAD_JOB_ID');
+    }
+    if (type !== 'sent' && type !== 'replied') {
+      throw new AppError('type must be "sent" or "replied"', 400, 'BAD_EXPORT_TYPE');
+    }
+
+    // Ownership guard. Admins (user_id null on legacy rows) are allowed
+    // through for their own jobs only.
+    const { rows: jobRows } = await pool.query(
+      `SELECT id, user_id FROM messaging_jobs WHERE id = $1`,
+      [jobId]
+    );
+    if (jobRows.length === 0) {
+      throw new AppError('Job not found', 404, 'JOB_NOT_FOUND');
+    }
+    if (jobRows[0].user_id != null && jobRows[0].user_id !== userId) {
+      throw new AppError('Job not found', 404, 'JOB_NOT_FOUND');
+    }
+
+    let rows;
+    let header;
+    if (type === 'replied') {
+      const r = await pool.query(
+        `SELECT mrt.target_id, mrt.peer_id, mrt.target_label,
+                s.phone AS session_phone,
+                s.account_info->>'firstName' AS session_name,
+                mrt.sent_at, mrt.replied_at
+           FROM message_reply_tracking mrt
+           LEFT JOIN sessions s ON s.id = mrt.session_id
+          WHERE mrt.job_id = $1 AND mrt.replied = TRUE
+          ORDER BY mrt.replied_at ASC NULLS LAST, mrt.id ASC`,
+        [jobId]
+      );
+      rows = r.rows;
+      header = ['target', 'peer_id', 'label', 'session', 'sent_at', 'replied_at'];
+    } else {
+      const r = await pool.query(
+        `SELECT ml.target_id,
+                MAX(mrt.peer_id) AS peer_id,
+                MAX(mrt.target_label) AS target_label,
+                MAX(s.phone) AS session_phone,
+                MAX(s.account_info->>'firstName') AS session_name,
+                MAX(ml.sent_at) AS sent_at
+           FROM message_logs ml
+           LEFT JOIN message_reply_tracking mrt
+             ON mrt.job_id = ml.job_id AND mrt.target_id = ml.target_id
+           LEFT JOIN sessions s ON s.id = ml.session_id
+          WHERE ml.job_id = $1 AND ml.status = 'sent'
+          GROUP BY ml.target_id
+          ORDER BY sent_at ASC NULLS LAST`,
+        [jobId]
+      );
+      rows = r.rows;
+      header = ['target', 'peer_id', 'label', 'session', 'sent_at'];
+    }
+
+    const esc = (v) => {
+      if (v === null || v === undefined) return '';
+      const s = String(v);
+      if (/[",\r\n]/.test(s)) return `"${s.replace(/"/g, '""')}"`;
+      return s;
+    };
+
+    const lines = [header.join(',')];
+    for (const row of rows) {
+      const sessionLabel = row.session_name || row.session_phone || '';
+      const base = [
+        esc(row.target_id),
+        esc(row.peer_id),
+        esc(row.target_label),
+        esc(sessionLabel),
+        esc(row.sent_at ? new Date(row.sent_at).toISOString() : ''),
+      ];
+      if (type === 'replied') {
+        base.push(esc(row.replied_at ? new Date(row.replied_at).toISOString() : ''));
+      }
+      lines.push(base.join(','));
+    }
+    const csv = lines.join('\r\n');
+
+    const filename = `job-${jobId}-${type}-${rows.length}.csv`;
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+    logger.info(`Export job ${jobId} type=${type} rows=${rows.length} by user ${userId}`);
+    return res.status(200).send(csv);
+  }),
+
+  /**
    * Send a message to a Telegram group or channel.
    *
    * Expects req.body: { sessionId, groupId, message }

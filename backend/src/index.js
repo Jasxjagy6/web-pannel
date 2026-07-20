@@ -680,6 +680,32 @@ async function start() {
       logger.warn(`aiChatWorker.start failed: ${err.message}`);
     }
 
+    // 7d-bis. Boot the AI catch-up sweeper. When AI is enabled on a
+    //     session it fires a one-off sweep of that session's pending,
+    //     unreplied personal DMs (<=24h old) so they get answered even
+    //     though they arrived before AI was on. A slow periodic sweep is
+    //     the safety net. Enqueue-only — the AI worker sends the replies —
+    //     and it skips any chat already answered, so it never disturbs
+    //     chats the live listener is already handling.
+    try {
+      const aiCatchupService = require('./services/aiCatchupService');
+      aiCatchupService.start();
+    } catch (err) {
+      logger.warn(`aiCatchupService.start failed: ${err.message}`);
+    }
+
+    // AI re-engagement ("keep user engaged"). Scans for chats where the AI
+    // spoke last and the user went silent, and after a RANDOM 10-25 min
+    // sends a CapitalBot auto-generated follow-up (in the user's language)
+    // to keep the conversation alive. Max a few nudges per chat; enqueue
+    // only (the AI worker sends).
+    try {
+      const aiReengageService = require('./services/aiReengageService');
+      aiReengageService.start();
+    } catch (err) {
+      logger.warn(`aiReengageService.start failed: ${err.message}`);
+    }
+
     // 7e. AI response log retention sweeper (daily).
     try {
       const aiChatService = require('./services/aiChatService');

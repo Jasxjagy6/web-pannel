@@ -1,6 +1,13 @@
 import api from './client';
 
-export const updateAccountSettings = (data) => api.post('/account-settings/update', data);
+// Bulk profile updates touch each selected session sequentially over
+// Telegram MTProto, so a 70-session photo update can take several minutes.
+// Use a long timeout so the request doesn't abort mid-flight while the
+// backend is still working (the update itself completes fine).
+const LONG_RUNNING_TIMEOUT_MS = 15 * 60 * 1000; // 15 minutes
+
+export const updateAccountSettings = (data) =>
+  api.post('/account-settings/update', data, { timeout: LONG_RUNNING_TIMEOUT_MS });
 
 export const uploadProfilePhoto = (formData) => 
   api.post('/account-settings/upload-photo', formData, {
@@ -25,14 +32,6 @@ export const randomAvatarUrl = (avatarId) => {
   const base = (api.defaults && api.defaults.baseURL) || '';
   return `${base.replace(/\/$/, '')}/account-settings/randomize/avatars/${avatarId}`;
 };
-
-// Bulk profile updates touch each selected session sequentially via
-// Telegram's MTProto, so they can legitimately take many minutes when
-// dozens of sessions are picked. Override the axios default (30s) so
-// the request doesn't error out mid-flight while the backend is still
-// processing — this was the root cause of the "Time exceeds" toast
-// even though the backend completed successfully.
-const LONG_RUNNING_TIMEOUT_MS = 15 * 60 * 1000; // 15 minutes
 
 export const applyRandomizedAccountSettings = (assignments) =>
   api.post('/account-settings/randomize/apply', { assignments }, {

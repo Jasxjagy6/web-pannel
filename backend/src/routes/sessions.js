@@ -4,6 +4,7 @@ const sessionController = require('../controllers/sessionController');
 const cloneExportController = require('../controllers/sessionDuplicationController');
 const bulkLoginController = require('../controllers/sessionBulkLoginController');
 const bulkAuthPurgeController = require('../controllers/sessionBulkAuthPurgeController');
+const spamAppealController = require('../controllers/spamBotAppealController');
 const { authenticate, requireApproved } = require('../middleware/auth');
 const { uploadLimiter } = require('../middleware/rateLimiter');
 const { uploadMultiple } = require('../middleware/upload');
@@ -54,6 +55,14 @@ router.post('/bulk-auth-purge/preview', bulkAuthPurgeController.preview);
 router.post('/bulk-auth-purge/start', bulkAuthPurgeController.start);
 router.get('/bulk-auth-purge/:jobId/status', bulkAuthPurgeController.status);
 router.post('/bulk-auth-purge/:jobId/cancel', bulkAuthPurgeController.cancel);
+
+// @SpamBot appeal job runner. Walks each selected session: sends /start to
+// @SpamBot, and if the account is restricted, presses the reply-keyboard
+// appeal button and submits an appeal. Accepts sessionIds or session
+// list(s). Mounted before /:id so the literal path isn't shadowed.
+router.post('/spam-appeal/start', spamAppealController.start);
+router.get('/spam-appeal/:jobId/status', spamAppealController.status);
+router.post('/spam-appeal/:jobId/cancel', spamAppealController.cancel);
 
 // GET /api/sessions - List sessions
 router.get('/', sessionController.listSessions);

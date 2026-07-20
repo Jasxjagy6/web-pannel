@@ -175,9 +175,16 @@ export default function AccountSettings() {
       const formData = new FormData();
       formData.append('photo', file);
 
-      await uploadProfilePhoto(formData);
+      const resp = await uploadProfilePhoto(formData);
+      const filePath = resp.data?.data?.filePath;
+      if (!filePath) {
+        throw new Error('Upload did not return a file path');
+      }
 
-      setProfilePhoto(file);
+      // Store the server-side path alongside the File so handleSubmit can
+      // read profilePhoto.path. A raw File object has no .path — that was
+      // the bug that made bulk photo updates silently apply to 0 sessions.
+      setProfilePhoto(Object.assign(file, { path: filePath }));
       setProfilePhotoPreview(URL.createObjectURL(file));
       setUpdateFlags(prev => ({ ...prev, profilePhoto: true }));
       
@@ -1989,6 +1996,30 @@ export default function AccountSettings() {
           </button>
         </div>
       </form>
+      )}
+
+      {/* Full-screen working overlay for the synchronous bulk update.
+          The backend applies each field to every selected session over
+          Telegram MTProto one-by-one, so a large fleet legitimately takes
+          minutes. This keeps the operator informed and stops them from
+          navigating away (which would look like a failure even though the
+          backend keeps going). */}
+      {submitting && (
+        <div className="fixed inset-0 z-[100] flex items-center justify-center bg-black/70 backdrop-blur-sm">
+          <div className="mx-4 w-full max-w-sm rounded-2xl border border-white/10 bg-dark-800 p-8 text-center shadow-2xl">
+            <Loader2 className="mx-auto h-10 w-10 animate-spin text-primary-500" />
+            <h3 className="mt-4 text-base font-semibold text-white">
+              Updating {sessionPickMode === 'list' ? 'session list' : `${selectedSessionIds.length} session${selectedSessionIds.length === 1 ? '' : 's'}`}…
+            </h3>
+            <p className="mt-2 text-sm text-gray-400">
+              Applying your changes to each account over Telegram. This can
+              take a few minutes for large lists — please keep this tab open.
+            </p>
+            <div className="mt-4 h-1.5 w-full overflow-hidden rounded-full bg-white/10">
+              <div className="h-full w-1/3 animate-pulse rounded-full bg-gradient-to-r from-primary-500 to-blue-500" />
+            </div>
+          </div>
+        </div>
       )}
     </div>
   );

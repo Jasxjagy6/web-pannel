@@ -433,6 +433,33 @@ class AccountSettingsService {
         // Mark as success if at least one field was updated
         sessionResult.success = sessionResult.updatedFields.length > 0;
 
+        // Write the new values back into sessions.account_info so the panel
+        // reflects them immediately. account_info is a snapshot captured at
+        // login and is NOT otherwise refreshed, so without this the Sessions
+        // list keeps showing the OLD name/bio even though Telegram already
+        // has the new one (the "it says success but still shows old name"
+        // confusion). Only patch the fields we actually changed. Best-effort.
+        if (sessionResult.success) {
+          try {
+            const patch = {};
+            if (updateFlags.firstName && !wantsRemove.firstName) patch.firstName = firstName || '';
+            if (updateFlags.lastName) patch.lastName = wantsRemove.lastName ? '' : (lastName || '');
+            if (updateFlags.username && !wantsRemove.username && username) patch.username = username;
+            if (updateFlags.bio) patch.bio = wantsRemove.bio ? '' : (bio || '');
+            if (Object.keys(patch).length > 0) {
+              await pool.query(
+                `UPDATE sessions
+                    SET account_info = COALESCE(account_info, '{}'::jsonb) || $2::jsonb,
+                        updated_at = NOW()
+                  WHERE id = $1`,
+                [session.id, JSON.stringify(patch)]
+              );
+            }
+          } catch (cacheErr) {
+            logger.debug(`account_info writeback failed for ${session.id}: ${cacheErr.message}`);
+          }
+        }
+
       } catch (err) {
         sessionResult.errors.push(`Session error: ${err.message}`);
       }
