@@ -76,3 +76,26 @@ export const getJobReplyDetails = (id) => api.get(`/messages/jobs/${id}/replies`
 // Per-session send breakdown: how many sessions were used (sent ≥1 successful
 // DM) out of total provided, and how many successful DMs each session sent.
 export const getJobSessionBreakdown = (id) => api.get(`/messages/jobs/${id}/session-breakdown`);
+
+// Download a job's recipients as CSV. `type` is 'sent' (everyone the DM
+// succeeded on) or 'replied' (those who replied back within 24h). Fetches
+// as a blob (auth header is attached by the interceptor) and triggers a
+// browser download.
+export const exportJobRecipients = async (id, type = 'sent') => {
+  const res = await api.get(`/messages/jobs/${id}/export`, {
+    params: { type },
+    responseType: 'blob',
+  });
+  const disposition = res.headers?.['content-disposition'] || '';
+  const match = /filename="?([^"]+)"?/.exec(disposition);
+  const filename = match ? match[1] : `job-${id}-${type}.csv`;
+  const url = window.URL.createObjectURL(new Blob([res.data], { type: 'text/csv' }));
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  window.URL.revokeObjectURL(url);
+  return { filename };
+};

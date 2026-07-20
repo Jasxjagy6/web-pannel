@@ -203,6 +203,16 @@ class AiChatService {
 
     await aiMemoryService.append(sid, peerType, peerId, memoryItem, cfg.memoryMessageLimit);
 
+    // Reset re-engagement nudge counter when user replies — a real human
+    // interaction means a fresh cycle can start.
+    await pool.query(
+      `UPDATE ai_chat_memories
+          SET reengage = '{}'::jsonb
+        WHERE session_id = $1 AND peer_type = $2 AND peer_id = $3
+          AND reengage IS NOT NULL AND reengage != '{}'::jsonb`,
+      [sid, peerType, String(peerId)]
+    ).catch(() => {});
+
     // Fetch recipient profile from Telegram for better AI context
     const recipientProfile = await this._getRecipientProfile(sid, peerType, peerId, chat);
     await aiMemoryService.setRecipientProfile(sid, peerType, peerId, recipientProfile);
@@ -258,6 +268,82 @@ class AiChatService {
     });
 
     logger.info(`AI: job enqueued — returning handled:true`);
+    return { handled: true };
+  }
+
+  /**
+   * Enqueue a proactive FOLLOW-UP (re-engagement) for a chat where the AI
+   * spoke last and the user went silent. Used by aiReengageService.
+   *
+   * No new incoming message — we replay the existing chatHistory (which
+   * ends with the assistant's message). For CapitalBot this triggers its
+   * automatic follow-up generation (a natural, in-language nudge); for
+   * CupidBot we set isFollowUp explicitly. Skips gracefully if the session
+   * is disabled, the chat is opted out, or the last message is no longer
+   * outbound (the user replied in the meantime).
+   *
+   * @returns {Promise<{handled:boolean, reason?:string}>}
+   */
+  async enqueueFollowUp(sessionId, peerType, peerId) {
+    const sid = Number(sessionId);
+    const pid = Number(peerId);
+    if (peerType !== 'user') return { handled: false, reason: 'not_dm' };
+    if (pid === 777000) return { handled: false, reason: 'service_account' };
+
+    // Session must still be AI-enabled.
+    const sessionSettings = await this.getSessionSettings(sid);
+    if (!sessionSettings.enabled) return { handled: false, reason: 'session_disabled' };
+
+    // Per-chat opt-out still applies.
+    const chatOverride = await this.getChatSettings(sid, peerType, pid);
+    if (chatOverride && chatOverride.enabled === false) {
+      return { handled: false, reason: 'chat_disabled' };
+    }
+    const cfg = _mergeConfig({ ...sessionSettings.config, ...(chatOverride?.config || {}) });
+
+    // Re-check the live memory: only nudge if the newest message is still
+    // OUTBOUND (the user hasn't replied since the scan picked this up).
+    const state = await aiMemoryService.getConversationState(sid, peerType, pid, cfg.memoryMessageLimit);
+    const recent = state.allRecent || [];
+    if (recent.length === 0) return { handled: false, reason: 'no_history' };
+    const newest = recent[recent.length - 1];
+    if (!newest || newest.isIncoming) return { handled: false, reason: 'user_already_replied' };
+
+    const userId = await this._resolveUserId(sid);
+    if (!userId) return { handled: false, reason: 'no_user_id' };
+
+    // Reuse the stored recipient profile (no Telegram round-trip).
+    const rp = (await aiMemoryService.getRecipientProfile(sid, peerType, pid)) || {};
+    const recipient = {
+      id: String(pid),
+      name: rp.name || '',
+      username: rp.username || '',
+      bio: rp.bio || '',
+      location: rp.location || '',
+      accessHash: rp.accessHash || null,
+    };
+
+    const botProfile = await this._getBotProfile(sid);
+    const confirmedMessages = await this._getConfirmedMessageIds(sid, peerType, pid);
+
+    logger.info(`AI reengage: enqueuing follow-up for session ${sid} peer ${peerType}:${pid} (history=${recent.length})`);
+    await aiChatQueue.add('generate-reply', {
+      sessionId: sid,
+      userId,
+      peerType,
+      peerId: pid,
+      incomingMessage: null,
+      recipient,
+      config: cfg,
+      conversationState: {
+        messages: state.messages,
+        lastExchange: state.lastExchange,
+        allRecent: recent,
+      },
+      confirmedMessageIds: confirmedMessages,
+      botProfile,
+      isReengage: true,
+    });
     return { handled: true };
   }
 

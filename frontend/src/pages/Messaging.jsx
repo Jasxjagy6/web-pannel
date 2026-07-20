@@ -10,6 +10,7 @@ import {
   previewMessage,
   previewBulk,
   getMessageHistory,
+  exportJobRecipients,
 } from '../api/messages';
 import { listsAPI } from '../api/lists';
 import SessionListSwitcher from '../components/common/SessionListSwitcher';
@@ -52,6 +53,7 @@ import {
   Search,
   Group,
   AtSign,
+  Download,
   History as HistoryIcon,
 } from 'lucide-react';
 import {
@@ -881,6 +883,24 @@ export default function Messaging() {
   const [statusFilter, setStatusFilter] = useState('all');
   const [currentPage, setCurrentPage] = useState(1);
   const pageSize = 10;
+
+  // Download recipients modal
+  const [downloadJob, setDownloadJob] = useState(null);
+  const [downloading, setDownloading] = useState('');
+
+  const handleDownloadRecipients = useCallback(async (job, type) => {
+    if (downloading) return;
+    setDownloading(type);
+    try {
+      const { filename } = await exportJobRecipients(job.id, type);
+      showSuccess(`Downloaded ${filename}`, 'Export ready');
+      setDownloadJob(null);
+    } catch (err) {
+      showError(parseApiError(err), 'Export failed');
+    } finally {
+      setDownloading('');
+    }
+  }, [downloading, showSuccess, showError]);
 
   // Fetch sessions
   const fetchSessions = useCallback(async () => {
@@ -1829,6 +1849,13 @@ export default function Messaging() {
                         <td className="px-4 py-3 text-right">
                           <div className="inline-flex items-center gap-1">
                             <button
+                              onClick={() => setDownloadJob(job)}
+                              className="p-1.5 rounded-lg text-gray-400 hover:text-emerald-400 hover:bg-emerald-500/10 transition"
+                              title="Download recipients (successful / replied)"
+                            >
+                              <Download className="w-4 h-4" />
+                            </button>
+                            <button
                               onClick={() => setExpandedReplyJobId(isExpanded ? null : job.id)}
                               className={`p-1.5 rounded-lg transition ${isExpanded ? 'text-primary-400 bg-primary-500/10' : 'text-gray-400 hover:text-primary-400 hover:bg-primary-500/10'}`}
                               title="View reply tracking / who replied"
@@ -1934,6 +1961,62 @@ export default function Messaging() {
         sessions={sessions}
         onSendTest={handleSendTest}
       />
+
+      {/* Download Recipients Modal */}
+      <Modal
+        isOpen={!!downloadJob}
+        onClose={() => { if (!downloading) setDownloadJob(null); }}
+        title={downloadJob ? `Download recipients — Job #${downloadJob.id}` : 'Download recipients'}
+        size="md"
+      >
+        {downloadJob && (
+          <div className="space-y-3">
+            <p className="text-sm text-gray-400">
+              Choose which list to download as a CSV file.
+            </p>
+
+            <button
+              onClick={() => handleDownloadRecipients(downloadJob, 'sent')}
+              disabled={!!downloading}
+              className="w-full flex items-center justify-between gap-3 rounded-xl border border-white/10 bg-dark-900 px-4 py-3 text-left transition hover:border-emerald-500/40 hover:bg-emerald-500/5 disabled:opacity-50 disabled:cursor-not-allowed"
+            >
+              <div className="flex items-center gap-3">
+                <div className="flex h-9 w-9 items-center justify-center rounded-lg bg-emerald-500/10 text-emerald-400">
+                  {downloading === 'sent' ? <Loader2 className="h-4 w-4 animate-spin" /> : <CheckCircle className="h-4 w-4" />}
+                </div>
+                <div>
+                  <p className="text-sm font-medium text-white">Successful DMs</p>
+                  <p className="text-xs text-gray-500">Everyone the message was delivered to.</p>
+                </div>
+              </div>
+              <span className="text-sm font-semibold text-emerald-400">{formatNumber(downloadJob.sentCount || 0)}</span>
+            </button>
+
+            <button
+              onClick={() => handleDownloadRecipients(downloadJob, 'replied')}
+              disabled={!!downloading}
+              className="w-full flex items-center justify-between gap-3 rounded-xl border border-white/10 bg-dark-900 px-4 py-3 text-left transition hover:border-primary-500/40 hover:bg-primary-500/5 disabled:opacity-50 disabled:cursor-not-allowed"
+            >
+              <div className="flex items-center gap-3">
+                <div className="flex h-9 w-9 items-center justify-center rounded-lg bg-primary-500/10 text-primary-400">
+                  {downloading === 'replied' ? <Loader2 className="h-4 w-4 animate-spin" /> : <MessageSquare className="h-4 w-4" />}
+                </div>
+                <div>
+                  <p className="text-sm font-medium text-white">Successful DMs + replied back</p>
+                  <p className="text-xs text-gray-500">Recipients who replied within the 24h tracking window.</p>
+                </div>
+              </div>
+              <span className="text-sm font-semibold text-primary-400">{formatNumber(downloadJob.repliedCount || 0)}</span>
+            </button>
+
+            {!downloadJob.replyTrackingStatus && (downloadJob.repliedCount || 0) === 0 && (
+              <p className="text-xs text-amber-300/80">
+                Reply tracking wasn't enabled for this job, so the "replied back" list may be empty.
+              </p>
+            )}
+          </div>
+        )}
+      </Modal>
         </>
       ) : activeTab === 'groups' ? (
         <MessageGroupsTab />

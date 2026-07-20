@@ -695,6 +695,40 @@ const adminController = {
   }),
 
   // ---------------------------------------------------------------------
+  // Global AI re-engagement toggle (system_settings.ai.reengage_enabled).
+  // When OFF the periodic scan that nudges silent chats stops entirely.
+  // ---------------------------------------------------------------------
+
+  /** GET /api/admin/ai-reengage/settings — current re-engage config. */
+  getReengageSettings: asyncHandler(async (_req, res) => {
+    const settingsService = require('../services/systemSettingsService');
+    const cfg = await settingsService.getReengageConfig();
+    res.json({ success: true, data: cfg });
+  }),
+
+  /** PUT /api/admin/ai-reengage/settings — update re-engage config. */
+  setReengageSettings: asyncHandler(async (req, res) => {
+    const settingsService = require('../services/systemSettingsService');
+    const allowedKeys = ['ai.reengage_enabled'];
+    const patch = {};
+    for (const k of allowedKeys) {
+      if (Object.prototype.hasOwnProperty.call(req.body || {}, k)) {
+        patch[k] = req.body[k];
+      }
+    }
+    if (Object.keys(patch).length === 0) {
+      throw new AppError('No settings to update', 400, 'BAD_REQUEST');
+    }
+    if (patch['ai.reengage_enabled'] !== undefined) {
+      patch['ai.reengage_enabled'] = !!patch['ai.reengage_enabled'];
+    }
+    const updated = await settingsService.setSettings(patch, req.user.id);
+    await recordAdminAction(req.user.id, req.user.id, 'ai_reengage_settings_update', patch);
+    logger.info('admin: ai re-engage settings updated', { admin: req.user.id, patch });
+    res.json({ success: true, data: updated });
+  }),
+
+  // ---------------------------------------------------------------------
   // Active logins — list / revoke per-user JWT sessions.
   //
   // GET    /api/admin/users/:id/sessions           — list active sessions

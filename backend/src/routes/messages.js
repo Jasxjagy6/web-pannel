@@ -86,6 +86,10 @@ router.post('/schedules/:id/cancel', messageController.cancelSchedule);
 // (the job-history dropdown). Declared before the catch-all `/:id`.
 router.get('/jobs/:id/replies', messageController.getJobReplyDetails);
 
+// GET /api/messages/jobs/:id/export?type=sent|replied - CSV download of
+// the job's successful recipients, or those who replied back.
+router.get('/jobs/:id/export', messageController.exportJobRecipients);
+
 // GET /api/messages/jobs/:id/session-breakdown - Per-session send breakdown
 router.get('/jobs/:id/session-breakdown', getJobSessionBreakdown);
 

@@ -1381,13 +1381,21 @@ class MessageService {
     // sequential, so session order is meaningful (unlike bulk rotation).
     const verified = await this._verifyMultipleSessionsOwnership(sessionIds, userId);
     const verifiedSet = new Set(verified.map((s) => String(s.id)));
-    const orderedSessionIds = sessionIds
+    let orderedSessionIds = sessionIds
       .map((s) => String(s))
       .filter((s) => verifiedSet.has(s));
 
     if (orderedSessionIds.length === 0) {
       throw new AppError('No valid sessions found for this user', 404, 'NO_VALID_SESSIONS');
     }
+
+    // Rotate the pool so the least-recently-used accounts lead. Failover
+    // stops early on big jobs (the tail of the list is never reached), so
+    // this spreads load across every session over successive jobs — the
+    // ~67 sessions untouched by the last run go FIRST this time. The
+    // sequential failover mechanism itself is unchanged; only the start
+    // order is rebalanced, no matter how the lists were selected.
+    orderedSessionIds = await this._orderSessionsByLeastUsed(orderedSessionIds);
 
     // Build rich target descriptors so we can address each one correctly
     // (numeric id -> id, alpha -> @username) AND keep a label + resolved
@@ -1505,6 +1513,15 @@ class MessageService {
     let sessionIndex = 0;
     const retired = new Set();
 
+    // Track consecutive target-side failures per session. When a session
+    // hits this many target-side errors in a row (e.g. "No user has" for
+    // every target) it is almost certainly broken — retire it and let the
+    // next session try. A low value catches broken sessions quickly but
+    // risks retiring healthy sessions on garbage-heavy lists (clusters of
+    // 10+ invalid usernames at the top of a dump are common).
+    const CONSECUTIVE_FAILURE_LIMIT = 25;
+    const consecutiveFailures = {};
+
     const logRows = [];
     const flushLogs = async () => {
       if (logRows.length === 0) return;
@@ -1597,6 +1614,7 @@ class MessageService {
         await telegramService.sendMessage(sessionId, target.addr, message, sendOpts);
 
         sent++;
+        consecutiveFailures[sessionId] = 0; // reset on success
         logRows.push({ jobId, sessionId: Number(sessionId), targetId: target.addr, status: 'sent' });
 
         // Record who we messaged (for reply tracking) — upsert per target.
@@ -1628,6 +1646,7 @@ class MessageService {
         if (decision.action === 'switch_session') {
           // Retire this session and RETRY THE SAME TARGET on the next one.
           retired.add(sessionId);
+          delete consecutiveFailures[sessionId];
           logger.warn(
             `Failover job ${jobId}: session ${sessionId} retired (${decision.reason}) ` +
             `at target ${i + 1}/${targets.length} — handing off, resuming from this target`
@@ -1638,16 +1657,39 @@ class MessageService {
           });
           sessionIndex++; // move to next session; cursor `i` unchanged
         } else {
-          // Target-side problem: skip just this target, keep the session.
-          failed++;
-          logger.info(
-            `Failover job ${jobId}: skipping target ${target.addr} (${decision.reason}) — session kept`
-          );
-          logRows.push({
-            jobId, sessionId: Number(sessionId), targetId: target.addr,
-            status: 'failed', error: `${decision.reason}: ${raw.slice(0, 200)}`,
-          });
-          i++;
+          // Target-side error — track consecutive failures per session.
+          consecutiveFailures[sessionId] = (consecutiveFailures[sessionId] || 0) + 1;
+
+          if (consecutiveFailures[sessionId] >= CONSECUTIVE_FAILURE_LIMIT) {
+            // Session is fundamentally broken (e.g. cannot resolve ANY
+            // username). Retire it like a session-level error and retry
+            // the same target on the next session.
+            retired.add(sessionId);
+            delete consecutiveFailures[sessionId];
+            logger.warn(
+              `Failover job ${jobId}: session ${sessionId} retired after ` +
+              `${CONSECUTIVE_FAILURE_LIMIT} consecutive target-side failures ` +
+              `(${decision.reason}) — session likely broken, handing off`
+            );
+            logRows.push({
+              jobId, sessionId: Number(sessionId), targetId: target.addr,
+              status: 'session_limited',
+              error: `CONSECUTIVE_FAILURES (${decision.reason}): ${raw.slice(0, 200)}`,
+            });
+            sessionIndex++; // try this target on the next session instead
+          } else {
+            // Genuine target-side problem — skip just this target.
+            failed++;
+            logger.info(
+              `Failover job ${jobId}: skipping target ${target.addr} ` +
+              `(${decision.reason}) — session kept (${consecutiveFailures[sessionId]}/${CONSECUTIVE_FAILURE_LIMIT})`
+            );
+            logRows.push({
+              jobId, sessionId: Number(sessionId), targetId: target.addr,
+              status: 'failed', error: `${decision.reason}: ${raw.slice(0, 200)}`,
+            });
+            i++;
+          }
         }
       }
 
@@ -3830,6 +3872,72 @@ class MessageService {
       [sessionIds.map((s) => parseInt(s, 10)), userId]
     );
     return result.rows;
+  }
+
+  /**
+   * Reorder a session list so the LEAST-recently-used accounts lead.
+   *
+   * Failover is sequential (session #1 sends until Telegram limits it,
+   * then hands off to #2, …), so a large job often finishes before the
+   * back of the list is ever reached — that's why a 100-session run only
+   * exercised ~34 accounts. To spread load across the whole pool over
+   * successive jobs, we sort the operator's selection by how much each
+   * session has actually sent in a recent window (ascending): sessions
+   * that sent nothing lead, previously-used ones trail. The operator's
+   * original order is the stable tie-breaker, so behaviour is unchanged
+   * within a group of equally-rested sessions. The failover mechanism
+   * itself is untouched — only the starting ORDER changes, regardless of
+   * how the session lists were selected in the UI.
+   *
+   * Best-effort: any DB hiccup falls back to the operator's order so a
+   * send is never blocked by this optimisation.
+   *
+   * @param {string[]} orderedSessionIds  Operator-ordered session ids.
+   * @returns {Promise<string[]>}         Least-used-first ordering.
+   * @private
+   */
+  async _orderSessionsByLeastUsed(orderedSessionIds) {
+    try {
+      const ids = orderedSessionIds.map((s) => parseInt(s, 10)).filter(Number.isFinite);
+      if (ids.length <= 1) return orderedSessionIds;
+
+      const lookbackDays = parseInt(process.env.MSG_SESSION_ROTATION_LOOKBACK_DAYS || '14', 10);
+
+      // WITH ORDINALITY keeps the operator's position as a stable
+      // tiebreaker. attempts = every send row (sent / failed / limited)
+      // in the window — any of them "consumed" the account's action
+      // budget, so they all count as usage.
+      const { rows } = await pool.query(
+        `SELECT s.id::text AS id
+           FROM unnest($1::int[]) WITH ORDINALITY AS s(id, ord)
+           LEFT JOIN (
+             SELECT session_id,
+                    COUNT(*)      AS attempts,
+                    MAX(sent_at)  AS last_used
+               FROM message_logs
+              WHERE session_id = ANY($1::int[])
+                AND sent_at > NOW() - ($2 || ' days')::interval
+              GROUP BY session_id
+           ) u ON u.session_id = s.id
+          ORDER BY COALESCE(u.attempts, 0) ASC,
+                   u.last_used ASC NULLS FIRST,
+                   s.ord ASC`,
+        [ids, String(lookbackDays)]
+      );
+
+      if (!rows || rows.length !== ids.length) return orderedSessionIds;
+      const reordered = rows.map((r) => String(r.id));
+
+      const leadPreview = reordered.slice(0, 5).join(',');
+      logger.info(
+        `Session rotation: reordered ${reordered.length} sessions least-used-first ` +
+        `(lookback ${lookbackDays}d, lead: ${leadPreview}…)`
+      );
+      return reordered;
+    } catch (err) {
+      logger.warn(`_orderSessionsByLeastUsed failed, keeping operator order: ${err.message}`);
+      return orderedSessionIds;
+    }
   }
 
   /**

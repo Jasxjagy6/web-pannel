@@ -14,7 +14,7 @@ import {
 import { useToast } from '../components/common/Toast';
 import { parseApiError } from '@/utils/formatters';
 import TelegramCredentialsCard from '../components/settings/TelegramCredentialsCard';
-import { getProxySettings, updateProxySettings } from '@/api/admin';
+import { getProxySettings, updateProxySettings, getReengageSettings, updateReengageSettings } from '@/api/admin';
 
 function SectionCard({ icon: Icon, title, description, children, className = '' }) {
   return (
@@ -124,6 +124,11 @@ export default function Settings() {
   const [proxyLoading, setProxyLoading] = useState(false);
   const [proxySaving, setProxySaving] = useState(false);
 
+  // --- AI re-engagement toggle (admin only) ---
+  const [reengageEnabled, setReengageEnabled] = useState(true);
+  const [reengageLoading, setReengageLoading] = useState(false);
+  const [reengageSaving, setReengageSaving] = useState(false);
+
   const loadProxySettings = useCallback(async () => {
     if (!isAdmin) return;
     setProxyLoading(true);
@@ -139,6 +144,44 @@ export default function Settings() {
   }, [isAdmin, showError]);
 
   useEffect(() => { loadProxySettings(); }, [loadProxySettings]);
+
+  // --- AI re-engage ---
+  const loadReengageSettings = useCallback(async () => {
+    if (!isAdmin) return;
+    setReengageLoading(true);
+    try {
+      const r = await getReengageSettings();
+      const v = r?.data?.data?.['ai.reengage_enabled'];
+      setReengageEnabled(v !== false);
+    } catch (e) {
+      showError(parseApiError(e), 'Failed to load re-engagement settings');
+    } finally {
+      setReengageLoading(false);
+    }
+  }, [isAdmin, showError]);
+
+  useEffect(() => { loadReengageSettings(); }, [loadReengageSettings]);
+
+  const handleReengageToggle = async (next) => {
+    if (reengageSaving) return;
+    setReengageSaving(true);
+    const previous = reengageEnabled;
+    setReengageEnabled(next);
+    try {
+      await updateReengageSettings({ 'ai.reengage_enabled': next });
+      showSuccess(
+        next
+          ? 'AI re-engagement enabled. Silent chats will receive follow-up nudges.'
+          : 'AI re-engagement disabled. No nudges will be sent.',
+        'Re-engagement settings saved'
+      );
+    } catch (e) {
+      setReengageEnabled(previous);
+      showError(parseApiError(e), 'Failed to update re-engagement settings');
+    } finally {
+      setReengageSaving(false);
+    }
+  };
 
   const handleProxyToggle = async (next) => {
     if (proxySaving) return;
@@ -286,6 +329,47 @@ export default function Settings() {
                 {proxyGlobalEnabled
                   ? 'Tip: turn this OFF to bypass the proxy pool entirely if your proxies are dead and login is timing out. Existing sessions reconnect on next heartbeat.'
                   : 'All proxy paths (BYO, admin pool, free, auto-rotating) are bypassed. STRICT_PROXY_ISOLATION and REQUIRE_USER_PROXY do not apply while this is OFF.'}
+              </div>
+            </>
+          )}
+        </SectionCard>
+      )}
+
+      {/* AI RE-ENGAGEMENT TOGGLE (admin only).
+          When OFF the periodic scan that nudges silent chats stops
+          entirely — no follow-ups are enqueued until toggled ON. */}
+      {isAdmin && (
+        <SectionCard
+          icon={MessageSquare}
+          title="AI Re-engagement"
+          description="Automatically nudge silent chats to keep conversations alive."
+        >
+          {reengageLoading ? (
+            <div className="flex items-center gap-2 text-sm text-gray-400">
+              <Loader2 className="h-4 w-4 animate-spin" /> Loading re-engagement settings…
+            </div>
+          ) : (
+            <>
+              <Toggle
+                checked={reengageEnabled}
+                onChange={handleReengageToggle}
+                label={reengageSaving ? 'Saving…' : 'Enable AI re-engagement'}
+                description={
+                  reengageEnabled
+                    ? 'ON — silent chats receive contextual follow-up nudges (max 3 per chat, randomised timing).'
+                    : 'OFF — no re-engagement nudges are sent. Existing chat cycles are paused.'
+                }
+              />
+              <div
+                className={`mt-3 rounded-lg border p-3 text-xs ${
+                  reengageEnabled
+                    ? 'border-primary-500/20 bg-primary-500/5 text-primary-200/80'
+                    : 'border-amber-500/20 bg-amber-500/5 text-amber-200/90'
+                }`}
+              >
+                {reengageEnabled
+                  ? 'Chats where the AI spoke last and the user hasn\'t replied within ~30–60 min receive a contextual follow-up. Max 3 nudges per chat; no nudges after the user replies.'
+                  : 'Re-engagement is paused. The next scan cycle will find zero candidates. Toggle ON to resume.'}
               </div>
             </>
           )}

@@ -75,4 +75,11 @@ router.delete('/proxies/:id',  ctrl.deleteAdminProxy);
 router.get('/proxy/settings', ctrl.getProxySettings);
 router.put('/proxy/settings', ctrl.setProxySettings);
 
+// ---------------------------------------------------------------------
+// Global AI re-engagement toggle (system_settings.ai.reengage_enabled).
+// When OFF the periodic scan that nudges silent chats stops entirely.
+// ---------------------------------------------------------------------
+router.get('/ai-reengage/settings', ctrl.getReengageSettings);
+router.put('/ai-reengage/settings', ctrl.setReengageSettings);
+
 module.exports = router;
