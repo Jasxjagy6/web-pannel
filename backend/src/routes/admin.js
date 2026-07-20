@@ -18,6 +18,10 @@ router.post('/users/:id/ban', ctrl.banUser);
 router.post('/users/:id/unban', ctrl.unbanUser);
 router.put('/users/:id/subscription', ctrl.setSubscription);
 
+// Simplified none/pro plan lever. 'pro' grants full unlimited access on
+// both platforms + lifts the per-credential session cap; 'none' closes it.
+router.post('/users/:id/plan', ctrl.setUserPlan);
+
 // Active logins (auth_sessions) — list and revoke per-user JWT sessions.
 router.get('/users/:id/sessions', ctrl.listUserSessions);
 router.post('/users/:id/sessions/revoke-all', ctrl.revokeAllUserSessions);
