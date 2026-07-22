@@ -7,7 +7,7 @@ import {
 } from 'lucide-react';
 import {
   listUsers, approveUser, banUser, unbanUser, deleteUser,
-  setSubscription, getSystemStats,
+  setSubscription, setUserPlan, getSystemStats,
   getBillingSettings, updateBillingSettings, listAdminInvoices,
   grantUserSubscription, expireUserSubscription,
   listUserPlatformSubscriptions, setUserPlatformSubscription,
@@ -164,6 +164,21 @@ function UsersTab() {
     } finally { setActingUserId(null); }
   };
 
+  // One-click none/pro plan lever. 'pro' unlocks all features on both
+  // platforms and lifts the per-credential session cap to the max.
+  const onSetPlan = async (u, plan) => {
+    setActingUserId(u.id);
+    try {
+      await setUserPlan(u.id, plan);
+      toast.success(plan === 'pro'
+        ? `${u.email} upgraded to Pro (full unlimited access)`
+        : `${u.email} set to None (access closed)`);
+      await load();
+    } catch (e) {
+      toast.error(parseApiError(e), 'Plan update failed');
+    } finally { setActingUserId(null); }
+  };
+
   return (
     <div className="space-y-6">
       <div className="flex justify-end">
@@ -237,6 +252,7 @@ function UsersTab() {
                       onUnban={onUnban}
                       onDelete={onDelete}
                       onEdit={() => setEditing(u)}
+                      onSetPlan={onSetPlan}
                     />
                   ))}
                 </tbody>
@@ -253,6 +269,7 @@ function UsersTab() {
                   onUnban={onUnban}
                   onDelete={onDelete}
                   onEdit={() => setEditing(u)}
+                  onSetPlan={onSetPlan}
                 />
               ))}
             </ul>
@@ -298,7 +315,7 @@ function StatsGrid({ stats }) {
   );
 }
 
-function UserRow({ u, acting, onApprove, onBan, onUnban, onDelete, onEdit }) {
+function UserRow({ u, acting, onApprove, onBan, onUnban, onDelete, onEdit, onSetPlan }) {
   return (
     <tr className="border-b border-dark-800/60 hover:bg-dark-800/40">
       <td className="p-3">
@@ -311,9 +328,7 @@ function UserRow({ u, acting, onApprove, onBan, onUnban, onDelete, onEdit }) {
         <StatusBadge status={u.status} />
       </td>
       <td className="p-3 text-dark-300">
-        {u.subscription?.plan ? (
-          <span className="capitalize">{u.subscription.plan} <span className="text-dark-500">({u.subscription.status})</span></span>
-        ) : <span className="text-dark-500">—</span>}
+        <PlanToggle u={u} acting={acting} onSetPlan={onSetPlan} />
       </td>
       <td className="p-3 text-dark-300">{u.sessionsCount ?? 0} <span className="text-dark-500">({u.activeSessionsCount ?? 0} active)</span></td>
       <td className="p-3 text-dark-400">{u.createdAt ? new Date(u.createdAt).toLocaleDateString() : '—'}</td>
@@ -324,7 +339,34 @@ function UserRow({ u, acting, onApprove, onBan, onUnban, onDelete, onEdit }) {
   );
 }
 
-function UserCard({ u, acting, onApprove, onBan, onUnban, onDelete, onEdit }) {
+// A user is "pro" when they have an active subscription. The none/pro
+// lever flips the whole entitlement + session-cap in one click.
+function PlanToggle({ u, acting, onSetPlan }) {
+  if (u.role === 'admin') return <span className="text-xs text-dark-500">Admin</span>;
+  const isPro = u.subscription?.status === 'active';
+  return (
+    <div className="inline-flex overflow-hidden rounded-lg border border-dark-700">
+      <button
+        onClick={() => onSetPlan(u, 'none')} disabled={acting || !isPro}
+        className={`px-2.5 py-1 text-xs font-medium transition ${
+          !isPro ? 'bg-dark-700 text-white' : 'bg-dark-900/60 text-dark-400 hover:text-white'
+        } disabled:cursor-default`}
+      >
+        None
+      </button>
+      <button
+        onClick={() => onSetPlan(u, 'pro')} disabled={acting || isPro}
+        className={`inline-flex items-center gap-1 px-2.5 py-1 text-xs font-medium transition ${
+          isPro ? 'bg-primary-500/20 text-primary-300' : 'bg-dark-900/60 text-dark-400 hover:text-primary-300'
+        } disabled:cursor-default`}
+      >
+        <Sparkles className="h-3 w-3" /> Pro
+      </button>
+    </div>
+  );
+}
+
+function UserCard({ u, acting, onApprove, onBan, onUnban, onDelete, onEdit, onSetPlan }) {
   return (
     <li className="space-y-3 p-4">
       <div className="flex items-start justify-between gap-2">
@@ -335,7 +377,7 @@ function UserCard({ u, acting, onApprove, onBan, onUnban, onDelete, onEdit }) {
         <StatusBadge status={u.status} />
       </div>
       <div className="flex flex-wrap items-center gap-3 text-xs text-dark-300">
-        <span><span className="text-dark-500">Subscription:</span> {u.subscription?.plan ? `${u.subscription.plan} (${u.subscription.status})` : '—'}</span>
+        <span className="inline-flex items-center gap-2"><span className="text-dark-500">Plan:</span> <PlanToggle u={u} acting={acting} onSetPlan={onSetPlan} /></span>
         <span><span className="text-dark-500">Sessions:</span> {u.sessionsCount ?? 0} ({u.activeSessionsCount ?? 0} active)</span>
       </div>
       <RowActions u={u} acting={acting} onApprove={onApprove} onBan={onBan} onUnban={onUnban} onDelete={onDelete} onEdit={onEdit} />

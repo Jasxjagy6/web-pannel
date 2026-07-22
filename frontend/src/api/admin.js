@@ -14,6 +14,11 @@ export const unbanUser = (id) => api.post(`/admin/users/${id}/unban`);
 export const setSubscription = (id, payload) =>
   api.put(`/admin/users/${id}/subscription`, payload);
 
+// Simplified none/pro plan lever. 'pro' unlocks all features on both
+// platforms and lifts the per-credential session cap; 'none' closes it.
+export const setUserPlan = (id, plan) =>
+  api.post(`/admin/users/${id}/plan`, { plan });
+
 // Per-platform subscription editor (used by the multi-platform admin UI).
 export const listUserPlatformSubscriptions = (id) =>
   api.get(`/admin/users/${id}/subscriptions`);

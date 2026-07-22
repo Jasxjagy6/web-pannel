@@ -75,6 +75,24 @@ function sleep(ms) {
 }
 
 /**
+ * Sleep, but bail out early as soon as `isCancelled()` returns true.
+ * Polls every 250ms so a long cooldown can't hold a job hostage after
+ * the operator clicks Cancel. `isCancelled` may be sync or async.
+ */
+async function cancellableSleep(ms, isCancelled) {
+  const start = Date.now();
+  const step = 250;
+  while (Date.now() - start < ms) {
+    if (typeof isCancelled === 'function') {
+      try {
+        if (await isCancelled()) return;
+      } catch (_) { /* best-effort */ }
+    }
+    await sleep(Math.min(step, ms - (Date.now() - start)));
+  }
+}
+
+/**
  * Generate a random integer between min and max (inclusive).
  * @param {number} min - Minimum value
  * @param {number} max - Maximum value
@@ -774,7 +792,7 @@ class DistributionEngine {
             { jobId }
           );
           await updateProgress('cooldown');
-          await sleep(cooldownSec * 1000);
+          await cancellableSleep(cooldownSec * 1000, isCancelled);
         }
       }
     } else {
@@ -1636,7 +1654,7 @@ class MessageService {
 
         // Human-like delay between sends on the same session.
         if (i < targets.length) {
-          await sleep(randomInt(delayMin, delayMax));
+          await cancellableSleep(randomInt(delayMin, delayMax), isCancelled);
         }
       } catch (err) {
         const raw = err && err.message ? err.message : String(err);
@@ -1716,6 +1734,372 @@ class MessageService {
 
     logger.info(`Failover job ${jobId} ${finalStatus}: ${sent} sent, ${failed} failed, ${skipped} skipped`);
     return { sent, failed, skipped, sessionsUsed: sessionIndex + 1 - retired.size >= 0 ? Math.min(sessionIndex + 1, sessionIds.length) : sessionIds.length };
+  }
+
+
+  // =========================================================================
+  // Parallel Round-Robin Mass DM (new mode)
+  // =========================================================================
+
+  /**
+   * PARALLEL round-robin mass DM.
+   *
+   * Behaviour (operator spec):
+   *   - Every session works IN PARALLEL, pulling the next target off a
+   *     shared queue: session #1 -> target 1, session #2 -> target 2, …
+   *   - If a target is invalid / not found (target-side error) the session
+   *     SKIPS it and immediately pulls the NEXT target, so no session sits
+   *     idle and every session gets used for at least one DM.
+   *   - If a session is rate-limited (FLOOD_WAIT) it cools down and rejoins;
+   *     if it's flagged (PEER_FLOOD) or dead (auth revoked) it retires and
+   *     the target it was on is re-queued for a different session.
+   *   - A session that fails many targets in a row (broken account that
+   *     can't resolve anything) is retired so it stops eating the queue.
+   *
+   * Unlike failover (one active session, sequential) this saturates the
+   * whole pool: 1500 targets across 100 sessions finish in minutes, not
+   * hours, while each individual account stays within safe pacing.
+   *
+   * Same params contract as sendFailoverMessage.
+   */
+  async sendParallelMassDm(params, userId) {
+    const {
+      sessionIds,
+      message,
+      messageType = 'text',
+      delayMin = DEFAULT_DELAY_MIN,
+      delayMax = DEFAULT_DELAY_MAX,
+      messageOptions = {},
+      sourceType = 'manual',
+      sourceId = null,
+      trackReplies = true,
+      replyWindowHours = 24,
+      // Safe-pacing knobs (all optional; safe defaults below).
+      perSessionBurst,
+      burstCooldownSecMin,
+      burstCooldownSecMax,
+      startStaggerMsMin,
+      startStaggerMsMax,
+    } = params;
+
+    let targetList = params.targetList;
+
+    if (!sessionIds || sessionIds.length === 0) {
+      throw new AppError('At least one session ID is required', 400, 'NO_SESSIONS');
+    }
+
+    // Reload the full list server-side (same reason as failover: the
+    // paginated /lists endpoint caps at 100 rows, which would silently
+    // truncate the audience).
+    if (sourceType === 'list' && sourceId != null) {
+      try {
+        const { rows } = await pool.query(
+          `SELECT telegram_id, username, first_name, last_name, phone, access_hash
+             FROM list_items WHERE list_id = $1 ORDER BY id ASC`,
+          [Number(sourceId)]
+        );
+        if (rows.length > 0) {
+          targetList = rows.map((r) => ({
+            telegram_id: r.telegram_id,
+            username: r.username,
+            first_name: r.first_name,
+            last_name: r.last_name,
+            phone: r.phone,
+            access_hash: r.access_hash,
+          }));
+          logger.info(`Parallel: loaded full list ${sourceId} server-side (${targetList.length} items)`);
+        }
+      } catch (err) {
+        logger.warn(`Parallel: full-list load for ${sourceId} failed, using client targetList: ${err.message}`);
+      }
+    }
+
+    if (!targetList || targetList.length === 0) {
+      throw new AppError('Target list cannot be empty', 400, 'EMPTY_TARGET_LIST');
+    }
+    if (!message || message.trim().length === 0) {
+      throw new AppError('Message content is required', 400, 'EMPTY_MESSAGE');
+    }
+
+    // Verify + rotate sessions least-used-first so the whole pool is
+    // exercised evenly across successive jobs.
+    const verified = await this._verifyMultipleSessionsOwnership(sessionIds, userId);
+    const verifiedSet = new Set(verified.map((s) => String(s.id)));
+    let orderedSessionIds = sessionIds
+      .map((s) => String(s))
+      .filter((s) => verifiedSet.has(s));
+
+    if (orderedSessionIds.length === 0) {
+      throw new AppError('No valid sessions found for this user', 404, 'NO_VALID_SESSIONS');
+    }
+    orderedSessionIds = await this._orderSessionsByLeastUsed(orderedSessionIds);
+
+    // Build rich target descriptors (same shape as failover).
+    const targets = [];
+    for (const t of targetList) {
+      const addr = normalizeTargetId(t);
+      if (!addr) continue;
+      const obj = (t && typeof t === 'object') ? t : {};
+      const rawPeer = obj.telegram_id ?? obj.telegramId ?? obj.id ?? obj.user_id ?? null;
+      const peerId = rawPeer != null && /^-?\d+$/.test(String(rawPeer).trim())
+        ? String(rawPeer).trim()
+        : (/^-?\d+$/.test(addr) ? addr : null);
+      const label =
+        (obj.username && `@${String(obj.username).replace(/^@+/, '')}`) ||
+        [obj.first_name, obj.last_name].filter(Boolean).join(' ').trim() ||
+        addr;
+      targets.push({
+        addr,
+        peerId,
+        label,
+        accessHash: obj.access_hash ?? obj.accessHash ?? null,
+      });
+    }
+
+    if (targets.length === 0) {
+      throw new AppError('No valid targets in the target list', 400, 'NO_VALID_TARGETS');
+    }
+
+    const jobResult = await pool.query(
+      `INSERT INTO messaging_jobs (
+         user_id, session_id, job_type, target_list, message_content,
+         message_type, status, total_count, sent_count, failed_count,
+         skipped_count, options, platform_state, created_at
+       ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,0,0,0,$9,$10, NOW())
+       RETURNING id`,
+      [
+        userId,
+        Number(orderedSessionIds[0]),
+        'parallel',
+        JSON.stringify(targets.map((t) => t.addr)),
+        message,
+        messageType,
+        'running',
+        targets.length,
+        JSON.stringify({
+          sessionIds: orderedSessionIds,
+          delayMin,
+          delayMax,
+          messageOptions,
+          sourceType,
+          sourceId,
+          trackReplies,
+          replyWindowHours,
+          perSessionBurst,
+          burstCooldownSecMin,
+          burstCooldownSecMax,
+          startStaggerMsMin,
+          startStaggerMsMax,
+        }),
+        JSON.stringify({ mode: 'parallel', sessionCount: orderedSessionIds.length }),
+      ]
+    );
+    const jobId = jobResult.rows[0].id;
+
+    logger.info(`Parallel mass-DM job ${jobId} started`, {
+      userId,
+      sessions: orderedSessionIds.length,
+      targets: targets.length,
+    });
+
+    const result = await this._runParallelMassDm(jobId, orderedSessionIds, targets, {
+      message,
+      messageType,
+      delayMin,
+      delayMax,
+      messageOptions,
+      perSessionBurst,
+      burstCooldownSecMin,
+      burstCooldownSecMax,
+      startStaggerMsMin,
+      startStaggerMsMax,
+    });
+
+    if (trackReplies) {
+      try {
+        const replyTracking = require('./replyTrackingService');
+        await replyTracking.initForJob(jobId, { windowHours: replyWindowHours });
+      } catch (err) {
+        logger.warn(`Failed to init reply tracking for job ${jobId}: ${err.message}`);
+      }
+    }
+
+    return {
+      jobId,
+      status: 'completed',
+      totalTargets: targets.length,
+      ...result,
+    };
+  }
+
+  /**
+   * The parallel worker-pool runner. Each session is a worker pulling
+   * targets off a shared queue. Extracted so a resume path can reuse it.
+   * @private
+   */
+  async _runParallelMassDm(jobId, sessionIds, targets, opts) {
+    const {
+      message, delayMin, delayMax, messageOptions,
+      perSessionBurst, burstCooldownSecMin, burstCooldownSecMax,
+      startStaggerMsMin, startStaggerMsMax,
+    } = opts;
+
+    const MAX_CONCURRENT = Math.max(1, parseInt(process.env.MAX_CONCURRENT_SESSIONS || '200', 10));
+
+    // Safe-pacing defaults. Each session sends a small burst then cools
+    // down; successive sends within a burst are spaced by delayMin..Max.
+    // Sessions' first sends are staggered so 100 accounts don't all fire
+    // in the same second. These keep every account well under Telegram's
+    // per-account action rate while the POOL finishes fast.
+    const burst = Math.max(1, Number.isFinite(perSessionBurst) ? perSessionBurst : 5);
+    const cdMin = (Number.isFinite(burstCooldownSecMin) ? burstCooldownSecMin : 15) * 1000;
+    const cdMax = (Number.isFinite(burstCooldownSecMax) ? burstCooldownSecMax : 30) * 1000;
+    const stMin = Number.isFinite(startStaggerMsMin) ? startStaggerMsMin : 150;
+    const stMax = Number.isFinite(startStaggerMsMax) ? startStaggerMsMax : 400;
+
+    const sessions = sessionIds.map((id) => ({ id: String(id) }));
+
+    // Per-session consecutive target-side failures — a session that fails
+    // this many targets in a row is treated as broken and retired so it
+    // stops eating targets that could succeed on a healthy account.
+    const CONSECUTIVE_FAILURE_LIMIT = 25;
+    const consecutiveFailures = {};
+
+    let sent = 0;
+    let failed = 0;
+    let lastPersist = 0;
+
+    const persist = async (status) => {
+      await pool.query(
+        `UPDATE messaging_jobs
+            SET sent_count = $2, failed_count = $3, status = $4
+          WHERE id = $1`,
+        [jobId, sent, failed, status]
+      ).catch((e) => logger.warn(`parallel state persist failed: ${e.message}`));
+      await this._notifyProgress(jobId, {
+        job_id: jobId, status,
+        sent, failed, skipped: 0, total: targets.length,
+      });
+    };
+
+    const isCancelled = () => this._isJobCancelled(jobId);
+
+    const { stats } = await runWorkerPool({
+      sessions,
+      items: targets,
+      concurrency: Math.min(MAX_CONCURRENT, sessions.length),
+      perSessionBurst: burst,
+      cooldownMsMin: cdMin,
+      cooldownMsMax: cdMax,
+      itemDelayMsMin: delayMin,
+      itemDelayMsMax: delayMax,
+      startStaggerMsMin: stMin,
+      startStaggerMsMax: stMax,
+      // Give each target a few chances on different sessions before we
+      // give up (covers a target that a broken/flooded session bounced).
+      maxAttemptsPerItem: Math.min(5, sessions.length),
+
+      isCancelled,
+
+      onProgress: async (snapshot) => {
+        sent = snapshot.succeeded;
+        failed = snapshot.failed;
+        // Throttle DB writes to ~every 25 completions.
+        if (snapshot.completed - lastPersist >= 25) {
+          lastPersist = snapshot.completed;
+          await persist('running');
+        }
+      },
+
+      attempt: async ({ session, item }) => {
+        const sid = String(session.id);
+        const target = item; // { addr, peerId, label, accessHash }
+        try {
+          const sendOpts = { ...messageOptions };
+          if (target.accessHash != null) sendOpts.accessHash = target.accessHash;
+          await telegramService.sendMessage(sid, target.addr, message, sendOpts);
+
+          consecutiveFailures[sid] = 0;
+
+          await pool.query(
+            `INSERT INTO message_logs (job_id, session_id, target_id, status, sent_at)
+             VALUES ($1,$2,$3,'sent', NOW())`,
+            [jobId, Number(sid), target.addr]
+          ).catch(() => {});
+
+          await pool.query(
+            `INSERT INTO message_reply_tracking
+               (job_id, session_id, target_id, peer_id, target_label, sent_status, sent_at)
+             VALUES ($1,$2,$3,$4,$5,'sent', NOW())
+             ON CONFLICT (job_id, target_id) DO UPDATE
+               SET session_id = EXCLUDED.session_id,
+                   peer_id = COALESCE(EXCLUDED.peer_id, message_reply_tracking.peer_id),
+                   target_label = EXCLUDED.target_label,
+                   sent_status = 'sent', sent_at = NOW()`,
+            [jobId, Number(sid), target.addr,
+             target.peerId ? String(target.peerId) : null, target.label]
+          ).catch(() => {});
+
+          return { status: 'ok' };
+        } catch (err) {
+          const raw = err && err.message ? err.message : String(err);
+          const code = err && err.code ? err.code : null;
+          const decision = classifyFailoverError(raw, code);
+
+          const logFail = () => pool.query(
+            `INSERT INTO message_logs (job_id, session_id, target_id, status, error_message, sent_at)
+             VALUES ($1,$2,$3,'failed',$4, NOW())`,
+            [jobId, Number(sid), target.addr, `${decision.reason}: ${raw.slice(0, 200)}`]
+          ).catch(() => {});
+
+          if (decision.action === 'switch_session') {
+            // Session-level problem. FLOOD_WAIT -> cooldown & rejoin;
+            // PEER_FLOOD / dead -> retire this session, re-queue target.
+            const hay = (String(code || '') + ' ' + raw).toUpperCase();
+            const floodMatch = hay.match(/A WAIT OF (\d+) SECONDS/) || hay.match(/FLOOD_WAIT_(\d+)/);
+            if (floodMatch && !hay.includes('PEER_FLOOD')) {
+              const secs = parseInt(floodMatch[1], 10) || 30;
+              return { status: 'session_cooldown', reason: decision.reason, cooldownMs: Math.min(secs, 300) * 1000 };
+            }
+            // AUTH dead -> flag revoked so the Sessions UI updates.
+            if (/AUTH_KEY_UNREGISTERED|SESSION_REVOKED|SESSION_EXPIRED|USER_DEACTIVATED/.test(hay)) {
+              try { await sessionService.flagSessionRevoked(sid, { error: err, source: 'messageService.parallel' }); } catch (_) {}
+            }
+            return { status: 'session_dead', reason: decision.reason };
+          }
+
+          // Target-side failure: record it, skip the target.
+          await logFail();
+          consecutiveFailures[sid] = (consecutiveFailures[sid] || 0) + 1;
+          if (consecutiveFailures[sid] >= CONSECUTIVE_FAILURE_LIMIT) {
+            consecutiveFailures[sid] = 0;
+            logger.warn(`Parallel job ${jobId}: session ${sid} retired after ${CONSECUTIVE_FAILURE_LIMIT} consecutive failures — likely broken`);
+            return { status: 'session_dead', reason: `CONSECUTIVE_FAILURES: ${decision.reason}` };
+          }
+          return { status: 'item_failed', reason: decision.reason };
+        }
+      },
+    });
+
+    sent = stats.succeeded;
+    failed = stats.failed;
+
+    const cancelled = await this._isJobCancelled(jobId);
+    const finalStatus = cancelled ? 'cancelled' : 'completed';
+    await pool.query(
+      `UPDATE messaging_jobs
+          SET status = $5, sent_count = $2, failed_count = $3,
+              skipped_count = $4, completed_at = NOW()
+        WHERE id = $1`,
+      [jobId, sent, failed, 0, finalStatus]
+    );
+    await this._notifyProgress(jobId, {
+      job_id: jobId, status: finalStatus,
+      sent, failed, skipped: 0, total: targets.length,
+    });
+
+    logger.info(`Parallel job ${jobId} ${finalStatus}: ${sent} sent, ${failed} failed`);
+    return { sent, failed, skipped: 0, sessionsUsed: sessions.length };
   }
 
 
@@ -2797,7 +3181,7 @@ class MessageService {
         if (g > 0) {
           const delayMs = delayBetweenRounds * 1000;
           logger.info(`Waiting ${delayBetweenRounds}s before next group`, { jobId, group: g });
-          await sleep(delayMs);
+          await cancellableSleep(delayMs, () => this._isJobCancelled(jobId));
         }
 
         // All sessions send to this group
@@ -3065,7 +3449,7 @@ class MessageService {
         if (r > 0) {
           const delayMs = delayBetweenRounds * 1000;
           logger.info(`Waiting ${delayBetweenRounds}s before next round`, { jobId, round: r });
-          await sleep(delayMs);
+          await cancellableSleep(delayMs, () => this._isJobCancelled(jobId));
         }
 
         // Each session sends to usersPerRound users in this round
@@ -3937,6 +4321,28 @@ class MessageService {
     } catch (err) {
       logger.warn(`_orderSessionsByLeastUsed failed, keeping operator order: ${err.message}`);
       return orderedSessionIds;
+    }
+  }
+
+  /**
+   * Fast cancellation check for a job: reads the Redis cancel token
+   * (set synchronously by cancelJob the instant the operator clicks
+   * Cancel) first, then falls back to the DB status flag. Used by
+   * every long-running runner so a Cancel is honoured within ~250ms
+   * even during a cooldown sleep.
+   */
+  async _isJobCancelled(jobId) {
+    try {
+      if (redisClient && redisClient.isReady) {
+        const tok = await redisClient.get(`message:cancel:${jobId}`);
+        if (tok) return true;
+      }
+    } catch (_) { /* fall through to DB */ }
+    try {
+      const r = await pool.query('SELECT status FROM messaging_jobs WHERE id = $1', [jobId]);
+      return r.rows[0]?.status === 'cancelled';
+    } catch (_) {
+      return false;
     }
   }
 

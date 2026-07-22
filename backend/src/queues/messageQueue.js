@@ -5,6 +5,18 @@ const { withJobLock, QUEUED_BEHIND_LOCK } = require('../utils/jobLock');
 
 const MESSAGE_QUEUE_NAME = 'message-jobs';
 
+// How many message jobs run concurrently panel-wide. Each job can itself
+// fan out to up to MAX_CONCURRENT_SESSIONS sessions in parallel (the
+// parallel/single-user runners), and per-(user,category) jobLocks keep a
+// single user from stampeding — so this knob governs how many DIFFERENT
+// users' jobs progress at once. Raise for more multi-user throughput on a
+// bigger VPS; default 10 (up from 5) balances 100-pro-user load vs. the
+// event-loop/Telegram connection budget. Override with MESSAGE_QUEUE_CONCURRENCY.
+const MESSAGE_QUEUE_CONCURRENCY = Math.max(
+  1,
+  parseInt(process.env.MESSAGE_QUEUE_CONCURRENCY || '10', 10)
+);
+
 // BullMQ requires its own ioredis-style connection — it cannot reuse a
 // node-redis (v4) instance. Passing one used to silently hang every
 // `queue.add(...)` call. We pass plain options so BullMQ creates its
@@ -53,6 +65,7 @@ class MessageQueueManager {
         let heavyCategory = null;
         if (type === 'bulk') heavyCategory = 'message:bulk';
         else if (type === 'failover') heavyCategory = 'message:failover';
+        else if (type === 'parallel') heavyCategory = 'message:parallel';
         else if (type === 'single_user_mass_dm') heavyCategory = 'message:single_user_mass_dm';
 
         const run = async () => {
@@ -62,6 +75,8 @@ class MessageQueueManager {
             return await messageService.sendBulkMessage(params, userId);
           } else if (type === 'failover') {
             return await messageService.sendFailoverMessage(params, userId);
+          } else if (type === 'parallel') {
+            return await messageService.sendParallelMassDm(params, userId);
           } else if (type === 'group-message') {
             return await messageService.sendMessageToGroup(sessionId, groupId, message, userId);
           } else if (type === 'forward') {
@@ -83,7 +98,7 @@ class MessageQueueManager {
         }
         return result;
       },
-      { connection: redisConnection, concurrency: 5 }
+      { connection: redisConnection, concurrency: MESSAGE_QUEUE_CONCURRENCY }
     );
 
     this.queueEvents = new QueueEvents(MESSAGE_QUEUE_NAME, { connection: redisConnection });
@@ -118,7 +133,7 @@ class MessageQueueManager {
     });
 
     this.initialized = true;
-    logger.info('Message queue initialized');
+    logger.info(`Message queue initialized (concurrency=${MESSAGE_QUEUE_CONCURRENCY})`);
   }
 
   async addJob(jobData) {

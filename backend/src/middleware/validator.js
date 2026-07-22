@@ -144,6 +144,12 @@ const schemas = {
     trackReplies: Joi.alternatives().try(Joi.boolean(), Joi.string()).optional(),
     replyWindowHours: Joi.number().integer().min(1).max(168).optional(),
     async: Joi.alternatives().try(Joi.boolean(), Joi.string()).optional(),
+    // Parallel-mode pacing knobs (ignored by the sequential failover
+    // runner; used by POST /messages/parallel). Safe defaults applied
+    // server-side when omitted.
+    perSessionBurst: Joi.number().integer().min(1).max(100).optional(),
+    burstCooldownSecMin: Joi.number().integer().min(0).max(600).optional(),
+    burstCooldownSecMax: Joi.number().integer().min(0).max(600).optional(),
   }).or('sessionIds', 'sessionListId', 'sessionListIds'),
 
   // Single-User Mass DM

@@ -82,7 +82,7 @@ class OtpService {
         'NO_VALID_SESSIONS'
       );
 
-    const duration = Math.max(60, Math.min(durationSeconds || DEFAULT_DURATION_SECONDS, 1800));
+    const duration = Math.max(60, Math.min(durationSeconds || DEFAULT_DURATION_SECONDS, 3600));
     const ids = owned.rows.map((r) => r.id);
 
     const client = await pool.connect();

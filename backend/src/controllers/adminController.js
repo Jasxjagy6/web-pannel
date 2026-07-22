@@ -354,6 +354,101 @@ const adminController = {
   }),
 
   /**
+   * POST /api/admin/users/:id/plan
+   *
+   * Simplified single-lever subscription control: the panel now offers
+   * exactly two plans — 'none' or 'pro'.
+   *
+   *   pro  -> full, unlimited access to every feature on both platforms.
+   *           Sets an ACTIVE subscription with a far-future expiry and
+   *           features={"all":true}, AND lifts the per-credential
+   *           max_sessions cap to the maximum (50) so a pro user can run
+   *           as many sessions as they want.
+   *   none -> subscription set inactive (feature gate closes).
+   *
+   * Body: { plan: 'none' | 'pro' }
+   */
+  setUserPlan: asyncHandler(async (req, res) => {
+    const userId = parseInt(req.params.id, 10);
+    if (!Number.isFinite(userId)) throw new AppError('Invalid user id', 400, 'BAD_ID');
+
+    const plan = String(req.body?.plan || '').toLowerCase();
+    if (!['none', 'pro'].includes(plan)) {
+      throw new AppError("plan must be 'none' or 'pro'", 400, 'BAD_PLAN');
+    }
+
+    const isPro = plan === 'pro';
+    const status = isPro ? 'active' : 'inactive';
+    // Far-future expiry for pro ("as much as they want", no time pressure).
+    const expiresIso = isPro
+      ? new Date(Date.now() + 100 * 365 * 24 * 60 * 60 * 1000).toISOString()
+      : null;
+    const featObj = isPro ? { all: true } : {};
+
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+
+      // Upsert both platform subscription rows so pro unlocks everything.
+      for (const platform of ['telegram', 'instagram']) {
+        await client.query(
+          `INSERT INTO user_subscriptions
+             (user_id, platform, plan, status, expires_at, features, created_at, updated_at)
+           VALUES ($1, $2::platform_type, $3, $4, $5, $6::jsonb, NOW(), NOW())
+           ON CONFLICT (user_id, platform) DO UPDATE
+             SET plan = EXCLUDED.plan, status = EXCLUDED.status,
+                 expires_at = EXCLUDED.expires_at, features = EXCLUDED.features,
+                 updated_at = NOW()`,
+          [userId, platform, isPro ? 'pro' : null, status, expiresIso, JSON.stringify(featObj)]
+        );
+      }
+
+      // Mirror onto the legacy users.subscription_* columns (kept in sync
+      // for one release per the subscription-split migration).
+      await client.query(
+        `UPDATE users
+            SET subscription_plan = $2, subscription_status = $3,
+                subscription_expires_at = $4, subscription_features = $5::jsonb,
+                updated_at = NOW()
+          WHERE id = $1`,
+        [userId, isPro ? 'pro' : null, status, expiresIso, JSON.stringify(featObj)]
+      );
+
+      // Lift (or reset) the per-credential session cap. Pro = 50 (max the
+      // CHECK constraint allows); none leaves whatever they had but clamps
+      // to the default so a downgraded user can't keep 50 slots.
+      if (isPro) {
+        await client.query(
+          `UPDATE user_api_credentials SET max_sessions = 50, updated_at = NOW()
+            WHERE user_id = $1 AND deleted_at IS NULL`,
+          [userId]
+        );
+      }
+
+      await client.query('COMMIT');
+    } catch (err) {
+      await client.query('ROLLBACK');
+      throw err;
+    } finally {
+      client.release();
+    }
+
+    await recordAdminAction(req.user.id, userId, 'plan_set', { plan });
+
+    const fresh = await pool.query(
+      `SELECT ${SAFE_USER_COLUMNS} FROM users WHERE id = $1`,
+      [userId]
+    );
+    if (!fresh.rows[0]) throw new AppError('User not found', 404, 'NOT_FOUND');
+
+    return res.status(200).json({
+      success: true,
+      plan,
+      user: publicUser(fresh.rows[0]),
+    });
+  }),
+
+  /**
    * DELETE /api/admin/users/:id
    *
    * Hard-delete: cascades to sessions, jobs etc. via FK.

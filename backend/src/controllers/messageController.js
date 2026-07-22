@@ -338,6 +338,105 @@ const messageController = {
   }),
 
   /**
+   * Parallel round-robin mass DM. Every session works in parallel,
+   * pulling the next target off a shared queue (session 1 -> target 1,
+   * session 2 -> target 2, …). Invalid targets are skipped so no session
+   * sits idle; each session sends to DIFFERENT users. Finishes a large
+   * list in minutes instead of hours while keeping per-account pacing safe.
+   *
+   * Same body contract as sendFailover.
+   */
+  sendParallel: asyncHandler(async (req, res) => {
+    const userId = req.user.id;
+    const {
+      sessionIds: rawSessionIds,
+      targetList,
+      message,
+      messageType,
+      delayMin,
+      delayMax,
+      messageOptions,
+      sourceType,
+      sourceId,
+      trackReplies,
+      replyWindowHours,
+      perSessionBurst,
+      burstCooldownSecMin,
+      burstCooldownSecMax,
+      async,
+    } = req.body;
+
+    const sessionIds = await resolveSessionIdsFromRequest(req, rawSessionIds || []);
+    if (!Array.isArray(sessionIds) || sessionIds.length === 0) {
+      throw new AppError(
+        'sessionIds array (or a non-empty sessionListId) is required',
+        400,
+        'NO_SESSIONS'
+      );
+    }
+    if (!targetList || !Array.isArray(targetList) || targetList.length === 0) {
+      throw new AppError('targetList is required and must not be empty', 400, 'EMPTY_TARGET_LIST');
+    }
+    if (!message || message.trim().length === 0) {
+      throw new AppError('message content is required', 400, 'EMPTY_MESSAGE');
+    }
+
+    const params = {
+      sessionIds,
+      targetList,
+      message: message.trim(),
+      messageType: messageType || 'text',
+      delayMin: delayMin != null ? parseInt(delayMin, 10) : undefined,
+      delayMax: delayMax != null ? parseInt(delayMax, 10) : undefined,
+      messageOptions: typeof messageOptions === 'string' ? JSON.parse(messageOptions) : (messageOptions || {}),
+      sourceType: sourceType || 'manual',
+      sourceId: sourceId != null ? parseInt(sourceId, 10) : undefined,
+      trackReplies: trackReplies === false ? false : true,
+      replyWindowHours: replyWindowHours != null ? parseInt(replyWindowHours, 10) : 24,
+      perSessionBurst: perSessionBurst != null ? parseInt(perSessionBurst, 10) : undefined,
+      burstCooldownSecMin: burstCooldownSecMin != null ? parseInt(burstCooldownSecMin, 10) : undefined,
+      burstCooldownSecMax: burstCooldownSecMax != null ? parseInt(burstCooldownSecMax, 10) : undefined,
+    };
+
+    if (async === false || async === 'false') {
+      const result = await messageService.sendParallelMassDm(params, userId);
+      return res.status(200).json({ success: true, data: result });
+    }
+
+    const queueJob = await messageQueue.addJob({ type: 'parallel', params, userId });
+
+    await reportService.logActivity(
+      userId,
+      'message_bulk_start',
+      'messaging_job',
+      null,
+      {
+        queueJobId: queueJob.id,
+        mode: 'parallel',
+        sessionCount: sessionIds.length,
+        targetCount: targetList.length,
+      }
+    );
+
+    logger.info(`Parallel mass-DM job queued by user ${userId}`, {
+      queueJobId: queueJob.id,
+      sessionCount: sessionIds.length,
+      targetCount: targetList.length,
+    });
+
+    return res.status(202).json({
+      success: true,
+      data: {
+        queueJobId: queueJob.id,
+        status: 'queued',
+        mode: 'parallel',
+        totalTargets: targetList.length,
+        sessionCount: sessionIds.length,
+      },
+    });
+  }),
+
+  /**
    * Per-recipient reply breakdown for a finished send job (the job-history
    * dropdown: "sent to user 1 — not replied", "sent to user 2 — replied").
    */
