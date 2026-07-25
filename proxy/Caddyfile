@@ -30,6 +30,16 @@
 # is set, Caddy will auto-provision Let's Encrypt certificates.
 }
 
+# Signal Desk has its own hostname and standalone Next.js runtime on the host.
+# Keep this route separate from the panel's blue/green upstreams.
+{$VALIDATOR_DOMAIN:play-casino.me} {
+	reverse_proxy {$VALIDATOR_UPSTREAM:172.17.0.1:3100} {
+		header_up X-Real-IP {remote_host}
+	}
+
+	encode gzip zstd
+}
+
 # Public site — uses domain name for auto-TLS when PUBLIC_DOMAIN is set.
 {$PUBLIC_DOMAIN}, :80 {
 	# /api/* and /socket.io/* go to the active backend color.

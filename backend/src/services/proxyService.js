@@ -2,16 +2,13 @@
  * ProxyService - Dynamic proxy pool for Telegram MTProto connections.
  *
  * Responsibilities:
- *   - Scrape free SOCKS5/HTTP proxies from public open-source lists
- *   - Validate proxies against Telegram MTProto endpoints
- *   - Maintain up to FREE_PROXY_POOL_SIZE working free proxies
- *   - Re-validate every PROXY_RECHECK_INTERVAL_MS and prune dead ones
- *   - Manage manually-added (paid) proxies with top priority
- *   - Assign proxies to sessions enforcing MAX_SESSIONS_PER_PROXY (default 4)
+ *   - Validate user-owned proxies against Telegram MTProto endpoints
+ *   - Persist encrypted credentials and health metadata
+ *   - Bind one dedicated proxy to one strict Telegram session
  *
  * Public API:
- *   listProxies(filter), addManualProxy(payload), deleteProxy(id),
- *   refreshFreeProxies(), assignProxyForSession(sessionId), releaseProxy(sessionId),
+ *   listMyProxies(userId), addMyProxy(userId, payload),
+ *   assignUserProxyToSession(userId, sessionId, proxyId),
  *   getProxyForSession(sessionId), buildGramJSProxy(proxy),
  *   reserveAdHoc(key), releaseAdHoc(key), transferAdHocToSession(key, sessionId)
  */
@@ -25,13 +22,11 @@ const https = require('https');
 const http = require('http');
 const { URL } = require('url');
 
-const FREE_PROXY_POOL_SIZE = 20;
-const MAX_SESSIONS_PER_PROXY = 4;
+const MAX_SESSIONS_PER_PROXY = 1;
 const PROXY_RECHECK_INTERVAL_MS = 10 * 60 * 1000; // 10 minutes
 const PROXY_VALIDATION_TIMEOUT_MS = 8000;
 const TELEGRAM_PROBE_HOST = '149.154.167.51'; // Telegram DC4 IPv4
 const TELEGRAM_PROBE_PORT = 443;
-const MAX_CANDIDATE_BATCH = 200;
 
 // BYO Proxy — Phase 2 (BYO_PROXY_PROPOSAL §4.2).
 //
@@ -56,13 +51,6 @@ const EGRESS_FINGERPRINT_URL =
 const INSTAGRAM_PROBE_URL =
   process.env.PROXY_IG_PROBE_URL || 'https://i.instagram.com/api/v1/qe/sync/';
 
-// Free proxy lists - reasonably reliable open source sources.
-const FREE_PROXY_SOURCES = [
-  'https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/socks5.txt',
-  'https://raw.githubusercontent.com/hookzof/socks5_list/master/proxy.txt',
-  'https://raw.githubusercontent.com/zloi-user/hideip.me/main/socks5.txt',
-];
-
 /**
  * Sleep helper.
  */
@@ -75,41 +63,6 @@ function sleep(ms) {
  * @param {string} url
  * @returns {Promise<string>}
  */
-function fetchText(url, timeoutMs = 15000) {
-  return new Promise((resolve, reject) => {
-    const u = new URL(url);
-    const lib = u.protocol === 'http:' ? http : https;
-    const req = lib.get(url, { timeout: timeoutMs }, (res) => {
-      if (res.statusCode && res.statusCode >= 400) {
-        res.resume();
-        reject(new Error(`HTTP ${res.statusCode}`));
-        return;
-      }
-      const chunks = [];
-      res.on('data', (c) => chunks.push(c));
-      res.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
-      res.on('error', reject);
-    });
-    req.on('timeout', () => req.destroy(new Error('fetch timeout')));
-    req.on('error', reject);
-  });
-}
-
-/**
- * Parse a `host:port` line into a candidate.
- */
-function parseCandidate(line, defaultProtocol = 'socks5') {
-  const trimmed = String(line || '').trim().split(/\s+/)[0];
-  if (!trimmed) return null;
-  const m = trimmed.match(/^(?:(socks5|socks4|http|https):\/\/)?([\w.\-]+):(\d{2,5})$/i);
-  if (!m) return null;
-  const protocol = (m[1] || defaultProtocol).toLowerCase();
-  const host = m[2];
-  const port = parseInt(m[3], 10);
-  if (!host || !port || port > 65535) return null;
-  return { host, port, protocol };
-}
-
 /**
  * Probe a proxy by trying to open a SOCKS5 tunnel to Telegram's IP.
  *
@@ -379,48 +332,11 @@ async function httpGetThroughProxy(proxy, urlString, timeoutMs = PROXY_VALIDATIO
 
 class ProxyService {
   constructor() {
-    /** @type {NodeJS.Timeout|null} */
-    this._recheckTimer = null;
-    this._scrapeInFlight = false;
   }
 
   // =========================================================================
   // Background scheduling
   // =========================================================================
-
-  startBackground() {
-    if (this._recheckTimer) return;
-    logger.info('ProxyService background scheduler starting');
-    // Initial async tick - don't block startup.
-    setTimeout(() => this._tick().catch((e) => logger.error('proxy initial tick failed', { error: e.message })), 5000);
-    this._recheckTimer = setInterval(
-      () => this._tick().catch((e) => logger.error('proxy tick failed', { error: e.message })),
-      PROXY_RECHECK_INTERVAL_MS
-    );
-  }
-
-  stopBackground() {
-    if (this._recheckTimer) {
-      clearInterval(this._recheckTimer);
-      this._recheckTimer = null;
-    }
-  }
-
-  async _tick() {
-    // Skip the entire health-check pass when the global proxy switch
-    // is OFF. With proxying disabled the panel egresses directly from
-    // the VPS IP, so probing/refreshing the SOCKS pool is wasted work
-    // (and pollutes logs with "evicted N dead free proxies" lines that
-    // confuse operators trying to diagnose login failures).
-    try {
-      const settingsService = require('./systemSettingsService');
-      if (!(await settingsService.isProxyGloballyEnabled())) return;
-    } catch (err) {
-      logger.debug(`proxy _tick gate failed, falling through: ${err.message}`);
-    }
-    await this.revalidateAll();
-    await this.refreshFreeProxies();
-  }
 
   // =========================================================================
   // CRUD - Manual / Free proxies
@@ -457,17 +373,7 @@ class ProxyService {
     return result.rows.map((r) => ({ ...r, hasPassword: !!r.password_enc }));
   }
 
-  // ===========================================================================
-  // BYO Proxy — Phase 1 (read-only stubs)
-  // ===========================================================================
-  // These two methods land in Phase 1 of the BYO_PROXY_PROPOSAL rollout. They
-  // expose user-scoped (`listMyProxies`) and admin-scoped (`listAdminProxies`)
-  // views over the same `proxies` table — backed by the new `user_id` column
-  // added in migration_v14_user_proxies.sql.
-  //
-  // Mutations stay on the existing global functions for now; full per-user
-  // CRUD + REQUIRE_USER_PROXY enforcement + entitlement gating land in Phase 2.
-  // See BYO_PROXY_PROPOSAL.md §4 (Phase 1) for the full design.
+  // BYO Proxy — Phase 1 (user-scoped view)
 
   /**
    * List proxies that belong to a specific user. NULL `user_id` rows
@@ -483,54 +389,33 @@ class ProxyService {
       throw new AppError('userId required', 400, 'PROXY_USER_ID_REQUIRED');
     }
     const r = await pool.query(
-      `SELECT id, host, port, protocol, username, source,
-              label, country_code, notes,
+      `SELECT id, host, port, protocol, username, password_enc, source, enabled,
+               label, country_code, notes,
               is_working, priority,
               active_assignments, total_assignments,
               last_checked_at, last_failed_at, last_latency_ms,
               consecutive_failures,
               last_health_check, last_health_ok, health_message,
               validated_for_telegram, validated_for_instagram,
-              metadata, created_at
+               metadata, created_at,
+               (SELECT jsonb_agg(jsonb_build_object(
+                  'sessionId', s.id,
+                  'phone', s.phone,
+                  'status', s.status,
+                  'isLoggedIn', s.is_logged_in
+                ) ORDER BY s.id)
+                  FROM session_proxy_assignments a
+                  JOIN sessions s ON s.id = a.session_id
+                 WHERE a.proxy_id = proxies.id) AS assigned_sessions
          FROM proxies
-        WHERE user_id = $1
+        WHERE user_id = $1 AND source = 'user'
         ORDER BY priority DESC, last_latency_ms NULLS LAST, id ASC`,
       [userId]
     );
-    return r.rows.map((p) => ({ ...p, hasPassword: !!p.password_enc }));
-  }
-
-  /**
-   * List the shared admin pool — rows with `user_id IS NULL`. Used by
-   * the admin-only `/admin/proxies` endpoint (Phase 2/3).
-   *
-   * @param {{source?:string, working?:boolean}} [filter]
-   */
-  async listAdminProxies(filter = {}) {
-    const conditions = ['user_id IS NULL'];
-    const params = [];
-    if (filter.source) {
-      params.push(filter.source);
-      conditions.push(`source = $${params.length}`);
-    }
-    if (typeof filter.working === 'boolean') {
-      params.push(filter.working);
-      conditions.push(`is_working = $${params.length}`);
-    }
-    const where = `WHERE ${conditions.join(' AND ')}`;
-    const result = await pool.query(
-      `SELECT id, host, port, protocol, username, source, is_working, priority,
-              active_assignments, total_assignments, last_checked_at,
-              last_failed_at, last_latency_ms, consecutive_failures, metadata,
-              created_at,
-              user_id, label, country_code, notes,
-              last_health_check, last_health_ok, health_message
-         FROM proxies
-        ${where}
-        ORDER BY priority DESC, last_latency_ms NULLS LAST, id ASC`,
-      params
-    );
-    return result.rows.map((p) => ({ ...p, hasPassword: !!p.password_enc }));
+    return r.rows.map((p) => {
+      const { password_enc: passwordEnc, ...safe } = p;
+      return { ...safe, hasPassword: !!passwordEnc };
+    });
   }
 
   // ===========================================================================
@@ -555,7 +440,7 @@ class ProxyService {
     if (!proxyId) return null;
     const r = await pool.query(
       `SELECT id, host, port, protocol, username, password_enc, secret,
-              source, user_id, label, country_code, notes,
+               source, user_id, enabled, label, country_code, notes,
               is_working, priority,
               active_assignments, total_assignments,
               last_checked_at, last_failed_at, last_latency_ms,
@@ -679,6 +564,10 @@ class ProxyService {
         : null);
       sets.push(`country_code = $${params.length}`);
     }
+    if (patch && Object.prototype.hasOwnProperty.call(patch, 'enabled')) {
+      params.push(patch.enabled === true);
+      sets.push(`enabled = $${params.length}`);
+    }
     if (sets.length === 0) return row;
     params.push(proxyId);
     params.push(userId);
@@ -700,6 +589,21 @@ class ProxyService {
    */
   async deleteMyProxy(userId, proxyId) {
     if (!userId) throw new AppError('userId required', 400, 'PROXY_USER_ID_REQUIRED');
+    const assigned = await pool.query(
+      `SELECT s.id, s.phone
+         FROM session_proxy_assignments a
+         JOIN sessions s ON s.id = a.session_id
+        WHERE a.proxy_id = $1 AND s.user_id = $2
+        LIMIT 1`,
+      [proxyId, userId]
+    );
+    if (assigned.rowCount > 0) {
+      throw new AppError(
+        `Proxy is assigned to session ${assigned.rows[0].phone || assigned.rows[0].id}. Reassign or delete that session first.`,
+        409,
+        'PROXY_IN_USE'
+      );
+    }
     const r = await pool.query(
       `DELETE FROM proxies WHERE id = $1 AND user_id = $2 RETURNING id`,
       [proxyId, userId]
@@ -910,7 +814,7 @@ class ProxyService {
    *
    * Returns the freshly bound proxy row.
    */
-  async assignUserProxyToSession(userId, sessionId, proxyId) {
+  async assignUserProxyToSession(userId, sessionId, proxyId, opts = {}) {
     if (!userId) throw new AppError('userId required', 400, 'PROXY_USER_ID_REQUIRED');
     if (!sessionId) throw new AppError('sessionId required', 400, 'SESSION_ID_REQUIRED');
     if (!proxyId) throw new AppError('proxyId required', 400, 'PROXY_ID_REQUIRED');
@@ -926,6 +830,11 @@ class ProxyService {
 
     const proxy = await this.getMyProxy(userId, proxyId);
     if (!proxy) throw new AppError('Proxy not found', 404, 'PROXY_NOT_FOUND');
+    if (opts.requireHealthy && (
+      proxy.enabled !== true || proxy.is_working !== true || proxy.validated_for_telegram !== true
+    )) {
+      throw new AppError('Proxy is disabled or has not passed the Telegram health check', 412, 'PROXY_UNHEALTHY');
+    }
 
     // Build the proxy_url IG reads.
     const proxyUrl = buildProxyUrl(proxy);
@@ -933,6 +842,18 @@ class ProxyService {
     const client = await pool.connect();
     try {
       await client.query('BEGIN');
+      await client.query('SELECT id FROM proxies WHERE id = $1 FOR UPDATE', [proxyId]);
+      if (opts.dedicated) {
+        const used = await client.query(
+          `SELECT session_id FROM session_proxy_assignments
+            WHERE proxy_id = $1 AND session_id <> $2
+            LIMIT 1`,
+          [proxyId, sessionId]
+        );
+        if (used.rowCount > 0) {
+          throw new AppError('Proxy is already dedicated to another session', 409, 'PROXY_ALREADY_ASSIGNED');
+        }
+      }
       // Release any previous binding so active_assignments stays sane.
       const prev = await client.query(
         `DELETE FROM session_proxy_assignments WHERE session_id = $1 RETURNING proxy_id`,
@@ -946,18 +867,22 @@ class ProxyService {
         );
       }
       await client.query(
-        `INSERT INTO session_proxy_assignments (session_id, proxy_id, assigned_at)
-         VALUES ($1, $2, NOW())
+        `INSERT INTO session_proxy_assignments (session_id, proxy_id, assigned_at, dedicated)
+         VALUES ($1, $2, NOW(), $3)
          ON CONFLICT (session_id) DO UPDATE
-           SET proxy_id = EXCLUDED.proxy_id, assigned_at = NOW()`,
-        [sessionId, proxyId]
+           SET proxy_id = EXCLUDED.proxy_id,
+               assigned_at = NOW(),
+               dedicated = EXCLUDED.dedicated`,
+        [sessionId, proxyId, opts.dedicated === true]
       );
-      await client.query(
-        `UPDATE proxies SET active_assignments = active_assignments + 1,
-                total_assignments = total_assignments + 1
-          WHERE id = $1`,
-        [proxyId]
-      );
+      if (prev.rowCount === 0 || prev.rows[0].proxy_id !== proxyId) {
+        await client.query(
+          `UPDATE proxies SET active_assignments = active_assignments + 1,
+                  total_assignments = total_assignments + 1
+            WHERE id = $1`,
+          [proxyId]
+        );
+      }
       await client.query(
         `UPDATE sessions
             SET bound_proxy_id = $1,
@@ -973,6 +898,13 @@ class ProxyService {
       client.release();
     }
     logger.info(`Bound user proxy`, { userId, sessionId, proxyId });
+    // A TelegramClient keeps its connection transport for life. Rebinding the
+    // database row is not enough; evict any live client so the next operation
+    // rebuilds it through the newly assigned proxy.
+    try {
+      const telegramService = require('./telegramService');
+      await telegramService.disconnectSession(String(sessionId)).catch(() => {});
+    } catch { /* optional during boot/tests */ }
     return await this.getMyProxy(userId, proxyId);
   }
 
@@ -1024,18 +956,6 @@ class ProxyService {
       if (existing.rows[0]) return existing.rows[0];
     }
 
-    // 1.5. Auto-rotating provider configured for this user?
-    //      Mint a sticky proxy via the driver and bind it.
-    //      This is the new auto-proxy path. When no provider is enabled
-    //      it's a no-op and steps 2/3 run as before. The driver layer
-    //      handles vendor-specific suffix / API contracts; everything
-    //      below this method (URL building, health, anti-detect) keeps
-    //      working unchanged.
-    if (sessionId && opts.skipProvider !== true) {
-      const minted = await tryProvisionFromProvider(userId, sessionId);
-      if (minted) return minted;
-    }
-
     // 2. Highest-priority working user proxy.
     const r = await pool.query(
       `SELECT * FROM proxies
@@ -1064,80 +984,6 @@ class ProxyService {
   }
 
   /**
-   * Add a manually-supplied proxy. Manual proxies get top priority over free.
-   *
-   * @param {{host:string,port:number,protocol?:string,username?:string,password?:string,secret?:string,priority?:number}} payload
-   */
-  async addManualProxy(payload) {
-    if (!payload || !payload.host || !payload.port) {
-      throw new AppError('host and port are required', 400, 'PROXY_INVALID');
-    }
-    const protocol = (payload.protocol || 'socks5').toLowerCase();
-    if (!['socks5', 'socks4', 'http', 'https', 'mtproto'].includes(protocol)) {
-      throw new AppError('Unsupported proxy protocol', 400, 'PROXY_BAD_PROTOCOL');
-    }
-    const port = parseInt(payload.port, 10);
-    if (!Number.isFinite(port) || port < 1 || port > 65535) {
-      throw new AppError('Invalid port', 400, 'PROXY_BAD_PORT');
-    }
-
-    const passwordEnc = payload.password ? encrypt(String(payload.password)) : null;
-
-    // Migration v14 replaced the unconditional `proxies_host_port_protocol_key`
-    // unique constraint with two PARTIAL unique indexes — one for shared
-    // admin rows (`uniq_proxies_admin_host_port_protocol` WHERE user_id IS
-    // NULL) and one for per-user rows. Postgres requires ON CONFLICT to
-    // match the partial-index predicate exactly, so we have to repeat the
-    // `WHERE user_id IS NULL` here. Without it the insert raises
-    // "there is no unique or exclusion constraint matching the ON CONFLICT
-    // specification".
-    const insert = await pool.query(
-      `INSERT INTO proxies
-        (host, port, protocol, username, password_enc, secret,
-         source, priority, metadata)
-       VALUES ($1,$2,$3,$4,$5,$6,'manual',$7,$8)
-       ON CONFLICT (host, port, protocol) WHERE user_id IS NULL DO UPDATE SET
-         username = EXCLUDED.username,
-         password_enc = EXCLUDED.password_enc,
-         secret = EXCLUDED.secret,
-         source = 'manual',
-         priority = EXCLUDED.priority,
-         metadata = EXCLUDED.metadata
-       RETURNING id`,
-      [
-        payload.host,
-        port,
-        protocol,
-        payload.username || null,
-        passwordEnc,
-        payload.secret || null,
-        payload.priority != null ? Number(payload.priority) : 500,
-        payload.metadata ? JSON.stringify(payload.metadata) : null,
-      ]
-    );
-
-    const proxyId = insert.rows[0].id;
-    // Probe the new proxy immediately.
-    const probe = await probeWithTimeout({ host: payload.host, port, protocol });
-    await pool.query(
-      `UPDATE proxies SET is_working = $1, last_checked_at = NOW(),
-              last_latency_ms = $2,
-              consecutive_failures = CASE WHEN $1 THEN 0 ELSE consecutive_failures + 1 END,
-              last_failed_at = CASE WHEN $1 THEN last_failed_at ELSE NOW() END
-       WHERE id = $3`,
-      [probe.ok, probe.latencyMs, proxyId]
-    );
-
-    logger.info(`Manual proxy added (working=${probe.ok})`, {
-      host: payload.host,
-      port,
-      protocol,
-    });
-
-    return await this._getById(proxyId);
-  }
-
-  /**
    * Delete a proxy. Direct VPS row cannot be removed.
    */
   async deleteProxy(id) {
@@ -1163,150 +1009,6 @@ class ProxyService {
   }
 
   // =========================================================================
-  // Free proxy scraper
-  // =========================================================================
-
-  /**
-   * Pull candidate IPs from public lists, dedupe and probe them.
-   * Top FREE_PROXY_POOL_SIZE working entries are kept; rest discarded.
-   */
-  async refreshFreeProxies() {
-    if (this._scrapeInFlight) {
-      logger.debug('refreshFreeProxies: already in flight');
-      return { added: 0, kept: 0, rejected: 0, skipped: true };
-    }
-    this._scrapeInFlight = true;
-    try {
-      // Count current working free proxies first.
-      const countRes = await pool.query(
-        `SELECT COUNT(*)::int AS c FROM proxies WHERE source = 'free' AND is_working = TRUE`
-      );
-      const currentWorking = countRes.rows[0].c;
-      if (currentWorking >= FREE_PROXY_POOL_SIZE) {
-        logger.debug(`refreshFreeProxies: pool full (${currentWorking})`);
-        return { added: 0, kept: currentWorking, rejected: 0 };
-      }
-
-      const need = FREE_PROXY_POOL_SIZE - currentWorking;
-
-      // Fetch candidate lists (parallel, tolerant of failures).
-      const lists = await Promise.allSettled(
-        FREE_PROXY_SOURCES.map((url) => fetchText(url))
-      );
-
-      const candidates = new Map(); // key: host:port:protocol
-      for (const settled of lists) {
-        if (settled.status !== 'fulfilled') continue;
-        for (const line of settled.value.split(/\r?\n/)) {
-          const c = parseCandidate(line, 'socks5');
-          if (!c) continue;
-          const key = `${c.host}:${c.port}:${c.protocol}`;
-          if (!candidates.has(key)) candidates.set(key, c);
-          if (candidates.size >= MAX_CANDIDATE_BATCH * 5) break;
-        }
-      }
-
-      const candList = Array.from(candidates.values()).slice(0, MAX_CANDIDATE_BATCH);
-      if (candList.length === 0) {
-        logger.warn('refreshFreeProxies: no candidates fetched');
-        return { added: 0, kept: currentWorking, rejected: 0 };
-      }
-
-      logger.info(`Probing ${candList.length} free proxy candidates (need ${need})`);
-
-      let added = 0;
-      let rejected = 0;
-      const concurrency = 25;
-      let cursor = 0;
-
-      const worker = async () => {
-        while (added < need && cursor < candList.length) {
-          const idx = cursor++;
-          const cand = candList[idx];
-          // Skip if we already store a row for this host:port:protocol.
-          const exists = await pool.query(
-            `SELECT id FROM proxies WHERE host=$1 AND port=$2 AND protocol=$3`,
-            [cand.host, cand.port, cand.protocol]
-          );
-          if (exists.rowCount > 0) {
-            rejected++;
-            continue;
-          }
-          const probe = await probeWithTimeout(cand).catch(() => ({ ok: false, latencyMs: 0 }));
-          if (!probe.ok) {
-            rejected++;
-            continue;
-          }
-          // See addManualProxy for why this needs the partial-index
-          // predicate. Free-pool harvesting only writes admin rows
-          // (user_id IS NULL).
-          await pool.query(
-            `INSERT INTO proxies
-              (host, port, protocol, source, is_working, priority,
-               last_checked_at, last_latency_ms)
-             VALUES ($1,$2,$3,'free',TRUE,100,NOW(),$4)
-             ON CONFLICT (host, port, protocol) WHERE user_id IS NULL DO NOTHING`,
-            [cand.host, cand.port, cand.protocol, probe.latencyMs]
-          );
-          added++;
-        }
-      };
-      await Promise.all(Array.from({ length: concurrency }, () => worker()));
-
-      logger.info(`refreshFreeProxies done: added=${added} rejected=${rejected}`);
-      return { added, kept: currentWorking + added, rejected };
-    } finally {
-      this._scrapeInFlight = false;
-    }
-  }
-
-  /**
-   * Re-validate every existing proxy. Free proxies that fail twice in a row
-   * are evicted to free capacity for the scraper to refill.
-   */
-  async revalidateAll() {
-    const rows = (await pool.query(
-      `SELECT id, host, port, protocol, source, consecutive_failures
-       FROM proxies WHERE host <> '__direct__'`
-    )).rows;
-    if (rows.length === 0) return { checked: 0, evicted: 0 };
-
-    let evicted = 0;
-    const concurrency = 15;
-    let cursor = 0;
-    const worker = async () => {
-      while (cursor < rows.length) {
-        const r = rows[cursor++];
-        const probe = await probeWithTimeout(r).catch(() => ({ ok: false, latencyMs: 0 }));
-        if (probe.ok) {
-          await pool.query(
-            `UPDATE proxies SET is_working=TRUE, last_checked_at=NOW(),
-                    last_latency_ms=$1, consecutive_failures=0
-             WHERE id=$2`,
-            [probe.latencyMs, r.id]
-          );
-        } else {
-          // Free proxies: evict after 2 consecutive failures.
-          if (r.source === 'free' && r.consecutive_failures + 1 >= 2) {
-            await pool.query('DELETE FROM proxies WHERE id = $1', [r.id]);
-            evicted++;
-          } else {
-            await pool.query(
-              `UPDATE proxies SET is_working=FALSE, last_checked_at=NOW(),
-                      last_failed_at=NOW(), consecutive_failures=consecutive_failures+1
-               WHERE id=$1`,
-              [r.id]
-            );
-          }
-        }
-      }
-    };
-    await Promise.all(Array.from({ length: concurrency }, () => worker()));
-    if (evicted) logger.info(`Proxy revalidation evicted ${evicted} dead free proxies`);
-    return { checked: rows.length, evicted };
-  }
-
-  // =========================================================================
   // Assignment / rotation
   // =========================================================================
 
@@ -1329,108 +1031,6 @@ class ProxyService {
    * toggle is OFF — buildGramJSProxy() turns the direct row into
    * `null` so GramJS connects from the VPS IP.
    */
-  /**
-   * Move every session currently bound to a non-direct proxy onto the
-   * `__direct__` sentinel row so that future reconnects egress
-   * directly from the VPS, AND tear down any in-memory GramJS client
-   * that is *stuck* (zombie reconnect loop through a now-dead proxy).
-   *
-   * Triggered by the admin toggle when `proxy.global_enabled` flips
-   * ON → OFF. Without this step, TelegramClient instances that were
-   * created while proxying was on keep their old proxy options baked
-   * in: their `_updateLoop` retries forever against an unreachable
-   * SOCKS5 endpoint (the "Reconnecting session N (timeout=10000ms) /
-   * SocksClientError ECONNREFUSED" loop in the logs).
-   *
-   * Behavior intentionally avoids interrupting healthy proxied
-   * sessions: clients that are *actually connected* right now keep
-   * running on their current proxy until the connection naturally
-   * drops, at which point the heartbeat / restore loop will
-   * reconnect via `assignProxyForSession()` and pick up the
-   * `__direct__` row we just bound. Only stuck/disconnected clients
-   * are torn down, because those are the ones flooding logs with
-   * SOCKS5 errors and never making forward progress.
-   *
-   * @param {{mode?:'soft'|'hard'}} [opts] - 'soft' (default) leaves
-   *   currently-connected clients alone; 'hard' disconnects every
-   *   proxied client unconditionally.
-   */
-  async releaseAllProxiedSessions(opts = {}) {
-    const mode = opts.mode === 'hard' ? 'hard' : 'soft';
-    const direct = (await pool.query(
-      `SELECT id FROM proxies WHERE host='__direct__' LIMIT 1`
-    )).rows[0] || null;
-
-    // Sessions whose binding is to a non-direct proxy. We deliberately
-    // walk session_proxy_assignments rather than sessions.bound_proxy_id
-    // because the assignments table is the source of truth for the
-    // GramJS proxy actually in use.
-    const directId = direct ? direct.id : -1;
-    const r = await pool.query(
-      `SELECT spa.session_id
-         FROM session_proxy_assignments spa
-         JOIN proxies p ON p.id = spa.proxy_id
-        WHERE p.host <> '__direct__' AND spa.proxy_id <> $1`,
-      [directId]
-    );
-
-    // Resolve telegramService lazily (proxyService is loaded during
-    // sessionService construction; telegramService depends on
-    // sessionService).
-    let tg = null;
-    try { tg = require('./telegramService'); } catch { /* optional */ }
-
-    let rebound = 0;
-    let disconnected = 0;
-    let kept = 0;
-    for (const row of r.rows) {
-      const sid = row.session_id;
-      try {
-        await this._bindDirectRow(sid);
-        rebound++;
-      } catch (err) {
-        logger.warn(`releaseAllProxiedSessions: rebind failed for ${sid}: ${err.message}`);
-      }
-      if (!tg || typeof tg.disconnectSession !== 'function') continue;
-
-      // Decide whether to disconnect the in-memory client.
-      let shouldDisconnect = mode === 'hard';
-      if (mode === 'soft') {
-        // Only kill the client when it's NOT actively connected — i.e.
-        // it's the zombie path: GramJS dropped the connection, the
-        // _updateLoop is now retrying through the dead proxy, and
-        // `isSessionActive` returns false because `entry.connected` is
-        // false. Healthy proxied sessions (entry.connected === true)
-        // keep running on their existing proxy until they naturally
-        // drop, then reconnect direct via the bound `__direct__` row.
-        try {
-          const active =
-            typeof tg.isSessionActive === 'function'
-              ? tg.isSessionActive(String(sid))
-              : false;
-          if (!active) shouldDisconnect = true;
-          else kept++;
-        } catch (err) {
-          logger.debug(`releaseAllProxiedSessions: isSessionActive failed for ${sid}: ${err.message}`);
-          shouldDisconnect = true;
-        }
-      }
-      if (!shouldDisconnect) continue;
-      try {
-        const res = await tg.disconnectSession(String(sid)).catch(() => null);
-        if (res && res.disconnected) disconnected++;
-      } catch (err) {
-        logger.debug(`releaseAllProxiedSessions: disconnect failed for ${sid}: ${err.message}`);
-      }
-    }
-
-    logger.info(
-      `releaseAllProxiedSessions(${mode}): rebound=${rebound} ` +
-        `disconnected=${disconnected} kept=${kept} total=${r.rows.length}`
-    );
-    return { mode, rebound, disconnected, kept, total: r.rows.length };
-  }
-
   async _bindDirectRow(sessionId) {
     const direct = (await pool.query(
       `SELECT * FROM proxies WHERE host='__direct__' LIMIT 1`
@@ -1642,8 +1242,66 @@ class ProxyService {
       return r.rows[0] || null;
     }
 
-    // Global proxy switch: short-circuit to the `__direct__` sentinel
-    // so SendCode / SignIn paths egress directly from the VPS IP.
+    const userId = opts.userId || null;
+    const role = opts.role || null;
+    let proxy = null;
+
+    // Strict session creation path: user-owned, Telegram-validated, enabled,
+    // one reservation/assignment per proxy, and absolutely no provider/admin/
+    // direct fallback.
+    if (opts.dedicated === true) {
+      if (!userId) throw new AppError('userId required for a dedicated proxy', 400, 'PROXY_USER_ID_REQUIRED');
+      if (opts.proxyId) {
+        proxy = (await pool.query(
+          `UPDATE proxies
+              SET active_assignments = 1,
+                  total_assignments = total_assignments + 1
+            WHERE id = $1 AND user_id = $2 AND source = 'user'
+              AND enabled = TRUE AND is_working = TRUE
+              AND validated_for_telegram = TRUE
+              AND protocol IN ('socks5', 'mtproto')
+              AND active_assignments = 0
+              AND NOT EXISTS (
+                SELECT 1 FROM session_proxy_assignments a WHERE a.proxy_id = proxies.id
+              )
+          RETURNING *`,
+          [opts.proxyId, userId]
+        )).rows[0] || null;
+      } else {
+        proxy = (await pool.query(
+          `WITH candidate AS (
+             SELECT p.id
+               FROM proxies p
+              WHERE p.user_id = $1 AND p.source = 'user' AND p.enabled = TRUE
+                AND p.is_working = TRUE AND p.validated_for_telegram = TRUE
+                AND p.protocol IN ('socks5', 'mtproto')
+                AND p.active_assignments = 0
+                AND NOT EXISTS (
+                  SELECT 1 FROM session_proxy_assignments a WHERE a.proxy_id = p.id
+                )
+              ORDER BY p.last_latency_ms NULLS LAST, p.id
+              FOR UPDATE SKIP LOCKED
+              LIMIT 1
+           )
+           UPDATE proxies p
+              SET active_assignments = 1,
+                  total_assignments = total_assignments + 1
+             FROM candidate c
+            WHERE p.id = c.id
+        RETURNING p.*`,
+          [userId]
+        )).rows[0] || null;
+      }
+      if (!proxy) {
+        throw new AppError('No healthy unassigned dedicated proxy is available', 412, 'NO_USER_PROXY');
+      }
+      if (!this._adHocReservations) this._adHocReservations = new Map();
+      this._adHocReservations.set(key, proxy.id);
+      return proxy;
+    }
+
+    // Legacy-only global bypass. Strict creation returns above and can never
+    // reach the direct sentinel, even if an old setting remains in the DB.
     const settingsService = require('./systemSettingsService');
     if (!(await settingsService.isProxyGloballyEnabled())) {
       const direct = (await pool.query(
@@ -1655,10 +1313,6 @@ class ProxyService {
       }
       return direct;
     }
-
-    const userId = opts.userId || null;
-    const role = opts.role || null;
-    let proxy = null;
 
     // (a) Caller pinned a specific proxy — must own it (admin
     //     bypasses).
@@ -1744,13 +1398,23 @@ class ProxyService {
     }
     this._adHocReservations.delete(key);
     await pool.query(
-      `INSERT INTO session_proxy_assignments (session_id, proxy_id, assigned_at)
-       VALUES ($1, $2, NOW())
+      `INSERT INTO session_proxy_assignments (session_id, proxy_id, assigned_at, dedicated)
+       VALUES ($1, $2, NOW(), TRUE)
        ON CONFLICT (session_id) DO UPDATE
-         SET proxy_id = EXCLUDED.proxy_id, assigned_at = NOW()`,
+         SET proxy_id = EXCLUDED.proxy_id,
+             assigned_at = NOW(),
+             dedicated = TRUE`,
       [sessionId, proxyId]
     );
-    return (await pool.query(`SELECT * FROM proxies WHERE id = $1`, [proxyId])).rows[0] || null;
+    const proxy = (await pool.query(`SELECT * FROM proxies WHERE id = $1`, [proxyId])).rows[0] || null;
+    if (proxy) {
+      await pool.query(
+        `UPDATE sessions SET bound_proxy_id = $1, proxy_url = $2, updated_at = NOW()
+          WHERE id = $3`,
+        [proxyId, buildProxyUrl(proxy), sessionId]
+      );
+    }
+    return proxy;
   }
 
   async releaseProxy(sessionId) {
@@ -1817,48 +1481,6 @@ function safeDecrypt(text) {
 }
 
 /**
- * Auto-rotating provider hook. Called from pickProxyForSession when no
- * existing binding is good. Loads the user's enabled provider row (if
- * any) and asks proxyProviderService to mint a fresh sticky `proxies`
- * row for this session. Returns the row, or `null` when:
- *   - no provider row is configured / enabled for the user
- *   - the driver lookup fails
- *   - any persistence error occurs (we soft-fail so the legacy
- *     fallback path can still pick a BYO proxy).
- */
-async function tryProvisionFromProvider(userId, sessionId) {
-  if (!userId || !sessionId) return null;
-  let providerService;
-  try {
-    providerService = require('./proxyProviderService');
-  } catch (err) {
-    logger.warn('proxyProviderService unavailable', { error: err.message });
-    return null;
-  }
-  let provider = null;
-  try {
-    provider = await providerService.getActiveProvider(userId);
-  } catch (err) {
-    logger.warn('Failed to load active proxy provider', {
-      userId, error: err.message,
-    });
-    return null;
-  }
-  if (!provider) return null;
-
-  let row;
-  try {
-    row = await providerService.provisionForSession(provider, { sessionId });
-  } catch (err) {
-    logger.warn('Auto-proxy provision failed', {
-      userId, sessionId, vendor: provider.vendor, error: err.message,
-    });
-    return null;
-  }
-  return row;
-}
-
-/**
  * Build a `protocol://[user[:pass]@]host:port` URL string for a proxy
  * row. Used to mirror a binding into `sessions.proxy_url` so the IG
  * provider's per-row reads (`SELECT proxy_url ...`) keep working
@@ -1886,7 +1508,6 @@ function buildProxyUrl(proxy) {
 
 module.exports = new ProxyService();
 module.exports.constants = {
-  FREE_PROXY_POOL_SIZE,
   MAX_SESSIONS_PER_PROXY,
   PROXY_RECHECK_INTERVAL_MS,
   REQUIRE_USER_PROXY,

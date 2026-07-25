@@ -60,10 +60,6 @@ const fingerprint = require('../utils/deviceFingerprint');
 
 const SESSION_SUBDIR = 'sessions';
 const CREATION_TTL_MS = parseInt(process.env.SESSION_CREATION_TTL_MS || `${5 * 60 * 1000}`, 10);
-const STRICT_PROXY_ISOLATION = String(
-  process.env.STRICT_PROXY_ISOLATION ?? 'false'
-).toLowerCase() === 'true';
-
 class SessionCreationService {
   constructor() {
     /** @type {Map<string, {
@@ -184,11 +180,9 @@ class SessionCreationService {
   // Step 1: start — sendCode
   // ---------------------------------------------------------------------------
   async start({ userId, phone, apiId, apiHash, country, platform, proxyId, userRole, useProxy, loginOnPanel }) {
-    // BYO Proxy — opt-out: when the operator explicitly unchecks the
-    // "Use a proxy" box we skip every proxy primitive in the create
-    // flow. Default keeps Phase 3 behaviour intact (proxy required for
-    // BYO users) so existing flows are unaffected.
-    const wantsProxy = useProxy === false ? false : true;
+    // Every newly-created Telegram session is strict. There is no direct-IP
+    // opt-out: SendCode, SignIn, and all future work use the same proxy.
+    const wantsProxy = true;
     // "Login on panel" opt-out: when the operator unchecks the box, the
     // panel still completes the OTP/2FA handshake (so we can hand the
     // session string back as a download), but it does NOT adopt the
@@ -244,7 +238,7 @@ class SessionCreationService {
         const proxyService = require('./proxyService');
         const reserved = await proxyService.reserveAdHoc(
           `creation:${tempId}`,
-          { userId, role: userRole || null, proxyId: proxyId || null }
+          { userId, role: userRole || null, proxyId: proxyId || null, dedicated: true }
         );
         if (reserved) {
           reservedProxyId = reserved.id;
@@ -263,11 +257,10 @@ class SessionCreationService {
 
       if (proxyError) throw proxyError;
 
-      if (!proxyConf && STRICT_PROXY_ISOLATION) {
+      if (!proxyConf) {
         throw new AppError(
-          'No proxy available for new session (STRICT_PROXY_ISOLATION=true). ' +
-            'Add a working proxy in the Proxies page first.',
-          503,
+          'No healthy dedicated proxy is available. Add and test a SOCKS5 proxy first.',
+          412,
           'NO_PROXY_AVAILABLE'
         );
       }
@@ -566,9 +559,9 @@ class SessionCreationService {
          user_id, phone, session_file_path, api_id, api_hash,
          user_api_credential_id,
          status, is_2fa_enabled, is_logged_in, keep_alive, account_info,
-         device_identity, bound_proxy_id,
+         device_identity, bound_proxy_id, proxy_required,
          last_heartbeat, last_active, created_at
-       ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12::jsonb, $13, NOW(), NOW(), NOW())
+       ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12::jsonb, $13, TRUE, NOW(), NOW(), NOW())
        RETURNING id`,
       [
         userId,
@@ -589,10 +582,19 @@ class SessionCreationService {
           loginOnPanel: wantsLogin,
         }),
         identity ? JSON.stringify(identity) : null,
-        wantsLogin ? (reservedProxyId || null) : null,
+        reservedProxyId || null,
       ]
     );
     const sessionId = insert.rows[0].id;
+
+    // Convert the pre-login reservation into the permanent 1:1 binding before
+    // adopting the live client or exposing the new session to other workers.
+    const proxyService = require('./proxyService');
+    if (!reservedProxyId) {
+      throw new AppError('Dedicated proxy reservation was lost', 412, 'SESSION_PROXY_REQUIRED');
+    }
+    await proxyService.transferAdHocToSession(`creation:${tempId}`, sessionId);
+    await proxyService.validateMyProxyForPlatform(userId, reservedProxyId, 'telegram');
 
     // Adopt the live, already-connected client into telegramService so we
     // don't immediately reconnect. If adoption fails we just disconnect and
@@ -623,59 +625,8 @@ class SessionCreationService {
       );
       try { await client.disconnect(); } catch (_) {}
       try { await client.destroy(); } catch (_) {}
-      // Release any ad-hoc proxy slot reserved during start() — we
-      // don't want a parked, never-logged-in session to keep a slot
-      // out of rotation for the proxy pool.
-      if (reservedProxyId) {
-        try {
-          const proxyService = require('./proxyService');
-          await proxyService.releaseAdHoc(`creation:${tempId}`);
-        } catch (_) {}
-      }
-    }
-
-    // Bind the proxy slot to the new session ID so future reconnects
-    // resolve through the same pool. If the start() flow already
-    // reserved one we just transfer that reservation; otherwise we let
-    // proxyService pick — except when the operator explicitly opted
-    // out of proxies on this create flow OR opted out of login-on-panel
-    // (parked sessions don't need a long-lived proxy slot), in which
-    // case we leave bound_proxy_id NULL and never call
-    // assignProxyForSession (which would otherwise try to reserve from
-    // the pool, defeating the opt-out).
-    try {
-      const proxyService = require('./proxyService');
-      if (!wantsLogin) {
-        logger.info(
-          `Session ${sessionId} created with loginOnPanel=false; skipping proxy bind.`
-        );
-      } else if (!wantsProxy) {
-        logger.info(
-          `Session ${sessionId} created with useProxy=false; skipping proxy bind.`
-        );
-      } else if (reservedProxyId) {
-        await proxyService.transferAdHocToSession(`creation:${tempId}`, sessionId);
-      } else {
-        await proxyService.assignProxyForSession(sessionId);
-      }
-      // BYO Proxy (Phase 2): now that the session is connected through
-      // this proxy, mark it as TG-validated so the user UI can render
-      // the green "validated for Telegram" chip immediately.
-      try {
-        const userIdForBind = entry && entry.userId;
-        if (userIdForBind && reservedProxyId) {
-          const owned = await proxyService.getMyProxy(userIdForBind, reservedProxyId);
-          if (owned) {
-            await proxyService.validateMyProxyForPlatform(
-              userIdForBind, reservedProxyId, 'telegram'
-            );
-          }
-        }
-      } catch (validateErr) {
-        logger.debug(`validateMyProxyForPlatform skipped: ${validateErr.message}`);
-      }
-    } catch (err) {
-      logger.debug(`proxy assign post-creation skipped: ${err.message}`);
+      // Keep the dedicated proxy reserved even for parked sessions: the
+      // first later login must use the same egress as SendCode/SignIn.
     }
 
     this.pending.delete(tempId);

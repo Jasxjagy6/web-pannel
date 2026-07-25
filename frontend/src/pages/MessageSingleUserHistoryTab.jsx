@@ -189,9 +189,9 @@ export default function MessageSingleUserHistoryTab({ refreshKey }) {
 function JobRow({ job, onCancel }) {
   // The list endpoint now returns a preview of the job's target_list
   // (the actual usernames/IDs the job ran against). For single-user
-  // mass DM jobs the list is small (1..3) so we render it inline; for
-  // bulk jobs the backend caps the preview at 25 entries and exposes
-  // `targetsTruncated` so we know to show a "+N more" pill.
+  // mass DM jobs are capped at 50. The backend caps the preview at 25
+  // entries and exposes `targetsTruncated` so we know to show a "+N more"
+  // pill.
   const opts = job.options || {};
   const total = job.totalCount ?? 0;
   const sent = job.sentCount ?? 0;

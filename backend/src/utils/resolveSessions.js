@@ -39,12 +39,17 @@ async function resolveSessionIdsFromRequest(req, fallbackSessionIds = [], opts =
       sessionListId: listId,
       sessionListIds: Array.isArray(listIds) ? listIds : undefined,
       includeAll: !!opts.includeAll,
+      includeFrozen: !!opts.includeFrozen,
     });
   }
   if (!Array.isArray(fallbackSessionIds)) return [];
-  return fallbackSessionIds
-    .map((x) => Number(x))
-    .filter((n) => Number.isFinite(n) && n > 0);
+  return sessionListService.resolveSessionIds({
+    userId: req.user && req.user.id,
+    platform: req.platform || 'telegram',
+    sessionIds: fallbackSessionIds,
+    includeAll: !!opts.includeAll,
+    includeFrozen: !!opts.includeFrozen,
+  });
 }
 
 module.exports = {

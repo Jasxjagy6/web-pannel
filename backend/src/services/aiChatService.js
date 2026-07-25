@@ -86,6 +86,14 @@ class AiChatService {
    */
   async handleIncomingMessage(sessionId, event) {
     const sid = Number(sessionId);
+    const { rows: sessionRows } = await pool.query(
+      `SELECT COALESCE(spam_status, 'unknown') AS spam_status FROM sessions WHERE id = $1`,
+      [sid]
+    );
+    if (sessionRows[0]?.spam_status === 'frozen') {
+      await this._forceFrozenOff(sid);
+      return { handled: false, reason: 'session_frozen' };
+    }
     const msg = event?.message;
     if (!msg) {
       logger.warn(`AI: no_message for session ${sid}`);
@@ -435,13 +443,34 @@ class AiChatService {
   async getSessionSettings(sessionId) {
     const sid = Number(sessionId);
     const { rows } = await pool.query(
-      `SELECT enabled, config FROM ai_session_settings WHERE session_id = $1`,
+      `SELECT COALESCE(settings.enabled, FALSE) AS enabled,
+              COALESCE(settings.config, '{}'::jsonb) AS config,
+              COALESCE(s.spam_status, 'unknown') AS spam_status
+         FROM sessions s
+         LEFT JOIN ai_session_settings settings ON settings.session_id = s.id
+        WHERE s.id = $1`,
       [sid]
     );
     if (rows.length) {
-      return { enabled: rows[0].enabled, config: rows[0].config || {} };
+      if (rows[0].spam_status === 'frozen') {
+        await this._forceFrozenOff(sid, rows[0].config || {});
+        return { enabled: false, config: rows[0].config || {}, frozen: true };
+      }
+      return { enabled: rows[0].enabled, config: rows[0].config || {}, frozen: false };
     }
     return { enabled: false, config: {} };
+  }
+
+  async _forceFrozenOff(sessionId, config = {}) {
+    const sid = Number(sessionId);
+    await aiSessionManager.detach(sid).catch(() => {});
+    await pool.query(
+      `INSERT INTO ai_session_settings (session_id, enabled, config, updated_at)
+       VALUES ($1, FALSE, $2, NOW())
+       ON CONFLICT (session_id) DO UPDATE
+       SET enabled = FALSE, updated_at = NOW()`,
+      [sid, JSON.stringify(_mergeConfig(config))]
+    );
   }
 
   /**
@@ -461,9 +490,21 @@ class AiChatService {
    */
   async setSessionEnabled(sessionId, userId, enabled, config = {}) {
     const sid = Number(sessionId);
-    await this._authorizeSession(sid, userId);
+    const session = await this._authorizeSession(sid, userId);
 
     const cfg = _mergeConfig(config);
+
+    if (session.spam_status === 'frozen') {
+      await this._forceFrozenOff(sid, cfg);
+      if (enabled) {
+        throw new AppError(
+          'AI Chat is permanently OFF while this Telegram session is frozen',
+          409,
+          'FROZEN_SESSION_AI_DISABLED'
+        );
+      }
+      return { sessionId: sid, enabled: false, config: cfg, attached: false, frozen: true };
+    }
 
     let attached = false;
     if (enabled) {
@@ -595,7 +636,7 @@ class AiChatService {
 
     // Every Telegram session this user owns.
     const { rows } = await pool.query(
-      `SELECT id, is_logged_in FROM sessions
+      `SELECT id, is_logged_in, COALESCE(spam_status, 'unknown') AS spam_status FROM sessions
         WHERE user_id = $1 AND platform = 'telegram'
         ORDER BY id`,
       [userId]
@@ -612,9 +653,17 @@ class AiChatService {
       // Can't attach a listener to a session that isn't logged in, so
       // skip those on enable. On disable we still process them so any
       // stale enabled row is cleared.
-      if (enabled && !row.is_logged_in) {
+      if (enabled && (row.spam_status === 'frozen' || !row.is_logged_in)) {
+        if (row.spam_status === 'frozen') {
+          // eslint-disable-next-line no-await-in-loop
+          await this._forceFrozenOff(sid);
+        }
         skipped++;
-        results.push({ sessionId: sid, ok: false, reason: 'not_logged_in' });
+        results.push({
+          sessionId: sid,
+          ok: false,
+          reason: row.spam_status === 'frozen' ? 'frozen' : 'not_logged_in',
+        });
         continue;
       }
 
@@ -1063,12 +1112,14 @@ class AiChatService {
    */
   async _authorizeSession(sessionId, userId) {
     const { rows } = await pool.query(
-      `SELECT id FROM sessions WHERE id = $1 AND user_id = $2 AND platform = 'telegram'`,
+      `SELECT id, COALESCE(spam_status, 'unknown') AS spam_status
+         FROM sessions WHERE id = $1 AND user_id = $2 AND platform = 'telegram'`,
       [sessionId, userId]
     );
     if (!rows.length) {
       throw new AppError('Session not found', 404, 'SESSION_NOT_FOUND');
     }
+    return rows[0];
   }
 
   async _resolveUserId(sessionId) {

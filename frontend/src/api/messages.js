@@ -33,10 +33,11 @@ export const sendBulkToGroups = (data) => api.post('/messages/bulk-groups', data
 export const sendBulkToUsers = (data) => api.post('/messages/bulk-users', data);
 
 // Single-User Mass DM. The body shape mirrors the backend validator:
-//   { sessionIds | sessionListId, targets: string[1..3], message,
-//     messageType?, delaySeconds?, async? }
+//   { sessionIds | sessionListId, sourceType?: 'manual'|'list',
+//     targets?: string[1..50], sourceId?, message, messageType?,
+//     delaySeconds?, async? }
 // Each session DMs every target sequentially with `delaySeconds` between
-// sends. The 3-target hard cap and 1..120-second delay band are enforced
+// sends. The 50-target hard cap and 1..120-second delay band are enforced
 // server-side; the form should match those bounds.
 export const sendSingleUserMassDm = (data) =>
   api.post('/messages/single-user-mass-dm', data);
@@ -75,6 +76,13 @@ export const sendFailover = (data) => api.post('/messages/failover', data);
 // DIFFERENT users. Finishes a big list in minutes with safe pacing. Body
 // shape mirrors sendFailover.
 export const sendParallel = (data) => api.post('/messages/parallel', data);
+
+// Split mass DM. Same body as parallel plus `dmsPerSession` (per-session
+// quota). The audience is cut into contiguous slices — session 1 -> users
+// 1..q, session 2 -> users q+1..2q, … — and every slice runs simultaneously,
+// so the whole job finishes in roughly the time ONE session needs for its
+// slice. Targets must be pre-verified (a limited session just stops its slice).
+export const sendSplit = (data) => api.post('/messages/split', data);
 
 // Per-recipient reply breakdown for a finished send job (job-history
 // dropdown: "sent to user 1 — not replied", "sent to user 2 — replied").

@@ -38,23 +38,28 @@ class AiSessionManager {
    */
   async attach(sessionId) {
     const sid = String(sessionId);
-    if (this._sessions.has(sid)) {
-      const existing = this._sessions.get(sid);
-      return { attached: false, method: existing.method, reason: 'already_attached' };
-    }
 
     let panelUserId;
     try {
       const { rows } = await pool.query(
-        'SELECT user_id FROM sessions WHERE id = $1 LIMIT 1',
+        `SELECT user_id, COALESCE(spam_status, 'unknown') AS spam_status
+           FROM sessions WHERE id = $1 LIMIT 1`,
         [sid]
       );
       if (!rows.length) {
         throw new Error(`Session ${sid} not found in DB`);
       }
       panelUserId = rows[0].user_id;
+      if (rows[0].spam_status === 'frozen') {
+        await this.detach(sid);
+        throw new Error('FROZEN_SESSION_AI_DISABLED');
+      }
       if (!panelUserId) {
         throw new Error(`Session ${sid} has no user_id`);
+      }
+      if (this._sessions.has(sid)) {
+        const existing = this._sessions.get(sid);
+        return { attached: false, method: existing.method, reason: 'already_attached' };
       }
     } catch (err) {
       logger.error(`AI attach: cannot resolve user_id for session ${sid}: ${err.message}`);

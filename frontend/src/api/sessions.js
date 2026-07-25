@@ -125,6 +125,9 @@ export const cancelCloneExport = (jobId) =>
 export const startBulkLogin = (payload) =>
   api.post('/sessions/bulk-login/start', payload);
 
+export const previewBulkLogin = (payload) =>
+  api.post('/sessions/bulk-login/preview', payload);
+
 export const getBulkLoginStatus = (jobId) =>
   api.get(`/sessions/bulk-login/${jobId}/status`);
 
@@ -159,6 +162,9 @@ export const cancelBulkAuthPurge = (jobId) =>
 export const startSpamAppeal = (payload) =>
   api.post('/sessions/spam-appeal/start', payload);
 
+export const recheckSpamStatus = (payload) =>
+  api.post('/sessions/spam-appeal/recheck', payload);
+
 export const getSpamAppealStatus = (jobId) =>
   api.get(`/sessions/spam-appeal/${jobId}/status`);
 
@@ -184,6 +190,9 @@ export const downloadCloneExportZip = async (jobId) => {
 // Refresh the live Telegram display details (firstName, lastName,
 // username, bio, premium/verified) from Telegram and rewrite
 // sessions.account_info / sessions.username. Read-only.
+
+export const removeProxyAndRelogin = (id) =>
+  api.post(`/sessions/${id}/remove-proxy-and-relogin`);
 
 export const syncSessionProfile = (id) =>
   api.post(`/sessions/${id}/sync-profile`);

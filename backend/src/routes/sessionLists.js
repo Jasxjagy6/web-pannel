@@ -9,6 +9,7 @@ router.use(requireApproved);
 // CRUD on session lists.
 router.get('/', ctrl.list);
 router.post('/', ctrl.create);
+router.post('/organize-spam-status', ctrl.organizeSpamStatus);
 router.get('/:id', ctrl.get);
 router.put('/:id', ctrl.update);
 router.delete('/:id', ctrl.remove);

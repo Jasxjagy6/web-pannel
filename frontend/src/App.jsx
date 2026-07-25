@@ -21,7 +21,6 @@ import Pending from './pages/Pending';
 import Landing from './pages/Landing';
 
 const Admin = lazy(() => import('./pages/Admin'));
-const AdminProxies = lazy(() => import('./pages/admin/AdminProxies'));
 const TrackingRoutes = lazy(() => import('./pages/tracking/TrackingRoutes'));
 const Dashboard = lazy(() => import('./pages/Dashboard'));
 const Sessions = lazy(() => import('./pages/Sessions'));
@@ -36,7 +35,6 @@ const Change2FA = lazy(() => import('./pages/Change2FA'));
 const GetOTP = lazy(() => import('./pages/GetOTP'));
 const OtpRelay = lazy(() => import('./pages/OtpRelay'));
 const Proxies = lazy(() => import('./pages/Proxies'));
-const ProxyProviders = lazy(() => import('./pages/ProxyProviders'));
 const CreateSession = lazy(() => import('./pages/CreateSession'));
 const AntiDetect = lazy(() => import('./pages/AntiDetect'));
 const Privacy = lazy(() => import('./pages/Privacy'));
@@ -326,7 +324,6 @@ function PlatformRoutes() {
       <Route path="get-otp" element={<ProtectedRoute title="Get OTP"><GetOTP /></ProtectedRoute>} />
       <Route path="otp-relay" element={<ProtectedRoute title="OTP Relay"><PlatformPage tg={OtpRelay} ig={InstagramWorkInProgress} /></ProtectedRoute>} />
       <Route path="proxies" element={<ProtectedRoute title="Proxies"><PlatformPage tg={Proxies} ig={InstagramProxies} /></ProtectedRoute>} />
-      <Route path="proxy-providers" element={<ProtectedRoute title="Auto-rotating proxy providers"><ProxyProviders /></ProtectedRoute>} />
       <Route path="anti-detect" element={<ProtectedRoute title="Anti-Detect"><PlatformPage tg={AntiDetect} ig={InstagramAntiDetect} /></ProtectedRoute>} />
       <Route path="privacy" element={<ProtectedRoute title="Privacy"><PlatformPage tg={Privacy} ig={InstagramPrivacy} /></ProtectedRoute>} />
       <Route path="settings" element={<ProtectedRoute title="Settings" allowWithoutSubscription><PlatformPage tg={Settings} ig={InstagramSettings} /></ProtectedRoute>} />
@@ -350,7 +347,6 @@ export default function App() {
               <Route path="/register" element={<Register />} />
               <Route path="/pending" element={<PendingGate />} />
               <Route path="/admin" element={<ProtectedRoute title="Admin Panel" requireAdmin><Admin /></ProtectedRoute>} />
-              <Route path="/admin/proxies" element={<ProtectedRoute title="Admin Proxies" requireAdmin><AdminProxies /></ProtectedRoute>} />
 
               {/* Tracking is its own standalone panel (like Instagram is
                   its own world) — reached from the header PanelSwitcher,

@@ -22,7 +22,9 @@ module.exports = {
     if (!userId) throw new AppError('Authentication required', 401, 'NO_AUTH');
 
     const { sessionIds: rawSessionIds, interSessionDelayMs } = req.body || {};
-    const sessionIds = await resolveSessionIdsFromRequest(req, rawSessionIds || []);
+    const sessionIds = await resolveSessionIdsFromRequest(req, rawSessionIds || [], {
+      includeFrozen: true,
+    });
     if (!Array.isArray(sessionIds) || sessionIds.length === 0) {
       throw new AppError(
         'sessionIds array (or a non-empty session list) is required',
@@ -39,6 +41,29 @@ module.exports = {
       res.status(202).json(result);
     } catch (err) {
       throw new AppError(err.message, 400, 'SPAM_APPEAL_START_FAILED');
+    }
+  }),
+
+  recheck: asyncHandler(async (req, res) => {
+    const userId = req.user && req.user.id;
+    if (!userId) throw new AppError('Authentication required', 401, 'NO_AUTH');
+
+    const { sessionIds: rawSessionIds, interSessionDelayMs } = req.body || {};
+    const sessionIds = await resolveSessionIdsFromRequest(req, rawSessionIds || [], {
+      includeFrozen: true,
+    });
+    if (!Array.isArray(sessionIds) || sessionIds.length === 0) {
+      throw new AppError('Select at least one session to recheck', 400, 'NO_SESSIONS');
+    }
+    try {
+      const result = await service.startStatusCheckJob({
+        userId,
+        sessionIds,
+        interSessionDelayMs,
+      });
+      res.status(202).json(result);
+    } catch (err) {
+      throw new AppError(err.message, 400, 'SPAM_STATUS_CHECK_START_FAILED');
     }
   }),
 

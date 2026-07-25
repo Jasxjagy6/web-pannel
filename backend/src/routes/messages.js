@@ -28,6 +28,13 @@ router.post('/failover', messageLimiter, validate(schemas.failoverMessage), mess
 // list in minutes with safe per-account pacing. Reuses the failover shape.
 router.post('/parallel', messageLimiter, validate(schemas.failoverMessage), messageController.sendParallel);
 
+// POST /api/messages/split - Split mass DM. Operator sets a per-session quota
+// (dmsPerSession); the audience is cut into contiguous slices (session 1 ->
+// users 1..q, session 2 -> users q+1..2q, …) and every slice runs at the same
+// time. Finishes in roughly the time ONE session needs for its slice. Targets
+// are pre-verified so a limited/dead session just stops its own slice.
+router.post('/split', messageLimiter, validate(schemas.failoverMessage), messageController.sendSplit);
+
 // POST /api/messages/bulk/preview - Distribution-engine preview
 // Returns the rotation/cooldown plan that would be used for a bulk
 // send, without enqueueing or sending anything.
@@ -58,9 +65,9 @@ router.post('/bulk-groups', messageController.sendBulkToGroups);
 router.post('/bulk-users', messageController.sendBulkToUsers);
 
 // POST /api/messages/single-user-mass-dm
-//   Single-User Mass DM: 1..3 target users, every selected session
-//   DMs each target with a per-send delay (in seconds). Validated by
-//   the `singleUserMassDm` Joi schema.
+//   Single-User Mass DM: 1..50 manual or saved-list target users; every
+//   selected session DMs each target with a per-send delay (in seconds).
+//   Validated by the `singleUserMassDm` Joi schema.
 router.post(
   '/single-user-mass-dm',
   messageLimiter,

@@ -346,7 +346,8 @@ class TelegramClientService {
    */
   async listLoggableSessions(userId) {
     const result = await pool.query(
-      `SELECT id, phone, status, is_logged_in, account_info, last_active, created_at
+      `SELECT id, phone, status, is_logged_in, account_info, last_active, created_at,
+              COALESCE(spam_status, 'unknown') AS spam_status
          FROM sessions
         WHERE user_id = $1 AND platform = 'telegram'
         ORDER BY (status = 'active' AND is_logged_in = TRUE) DESC,
@@ -374,6 +375,7 @@ class TelegramClientService {
         phone: row.phone,
         status: row.status,
         isLoggedIn: !!row.is_logged_in,
+        spamStatus: row.spam_status,
         displayName,
         firstName,
         lastName,

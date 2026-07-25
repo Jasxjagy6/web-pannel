@@ -42,6 +42,7 @@ router.get('/clone-export/:jobId/download', cloneExportController.download);
 // before /:id so the `bulk-login` literal isn't shadowed by the
 // param matcher.
 router.post('/bulk-login/start', bulkLoginController.start);
+router.post('/bulk-login/preview', bulkLoginController.preview);
 router.get('/bulk-login/:jobId/status', bulkLoginController.status);
 router.post('/bulk-login/:jobId/cancel', bulkLoginController.cancel);
 
@@ -61,6 +62,7 @@ router.post('/bulk-auth-purge/:jobId/cancel', bulkAuthPurgeController.cancel);
 // appeal button and submits an appeal. Accepts sessionIds or session
 // list(s). Mounted before /:id so the literal path isn't shadowed.
 router.post('/spam-appeal/start', spamAppealController.start);
+router.post('/spam-appeal/recheck', spamAppealController.recheck);
 router.get('/spam-appeal/:jobId/status', spamAppealController.status);
 router.post('/spam-appeal/:jobId/cancel', spamAppealController.cancel);
 
@@ -93,6 +95,10 @@ router.post('/:id/logout', sessionController.logoutSession);
 // session file or its newest backup, runs getMe, flips the row back
 // to active if the auth key is still good).
 router.post('/:id/recover', sessionController.recoverSession);
+
+// POST /api/sessions/:id/remove-proxy-and-relogin — remove the dedicated
+// proxy from a Telegram session and re-login from the panel's own IP.
+router.post('/:id/remove-proxy-and-relogin', sessionController.removeProxyAndRelogin);
 
 // POST /api/sessions/:id/sync-profile — refresh live Telegram profile
 // (firstName, lastName, username, bio, premium/verified) and rewrite

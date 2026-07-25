@@ -14,7 +14,7 @@ import {
 } from 'lucide-react';
 import { Modal } from './Modal';
 import {
-  startSpamAppeal, getSpamAppealStatus, cancelSpamAppeal,
+  startSpamAppeal, recheckSpamStatus, getSpamAppealStatus, cancelSpamAppeal,
 } from '../../api/sessions';
 import { useToast } from './Toast';
 
@@ -24,6 +24,10 @@ const STATUS_META = {
   appealing:      { label: 'Appealing',   cls: 'bg-amber-500/10 text-amber-200 border-amber-500/30', Icon: Loader2, spin: true },
   appealed:       { label: 'Appealed',    cls: 'bg-emerald-500/10 text-emerald-200 border-emerald-500/30', Icon: CheckCircle2, spin: false },
   no_restriction: { label: 'No limits',   cls: 'bg-emerald-500/10 text-emerald-300 border-emerald-500/30', Icon: ShieldCheck, spin: false },
+  limited:        { label: 'Limited',     cls: 'bg-amber-500/10 text-amber-200 border-amber-500/30', Icon: XCircle, spin: false },
+  frozen:         { label: 'Frozen',      cls: 'bg-red-500/10 text-red-200 border-red-500/30', Icon: XCircle, spin: false },
+  unknown:        { label: 'Inconclusive', cls: 'bg-zinc-500/10 text-zinc-300 border-zinc-500/30', Icon: Clock, spin: false },
+  inconclusive:   { label: 'Inconclusive', cls: 'bg-zinc-500/10 text-zinc-300 border-zinc-500/30', Icon: Clock, spin: false },
   failed:         { label: 'Failed',      cls: 'bg-red-500/10 text-red-200 border-red-500/30', Icon: XCircle, spin: false },
   cancelled:      { label: 'Cancelled',   cls: 'bg-zinc-500/10 text-zinc-300 border-zinc-500/30', Icon: StopCircle, spin: false },
 };
@@ -57,6 +61,11 @@ function SessionRow({ sess }) {
           <div className="truncate text-[11px] text-gray-500">
             {sess.phone ? `${sess.phone} · ` : ''}#{sess.sessionId}
             {sess.error ? <span className="text-red-300/80"> · {sess.error}</span> : ''}
+            {sess.limitUntil ? (
+              <span className="text-amber-300/80">
+                {' '}· until {new Date(sess.limitUntil).toLocaleString(undefined, { timeZone: 'UTC' })} UTC
+              </span>
+            ) : ''}
           </div>
         </div>
         {hasTranscript && (open ? <ChevronDown className="h-4 w-4 text-gray-500" /> : <ChevronRight className="h-4 w-4 text-gray-500" />)}
@@ -77,12 +86,21 @@ function SessionRow({ sess }) {
   );
 }
 
-export default function SpamAppealModal({ isOpen, onClose, selectedSessions = [], sessionListIds = [] }) {
+export default function SpamAppealModal({
+  isOpen,
+  onClose,
+  selectedSessions = [],
+  sessionListIds = [],
+  mode = 'appeal',
+  onCompleted,
+}) {
   const toast = useToast();
   const [jobId, setJobId] = useState(null);
   const [job, setJob] = useState(null);
   const [starting, setStarting] = useState(false);
   const pollRef = useRef(null);
+  const completedRef = useRef(false);
+  const checkingOnly = mode === 'check';
 
   const usingLists = Array.isArray(sessionListIds) && sessionListIds.length > 0;
   const sessionIds = selectedSessions.map((s) => s.id);
@@ -95,19 +113,29 @@ export default function SpamAppealModal({ isOpen, onClose, selectedSessions = []
     try {
       const { data } = await getSpamAppealStatus(id);
       setJob(data);
-      if (data.status === 'completed') stopPoll();
+      if (data.status === 'completed') {
+        stopPoll();
+        if (!completedRef.current) {
+          completedRef.current = true;
+          onCompleted?.(data);
+        }
+      }
     } catch {
       // keep polling; transient
     }
-  }, [stopPoll]);
+  }, [stopPoll, onCompleted]);
 
   const handleStart = async () => {
     setStarting(true);
     try {
       const payload = usingLists ? { sessionListIds } : { sessionIds };
-      const { data } = await startSpamAppeal(payload);
+      const { data } = checkingOnly
+        ? await recheckSpamStatus(payload)
+        : await startSpamAppeal(payload);
       setJobId(data.jobId);
-      toast?.success?.(`Appeal started for ${data.total} session${data.total === 1 ? '' : 's'}.`);
+      toast?.success?.(
+        `${checkingOnly ? 'Status recheck' : 'Appeal'} started for ${data.total} session${data.total === 1 ? '' : 's'}.`
+      );
       poll(data.jobId);
       pollRef.current = setInterval(() => poll(data.jobId), 2000);
     } catch (err) {
@@ -127,6 +155,7 @@ export default function SpamAppealModal({ isOpen, onClose, selectedSessions = []
     if (isOpen) {
       setJobId(null);
       setJob(null);
+      completedRef.current = false;
     } else {
       stopPoll();
     }
@@ -147,6 +176,9 @@ export default function SpamAppealModal({ isOpen, onClose, selectedSessions = []
           <>
             <span className="text-emerald-300">{s.appealed} appealed</span> ·{' '}
             <span className="text-emerald-400">{s.clean} clean</span> ·{' '}
+            <span className="text-amber-300">{s.limited || 0} limited</span> ·{' '}
+            <span className="text-red-300">{s.frozen || 0} frozen</span> ·{' '}
+            <span className="text-zinc-300">{s.inconclusive || 0} inconclusive</span> ·{' '}
             <span className="text-red-300">{s.failed} failed</span> ·{' '}
             <span className="text-gray-400">{s.pending} pending</span>
           </>
@@ -174,15 +206,23 @@ export default function SpamAppealModal({ isOpen, onClose, selectedSessions = []
   );
 
   return (
-    <Modal isOpen={isOpen} onClose={onClose} title="Appeal restrictions via @SpamBot" size="lg" footer={footer}>
+    <Modal
+      isOpen={isOpen}
+      onClose={onClose}
+      title={checkingOnly ? 'Recheck Telegram status' : 'Appeal restrictions via @SpamBot'}
+      size="lg"
+      footer={footer}
+    >
       <div className="space-y-4">
         <div className="rounded-lg border border-white/10 bg-white/5 p-3 text-xs text-gray-300">
           <div className="flex items-start gap-2">
             <MessageSquare className="mt-0.5 h-4 w-4 shrink-0 text-primary-400" />
             <p>
-              For each session we message <span className="font-medium text-gray-100">@SpamBot</span> with
-              {' '}<code className="rounded bg-white/10 px-1">/start</code>. If the account is free of limits
-              we skip it. If it's restricted, we press the appeal button and submit an appeal automatically.
+              For each session we message <span className="font-medium text-gray-100">@SpamBot</span> with{' '}
+              <code className="rounded bg-white/10 px-1">/start</code>.{' '}
+              {checkingOnly
+                ? 'This check updates clean, limited, and frozen status; it does not file an appeal. Clean accounts automatically return to all task pools.'
+                : 'If the account is restricted, we press the appeal button and submit an appeal automatically.'}{' '}
               Sessions are processed one by one with a delay to stay safe.
             </p>
           </div>
@@ -192,7 +232,7 @@ export default function SpamAppealModal({ isOpen, onClose, selectedSessions = []
           <div className="flex flex-col items-center gap-3 py-6">
             <p className="text-sm text-gray-300">
               {usingLists
-                ? `Appeal every session in the selected list${sessionListIds.length === 1 ? '' : 's'}.`
+                ? `${checkingOnly ? 'Recheck' : 'Appeal'} every session in the selected list${sessionListIds.length === 1 ? '' : 's'}.`
                 : `${total} session${total === 1 ? '' : 's'} selected.`}
             </p>
             <button
@@ -202,7 +242,7 @@ export default function SpamAppealModal({ isOpen, onClose, selectedSessions = []
               className="inline-flex items-center gap-2 rounded-md bg-primary-600 px-4 py-2 text-sm font-semibold text-white hover:bg-primary-500 disabled:opacity-50"
             >
               {starting ? <Loader2 className="h-4 w-4 animate-spin" /> : <ShieldCheck className="h-4 w-4" />}
-              Start appeal
+              {checkingOnly ? 'Start recheck' : 'Start appeal'}
             </button>
           </div>
         ) : !job ? (

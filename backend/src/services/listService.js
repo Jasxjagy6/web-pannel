@@ -15,11 +15,6 @@ const { AppError } = require('../utils/errorHandler');
 const { applyPagination, applySorting, buildPagination } = require('../utils/pagination');
 
 /**
- * Maximum number of items allowed per list.
- */
-const MAX_ITEMS_PER_LIST = 10000;
-
-/**
  * Valid list types.
  */
 const VALID_LIST_TYPES = ['users', 'groups', 'channels', 'scraped', 'manual', 'imported', 'merged', 'profile'];
@@ -1188,15 +1183,7 @@ class ListService {
       );
     }
 
-    // Limit to MAX_ITEMS_PER_LIST
     const totalParsed = entries.length;
-    if (entries.length > MAX_ITEMS_PER_LIST) {
-      logger.warn(`Truncating import from ${entries.length} to ${MAX_ITEMS_PER_LIST} items`, {
-        userId,
-        listName,
-      });
-      entries = entries.slice(0, MAX_ITEMS_PER_LIST);
-    }
 
     // Deduplicate by telegram_id when present, falling back to a
     // lower-cased username key for username-only entries. Without the
@@ -1365,13 +1352,7 @@ class ListService {
       );
     }
 
-    if (itemCount > MAX_ITEMS_PER_LIST) {
-      throw new AppError(
-        `Too many items (${itemCount}). Maximum allowed per list is ${MAX_ITEMS_PER_LIST}`,
-        400,
-        'LIST_TOO_LARGE'
-      );
-    }
+
 
     const client = await pool.connect();
     try {
@@ -1531,7 +1512,7 @@ class ListService {
       }
 
       // Cap at maximum
-      const finalItems = uniqueItems.slice(0, MAX_ITEMS_PER_LIST);
+      const finalItems = uniqueItems;
       const truncated = uniqueItems.length - finalItems.length;
       if (truncated > 0) {
         duplicateCount += truncated;
@@ -2339,7 +2320,7 @@ class ListService {
 
   /**
    * Load every row of a profile list, in insertion order. Profile lists
-   * are bounded by MAX_ITEMS_PER_LIST (10 000) so loading the whole list
+   * so loading the whole list
    * in one pass is safe.
    *
    * @param {number|string} userId
@@ -2436,6 +2417,22 @@ class ListService {
     // Validate ownership
     const list = await validateListOwnership(listId, userId);
 
+    const activeValidation = await pool.query(
+      `SELECT id FROM username_validation_jobs
+        WHERE user_id = $1
+          AND result_list_id = $2
+          AND status IN ('pending', 'running')
+        LIMIT 1`,
+      [userId, listId]
+    );
+    if (activeValidation.rows.length > 0) {
+      throw new AppError(
+        `This list is receiving valid usernames from running validation job #${activeValidation.rows[0].id}. Cancel or finish the job before deleting it.`,
+        409,
+        'LIST_USED_BY_ACTIVE_USERNAME_VALIDATION'
+      );
+    }
+
     const client = await pool.connect();
     try {
       await client.query('BEGIN');
@@ -2447,10 +2444,8 @@ class ListService {
       );
       const deletedItems = parseInt(countResult.rows[0].total, 10);
 
-      // Delete items first (foreign key)
-      await client.query('DELETE FROM list_items WHERE list_id = $1', [listId]);
-
-      // Delete the list
+      // The FK on list_items now cascades, so deleting the list
+      // automatically removes all its items.
       await client.query('DELETE FROM lists WHERE id = $1', [listId]);
 
       await client.query('COMMIT');
@@ -2679,13 +2674,7 @@ class ListService {
     );
     const currentCount = parseInt(currentCountResult.rows[0].total, 10);
 
-    if (currentCount + validItems.length > MAX_ITEMS_PER_LIST) {
-      throw new AppError(
-        `Adding these items would exceed the maximum of ${MAX_ITEMS_PER_LIST} items per list`,
-        400,
-        'LIST_CAPACITY_EXCEEDED'
-      );
-    }
+
 
     const client = await pool.connect();
     try {

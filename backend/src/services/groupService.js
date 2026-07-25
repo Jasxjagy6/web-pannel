@@ -1721,7 +1721,10 @@ class GroupService {
     }
 
     const sessionResult = await pool.query(
-      'SELECT id FROM sessions WHERE user_id = $1 AND is_logged_in = true LIMIT 1',
+      `SELECT id FROM sessions
+        WHERE user_id = $1 AND is_logged_in = true
+          AND COALESCE(spam_status, 'unknown') <> 'frozen'
+        LIMIT 1`,
       [userId]
     );
 

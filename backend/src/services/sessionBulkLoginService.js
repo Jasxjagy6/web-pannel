@@ -37,6 +37,7 @@ const crypto = require('crypto');
 const { pool } = require('../config/database');
 const logger = require('../utils/logger');
 const sessionService = require('./sessionService');
+const dedicatedProxyService = require('./dedicatedProxyService');
 
 // In-memory job registry — one panel process is sufficient for the
 // interactive bulk-login workflow. Matches the pattern used by
@@ -46,7 +47,7 @@ const jobs = new Map();
 
 const DEFAULT_INTER_ROW_DELAY_MS = 600;
 const JOB_TTL_MS = 30 * 60 * 1000; // 30 min after completion
-const MAX_SESSIONS_PER_JOB = 500;
+const MAX_SESSIONS_PER_JOB = 10000;
 
 function newJobId() {
   return `bulk-login-${Date.now()}-${crypto.randomBytes(4).toString('hex')}`;
@@ -79,6 +80,7 @@ function publicJobView(job) {
       progress: s.progress,
       error: s.error || null,
       accountInfo: s.accountInfo || null,
+      proxy: s.proxy || null,
     })),
   };
 }
@@ -159,7 +161,8 @@ async function runJob(job) {
         // Refresh the row's phone for nicer UI labels and short-
         // circuit early if the operator deleted the session.
         const r = await pool.query(
-          `SELECT id, phone FROM sessions WHERE id = $1 AND user_id = $2 AND platform = 'telegram'`,
+          `SELECT id, phone, is_logged_in
+             FROM sessions WHERE id = $1 AND user_id = $2 AND platform = 'telegram'`,
           [sessionState.sessionId, job.userId]
         );
         const row = r.rows[0];
@@ -170,6 +173,11 @@ async function runJob(job) {
           continue;
         }
         sessionState.phone = row.phone || sessionState.phone || null;
+        if (row.is_logged_in) {
+          sessionState.status = 'already_logged_in';
+          sessionState.progress = 100;
+          continue;
+        }
       } catch (_) {
         // Best-effort phone refresh — not fatal.
       }
@@ -202,12 +210,32 @@ async function runJob(job) {
  * @param {number} [params.interRowDelayMs]
  */
 async function startBulkLoginJob(params) {
-  const { userId, sessionIds, interRowDelayMs } = params || {};
+  const { userId, sessionIds, allInactive, interRowDelayMs, proxyPlanId, skipUnassigned } = params || {};
   if (!userId) throw new Error('userId required');
-  if (!Array.isArray(sessionIds) || sessionIds.length === 0) {
+  if (!proxyPlanId && !allInactive && (!Array.isArray(sessionIds) || sessionIds.length === 0)) {
     throw new Error('sessionIds required (non-empty array)');
   }
-  if (sessionIds.length > MAX_SESSIONS_PER_JOB) {
+
+  let requestedIds = Array.isArray(sessionIds)
+    ? Array.from(new Set(sessionIds.map(Number).filter((id) => Number.isInteger(id) && id > 0)))
+    : [];
+  let proxyMappings = [];
+  if (proxyPlanId) {
+    const consumed = await dedicatedProxyService.consumeLoginPlan(userId, proxyPlanId, {
+      skipUnassigned: skipUnassigned === true,
+    });
+    requestedIds = consumed.sessionIds;
+    proxyMappings = consumed.mappings;
+  } else if (allInactive) {
+    const inactive = await pool.query(
+      `SELECT id FROM sessions
+        WHERE user_id = $1 AND platform = 'telegram' AND is_logged_in = FALSE
+        ORDER BY id`,
+      [userId]
+    );
+    requestedIds = inactive.rows.map((row) => Number(row.id));
+  }
+  if (requestedIds.length > MAX_SESSIONS_PER_JOB) {
     throw new Error(`At most ${MAX_SESSIONS_PER_JOB} sessions can be logged in per job`);
   }
 
@@ -219,7 +247,7 @@ async function startBulkLoginJob(params) {
       WHERE user_id = $1
         AND platform = 'telegram'
         AND id = ANY($2::int[])`,
-    [userId, sessionIds.map((id) => Number(id))]
+    [userId, requestedIds]
   );
   const phoneById = new Map();
   for (const r of rows.rows) phoneById.set(Number(r.id), r.phone || null);
@@ -236,14 +264,17 @@ async function startBulkLoginJob(params) {
       Number.isFinite(interRowDelayMs) && interRowDelayMs >= 0
         ? Number(interRowDelayMs)
         : DEFAULT_INTER_ROW_DELAY_MS,
-    sessions: sessionIds.map((sid) => ({
+    sessions: requestedIds
+      .filter((sid) => phoneById.has(Number(sid)))
+      .map((sid) => ({
       sessionId: Number(sid),
       phone: phoneById.get(Number(sid)) || null,
       status: 'queued',
       progress: 0,
       error: null,
       accountInfo: null,
-    })),
+      proxy: proxyMappings.find((item) => item.sessionId === Number(sid))?.proxy || null,
+      })),
   };
   jobs.set(jobId, job);
 
@@ -255,7 +286,7 @@ async function startBulkLoginJob(params) {
     });
   });
 
-  return { jobId };
+  return { jobId, total: job.sessions.length };
 }
 
 /**

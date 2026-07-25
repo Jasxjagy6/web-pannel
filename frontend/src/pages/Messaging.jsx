@@ -6,6 +6,7 @@ import {
   sendBulk,
   sendFailover,
   sendParallel,
+  sendSplit,
   getJobs,
   cancelJob,
   previewMessage,
@@ -254,6 +255,17 @@ function DistributionSettings({
     return () => document.removeEventListener('mousedown', handleClick);
   }, []);
 
+  const massDmBlockReason = (session) => {
+    const status = String(session.spamStatus || session.spam_status || 'unknown').toLowerCase();
+    if (status === 'frozen') return 'Frozen';
+    if (status !== 'limited') return null;
+    const until = session.spamLimitUntil || session.spam_limit_until;
+    if (until && new Date(until).getTime() <= Date.now()) return null;
+    return until
+      ? `Limited until ${new Date(until).toLocaleString(undefined, { timeZone: 'UTC' })} UTC`
+      : 'Limited; no release time provided';
+  };
+
   const toggleSession = (id) => {
     setSelectedSessionIds((prev) => {
       const next = new Set(prev);
@@ -267,15 +279,15 @@ function DistributionSettings({
   };
 
   const toggleAllSessions = () => {
-    const activeSessions = sessions.filter((s) => s.status?.toLowerCase() === 'active');
-    if (selectedSessionIds.size === activeSessions.length) {
+    if (selectedSessionIds.size === eligibleSessions.length) {
       setSelectedSessionIds(new Set());
     } else {
-      setSelectedSessionIds(new Set(activeSessions.map((s) => s.id)));
+      setSelectedSessionIds(new Set(eligibleSessions.map((s) => s.id)));
     }
   };
 
   const activeSessions = sessions.filter((s) => s.status?.toLowerCase() === 'active');
+  const eligibleSessions = activeSessions.filter((s) => !massDmBlockReason(s));
 
   return (
     <div className="rounded-xl border border-white/5 bg-dark-800 p-5">
@@ -389,8 +401,8 @@ function DistributionSettings({
               <span className="truncate">
                 {selectedSessionIds.size === 0
                   ? 'Select sessions...'
-                  : selectedSessionIds.size === activeSessions.length
-                  ? 'All active sessions'
+                  : selectedSessionIds.size === eligibleSessions.length
+                  ? 'All mass-DM eligible sessions'
                   : `${selectedSessionIds.size} session(s) selected`}
               </span>
               <ChevronDown className={`w-4 h-4 text-gray-500 transition-transform ${showSessionDropdown ? 'rotate-180' : ''}`} />
@@ -402,28 +414,33 @@ function DistributionSettings({
                 <label className="flex items-center gap-2 px-3 py-2 border-b border-white/5 cursor-pointer hover:bg-white/5">
                   <input
                     type="checkbox"
-                    checked={selectedSessionIds.size === activeSessions.length && activeSessions.length > 0}
+                    checked={selectedSessionIds.size === eligibleSessions.length && eligibleSessions.length > 0}
                     onChange={toggleAllSessions}
                     className="rounded border-white/20 bg-dark-800 text-primary-600 focus:ring-primary-500/50 focus:ring-offset-0"
                   />
-                  <span className="text-sm text-white font-medium">Select All Active</span>
+                  <span className="text-sm text-white font-medium">Select All Eligible</span>
                 </label>
-                {activeSessions.map((session) => (
+                {activeSessions.map((session) => {
+                  const blockReason = massDmBlockReason(session);
+                  return (
                   <label
                     key={session.id}
-                    className="flex items-center gap-2 px-3 py-2 cursor-pointer hover:bg-white/5 transition"
+                    className={`flex items-center gap-2 px-3 py-2 transition ${blockReason ? 'cursor-not-allowed opacity-55' : 'cursor-pointer hover:bg-white/5'}`}
                   >
                     <input
                       type="checkbox"
                       checked={selectedSessionIds.has(session.id)}
                       onChange={() => toggleSession(session.id)}
+                      disabled={!!blockReason}
                       className="rounded border-white/20 bg-dark-800 text-primary-600 focus:ring-primary-500/50 focus:ring-offset-0"
                     />
-                    <span className="text-sm text-gray-300 truncate">
-                      {session.phone} {session.username ? `(@${session.username})` : ''}
+                    <span className="min-w-0 flex-1 text-sm text-gray-300">
+                      <span className="block truncate">{session.phone} {session.username ? `(@${session.username})` : ''}</span>
+                      {blockReason && <span className="block truncate text-[10px] text-amber-400">{blockReason}; skipped for mass DM</span>}
                     </span>
                   </label>
-                ))}
+                  );
+                })}
                 {activeSessions.length === 0 && (
                   <p className="px-3 py-3 text-sm text-gray-500 text-center">
                     No active sessions available
@@ -825,7 +842,7 @@ export default function Messaging() {
   // 'users' → one-shot DM bulk send
   // 'groups' → one-shot bulk-groups send
   // 'schedule' → recurring bulk-groups schedule
-  // 'single-user' → single-user mass DM (1..3 targets, all sessions)
+  // 'single-user' → single-user mass DM (up to 50 targets, all sessions)
   // 'history' → history of single-user mass DM jobs
   const [activeTab, setActiveTab] = useState('users');
 
@@ -864,6 +881,9 @@ export default function Messaging() {
   // resume from the same target).
   const [deliveryMode, setDeliveryMode] = useState('distribute');
   const [trackReplies, setTrackReplies] = useState(true);
+  // Split-mode: how many DMs one single session should do. The audience is
+  // cut into contiguous per-session slices of this size, all running at once.
+  const [dmsPerSession, setDmsPerSession] = useState('10');
   const [distPlan, setDistPlan] = useState(null);
   const [distLoading, setDistLoading] = useState(false);
   const [distError, setDistError] = useState(null);
@@ -1273,6 +1293,47 @@ export default function Messaging() {
         return;
       }
 
+      // Split mass DM: contiguous per-session slices, all running at once.
+      // Every session DMs exactly its quota of DIFFERENT users; the whole job
+      // finishes in ~the time one session needs for its slice.
+      if (deliveryMode === 'split') {
+        const quota = parseInt(dmsPerSession, 10);
+        if (!Number.isFinite(quota) || quota < 1) {
+          showError('Enter how many DMs each session should send (a positive number).', 'Missing quota');
+          return;
+        }
+        const splitPayload = {
+          message: payload.message,
+          messageType: payload.messageType,
+          targetList: payload.targetList,
+          sourceType: payload.sourceType,
+          sourceId: payload.sourceId,
+          delayMin: Math.max(0, Number(delayMin) * 1000),
+          delayMax: Math.max(0, Number(delayMax) * 1000),
+          dmsPerSession: quota,
+          trackReplies,
+          replyWindowHours: 24,
+          async: true,
+        };
+        if (payload.sessionListIds) splitPayload.sessionListIds = payload.sessionListIds;
+        if (payload.sessionIds) splitPayload.sessionIds = payload.sessionIds;
+
+        const sRes = await sendSplit(splitPayload);
+        const elapsedS = Date.now() - startTime;
+        await new Promise((r) => setTimeout(r, Math.max(0, minLoadingTime - elapsedS)));
+        const sData = sRes.data?.data || {};
+        showSuccess(
+          `Split send started: ${sData.sessionCount || 0} session(s), ${quota} DM(s) each, ` +
+          `${formatNumber(sData.totalTargets || (payload.targetList ? payload.targetList.length : 0))} target(s). ` +
+          `Every session works at once — finishes in about the time one session needs. Track progress in History.`,
+          'Split Send Started'
+        );
+        fetchActiveJobs();
+        fetchHistory();
+        setMessage('');
+        return;
+      }
+
       // Parallel round-robin: every session works in parallel, each pulling
       // the next target off a shared queue. Invalid users are skipped so no
       // session sits idle. Runs async and starts 24h reply tracking.
@@ -1588,7 +1649,7 @@ export default function Messaging() {
           <Send className="h-4 w-4 text-primary-500" />
           <h3 className="text-sm font-semibold text-white">Delivery strategy</h3>
         </div>
-        <div className="grid grid-cols-1 gap-2 sm:grid-cols-3">
+        <div className="grid grid-cols-1 gap-2 sm:grid-cols-2 lg:grid-cols-4">
           <button
             type="button"
             onClick={() => setDeliveryMode('distribute')}
@@ -1633,8 +1694,56 @@ export default function Messaging() {
               Invalid users are skipped so no session sits idle. Fastest — finishes big lists in minutes.
             </p>
           </button>
+          <button
+            type="button"
+            onClick={() => setDeliveryMode('split')}
+            className={`rounded-lg border p-3 text-left transition ${
+              deliveryMode === 'split'
+                ? 'border-primary-500/60 bg-primary-500/10'
+                : 'border-white/10 bg-dark-900 hover:border-white/20'
+            }`}
+          >
+            <p className="text-sm font-medium text-white">Split by quota 🚀</p>
+            <p className="mt-0.5 text-xs text-gray-400">
+              You set how many DMs each session sends. The list is cut into contiguous blocks
+              (session 1→users 1–q, session 2→users q+1–2q…) and every block runs at the same time.
+              Finishes in about the time ONE session needs. Use with verified lists.
+            </p>
+          </button>
         </div>
-        {(deliveryMode === 'failover' || deliveryMode === 'parallel') && (
+        {deliveryMode === 'split' && (
+          <div className="mt-3 rounded-lg border border-primary-500/20 bg-primary-500/5 p-3">
+            <label className="block text-xs font-medium text-gray-300 mb-1.5">
+              DMs per session (quota)
+            </label>
+            <div className="flex flex-wrap items-center gap-3">
+              <input
+                type="number"
+                min="1"
+                value={dmsPerSession}
+                onChange={(e) => setDmsPerSession(e.target.value)}
+                className="w-28 rounded-lg border border-white/10 bg-dark-900 py-2 px-3 text-sm text-white focus:border-primary-500 focus:outline-none focus:ring-1 focus:ring-primary-500"
+                placeholder="10"
+              />
+              <p className="text-xs text-gray-400">
+                {(() => {
+                  const q = parseInt(dmsPerSession, 10);
+                  const total = getTargetCount();
+                  const sess = selectedSessionIds.size || (selectedSessionListIds.length > 0 ? null : 0);
+                  if (!Number.isFinite(q) || q < 1) return 'Enter how many DMs each session should do.';
+                  if (!total) return `Each session will DM up to ${q} user(s).`;
+                  if (sess == null) return `${formatNumber(total)} user(s) will be split into blocks of ${q} across your selected session list(s).`;
+                  if (!sess) return `${formatNumber(total)} user(s) · pick sessions to see the split.`;
+                  const eff = Math.max(q, Math.ceil(total / sess));
+                  const active = Math.min(sess, Math.ceil(total / eff));
+                  return `${formatNumber(total)} user(s) ÷ ${sess} session(s) → ${eff} each across ${active} session(s)` +
+                    (eff > q ? ` (auto-raised from ${q} so no verified user is dropped)` : '') + '.';
+                })()}
+              </p>
+            </div>
+          </div>
+        )}
+        {(deliveryMode === 'failover' || deliveryMode === 'parallel' || deliveryMode === 'split') && (
           <label className="mt-3 flex items-center gap-2 text-xs text-gray-300">
             <input
               type="checkbox"
@@ -1702,6 +1811,8 @@ export default function Messaging() {
                     ? 'Start Failover Send'
                     : deliveryMode === 'parallel'
                     ? 'Start Parallel Send ⚡'
+                    : deliveryMode === 'split'
+                    ? 'Start Split Send 🚀'
                     : 'Send Bulk Messages'}
                 </>
               )}

@@ -103,6 +103,55 @@ function randomInt(min, max) {
 }
 
 /**
+ * SPLIT-mode assignment planner (pure, unit-tested via __internal).
+ *
+ * Cuts an ordered `targets` array into CONTIGUOUS, non-overlapping slices —
+ * one slice per session — so the whole audience is covered exactly once and
+ * every session works on a DIFFERENT block simultaneously:
+ *
+ *   session 0 -> targets[0 .. q)
+ *   session 1 -> targets[q .. 2q)
+ *   session 2 -> targets[2q .. 3q)
+ *   ...
+ *
+ * `requestedQuota` is the operator's "how many DMs one single session should
+ * do" (e.g. 10). The effective quota is bumped up when the audience is larger
+ * than sessions×requestedQuota so NO verified target is silently dropped:
+ *
+ *   effectiveQuota = max(requestedQuota, ceil(total / sessionCount))
+ *
+ * When the audience is smaller than sessions×quota, the trailing sessions get
+ * empty slices (they simply don't run). Order is preserved end-to-end.
+ *
+ * @param {number} totalTargets   Count of ordered targets (>= 0).
+ * @param {number} sessionCount   Count of usable sessions (>= 1).
+ * @param {number} requestedQuota Operator per-session cap (>= 1).
+ * @returns {{ effectiveQuota:number, slices:Array<{start:number,end:number,count:number}> }}
+ */
+function computeSplitAssignments(totalTargets, sessionCount, requestedQuota) {
+  const total = Math.max(0, Math.floor(Number(totalTargets) || 0));
+  const sessions = Math.max(1, Math.floor(Number(sessionCount) || 1));
+  const reqQuota = Math.max(1, Math.floor(Number(requestedQuota) || 1));
+
+  // Auto-scale the quota so sessions×quota always covers the whole list. This
+  // is what guarantees a 1000-user / 100-session / quota-10 job assigns every
+  // user (10 each) AND a 1500-user job over the same fleet bumps to 15 each
+  // instead of dropping the last 500.
+  const neededPerSession = Math.ceil(total / sessions);
+  const effectiveQuota = Math.max(reqQuota, neededPerSession);
+
+  const slices = [];
+  let cursor = 0;
+  for (let i = 0; i < sessions; i++) {
+    const start = Math.min(cursor, total);
+    const end = Math.min(start + effectiveQuota, total);
+    slices.push({ start, end, count: end - start });
+    cursor = end;
+  }
+  return { effectiveQuota, slices };
+}
+
+/**
  * Parse a JSON field, returning null on failure.
  * @param {*} value - The value to parse
  * @returns {object|null}
@@ -1086,8 +1135,13 @@ class MessageService {
     // privacy-restricted" reasons. Real Telegram errors during
     // send still surface per-target as failures.
 
-    // Verify all sessions belong to the user
-    const verifiedSessions = await this._verifyMultipleSessionsOwnership(sessionIds, userId);
+    // Bulk user messaging must not consume sessions that @SpamBot currently
+    // limits from cold DMs. Expired timed limits are eligible automatically.
+    const verifiedSessions = await this._verifyMultipleSessionsOwnership(
+      sessionIds,
+      userId,
+      { excludeLimited: true }
+    );
     let verifiedSessionIds = verifiedSessions.map((s) => s.id);
 
     // Anti-revoke Phase 3 (B17): drop high-risk sessions from the bulk
@@ -1395,9 +1449,12 @@ class MessageService {
       throw new AppError('Message content is required', 400, 'EMPTY_MESSAGE');
     }
 
-    // Verify sessions and PRESERVE the operator's ordering — failover is
-    // sequential, so session order is meaningful (unlike bulk rotation).
-    const verified = await this._verifyMultipleSessionsOwnership(sessionIds, userId);
+    // Verify mass-DM eligibility and preserve the operator's ordering.
+    const verified = await this._verifyMultipleSessionsOwnership(
+      sessionIds,
+      userId,
+      { excludeLimited: true }
+    );
     const verifiedSet = new Set(verified.map((s) => String(s.id)));
     let orderedSessionIds = sessionIds
       .map((s) => String(s))
@@ -1821,9 +1878,12 @@ class MessageService {
       throw new AppError('Message content is required', 400, 'EMPTY_MESSAGE');
     }
 
-    // Verify + rotate sessions least-used-first so the whole pool is
-    // exercised evenly across successive jobs.
-    const verified = await this._verifyMultipleSessionsOwnership(sessionIds, userId);
+    // Verify mass-DM eligibility, then rotate least-used-first.
+    const verified = await this._verifyMultipleSessionsOwnership(
+      sessionIds,
+      userId,
+      { excludeLimited: true }
+    );
     const verifiedSet = new Set(verified.map((s) => String(s.id)));
     let orderedSessionIds = sessionIds
       .map((s) => String(s))
@@ -2100,6 +2160,390 @@ class MessageService {
 
     logger.info(`Parallel job ${jobId} ${finalStatus}: ${sent} sent, ${failed} failed`);
     return { sent, failed, skipped: 0, sessionsUsed: sessions.length };
+  }
+
+
+  // =========================================================================
+  // Split Mass DM (fixed per-session quota, contiguous slices, simultaneous)
+  // =========================================================================
+
+  /**
+   * SPLIT mass DM.
+   *
+   * Operator picks a user list + session lists and a per-session quota `q`
+   * ("how many DMs one single session should do", e.g. 10). The panel cuts
+   * the ordered audience into CONTIGUOUS slices — session 1 gets users 1..q,
+   * session 2 gets users q+1..2q, and so on — and runs EVERY slice at the same
+   * time (bounded by MAX_CONCURRENT_SESSIONS). Each session sends its own slice
+   * sequentially with safe pacing. The whole job therefore finishes in roughly
+   * the time ONE session needs for its slice, instead of waiting for session 1
+   * to exhaust the list before session 2 starts.
+   *
+   * Targets are pre-verified (Username Validation), so a session that hits
+   * PEER_FLOOD / FLOOD_WAIT / dead simply stops its own slice — there is no
+   * re-assignment of its remaining users to other sessions (that would break
+   * the "each session does exactly its quota" contract and re-introduce the
+   * fan-out flood risk). Remaining users in a stopped slice are recorded as
+   * skipped.
+   *
+   * @param {object} params - Same base shape as sendParallelMassDm plus
+   *        `dmsPerSession` (the per-session quota).
+   * @param {number|string} userId
+   */
+  async sendSplitMassDm(params, userId) {
+    const {
+      sessionIds,
+      message,
+      messageType = 'text',
+      delayMin = DEFAULT_DELAY_MIN,
+      delayMax = DEFAULT_DELAY_MAX,
+      messageOptions = {},
+      sourceType = 'manual',
+      sourceId = null,
+      trackReplies = true,
+      replyWindowHours = 24,
+      dmsPerSession,
+    } = params;
+
+    let targetList = params.targetList;
+
+    if (!sessionIds || sessionIds.length === 0) {
+      throw new AppError('At least one session ID is required', 400, 'NO_SESSIONS');
+    }
+
+    const requestedQuota = Math.max(1, parseInt(dmsPerSession, 10) || 0);
+    if (!Number.isFinite(requestedQuota) || requestedQuota < 1) {
+      throw new AppError('dmsPerSession must be a positive integer', 400, 'BAD_QUOTA');
+    }
+
+    // Reload the full list server-side (the paginated /lists endpoint caps at
+    // 100 rows, which would silently truncate a large audience).
+    if (sourceType === 'list' && sourceId != null) {
+      try {
+        const { rows } = await pool.query(
+          `SELECT telegram_id, username, first_name, last_name, phone, access_hash
+             FROM list_items WHERE list_id = $1 ORDER BY id ASC`,
+          [Number(sourceId)]
+        );
+        if (rows.length > 0) {
+          targetList = rows.map((r) => ({
+            telegram_id: r.telegram_id,
+            username: r.username,
+            first_name: r.first_name,
+            last_name: r.last_name,
+            phone: r.phone,
+            access_hash: r.access_hash,
+          }));
+          logger.info(`Split: loaded full list ${sourceId} server-side (${targetList.length} items)`);
+        }
+      } catch (err) {
+        logger.warn(`Split: full-list load for ${sourceId} failed, using client targetList: ${err.message}`);
+      }
+    }
+
+    if (!targetList || targetList.length === 0) {
+      throw new AppError('Target list cannot be empty', 400, 'EMPTY_TARGET_LIST');
+    }
+    if (!message || message.trim().length === 0) {
+      throw new AppError('Message content is required', 400, 'EMPTY_MESSAGE');
+    }
+
+    // Verify mass-DM eligibility (Frozen + active-Limited excluded), then
+    // rotate least-used-first so repeated jobs spread load across the fleet.
+    const verified = await this._verifyMultipleSessionsOwnership(
+      sessionIds,
+      userId,
+      { excludeLimited: true }
+    );
+    const verifiedSet = new Set(verified.map((s) => String(s.id)));
+    let orderedSessionIds = sessionIds
+      .map((s) => String(s))
+      .filter((s) => verifiedSet.has(s));
+
+    if (orderedSessionIds.length === 0) {
+      throw new AppError('No valid sessions found for this user', 404, 'NO_VALID_SESSIONS');
+    }
+    orderedSessionIds = await this._orderSessionsByLeastUsed(orderedSessionIds);
+
+    // Build rich target descriptors (same shape as failover/parallel).
+    const targets = [];
+    for (const t of targetList) {
+      const addr = normalizeTargetId(t);
+      if (!addr) continue;
+      const obj = (t && typeof t === 'object') ? t : {};
+      const rawPeer = obj.telegram_id ?? obj.telegramId ?? obj.id ?? obj.user_id ?? null;
+      const peerId = rawPeer != null && /^-?\d+$/.test(String(rawPeer).trim())
+        ? String(rawPeer).trim()
+        : (/^-?\d+$/.test(addr) ? addr : null);
+      const label =
+        (obj.username && `@${String(obj.username).replace(/^@+/, '')}`) ||
+        [obj.first_name, obj.last_name].filter(Boolean).join(' ').trim() ||
+        addr;
+      targets.push({
+        addr,
+        peerId,
+        label,
+        accessHash: obj.access_hash ?? obj.accessHash ?? null,
+      });
+    }
+
+    if (targets.length === 0) {
+      throw new AppError('No valid targets in the target list', 400, 'NO_VALID_TARGETS');
+    }
+
+    const { effectiveQuota, slices } = computeSplitAssignments(
+      targets.length,
+      orderedSessionIds.length,
+      requestedQuota
+    );
+    const activeSessionCount = slices.filter((s) => s.count > 0).length;
+
+    const jobResult = await pool.query(
+      `INSERT INTO messaging_jobs (
+         user_id, session_id, job_type, target_list, message_content,
+         message_type, status, total_count, sent_count, failed_count,
+         skipped_count, options, platform_state, created_at
+       ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,0,0,0,$9,$10, NOW())
+       RETURNING id`,
+      [
+        userId,
+        Number(orderedSessionIds[0]),
+        'split',
+        JSON.stringify(targets.map((t) => t.addr)),
+        message,
+        messageType,
+        'running',
+        targets.length,
+        JSON.stringify({
+          sessionIds: orderedSessionIds,
+          delayMin,
+          delayMax,
+          messageOptions,
+          sourceType,
+          sourceId,
+          trackReplies,
+          replyWindowHours,
+          requestedQuota,
+          effectiveQuota,
+        }),
+        JSON.stringify({
+          mode: 'split',
+          sessionCount: orderedSessionIds.length,
+          activeSessionCount,
+          requestedQuota,
+          effectiveQuota,
+        }),
+      ]
+    );
+    const jobId = jobResult.rows[0].id;
+
+    logger.info(
+      `Split mass-DM job ${jobId} started: ${targets.length} targets across ` +
+      `${activeSessionCount}/${orderedSessionIds.length} sessions ` +
+      `(requested ${requestedQuota}/session, effective ${effectiveQuota}/session)`
+    );
+
+    const result = await this._runSplitMassDm(jobId, orderedSessionIds, targets, slices, {
+      message,
+      messageType,
+      delayMin,
+      delayMax,
+      messageOptions,
+    });
+
+    if (trackReplies) {
+      try {
+        const replyTracking = require('./replyTrackingService');
+        await replyTracking.initForJob(jobId, { windowHours: replyWindowHours });
+      } catch (err) {
+        logger.warn(`Failed to init reply tracking for job ${jobId}: ${err.message}`);
+      }
+    }
+
+    return {
+      jobId,
+      status: 'completed',
+      totalTargets: targets.length,
+      requestedQuota,
+      effectiveQuota,
+      sessionCount: orderedSessionIds.length,
+      activeSessionCount,
+      ...result,
+    };
+  }
+
+  /**
+   * Split runner: each session owns a fixed contiguous slice and sends it
+   * sequentially. All slices run concurrently, bounded by
+   * MAX_CONCURRENT_SESSIONS. Extracted so a resume path can reuse it.
+   * @private
+   */
+  async _runSplitMassDm(jobId, sessionIds, targets, slices, opts) {
+    const { message, delayMin, delayMax, messageOptions } = opts;
+
+    const MAX_CONCURRENT = Math.max(1, parseInt(process.env.MAX_CONCURRENT_SESSIONS || '200', 10));
+
+    let sent = 0;
+    let failed = 0;
+    let skipped = 0;
+    let completedUnits = 0;
+    let lastPersist = 0;
+
+    const persist = async (status) => {
+      await pool.query(
+        `UPDATE messaging_jobs
+            SET sent_count = $2, failed_count = $3, skipped_count = $4, status = $5
+          WHERE id = $1`,
+        [jobId, sent, failed, skipped, status]
+      ).catch((e) => logger.warn(`split state persist failed: ${e.message}`));
+      await this._notifyProgress(jobId, {
+        job_id: jobId, status,
+        sent, failed, skipped, total: targets.length,
+      });
+    };
+
+    const isCancelled = () => this._isJobCancelled(jobId);
+
+    // One async worker per session, each draining ONLY its own slice.
+    const runSlice = async (sessionId, slice) => {
+      if (slice.count === 0) return;
+      for (let i = slice.start; i < slice.end; i++) {
+        if (await isCancelled()) {
+          // Remaining targets in this slice are skipped.
+          for (let j = i; j < slice.end; j++) {
+            skipped++;
+            completedUnits++;
+          }
+          await pool.query(
+            `INSERT INTO message_logs (job_id, session_id, target_id, status, sent_at)
+             SELECT $1, NULL, unnest($2::text[]), 'skipped', NOW()`,
+            [jobId, targets.slice(i, slice.end).map((t) => t.addr)]
+          ).catch(() => {});
+          return;
+        }
+
+        const target = targets[i];
+        try {
+          const sendOpts = { ...messageOptions };
+          if (target.accessHash != null) sendOpts.accessHash = target.accessHash;
+          await telegramService.sendMessage(String(sessionId), target.addr, message, sendOpts);
+
+          sent++;
+          completedUnits++;
+
+          await pool.query(
+            `INSERT INTO message_logs (job_id, session_id, target_id, status, sent_at)
+             VALUES ($1,$2,$3,'sent', NOW())`,
+            [jobId, Number(sessionId), target.addr]
+          ).catch(() => {});
+          await pool.query(
+            `INSERT INTO message_reply_tracking
+               (job_id, session_id, target_id, peer_id, target_label, sent_status, sent_at)
+             VALUES ($1,$2,$3,$4,$5,'sent', NOW())
+             ON CONFLICT (job_id, target_id) DO UPDATE
+               SET session_id = EXCLUDED.session_id,
+                   peer_id = COALESCE(EXCLUDED.peer_id, message_reply_tracking.peer_id),
+                   target_label = EXCLUDED.target_label,
+                   sent_status = 'sent', sent_at = NOW()`,
+            [jobId, Number(sessionId), target.addr,
+             target.peerId ? String(target.peerId) : null, target.label]
+          ).catch(() => {});
+
+          // Human-like delay between sends on the SAME session.
+          if (i < slice.end - 1) {
+            await cancellableSleep(randomInt(delayMin, delayMax), isCancelled);
+          }
+        } catch (err) {
+          const raw = err && err.message ? err.message : String(err);
+          const code = err && err.code ? err.code : null;
+          const decision = classifyFailoverError(raw, code);
+
+          if (decision.action === 'switch_session') {
+            // Account-level limit / dead: this session stops its slice. The
+            // remaining users in ITS slice are recorded skipped (targets are
+            // pre-verified, so we don't reassign them and risk a fan-out flood
+            // or double-DM).
+            const hay = (String(code || '') + ' ' + raw).toUpperCase();
+            if (/AUTH_KEY_UNREGISTERED|SESSION_REVOKED|SESSION_EXPIRED|USER_DEACTIVATED/.test(hay)) {
+              try { await sessionService.flagSessionRevoked(String(sessionId), { error: err, source: 'messageService.split' }); } catch (_) {}
+            }
+            await pool.query(
+              `INSERT INTO message_logs (job_id, session_id, target_id, status, error_message, sent_at)
+               VALUES ($1,$2,$3,'session_limited',$4, NOW())`,
+              [jobId, Number(sessionId), target.addr, `${decision.reason}: ${raw.slice(0, 200)}`]
+            ).catch(() => {});
+            for (let j = i; j < slice.end; j++) {
+              skipped++;
+              completedUnits++;
+            }
+            if (i + 1 < slice.end) {
+              await pool.query(
+                `INSERT INTO message_logs (job_id, session_id, target_id, status, sent_at)
+                 SELECT $1, $2, unnest($3::text[]), 'skipped', NOW()`,
+                [jobId, Number(sessionId), targets.slice(i + 1, slice.end).map((t) => t.addr)]
+              ).catch(() => {});
+            }
+            logger.warn(
+              `Split job ${jobId}: session ${sessionId} stopped its slice at ` +
+              `${i - slice.start + 1}/${slice.count} (${decision.reason})`
+            );
+            return;
+          }
+
+          // Target-side failure: record it and move on within this slice.
+          failed++;
+          completedUnits++;
+          await pool.query(
+            `INSERT INTO message_logs (job_id, session_id, target_id, status, error_message, sent_at)
+             VALUES ($1,$2,$3,'failed',$4, NOW())`,
+            [jobId, Number(sessionId), target.addr, `${decision.reason}: ${raw.slice(0, 200)}`]
+          ).catch(() => {});
+          if (i < slice.end - 1) {
+            await cancellableSleep(randomInt(delayMin, delayMax), isCancelled);
+          }
+        }
+
+        // Throttled progress persistence (~every 25 completions).
+        if (completedUnits - lastPersist >= 25) {
+          lastPersist = completedUnits;
+          await persist('running');
+        }
+      }
+    };
+
+    // Bounded-concurrency scheduler: start at most MAX_CONCURRENT slice
+    // workers at a time. With 100 sessions and the default cap of 200 they all
+    // run at once; a 500-session fleet runs in waves of 200.
+    const pairs = sessionIds.map((id, idx) => ({ id, slice: slices[idx] }))
+      .filter((p) => p.slice && p.slice.count > 0);
+
+    let next = 0;
+    const worker = async () => {
+      while (next < pairs.length) {
+        const myIndex = next++;
+        const { id, slice } = pairs[myIndex];
+        await runSlice(id, slice);
+      }
+    };
+    const poolSize = Math.min(MAX_CONCURRENT, pairs.length);
+    await Promise.all(Array.from({ length: Math.max(1, poolSize) }, () => worker()));
+
+    const cancelled = await this._isJobCancelled(jobId);
+    const finalStatus = cancelled ? 'cancelled' : 'completed';
+    await pool.query(
+      `UPDATE messaging_jobs
+          SET status = $5, sent_count = $2, failed_count = $3,
+              skipped_count = $4, completed_at = NOW()
+        WHERE id = $1`,
+      [jobId, sent, failed, skipped, finalStatus]
+    );
+    await this._notifyProgress(jobId, {
+      job_id: jobId, status: finalStatus,
+      sent, failed, skipped, total: targets.length,
+    });
+
+    logger.info(`Split job ${jobId} ${finalStatus}: ${sent} sent, ${failed} failed, ${skipped} skipped`);
+    return { sent, failed, skipped, sessionsUsed: pairs.length };
   }
 
 
@@ -2414,7 +2858,7 @@ class MessageService {
 
     // Truncate each job's target_list to a small preview so the
     // payload stays bounded for big bulk jobs while single-user
-    // mass DM jobs (typically 1..3 targets) still render in full.
+    // mass DM jobs expose a useful target preview.
     const TARGETS_PREVIEW_LIMIT = 25;
     const jobs = jobsResult.rows.map((row) => {
       const parsedTargets = parseJson(row.target_list);
@@ -3076,7 +3520,8 @@ class MessageService {
       throw new AppError('Message is required', 400, 'EMPTY_MESSAGE');
     }
 
-    // Verify session ownership
+    // Group messaging remains enabled for Limited sessions; only user mass-DM
+    // modes opt into the Limited exclusion below.
     const verifiedSessions = await this._verifyMultipleSessionsOwnership(sessionIds, userId);
     if (verifiedSessions.length === 0) {
       throw new AppError('No valid sessions found', 404, 'NO_VALID_SESSIONS');
@@ -3335,7 +3780,11 @@ class MessageService {
     }
 
     // Verify session ownership
-    const verifiedSessions = await this._verifyMultipleSessionsOwnership(sessionIds, userId);
+    const verifiedSessions = await this._verifyMultipleSessionsOwnership(
+      sessionIds,
+      userId,
+      { excludeLimited: true }
+    );
     if (verifiedSessions.length === 0) {
       throw new AppError('No valid sessions found', 404, 'NO_VALID_SESSIONS');
     }
@@ -3537,9 +3986,9 @@ class MessageService {
   // =========================================================================
   // Single-User Mass DM
   //
-  // The operator picks 1..3 target users, a message, a per-send delay,
-  // and one or more sessions. Every selected session DMs every
-  // target, with `delaySeconds` inserted BETWEEN consecutive sends.
+  // The operator picks 1..50 target users manually or chooses a saved
+  // target list. Every selected session DMs every target, with
+  // `delaySeconds` inserted BETWEEN consecutive sends.
   //
   // Loop shape (target-major, session-minor):
   //   for each target T:
@@ -3547,9 +3996,9 @@ class MessageService {
   //       S → DM(T, message)
   //       sleep(delaySeconds)   # except after the very last send
   //
-  // The 3-target hard cap is enforced by the validator, but we
-  // re-check here to keep the service safe when called directly
-  // (tests, scripted callers). Cancellation is honoured at every
+  // The 50-target hard cap is enforced by the validator, but we re-check
+  // it after authoritative list loading and deduplication to keep the
+  // service safe when called directly. Cancellation is honoured at every
   // pre-send gate via `messaging_jobs.status = 'cancelled'`.
   // =========================================================================
 
@@ -3558,9 +4007,11 @@ class MessageService {
    *
    * @param {object} params
    * @param {number[]} params.sessionIds       - Sessions to fan out from.
-   * @param {string[]} params.targets          - 1..3 target identifiers
+   * @param {string[]} [params.targets]        - 1..50 manual target identifiers
    *                                              (numeric id, @username,
    *                                              or bare username).
+   * @param {'manual'|'list'} [params.sourceType='manual']
+   * @param {number} [params.sourceId]         - Saved target-list id.
    * @param {string}   params.message          - Message body (<=4096).
    * @param {string}  [params.messageType]     - 'text'|'html'|'markdown'.
    * @param {number}  [params.delaySeconds=3]  - Wait between sends.
@@ -3573,8 +4024,11 @@ class MessageService {
       message,
       messageType = 'text',
       delaySeconds = 3,
+      sourceType = 'manual',
+      sourceId = null,
     } = params;
-    const targets = Array.isArray(params.targets) ? params.targets : [];
+    let targets = Array.isArray(params.targets) ? params.targets : [];
+    let listSourceId = null;
 
     if (!userId) {
       throw new AppError('User ID is required', 400, 'MISSING_USER_ID');
@@ -3582,26 +4036,45 @@ class MessageService {
     if (!sessionIds || sessionIds.length === 0) {
       throw new AppError('At least one session is required', 400, 'NO_SESSIONS');
     }
-    if (targets.length === 0) {
-      throw new AppError('At least one target is required', 400, 'NO_TARGETS');
-    }
-    if (targets.length > 3) {
-      throw new AppError(
-        'A maximum of 3 targets is allowed for single-user mass DM',
-        400,
-        'TOO_MANY_TARGETS'
+    if (sourceType === 'list') {
+      listSourceId = Number(sourceId);
+      if (!Number.isInteger(listSourceId) || listSourceId <= 0) {
+        throw new AppError('A positive sourceId is required in list mode', 400, 'INVALID_SOURCE_ID');
+      }
+
+      const listResult = await pool.query(
+        `SELECT l.id AS list_id, li.telegram_id, li.username, li.phone
+           FROM lists l
+           LEFT JOIN list_items li ON li.list_id = l.id
+          WHERE l.id = $1 AND l.user_id = $2
+          ORDER BY li.id ASC`,
+        [listSourceId, userId]
       );
+      if (listResult.rows.length === 0) {
+        throw new AppError(
+          `List not found or access denied: ${listSourceId}`,
+          404,
+          'LIST_NOT_FOUND'
+        );
+      }
+      targets = listResult.rows;
+    } else if (sourceType === 'manual') {
+      if (targets.length === 0) {
+        throw new AppError('At least one target is required', 400, 'NO_TARGETS');
+      }
+    } else {
+      throw new AppError('sourceType must be manual or list', 400, 'INVALID_SOURCE_TYPE');
     }
     if (!message || message.trim().length === 0) {
       throw new AppError('Message is required', 400, 'EMPTY_MESSAGE');
     }
     const delaySec = Number.isFinite(Number(delaySeconds)) ? Math.max(1, Math.min(120, parseInt(delaySeconds, 10))) : 3;
 
-    // Strip duplicates / empty strings while preserving order.
+    // Normalize list rows/manual values and dedupe while preserving order.
     const cleanTargets = [];
     const seen = new Set();
     for (const raw of targets) {
-      const t = String(raw || '').trim();
+      const t = normalizeTargetId(raw);
       if (!t) continue;
       const key = t.toLowerCase();
       if (seen.has(key)) continue;
@@ -3611,8 +4084,16 @@ class MessageService {
     if (cleanTargets.length === 0) {
       throw new AppError('At least one valid target is required', 400, 'NO_VALID_TARGETS');
     }
+    if (cleanTargets.length > 50) {
+      throw new AppError(
+        'A maximum of 50 addressable targets is allowed for single-user mass DM',
+        400,
+        'TOO_MANY_TARGETS'
+      );
+    }
 
-    // Verify session ownership (and skip cooldown'd sessions).
+    // Single User DM is the explicit exception: Limited sessions remain
+    // selectable here. The shared ownership check still excludes Frozen.
     const verifiedSessions = await this._verifyMultipleSessionsOwnership(sessionIds, userId);
     if (verifiedSessions.length === 0) {
       throw new AppError('No valid sessions found', 404, 'NO_VALID_SESSIONS');
@@ -3645,6 +4126,8 @@ class MessageService {
           delaySeconds: delaySec,
           targetCount: cleanTargets.length,
           sessionIds: verifiedSessions.map((s) => s.id),
+          sourceType,
+          sourceId: listSourceId,
         }),
       ]
     );
@@ -4223,7 +4706,9 @@ class MessageService {
    */
   async _verifySessionOwnership(sessionId, userId) {
     const result = await pool.query(
-      'SELECT id, user_id, status FROM sessions WHERE id = $1 AND user_id = $2',
+      `SELECT id, user_id, status FROM sessions
+        WHERE id = $1 AND user_id = $2
+          AND COALESCE(spam_status, 'unknown') <> 'frozen'`,
       [sessionId, userId]
     );
 
@@ -4237,22 +4722,31 @@ class MessageService {
   /**
    * Verify that multiple sessions belong to the specified user.
    *
-   * Returns every matching row. The legacy per-session cooldown
-   * filter (cooldown_until > NOW()) was removed: bulk-message jobs
-   * now attempt every requested session and the in-run rotation
-   * (sessionWorkerPool) is responsible for dropping sessions that
-   * hit FLOOD_WAIT / PEER_FLOOD during the current run.
+   * Frozen sessions are always excluded. Callers implementing user bulk or
+   * mass DM pass `excludeLimited`; this excludes an indefinite limit or one
+   * whose UTC release deadline is still in the future. Other features retain
+   * Limited sessions, and expired timed limits become mass-DM eligible.
    *
    * @param {Array<string|number>} sessionIds - Array of session IDs
    * @param {number|string} userId - User ID
+   * @param {{excludeLimited?: boolean}} options
    * @returns {Promise<Array<{ id: number, user_id: number, status: string }>>}
    * @private
    */
-  async _verifyMultipleSessionsOwnership(sessionIds, userId) {
+  async _verifyMultipleSessionsOwnership(sessionIds, userId, { excludeLimited = false } = {}) {
     if (!sessionIds || sessionIds.length === 0) return [];
 
+    const limitedClause = excludeLimited
+      ? `AND NOT (
+           spam_status = 'limited'
+           AND (spam_limit_until IS NULL OR spam_limit_until > NOW())
+         )`
+      : '';
     const result = await pool.query(
-      'SELECT id, user_id, status FROM sessions WHERE id = ANY($1::int[]) AND user_id = $2',
+      `SELECT id, user_id, status, spam_status, spam_limit_until FROM sessions
+        WHERE id = ANY($1::int[]) AND user_id = $2
+          AND COALESCE(spam_status, 'unknown') <> 'frozen'
+          ${limitedClause}`,
       [sessionIds.map((s) => parseInt(s, 10)), userId]
     );
     return result.rows;
@@ -4404,4 +4898,6 @@ module.exports = new MessageService();
 module.exports.__internal = {
   normalizeTargetId,
   isRetryableError,
+  computeSplitAssignments,
+  classifyFailoverError,
 };

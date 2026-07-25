@@ -223,6 +223,7 @@ async function runSweep() {
          FROM sessions s
          JOIN ai_session_settings a ON a.session_id = s.id
         WHERE a.enabled = TRUE AND s.is_logged_in = TRUE AND s.platform = 'telegram'
+          AND COALESCE(s.spam_status, 'unknown') <> 'frozen'
         ORDER BY s.id`
     );
     let enqueued = 0;

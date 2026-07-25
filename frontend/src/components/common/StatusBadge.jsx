@@ -51,6 +51,7 @@ export default function StatusBadge({ status, size = 'md' }) {
       case 'banned':
       case 'revoked':
       case 'expired':
+      case 'frozen':
       case 'dead':
       case 'lost_access':
         return 'red';

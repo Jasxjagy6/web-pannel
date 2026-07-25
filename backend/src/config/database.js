@@ -15,16 +15,18 @@ const pool = new Pool({
   user: process.env.DB_USER || 'postgres',
   password: process.env.DB_PASSWORD || 'your_secure_password',
   max: parseInt(process.env.DB_POOL_MAX || '50'),
-  idleTimeoutMillis: parseInt(process.env.DB_POOL_IDLE_MS || '30000'),
+  idleTimeoutMillis: parseInt(process.env.DB_POOL_IDLE_MS || '120000'),
   connectionTimeoutMillis: parseInt(process.env.DB_POOL_CONNECT_MS || '5000'),
-  // Rotate every 10 minutes so a long-lived pod never builds up too
-  // many half-dead connections.
-  maxLifetimeSeconds: parseInt(process.env.DB_POOL_LIFETIME_SEC || '600'),
+  // Rotate every 2 hours — long-running jobs need stable connections.
+  maxLifetimeSeconds: parseInt(process.env.DB_POOL_LIFETIME_SEC || '7200'),
+  keepAlive: true,
+  keepAliveInitialDelayMillis: 10000,
 });
 
 pool.on('error', (err) => {
-  console.error('Unexpected error on idle client', err);
-  process.exit(-1);
+  // Log but never kill the process — a single dropped idle connection
+  // should not take down the entire panel.
+  console.error('Unexpected error on idle DB client:', err.message);
 });
 
 const initDB = async () => {

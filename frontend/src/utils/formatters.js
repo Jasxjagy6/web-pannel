@@ -163,7 +163,11 @@ export function parseApiError(error) {
     const data = error.response.data;
     if (typeof data === 'string') return data;
     if (data?.message) return data.message;
-    if (data?.error) return typeof data.error === 'string' ? data.error : JSON.stringify(data.error);
+    if (data?.error) {
+      if (typeof data.error === 'string') return data.error;
+      if (data.error.message) return data.error.message;
+      return JSON.stringify(data.error);
+    }
     if (data?.errors && Array.isArray(data.errors)) return data.errors.join(', ');
     return `Server error (${error.response.status})`;
   }

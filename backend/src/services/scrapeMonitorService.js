@@ -443,7 +443,8 @@ class ScrapeMonitorService {
     const ids = sessionIds.map((s) => parseInt(s, 10)).filter(Number.isFinite);
     const owned = await pool.query(
       `SELECT id FROM sessions
-       WHERE id = ANY($1::int[]) AND user_id = $2 AND is_logged_in = TRUE`,
+       WHERE id = ANY($1::int[]) AND user_id = $2 AND is_logged_in = TRUE
+         AND COALESCE(spam_status, 'unknown') <> 'frozen'`,
       [ids, userId]
     );
     if (owned.rows.length === 0) {

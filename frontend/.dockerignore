@@ -1,0 +1,12 @@
+node_modules
+dist
+coverage
+.cache
+.eslintcache
+.env*
+!.env.example
+*.log
+.git
+.gitignore
+.vscode
+.idea

@@ -10,6 +10,7 @@ import {
   bulkDeleteSessions,
   downloadSession,
   recoverSession,
+  removeProxyAndRelogin,
   syncSessionProfile,
   syncAllSessionProfiles,
 } from '../api/sessions';
@@ -71,6 +72,17 @@ function formatFileSize(bytes) {
   return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
 }
 
+function formatSpamLimitUntil(value) {
+  if (!value) return null;
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return null;
+  return `${date.toLocaleString(undefined, {
+    year: 'numeric', month: 'short', day: 'numeric',
+    hour: '2-digit', minute: '2-digit', hour12: false,
+    timeZone: 'UTC',
+  })} UTC`;
+}
+
 /**
  * Derive a human-friendly account-status descriptor from the row.
  *
@@ -102,6 +114,14 @@ function deriveAccountState(session) {
     {};
   const status = (session.status || '').toLowerCase();
   const loggedIn = session.isLoggedIn ?? session.is_logged_in ?? false;
+
+  if (String(session.spamStatus || session.spam_status || '').toLowerCase() === 'frozen') {
+    return { tone: 'red', icon: '!', label: 'Frozen by Telegram' };
+  }
+  if (String(session.spamStatus || session.spam_status || '').toLowerCase() === 'limited') {
+    const until = formatSpamLimitUntil(session.spamLimitUntil || session.spam_limit_until);
+    return { tone: 'amber', icon: '!', label: until ? `Limited until ${until}` : 'Limited by @SpamBot' };
+  }
 
   if (status === 'revoked') {
     const reason =
@@ -340,6 +360,15 @@ function SessionUploadArea({ onUpload, uploading }) {
   );
 }
 
+function ProxyDetailRow({ label, children }) {
+  return (
+    <div className="flex items-center justify-between px-4 py-2.5">
+      <span className="text-xs text-gray-400">{label}</span>
+      <span className="text-xs text-white font-mono text-right max-w-[60%] break-all">{children}</span>
+    </div>
+  );
+}
+
 // --- Session Detail Modal ---
 function SessionDetailModal({ session, isOpen, onClose }) {
   if (!session) return null;
@@ -488,6 +517,33 @@ function SessionDetailModal({ session, isOpen, onClose }) {
             </div>
           </div>
         </div>
+
+        {/* Proxy */}
+        {session.proxy && (
+          <div>
+            <h4 className="text-sm font-semibold text-gray-400 uppercase tracking-wider mb-3">
+              Proxy
+            </h4>
+            <div className="rounded-lg border border-white/5 bg-dark-900 divide-y divide-white/5">
+              <ProxyDetailRow label="Host">{session.proxy.host}:{session.proxy.port}</ProxyDetailRow>
+              <ProxyDetailRow label="Protocol">{session.proxy.protocol?.toUpperCase()}</ProxyDetailRow>
+              <ProxyDetailRow label="Label">{session.proxy.label || '—'}</ProxyDetailRow>
+              <ProxyDetailRow label="Country">{session.proxy.country_code?.toUpperCase() || '—'}</ProxyDetailRow>
+              <ProxyDetailRow label="Egress IP">{session.proxy.egress_ip || '—'}</ProxyDetailRow>
+              <ProxyDetailRow label="Enabled">{session.proxy.enabled !== false ? 'Yes' : 'No'}</ProxyDetailRow>
+              <ProxyDetailRow label="L4 Working">{session.proxy.is_working ? 'Yes' : 'No'}</ProxyDetailRow>
+              <ProxyDetailRow label="TG Validated">{session.proxy.validated_for_telegram ? 'Yes' : 'No'}</ProxyDetailRow>
+              <ProxyDetailRow label="Last Health OK">{session.proxy.last_health_ok !== null ? String(session.proxy.last_health_ok) : 'N/A'}</ProxyDetailRow>
+              <ProxyDetailRow label="Latency">{session.proxy.last_latency_ms != null ? `${session.proxy.last_latency_ms} ms` : 'N/A'}</ProxyDetailRow>
+              <ProxyDetailRow label="Failures">{session.proxy.consecutive_failures ?? 0}</ProxyDetailRow>
+              <ProxyDetailRow label="Last Check">{session.proxy.last_health_check ? formatRelativeTime(session.proxy.last_health_check) : '—'}</ProxyDetailRow>
+              <ProxyDetailRow label="Last Failed">{session.proxy.last_failed_at ? formatRelativeTime(session.proxy.last_failed_at) : '—'}</ProxyDetailRow>
+              {session.proxy.health_message && (
+                <ProxyDetailRow label="Message">{session.proxy.health_message}</ProxyDetailRow>
+              )}
+            </div>
+          </div>
+        )}
 
         {/* Account status (ban / premium / verified / restricted / etc.) */}
         <SessionAccountStatusBlock session={session} />
@@ -732,6 +788,103 @@ function DeviceDcCell({ session }) {
 }
 
 /**
+ * Proxy health status line shown inside the compact cell and modal.
+ */
+function proxyHealthLine(proxy) {
+  const last = proxy.last_health_check ? new Date(proxy.last_health_check).getTime() : 0;
+  const ageMs = last ? Date.now() - last : Infinity;
+  const healthy = proxy.is_working && proxy.last_health_ok && ageMs < 60 * 60 * 1000;
+  const stale = proxy.is_working && proxy.last_health_ok;
+  const disabled = proxy.enabled === false;
+
+  if (disabled) return { dot: 'bg-gray-500', label: 'Disabled', desc: 'Proxy is disabled' };
+  if (healthy) return { dot: 'bg-green-500', label: 'Healthy', desc: 'Working · TG validated < 1hr ago' };
+  if (stale) return { dot: 'bg-yellow-400', label: 'Stale', desc: 'Working · last check > 1hr ago' };
+  return { dot: 'bg-red-500', label: 'Unhealthy', desc: proxy.health_message || 'Not bound or last_health_ok = false' };
+}
+
+/**
+ * Proxy detail modal — click the compact cell to open.
+ */
+function ProxyDetailModal({ proxy, session, onClose }) {
+  if (!proxy) return null;
+  const hl = proxyHealthLine(proxy);
+  const cc = proxy.country_code || '';
+  const flag = cc && /^[a-zA-Z]{2}$/.test(cc)
+    ? String.fromCodePoint(...[...cc.toLowerCase()].map((c) => 0x1f1e6 + c.charCodeAt(0) - 97))
+    : '🌐';
+
+  function Row({ label, children }) {
+    return (
+      <div className="flex items-center justify-between py-2 border-b border-white/5 last:border-b-0">
+        <span className="text-xs text-gray-400">{label}</span>
+        <span className="text-xs text-white font-mono text-right max-w-[60%] break-all">{children}</span>
+      </div>
+    );
+  }
+
+  return (
+    <Modal isOpen={true} onClose={onClose} title={
+      <div className="flex items-center gap-2">
+        <span>{flag}</span>
+        <span>{proxy.label || `${proxy.host}:${proxy.port}`}</span>
+      </div>
+    } size="sm">
+      <div className="space-y-3">
+        {/* Status banner */}
+        <div className={`flex items-center gap-2 rounded-lg px-3 py-2 text-xs font-medium ${
+          hl.dot === 'bg-green-500' ? 'bg-emerald-500/10 text-emerald-300' :
+          hl.dot === 'bg-yellow-400' ? 'bg-amber-500/10 text-amber-300' :
+          hl.dot === 'bg-gray-500' ? 'bg-gray-500/10 text-gray-400' :
+          'bg-red-500/10 text-red-300'
+        }`}>
+          <span className={`inline-block w-2 h-2 rounded-full ${hl.dot}`} />
+          {hl.label} · {hl.desc}
+        </div>
+
+        {/* Connection */}
+        <div>
+          <h5 className="text-xs font-semibold text-gray-500 uppercase tracking-wider mb-1">Connection</h5>
+          <div className="rounded-lg border border-white/5 bg-dark-900 divide-y divide-white/5">
+            <Row label="Host">{proxy.host}:{proxy.port}</Row>
+            <Row label="Protocol">{proxy.protocol?.toUpperCase() || 'HTTP'}</Row>
+            <Row label="Label">{proxy.label || '—'}</Row>
+            <Row label="Country">{cc ? `${flag} ${cc.toUpperCase()}` : 'N/A'}</Row>
+            <Row label="Egress IP">{proxy.egress_ip || 'Not captured'}</Row>
+            <Row label="Enabled">{proxy.enabled !== false ? 'Yes' : 'No'}</Row>
+            <Row label="Source">{proxy.source || 'user'}</Row>
+          </div>
+        </div>
+
+        {/* Health */}
+        <div>
+          <h5 className="text-xs font-semibold text-gray-500 uppercase tracking-wider mb-1">Health & Validation</h5>
+          <div className="rounded-lg border border-white/5 bg-dark-900 divide-y divide-white/5">
+            <Row label="L4 Connectivity">{proxy.is_working ? 'Up' : 'Down'}</Row>
+            <Row label="Last Health OK">{proxy.last_health_ok !== null ? String(proxy.last_health_ok) : 'N/A'}</Row>
+            <Row label="TG Validated">{proxy.validated_for_telegram ? 'Yes' : 'No'}</Row>
+            <Row label="IG Validated">{proxy.validated_for_instagram ? 'Yes' : 'No'}</Row>
+            <Row label="Latency">{proxy.last_latency_ms != null ? `${proxy.last_latency_ms} ms` : 'N/A'}</Row>
+            <Row label="Consecutive Failures">{proxy.consecutive_failures ?? 0}</Row>
+            <Row label="Health Message">{proxy.health_message || '—'}</Row>
+          </div>
+        </div>
+
+        {/* Timing */}
+        <div>
+          <h5 className="text-xs font-semibold text-gray-500 uppercase tracking-wider mb-1">Timing</h5>
+          <div className="rounded-lg border border-white/5 bg-dark-900 divide-y divide-white/5">
+            <Row label="Last Health Check">{proxy.last_health_check ? formatRelativeTime(proxy.last_health_check) : '—'}</Row>
+            <Row label="Last Failed At">{proxy.last_failed_at ? formatRelativeTime(proxy.last_failed_at) : '—'}</Row>
+            <Row label="Proxy Required">{session?.proxyRequired !== undefined ? String(session.proxyRequired) : 'N/A'}</Row>
+          </div>
+        </div>
+      </div>
+    </Modal>
+  );
+}
+
+/**
  * BYO Proxy (Phase 3 §5.4): per-session pinned proxy summary cell.
  *
  * - Country flag + label/host
@@ -740,41 +893,56 @@ function DeviceDcCell({ session }) {
  *     green   → last_health_ok = true and last_health_check < 1h ago
  *     yellow  → stale (last_health_check older than 1h)
  *     red     → not bound or last_health_ok = false
+ *
+ * Click opens a ProxyDetailModal with full proxy details.
  */
 function ProxyCell({ session }) {
+  const [showDetail, setShowDetail] = useState(false);
   const proxy = session.proxy;
   if (!proxy || !proxy.host) {
+    const required = session.proxyRequired;
     return (
-      <span className="inline-flex items-center gap-1 text-[11px] text-red-400">
-        <span className="inline-block w-1.5 h-1.5 rounded-full bg-red-500" />
-        no proxy
-      </span>
+      <>
+        <span className="inline-flex items-center gap-1 text-[11px] text-red-400 cursor-default">
+          <span className="inline-block w-1.5 h-1.5 rounded-full bg-red-500" />
+          {required ? 'proxy required' : 'no proxy'}
+        </span>
+        {required && session.status?.toLowerCase() !== 'active' && session.isLoggedIn !== true && (
+          <span className="block text-[10px] text-red-500/70 mt-0.5">blocking login</span>
+        )}
+      </>
     );
   }
   const cc = proxy.country_code || '';
   const flag = cc && /^[a-zA-Z]{2}$/.test(cc)
     ? String.fromCodePoint(...[...cc.toLowerCase()].map((c) => 0x1f1e6 + c.charCodeAt(0) - 97))
     : '🌐';
-  const last = proxy.last_health_check ? new Date(proxy.last_health_check).getTime() : 0;
-  const ageMs = last ? Date.now() - last : Infinity;
-  let dot = 'bg-red-500';
-  if (proxy.is_working && proxy.last_health_ok && ageMs < 60 * 60 * 1000) dot = 'bg-green-500';
-  else if (proxy.is_working && proxy.last_health_ok) dot = 'bg-yellow-400';
+  const hl = proxyHealthLine(proxy);
   return (
-    <div className="flex flex-col gap-0.5 min-w-0">
-      <div className="flex items-center gap-1.5">
-        <span className="inline-block w-1.5 h-1.5 rounded-full" style={{}}>
-          <span className={`inline-block w-1.5 h-1.5 rounded-full ${dot}`} />
-        </span>
-        <span className="text-base leading-none">{flag}</span>
-        <span className="text-xs text-gray-200 truncate max-w-[120px]" title={`${proxy.host}:${proxy.port}`}>
-          {proxy.label || `${proxy.host}:${proxy.port}`}
-        </span>
-      </div>
-      <span className="text-[10px] text-gray-500 font-mono truncate max-w-[140px]">
-        {proxy.protocol?.toUpperCase()}{proxy.egress_ip ? ` · ${proxy.egress_ip}` : ''}
-      </span>
-    </div>
+    <>
+      <button
+        onClick={() => setShowDetail(true)}
+        className="flex flex-col gap-0.5 min-w-0 text-left hover:bg-white/5 rounded px-1 -mx-1 py-0.5 transition cursor-pointer"
+        title="Click for full proxy details"
+      >
+        <div className="flex items-center gap-1.5">
+          <span className={`inline-block w-1.5 h-1.5 rounded-full ${hl.dot}`} />
+          <span className="text-base leading-none">{flag}</span>
+          <span className="text-xs text-gray-200 truncate max-w-[120px]" title={`${proxy.host}:${proxy.port}`}>
+            {proxy.label || `${proxy.host}:${proxy.port}`}
+          </span>
+        </div>
+        <div className="flex items-center gap-1">
+          <span className="text-[10px] text-gray-500 font-mono truncate max-w-[140px]">
+            {proxy.protocol?.toUpperCase()}{proxy.egress_ip ? ` · ${proxy.egress_ip}` : ''}
+          </span>
+          {proxy.validated_for_telegram && (
+            <span className="text-[9px] text-emerald-500/70 shrink-0" title="TG validated">TG✓</span>
+          )}
+        </div>
+      </button>
+      {showDetail && <ProxyDetailModal proxy={proxy} session={session} onClose={() => setShowDetail(false)} />}
+    </>
   );
 }
 
@@ -793,7 +961,11 @@ function AntiRevokeSummary({ sessions }) {
   let highRisk = 0;
   let watch = 0;
   let needReauth = 0;
+  let frozen = 0;
   for (const s of sessions) {
+    if (String(s.spamStatus || s.spam_status || 'unknown').toLowerCase() === 'frozen') {
+      frozen++;
+    }
     const status = String(s.status || '').toLowerCase();
     if (status === 'revoked' || s?.tg_health?.last_reauth_required_at) {
       needReauth++;
@@ -803,7 +975,7 @@ function AntiRevokeSummary({ sessions }) {
     if (score >= 0.65) highRisk++;
     else if (score >= 0.4) watch++;
   }
-  if (highRisk === 0 && needReauth === 0 && watch === 0) {
+  if (highRisk === 0 && needReauth === 0 && watch === 0 && frozen === 0) {
     return (
       <div className="rounded-xl border border-emerald-500/20 bg-emerald-500/5 px-4 py-3 text-sm">
         <div className="flex items-center gap-2 text-emerald-300">
@@ -817,7 +989,7 @@ function AntiRevokeSummary({ sessions }) {
     );
   }
   const tone =
-    needReauth > 0 || highRisk > 0
+    needReauth > 0 || highRisk > 0 || frozen > 0
       ? 'border-red-500/30 bg-red-500/10 text-red-200'
       : 'border-amber-500/30 bg-amber-500/10 text-amber-200';
   return (
@@ -826,7 +998,7 @@ function AntiRevokeSummary({ sessions }) {
         <AlertTriangle className="w-4 h-4" />
         Anti-revoke posture: action recommended
       </div>
-      <div className="mt-1 grid grid-cols-1 sm:grid-cols-3 gap-2 text-xs">
+      <div className="mt-1 grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-2 text-xs">
         <div>
           <span className="font-semibold">{needReauth}</span>
           <span className="opacity-80"> session{needReauth === 1 ? '' : 's'} need re-link (revoked).</span>
@@ -839,7 +1011,89 @@ function AntiRevokeSummary({ sessions }) {
           <span className="font-semibold">{watch}</span>
           <span className="opacity-80"> watch-list (0.40–0.65) — still safe to use.</span>
         </div>
+        <div>
+          <span className="font-semibold">{frozen}</span>
+          <span className="opacity-80"> frozen by Telegram — Login/Get OTP allowed; other tasks excluded until clean.</span>
+        </div>
       </div>
+    </div>
+  );
+}
+
+function SpamStatusSummary({ sessions, onRecheck }) {
+  const frozen = (Array.isArray(sessions) ? sessions : []).filter(
+    (session) => String(session.spamStatus || session.spam_status || '').toLowerCase() === 'frozen'
+  );
+  const limited = (Array.isArray(sessions) ? sessions : []).filter(
+    (session) => String(session.spamStatus || session.spam_status || '').toLowerCase() === 'limited'
+  );
+  const hasIssue = frozen.length > 0 || limited.length > 0;
+  return (
+    <div className={`rounded-xl border px-4 py-4 ${
+      frozen.length
+        ? 'border-red-500/35 bg-red-500/10'
+        : limited.length
+          ? 'border-amber-500/30 bg-amber-500/5'
+          : 'border-emerald-500/20 bg-emerald-500/5'
+    }`}>
+      <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+        <div>
+          <div className={`text-sm font-semibold ${
+            frozen.length ? 'text-red-200' : limited.length ? 'text-amber-200' : 'text-emerald-300'
+          }`}>
+            Frozen: {frozen.length} <span className="mx-1 opacity-40">|</span> Limited: {limited.length}
+          </div>
+          <p className="mt-1 text-xs text-gray-400">
+            Frozen accounts are globally blocked except Login/Get OTP. Limited accounts stay enabled for Single User DM and other features, but are skipped by bulk Mass DM.
+          </p>
+        </div>
+        <button
+          type="button"
+          onClick={onRecheck}
+          className="inline-flex shrink-0 items-center justify-center gap-2 rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs font-medium text-red-200 hover:bg-red-500/20"
+        >
+          <RefreshCw className="h-3.5 w-3.5" /> Recheck status
+        </button>
+      </div>
+      {hasIssue && (
+        <div className="mt-3 max-h-48 space-y-3 overflow-y-auto rounded-lg border border-white/10 bg-black/15 p-2">
+          {frozen.length > 0 && (
+            <div>
+              <div className="mb-1 px-1 text-[10px] font-semibold uppercase tracking-wider text-red-300">Frozen</div>
+              <div className="grid grid-cols-1 gap-1 sm:grid-cols-2 xl:grid-cols-3">
+                {frozen.map((session) => (
+                  <div key={session.id} className="rounded-md bg-red-500/10 px-2.5 py-2 text-xs text-red-100">
+                    <span className="font-semibold">{session.phone || `Session #${session.id}`}</span>
+                    {session.username ? <span className="ml-1 text-red-200/70">@{session.username}</span> : null}
+                    <span className="ml-1 text-red-200/50">#{session.id}</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+          {limited.length > 0 && (
+            <div>
+              <div className="mb-1 px-1 text-[10px] font-semibold uppercase tracking-wider text-amber-300">Limited, bulk Mass DM skipped</div>
+              <div className="grid grid-cols-1 gap-1 sm:grid-cols-2 xl:grid-cols-3">
+                {limited.map((session) => {
+                  const until = formatSpamLimitUntil(session.spamLimitUntil || session.spam_limit_until);
+                  const expired = until && new Date(session.spamLimitUntil || session.spam_limit_until).getTime() <= Date.now();
+                  return (
+                  <div key={session.id} className="rounded-md bg-amber-500/10 px-2.5 py-2 text-xs text-amber-100">
+                    <span className="font-semibold">{session.phone || `Session #${session.id}`}</span>
+                    {session.username ? <span className="ml-1 text-amber-200/70">@{session.username}</span> : null}
+                    <span className="ml-1 text-amber-200/50">#{session.id}</span>
+                    <div className="mt-0.5 text-[10px] text-amber-200/75">
+                      {until ? `${expired ? 'Release time passed' : 'Limited until'} ${until}${expired ? '; recheck recommended' : ''}` : 'No release time provided; limited until @SpamBot reports clean'}
+                    </div>
+                  </div>
+                  );
+                })}
+              </div>
+            </div>
+          )}
+        </div>
+      )}
     </div>
   );
 }
@@ -921,10 +1175,13 @@ export default function Sessions() {
   // export session feature").
   const [bulkLoginOpen, setBulkLoginOpen] = useState(false);
   const [bulkLoginSelection, setBulkLoginSelection] = useState([]);
+  const [bulkLoginAllInactive, setBulkLoginAllInactive] = useState(false);
   const [authPurgeOpen, setAuthPurgeOpen] = useState(false);
   const [authPurgeSelection, setAuthPurgeSelection] = useState([]);
   const [appealOpen, setAppealOpen] = useState(false);
   const [appealSelection, setAppealSelection] = useState([]);
+  const [spamCheckOpen, setSpamCheckOpen] = useState(false);
+  const [spamCheckSelection, setSpamCheckSelection] = useState([]);
 
   // The Sessions tab lists every uploaded row in one shot — operators
   // routinely upload hundreds at a time and have asked for "no limit, list
@@ -1163,6 +1420,25 @@ export default function Sessions() {
     }
   };
 
+  const handleRemoveProxyAndRelogin = async (id) => {
+    setActionLoading((prev) => ({ ...prev, [id]: 'remove-proxy' }));
+    try {
+      const response = await removeProxyAndRelogin(id);
+      if (response.data?.success) {
+        const phone = response.data.data?.accountInfo?.phone || 'OK';
+        showSuccess(`Proxy removed, session re-logged from panel IP: ${phone}`, 'Proxy Removed');
+        setCurrentPage(1);
+        await fetchSessions();
+      } else {
+        showError('Proxy removal completed but response was invalid.');
+      }
+    } catch (err) {
+      showError(parseApiError(err), 'Remove Proxy Failed');
+    } finally {
+      setActionLoading((prev) => ({ ...prev, [id]: null }));
+    }
+  };
+
   const handleDelete = async (id) => {
     setActionLoading((prev) => ({ ...prev, [id]: 'delete' }));
     try {
@@ -1199,6 +1475,7 @@ export default function Sessions() {
   // mutate the rows the job is operating on.
   const handleBulkLogin = () => {
     if (selectedIds.size === 0) return;
+    setBulkLoginAllInactive(false);
     const ids = Array.from(selectedIds);
     setBulkLoginSelection(
       ids
@@ -1206,6 +1483,17 @@ export default function Sessions() {
         .filter(Boolean)
         .map((s) => ({ id: s.id, phone: s.phone }))
     );
+    setBulkLoginOpen(true);
+  };
+
+  const handleLoginAllInactive = () => {
+    const inactive = sessions.filter((session) => !(session.isLoggedIn ?? session.is_logged_in));
+    if (inactive.length === 0) {
+      showInfo('Every Telegram session is already logged in.', 'No inactive sessions');
+      return;
+    }
+    setBulkLoginSelection(inactive.map((session) => ({ id: session.id, phone: session.phone })));
+    setBulkLoginAllInactive(true);
     setBulkLoginOpen(true);
   };
 
@@ -1236,6 +1524,27 @@ export default function Sessions() {
         .map((s) => ({ id: s.id, phone: s.phone }))
     );
     setAppealOpen(true);
+  };
+
+  const handleSpamStatusRecheck = () => {
+    const selected = selectedIds.size > 0
+      ? sessions.filter((s) => selectedIds.has(s.id))
+      : sessions.filter((s) => {
+          const spamStatus = String(s.spamStatus || s.spam_status || 'unknown').toLowerCase();
+          const loggedIn = s.isLoggedIn ?? s.is_logged_in ?? false;
+          return loggedIn && (spamStatus === 'frozen' || spamStatus === 'limited' || spamStatus === 'unknown');
+        });
+    if (selected.length === 0) {
+      showInfo(
+        'No selected, frozen, limited, or unchecked logged-in sessions need a status recheck.',
+        'Telegram status'
+      );
+      return;
+    }
+    setSpamCheckSelection(
+      selected.map((s) => ({ id: s.id, phone: s.phone || `session-${s.id}` }))
+    );
+    setSpamCheckOpen(true);
   };
 
   const handleBulkLogout = async () => {
@@ -1324,7 +1633,11 @@ export default function Sessions() {
       (s.id && String(s.id).toLowerCase().includes(searchTerm.toLowerCase()));
     const matchesStatus =
       statusFilter === 'all' ||
-      s.status?.toLowerCase() === statusFilter;
+      (statusFilter === 'frozen'
+        ? String(s.spamStatus || s.spam_status || '').toLowerCase() === 'frozen'
+        : statusFilter === 'limited'
+          ? String(s.spamStatus || s.spam_status || '').toLowerCase() === 'limited'
+          : s.status?.toLowerCase() === statusFilter);
     return matchesSearch && matchesStatus;
   });
 
@@ -1373,12 +1686,34 @@ export default function Sessions() {
             Manage your Telegram sessions &middot; {totalResults} total
           </p>
         </div>
+        <div className="flex flex-col gap-2 sm:flex-row">
+          <button
+            type="button"
+            onClick={handleLoginAllInactive}
+            className="inline-flex items-center justify-center gap-2 rounded-lg border border-emerald-500/30 bg-emerald-500/10 px-4 py-2 text-sm font-medium text-emerald-200 hover:bg-emerald-500/20 transition"
+            title="Automatically log in every inactive Telegram session; already logged-in sessions are skipped"
+          >
+            <LogIn className="h-4 w-4" />
+            Login all inactive
+          </button>
+          <button
+            type="button"
+            onClick={handleSpamStatusRecheck}
+            className="inline-flex items-center justify-center gap-2 rounded-lg border border-red-500/30 bg-red-500/10 px-4 py-2 text-sm font-medium text-red-200 hover:bg-red-500/20 transition"
+            title="Recheck selected sessions, or all frozen/unchecked logged-in sessions when nothing is selected"
+          >
+            <RefreshCw className="h-4 w-4" />
+            Recheck Telegram status
+          </button>
+        </div>
       </div>
 
       {/* Anti-revoke summary banner (Phase 3 §B16/§B17): surfaces
           high-risk sessions + revoked rows so the user can act before
           opening individual modals. */}
       <AntiRevokeSummary sessions={sessions} />
+
+      <SpamStatusSummary sessions={sessions} onRecheck={handleSpamStatusRecheck} />
 
       {/* Anti-revoke Phase 4 — operator education banner. The single
           biggest cause of the panel losing a session is the user
@@ -1450,7 +1785,7 @@ export default function Sessions() {
           />
         </div>
         <div className="flex items-center gap-2">
-          {['all', 'active', 'inactive', 'error'].map((status) => (
+          {['all', 'active', 'inactive', 'error', 'limited', 'frozen'].map((status) => (
             <button
               key={status}
               onClick={() => {
@@ -1628,7 +1963,9 @@ export default function Sessions() {
                     <tr
                       key={session.id}
                       className={`transition-colors ${
-                        isSelected ? 'bg-primary-500/5' : 'hover:bg-white/[0.02]'
+                        String(session.spamStatus || session.spam_status || '').toLowerCase() === 'frozen'
+                          ? 'bg-red-500/[0.06] hover:bg-red-500/10'
+                          : isSelected ? 'bg-primary-500/5' : 'hover:bg-white/[0.02]'
                       }`}
                     >
                       <td className="px-4 py-3">
@@ -1662,6 +1999,24 @@ export default function Sessions() {
                             status={session.status || 'inactive'}
                             size="sm"
                           />
+                          {String(session.spamStatus || session.spam_status || '').toLowerCase() === 'frozen' && (
+                            <span
+                              className="inline-flex items-center rounded-full border border-red-500/30 bg-red-500/15 px-2 py-0.5 text-[11px] font-semibold text-red-300"
+                              title={`Frozen by Telegram${session.spamCheckedAt ? `; checked ${formatRelativeTime(session.spamCheckedAt)}` : ''}. Login and Get OTP remain available; other tasks are excluded until rechecked clean.`}
+                            >
+                              Frozen
+                            </span>
+                          )}
+                          {String(session.spamStatus || session.spam_status || '').toLowerCase() === 'limited' && (
+                            <span
+                              className="inline-flex items-center rounded-full border border-amber-500/30 bg-amber-500/15 px-2 py-0.5 text-[11px] font-semibold text-amber-300"
+                              title={`@SpamBot reports a cold-DM limit. Bulk Mass DM skips this session; Single User DM, AI chat, and other features remain enabled.${formatSpamLimitUntil(session.spamLimitUntil || session.spam_limit_until) ? ` Release: ${formatSpamLimitUntil(session.spamLimitUntil || session.spam_limit_until)}.` : ' No release time was provided.'}`}
+                            >
+                              {formatSpamLimitUntil(session.spamLimitUntil || session.spam_limit_until)
+                                ? `Limited until ${formatSpamLimitUntil(session.spamLimitUntil || session.spam_limit_until)}`
+                                : 'Limited'}
+                            </span>
+                          )}
                         </div>
                       </td>
                       <td className="px-4 py-3 hidden lg:table-cell">
@@ -1786,6 +2141,20 @@ export default function Sessions() {
                                 <Loader2 className="w-4 h-4 animate-spin" />
                               ) : (
                                 <LogIn className="w-4 h-4" />
+                              )}
+                            </button>
+                          )}
+                          {session.proxy && (
+                            <button
+                              onClick={() => handleRemoveProxyAndRelogin(session.id)}
+                              disabled={isLoading === 'remove-proxy'}
+                              className="p-1.5 rounded-lg text-gray-400 hover:text-orange-400 hover:bg-orange-500/10 transition disabled:opacity-50"
+                              title="Remove proxy & relogin from panel IP"
+                            >
+                              {isLoading === 'remove-proxy' ? (
+                                <Loader2 className="w-4 h-4 animate-spin" />
+                              ) : (
+                                <ShieldOff className="w-4 h-4" />
                               )}
                             </button>
                           )}
@@ -1993,10 +2362,13 @@ export default function Sessions() {
         isOpen={bulkLoginOpen}
         onClose={() => {
           setBulkLoginOpen(false);
+          setBulkLoginAllInactive(false);
           setCurrentPage(1);
           fetchSessions();
         }}
         selectedSessions={bulkLoginSelection}
+        allInactive={bulkLoginAllInactive}
+        autoStart={false}
         onCompleted={() => {
           // Refresh the table whenever a job finishes so the new
           // is_logged_in / account_info / status values land in the
@@ -2009,6 +2381,14 @@ export default function Sessions() {
         isOpen={appealOpen}
         onClose={() => setAppealOpen(false)}
         selectedSessions={appealSelection}
+      />
+
+      <SpamAppealModal
+        isOpen={spamCheckOpen}
+        onClose={() => setSpamCheckOpen(false)}
+        selectedSessions={spamCheckSelection}
+        mode="check"
+        onCompleted={() => fetchSessions()}
       />
 
       <SessionBulkAuthPurgeModal

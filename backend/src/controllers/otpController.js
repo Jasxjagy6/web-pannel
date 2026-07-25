@@ -8,7 +8,11 @@ const otpController = {
   createJob: asyncHandler(async (req, res) => {
     const userId = req.user.id;
     const { sessionIds: rawSessionIds, durationSeconds } = req.body || {};
-    const expanded = await resolveSessionIdsFromRequest(req, rawSessionIds || []);
+    // Get OTP is deliberately available for frozen accounts: it passively
+    // listens for Telegram service messages and does not perform user actions.
+    const expanded = await resolveSessionIdsFromRequest(req, rawSessionIds || [], {
+      includeFrozen: true,
+    });
     const result = await otpService.createJob({
       userId,
       sessionIds: Array.isArray(expanded) ? expanded.map(Number) : [],

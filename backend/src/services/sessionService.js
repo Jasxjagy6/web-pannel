@@ -176,7 +176,10 @@ class SessionService {
    */
   async uploadSessions(files, userId, options = {}) {
     const startTime = Date.now();
-    let { apiId, apiHash, autoLogin = false } = options;
+    let { apiId, apiHash } = options;
+    // Uploads are staged first. Login happens only after the operator reviews
+    // and confirms the 1:1 proxy plan in Login all inactive.
+    const autoLogin = false;
     let userApiCredentialId = null;
 
     // v8: every uploaded session must be tied to one of the user's
@@ -1493,6 +1496,10 @@ class SessionService {
         queryConditions.push("s.status IN ('active', 'uploaded') AND s.is_logged_in = true");
       } else if (filter === 'inactive') {
         queryConditions.push("s.status IN ('inactive', 'error', 'revoked', 'expired') OR s.is_logged_in = false");
+      } else if (filter === 'limited' || filter === 'frozen') {
+        queryConditions.push(`s.spam_status = $${paramIndex}`);
+        queryParams.push(filter);
+        paramIndex++;
       }
     }
 
@@ -1515,7 +1522,8 @@ class SessionService {
               s.created_at, s.last_active,
               s.device_identity, s.dc_id, s.dc_ip, s.dc_port,
               s.last_online_status_at, s.last_ping_at, s.auth_key_first_seen_at,
-              s.bound_proxy_id,
+               s.spam_status, s.spam_checked_at, s.spam_status_message, s.spam_limit_until,
+               s.bound_proxy_id, s.proxy_required,
               tsh.risk_score, tsh.consecutive_failed_pings,
               tsh.consecutive_flood_waits, tsh.last_flood_at,
               tsh.last_authorizations_check_at, tsh.last_reauth_required_at,
@@ -1526,16 +1534,23 @@ class SessionService {
               -- per-session metadata so the table can render the
               -- country-flag + label + egress + health-dot column
               -- without an N+1 lookup.
-              p.host           AS proxy_host,
-              p.port           AS proxy_port,
-              p.protocol       AS proxy_protocol,
-              p.country_code   AS proxy_country_code,
-              p.label          AS proxy_label,
-              p.is_working     AS proxy_is_working,
-              p.last_health_check AS proxy_last_health_check,
-              p.last_health_ok    AS proxy_last_health_ok,
-              p.metadata          AS proxy_metadata
-       FROM sessions s
+               p.host           AS proxy_host,
+               p.port           AS proxy_port,
+               p.protocol       AS proxy_protocol,
+               p.country_code   AS proxy_country_code,
+               p.label          AS proxy_label,
+               p.is_working     AS proxy_is_working,
+               p.enabled        AS proxy_enabled,
+               p.last_health_check AS proxy_last_health_check,
+               p.last_health_ok    AS proxy_last_health_ok,
+               p.health_message    AS proxy_health_message,
+               p.consecutive_failures AS proxy_consecutive_failures,
+               p.last_latency_ms     AS proxy_last_latency_ms,
+               p.validated_for_telegram AS proxy_validated_for_telegram,
+               p.validated_for_instagram AS proxy_validated_for_instagram,
+               p.last_failed_at   AS proxy_last_failed_at,
+               p.metadata          AS proxy_metadata
+        FROM sessions s
        LEFT JOIN tg_session_health tsh ON tsh.session_id = s.id
        LEFT JOIN proxies p              ON p.id          = s.bound_proxy_id
        WHERE ${whereClause}
@@ -1569,6 +1584,10 @@ class SessionService {
         last_online_status_at: row.last_online_status_at,
         last_ping_at: row.last_ping_at,
         auth_key_first_seen_at: row.auth_key_first_seen_at,
+        spamStatus: row.spam_status || 'unknown',
+        spamCheckedAt: row.spam_checked_at || null,
+        spamStatusMessage: row.spam_status_message || null,
+        spamLimitUntil: row.spam_limit_until || null,
         risk_score: row.risk_score != null ? Number(row.risk_score) : null,
         risk_score_updated_at: row.risk_score_updated_at || null,
         tg_health: row.risk_score == null ? null : {
@@ -1585,6 +1604,7 @@ class SessionService {
         },
         // BYO Proxy (Phase 3 §5.4): per-session pinned proxy summary.
         bound_proxy_id: row.bound_proxy_id || null,
+        proxyRequired: row.proxy_required === true,
         proxy: row.bound_proxy_id ? {
           id: row.bound_proxy_id,
           host: row.proxy_host,
@@ -1593,8 +1613,15 @@ class SessionService {
           country_code: row.proxy_country_code,
           label: row.proxy_label,
           is_working: row.proxy_is_working,
+          enabled: row.proxy_enabled,
           last_health_check: row.proxy_last_health_check,
           last_health_ok: row.proxy_last_health_ok,
+          health_message: row.proxy_health_message,
+          consecutive_failures: row.proxy_consecutive_failures,
+          last_latency_ms: row.proxy_last_latency_ms,
+          validated_for_telegram: row.proxy_validated_for_telegram,
+          validated_for_instagram: row.proxy_validated_for_instagram,
+          last_failed_at: row.proxy_last_failed_at,
           egress_ip: row.proxy_metadata?.egress_ip || null,
         } : null,
       };
@@ -1877,7 +1904,8 @@ class SessionService {
 
       const sessionResult = await client.query(
         `SELECT id, user_id, session_file_path, api_id, api_hash, status,
-                is_logged_in, account_info
+                 is_logged_in, account_info, proxy_required,
+                 COALESCE(spam_status, 'unknown') AS spam_status
          FROM sessions WHERE id = $1 AND user_id = $2 AND platform = 'telegram' FOR UPDATE`,
         [sessionId, userId]
       );
@@ -1974,21 +2002,14 @@ class SessionService {
       // Create and connect the telegram client with timeout
       const tgSessionId = String(sessionId);
 
-      // Allocate a proxy for this session (Upgrade 4 — IP rotation, max 4
-      // accounts per IP, VPS direct first then free / manual proxies).
-      // We commit the outer transaction's row lock first because the
-      // assignment itself inserts into session_proxy_assignments which has
-      // an FK to sessions.id, and the FK validation would deadlock-wait on
-      // our own SELECT ... FOR UPDATE.
+      // Resolve networking before constructing the client. New sessions are
+      // strict and must already have a healthy dedicated proxy from the
+      // confirmed bulk-login preview; legacy sessions remain direct.
       let assignedProxy = null;
       await client.query('COMMIT');
-      try {
-        const proxyService = require('./proxyService');
-        const row = await proxyService.assignProxyForSession(sessionId);
-        assignedProxy = proxyService.buildGramJSProxy(row);
-      } catch (proxyErr) {
-        logger.warn(`Proxy assignment failed for session ${sessionId}: ${proxyErr.message}`);
-      }
+      const dedicatedProxyService = require('./dedicatedProxyService');
+      const proxyResolution = await dedicatedProxyService.resolveSessionProxy(sessionId);
+      assignedProxy = proxyResolution.proxyConfig;
 
       // Anti-Detect: load (or generate) the persisted device identity so
       // every TelegramClient for this row reports the same hardware.
@@ -2016,7 +2037,7 @@ class SessionService {
         fileData.session,
         session.api_id || undefined,
         session.api_hash || undefined,
-        { identity }
+         { proxy: assignedProxy, identity, allowFrozen: session.spam_status === 'frozen' }
       );
       let connectTimer;
       const connectTimeout = new Promise((_, reject) => {
@@ -2052,7 +2073,9 @@ class SessionService {
         });
         try {
           me = await Promise.race([
-            tgService.getMe(tgSessionId),
+            tgService.getMe(tgSessionId, {
+              allowFrozen: session.spam_status === 'frozen',
+            }),
             getMeTimeout,
           ]);
         } finally {
@@ -2191,6 +2214,8 @@ class SessionService {
 
       await client.query('COMMIT');
 
+      const isFrozen = session.spam_status === 'frozen';
+
       logger.info(`Session logged in successfully`, {
         sessionId,
         userId,
@@ -2201,10 +2226,14 @@ class SessionService {
       // account-inventory CRM (profile, avatar, privacy, logins, live 2FA
       // state). Fire-and-forget + lazily required so it never delays or
       // fails the login, and can't create a circular import at boot.
-      try {
-        require('./trackingTelegramSyncService').syncFromSessionSafe(sessionId, { actorUserId: userId });
-      } catch (_) { /* best-effort */ }
+      if (!isFrozen) {
+        try {
+          require('./trackingTelegramSyncService').syncFromSessionSafe(sessionId, { actorUserId: userId });
+        } catch (_) { /* best-effort */ }
+      }
 
+      // Frozen accounts may log in and receive OTPs, but no other task or
+      // post-login Telegram mutation should run until @SpamBot reports clean.
       // Anti-revoke Phase 4: confirm the panel session against
       // Telegram's "unconfirmed authorization" timer AND push the
       // account TTL out to the protocol max so an idle account never
@@ -2213,7 +2242,7 @@ class SessionService {
       // committed, so a transient Telegram-side flake here doesn't
       // need to fail the whole flow.
       try {
-        await tgService.hardenSessionAgainstRevocation(tgSessionId);
+        if (!isFrozen) await tgService.hardenSessionAgainstRevocation(tgSessionId);
       } catch (hardenErr) {
         if (tgService.isPermanentAuthError(hardenErr)) {
           // The auth_key just died between getMe and Phase-4. Mark
@@ -2237,21 +2266,25 @@ class SessionService {
       // reference this session as a watch source, register their
       // listeners now that the GramJS client is connected. Idempotent
       // — re-runs after heartbeat reconnects are no-ops.
-      try {
-        const otpRelayService = require('./otpRelayService');
-        await otpRelayService.onSessionConnected(String(sessionId)).catch(() => {});
-      } catch { /* best-effort */ }
+      if (!isFrozen) {
+        try {
+          const otpRelayService = require('./otpRelayService');
+          await otpRelayService.onSessionConnected(String(sessionId)).catch(() => {});
+        } catch { /* best-effort */ }
+      }
 
       // AI auto-responder: attach persistent NewMessage listener if AI
       // is enabled for this session.  Idempotent — attach is a no-op
       // when already listening.  We log a warning on failure but never
       // fail the login itself: the operator can retry via the AI panel.
       try {
-        const aiSessionManager = require('./aiSessionManager');
-        const aiChatService = require('./aiChatService');
-        const aiSettings = await aiChatService.getSessionSettings(sessionId);
-        if (aiSettings.enabled) {
-          await aiSessionManager.attach(String(sessionId));
+        if (!isFrozen) {
+          const aiSessionManager = require('./aiSessionManager');
+          const aiChatService = require('./aiChatService');
+          const aiSettings = await aiChatService.getSessionSettings(sessionId);
+          if (aiSettings.enabled) {
+            await aiSessionManager.attach(String(sessionId));
+          }
         }
       } catch (aiErr) {
         logger.warn(
@@ -2438,6 +2471,59 @@ class SessionService {
     }
   }
 
+  /**
+   * Remove the dedicated proxy from a Telegram session and re-login from the
+   * panel's own IP.  Used when the user wants to take a proxied session back
+   * to a direct connection.
+   *
+   * Steps:
+   *  1. Clear bound_proxy_id, session_proxy_assignments, proxy_required
+   *  2. Disconnect the active Telegram client (if any)
+   *  3. Set is_logged_in = FALSE so loginSession accepts the request
+   *  4. Call loginSession — resolveSessionProxy returns null proxyConfig so
+   *     the client is created without a proxy (panel IP)
+   */
+  async removeProxyAndRelogin(sessionId, userId) {
+    logger.info(`Removing proxy & re-login for session`, { sessionId, userId });
+
+    const { rows } = await pool.query(
+      `SELECT id, user_id, is_logged_in
+       FROM sessions WHERE id = $1 AND user_id = $2 AND platform = 'telegram'`,
+      [sessionId, userId]
+    );
+    if (rows.length === 0) {
+      throw new AppError('Session not found or access denied', 404, 'SESSION_NOT_FOUND');
+    }
+    const session = rows[0];
+
+    // 1. Clear proxy binding
+    await pool.query(
+      `UPDATE sessions SET bound_proxy_id = NULL, proxy_required = FALSE WHERE id = $1`,
+      [sessionId]
+    );
+    await pool.query(
+      `DELETE FROM session_proxy_assignments WHERE session_id = $1`,
+      [sessionId]
+    );
+
+    // 2. Disconnect the active Telegram client (if any)
+    await this._disconnectSessionClient(String(sessionId));
+
+    // 3. Mark as not logged in so loginSession accepts it
+    if (session.is_logged_in) {
+      await pool.query(
+        `UPDATE sessions SET is_logged_in = FALSE, status = 'inactive', last_active = NOW() WHERE id = $1`,
+        [sessionId]
+      );
+    }
+
+    logger.info(`Proxy cleared for session, now re-logging from panel IP`, { sessionId });
+
+    // 4. Re-login — resolveSessionProxy will see proxy_required=FALSE and
+    //    return null proxyConfig, so the client connects directly.
+    return await this.loginSession(sessionId, userId);
+  }
+
   // =========================================================================
   // Session Info Update
   // =========================================================================
@@ -2608,6 +2694,8 @@ class SessionService {
          COUNT(*) FILTER (WHERE is_logged_in = false) as logged_out,
          COUNT(*) FILTER (WHERE is_2fa_enabled = true) as with_2fa,
          COUNT(*) FILTER (WHERE is_2fa_enabled = false) as without_2fa,
+         COUNT(*) FILTER (WHERE spam_status = 'frozen') as frozen,
+         COUNT(*) FILTER (WHERE spam_status = 'limited') as limited,
          MAX(last_active) as last_active
        FROM sessions
        WHERE user_id = $1 AND platform = 'telegram'`,
@@ -2633,6 +2721,8 @@ class SessionService {
       loggedOut: parseInt(loginRow.logged_out, 10),
       with2FA: parseInt(loginRow.with_2fa, 10),
       without2FA: parseInt(loginRow.without_2fa, 10),
+      frozen: parseInt(loginRow.frozen, 10),
+      limited: parseInt(loginRow.limited, 10),
       lastActive: loginRow.last_active,
       totalSessions: total,
     };
@@ -2794,7 +2884,8 @@ class SessionService {
       const result = await pool.query(
         `SELECT id FROM sessions
          WHERE is_logged_in = TRUE AND COALESCE(keep_alive, TRUE) = TRUE
-           AND platform = 'telegram'
+            AND platform = 'telegram'
+            AND COALESCE(spam_status, 'unknown') <> 'frozen'
          ORDER BY id ASC`
       );
       total = result.rows.length;
@@ -2809,42 +2900,12 @@ class SessionService {
 
       const restoreOne = async (sessionId) => {
         try {
-          // Try to (re)assign a proxy and load the client.
-          let proxyConf = null;
-          try {
-            const proxyService = require('./proxyService');
-            const proxyRow = await proxyService.assignProxyForSession(sessionId);
-            proxyConf = proxyService.buildGramJSProxy(proxyRow);
-          } catch (proxyErr) {
-            logger.debug(`Proxy assign failed during restore for ${sessionId}: ${proxyErr.message}`);
-          }
-
           if (tgService.isSessionActive(String(sessionId))) {
             restored++;
             return;
           }
-          // Use the lower-level loader and then reset proxy via _ensureConnected.
+          // The loader resolves and enforces the row's dedicated proxy.
           await tgService._loadSessionFromDB(sessionId);
-          // If a proxy is configured, replace the client with one bound to that proxy.
-          if (proxyConf) {
-            const sFile = await this._readSessionFile(sessionId);
-            if (sFile) {
-              // Anti-Detect: replay the persisted device identity.
-              let identity = null;
-              try {
-                const identityService = require('./identityService');
-                identity = await identityService.loadOrCreate(sessionId);
-              } catch { /* non-fatal */ }
-              await tgService.disconnectSession(String(sessionId)).catch(() => {});
-              await tgService.createSession(
-                String(sessionId),
-                sFile.encryptedSession,
-                sFile.apiId,
-                sFile.apiHash,
-                { proxy: proxyConf, identity }
-              );
-            }
-          }
 
           // Anti-revoke Phase 1 (B4): persist the DC the auth_key landed
           // on so subsequent reconnects pin to the same DC.
@@ -3068,7 +3129,8 @@ class SessionService {
         `SELECT id FROM sessions
           WHERE is_logged_in = TRUE
             AND COALESCE(keep_alive, TRUE) = TRUE
-            AND platform = 'telegram'`
+            AND platform = 'telegram'
+            AND COALESCE(spam_status, 'unknown') <> 'frozen'`
       );
       for (const row of result.rows) {
         const sid = String(row.id);

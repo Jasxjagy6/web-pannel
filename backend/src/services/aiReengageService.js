@@ -78,8 +78,9 @@ async function runScan() {
          JOIN ai_session_settings a ON a.session_id = m.session_id
          JOIN sessions s ON s.id = m.session_id
         WHERE a.enabled = TRUE
-          AND s.is_logged_in = TRUE
-          AND s.platform = 'telegram'
+           AND s.is_logged_in = TRUE
+           AND s.platform = 'telegram'
+           AND COALESCE(s.spam_status, 'unknown') <> 'frozen'
           AND m.peer_type = 'user'
           AND m.peer_id <> 777000
           AND (m.messages->-1->>'isIncoming')::boolean = FALSE

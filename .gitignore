@@ -1,6 +1,19 @@
 node_modules/
 .env
 .env.local
+.env.staging*
+backend/.env.staging*
+frontend/.env.staging*
+*.staging.env
+*.staging.env.*
+*.stage.env
+*.stage.env.*
+*.test.env
+*.test.env.*
+*.qa.env
+*.qa.env.*
+!.env.staging.example
+!backend/.env.staging.example
 *.log
 logs/
 uploads/
@@ -11,4 +24,3 @@ frontend/package-lock.json
 state/*
 !state/.gitkeep
 backups/
-

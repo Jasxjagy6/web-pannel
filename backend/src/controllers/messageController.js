@@ -7,6 +7,24 @@ const { resolveSessionIdsFromRequest } = require('../utils/resolveSessions');
 const logger = require('../utils/logger');
 const distributionPlanner = require('../services/distributionPlanner');
 
+async function filterBulkDmSessionIds(sessionIds, userId) {
+  const rows = await messageService._verifyMultipleSessionsOwnership(
+    sessionIds,
+    userId,
+    { excludeLimited: true }
+  );
+  const eligible = new Set(rows.map((row) => Number(row.id)));
+  const filtered = sessionIds.filter((id) => eligible.has(Number(id)));
+  if (filtered.length === 0) {
+    throw new AppError(
+      'No sessions are eligible for bulk Mass DM. Frozen sessions and active @SpamBot-limited sessions are skipped.',
+      423,
+      'NO_MASS_DM_ELIGIBLE_SESSIONS'
+    );
+  }
+  return filtered;
+}
+
 const messageController = {
   /**
    * Send a single message to a target.
@@ -126,7 +144,7 @@ const messageController = {
       );
     }
 
-    const sessionIds = await resolveSessionIdsFromRequest(req, rawSessionIds || []);
+    let sessionIds = await resolveSessionIdsFromRequest(req, rawSessionIds || []);
     if (!Array.isArray(sessionIds) || sessionIds.length === 0) {
       throw new AppError(
         'sessionIds array (or a non-empty sessionListId) is required',
@@ -134,6 +152,7 @@ const messageController = {
         'NO_SESSIONS'
       );
     }
+    sessionIds = await filterBulkDmSessionIds(sessionIds, userId);
 
     if (!targetList || !Array.isArray(targetList) || targetList.length === 0) {
       throw new AppError('targetList is required and must not be empty', 400, 'EMPTY_TARGET_LIST');
@@ -268,7 +287,7 @@ const messageController = {
     } = req.body;
 
     // Preserve operator order — failover hands off session #1 -> #2 -> …
-    const sessionIds = await resolveSessionIdsFromRequest(req, rawSessionIds || []);
+    let sessionIds = await resolveSessionIdsFromRequest(req, rawSessionIds || []);
     if (!Array.isArray(sessionIds) || sessionIds.length === 0) {
       throw new AppError(
         'sessionIds array (or a non-empty sessionListId) is required',
@@ -276,6 +295,7 @@ const messageController = {
         'NO_SESSIONS'
       );
     }
+    sessionIds = await filterBulkDmSessionIds(sessionIds, userId);
     if (!targetList || !Array.isArray(targetList) || targetList.length === 0) {
       throw new AppError('targetList is required and must not be empty', 400, 'EMPTY_TARGET_LIST');
     }
@@ -366,7 +386,7 @@ const messageController = {
       async,
     } = req.body;
 
-    const sessionIds = await resolveSessionIdsFromRequest(req, rawSessionIds || []);
+    let sessionIds = await resolveSessionIdsFromRequest(req, rawSessionIds || []);
     if (!Array.isArray(sessionIds) || sessionIds.length === 0) {
       throw new AppError(
         'sessionIds array (or a non-empty sessionListId) is required',
@@ -374,6 +394,7 @@ const messageController = {
         'NO_SESSIONS'
       );
     }
+    sessionIds = await filterBulkDmSessionIds(sessionIds, userId);
     if (!targetList || !Array.isArray(targetList) || targetList.length === 0) {
       throw new AppError('targetList is required and must not be empty', 400, 'EMPTY_TARGET_LIST');
     }
@@ -432,6 +453,109 @@ const messageController = {
         mode: 'parallel',
         totalTargets: targetList.length,
         sessionCount: sessionIds.length,
+      },
+    });
+  }),
+
+  /**
+   * SPLIT mass DM. Operator sets a per-session quota (how many DMs one
+   * session should do). The audience is cut into contiguous slices — session
+   * 1 -> users 1..q, session 2 -> users q+1..2q, … — and every slice runs
+   * simultaneously. Because targets are pre-verified, a limited/dead session
+   * just stops its own slice. Same body shape as sendParallel plus
+   * `dmsPerSession`.
+   */
+  sendSplit: asyncHandler(async (req, res) => {
+    const userId = req.user.id;
+    const {
+      sessionIds: rawSessionIds,
+      targetList,
+      message,
+      messageType,
+      delayMin,
+      delayMax,
+      messageOptions,
+      sourceType,
+      sourceId,
+      trackReplies,
+      replyWindowHours,
+      dmsPerSession,
+      async,
+    } = req.body;
+
+    const quota = parseInt(dmsPerSession, 10);
+    if (!Number.isFinite(quota) || quota < 1) {
+      throw new AppError('dmsPerSession must be a positive integer', 400, 'BAD_QUOTA');
+    }
+
+    let sessionIds = await resolveSessionIdsFromRequest(req, rawSessionIds || []);
+    if (!Array.isArray(sessionIds) || sessionIds.length === 0) {
+      throw new AppError(
+        'sessionIds array (or a non-empty sessionListId) is required',
+        400,
+        'NO_SESSIONS'
+      );
+    }
+    sessionIds = await filterBulkDmSessionIds(sessionIds, userId);
+    if (!targetList || !Array.isArray(targetList) || targetList.length === 0) {
+      throw new AppError('targetList is required and must not be empty', 400, 'EMPTY_TARGET_LIST');
+    }
+    if (!message || message.trim().length === 0) {
+      throw new AppError('message content is required', 400, 'EMPTY_MESSAGE');
+    }
+
+    const params = {
+      sessionIds,
+      targetList,
+      message: message.trim(),
+      messageType: messageType || 'text',
+      delayMin: delayMin != null ? parseInt(delayMin, 10) : undefined,
+      delayMax: delayMax != null ? parseInt(delayMax, 10) : undefined,
+      messageOptions: typeof messageOptions === 'string' ? JSON.parse(messageOptions) : (messageOptions || {}),
+      sourceType: sourceType || 'manual',
+      sourceId: sourceId != null ? parseInt(sourceId, 10) : undefined,
+      trackReplies: trackReplies === false ? false : true,
+      replyWindowHours: replyWindowHours != null ? parseInt(replyWindowHours, 10) : 24,
+      dmsPerSession: quota,
+    };
+
+    if (async === false || async === 'false') {
+      const result = await messageService.sendSplitMassDm(params, userId);
+      return res.status(200).json({ success: true, data: result });
+    }
+
+    const queueJob = await messageQueue.addJob({ type: 'split', params, userId });
+
+    await reportService.logActivity(
+      userId,
+      'message_bulk_start',
+      'messaging_job',
+      null,
+      {
+        queueJobId: queueJob.id,
+        mode: 'split',
+        sessionCount: sessionIds.length,
+        targetCount: targetList.length,
+        dmsPerSession: quota,
+      }
+    );
+
+    logger.info(`Split mass-DM job queued by user ${userId}`, {
+      queueJobId: queueJob.id,
+      sessionCount: sessionIds.length,
+      targetCount: targetList.length,
+      dmsPerSession: quota,
+    });
+
+    return res.status(202).json({
+      success: true,
+      data: {
+        queueJobId: queueJob.id,
+        status: 'queued',
+        mode: 'split',
+        totalTargets: targetList.length,
+        sessionCount: sessionIds.length,
+        dmsPerSession: quota,
       },
     });
   }),
@@ -1026,13 +1150,15 @@ const messageController = {
   }),
 
   /**
-   * Send a single message to 1..3 target users from many sessions
+   * Send a single message to 1..50 target users from many sessions
    * sequentially (Single-User Mass DM).
    *
    * Body: {
    *   sessionIds?:    number[]        (or `sessionListId`),
    *   sessionListId?: number|string,
-   *   targets:        string[]        (1..3 entries),
+   *   sourceType?:    'manual'|'list' (default manual),
+   *   sourceId?:      number          (required for list mode),
+   *   targets?:       string[]        (1..50 entries in manual mode),
    *   message:        string          (<=4096),
    *   messageType?:   'text'|'html'|'markdown',
    *   delaySeconds?:  number          (1..120, default 3),
@@ -1044,21 +1170,32 @@ const messageController = {
     const {
       sessionIds: rawSessionIds,
       targets,
+      sourceType = 'manual',
+      sourceId,
       message,
       messageType = 'text',
       delaySeconds = 3,
       async: asyncFlag,
     } = req.body || {};
 
-    if (!Array.isArray(targets) || targets.length === 0) {
-      throw new AppError('targets array is required', 400, 'NO_TARGETS');
-    }
-    if (targets.length > 3) {
-      throw new AppError(
-        'A maximum of 3 targets is allowed for single-user mass DM',
-        400,
-        'TOO_MANY_TARGETS'
-      );
+    if (sourceType === 'manual') {
+      if (!Array.isArray(targets) || targets.length === 0) {
+        throw new AppError('targets array is required in manual mode', 400, 'NO_TARGETS');
+      }
+      if (targets.length > 50) {
+        throw new AppError(
+          'A maximum of 50 targets is allowed for single-user mass DM',
+          400,
+          'TOO_MANY_TARGETS'
+        );
+      }
+    } else if (sourceType === 'list') {
+      const parsedSourceId = Number(sourceId);
+      if (!Number.isInteger(parsedSourceId) || parsedSourceId <= 0) {
+        throw new AppError('A positive sourceId is required in list mode', 400, 'INVALID_SOURCE_ID');
+      }
+    } else {
+      throw new AppError('sourceType must be manual or list', 400, 'INVALID_SOURCE_TYPE');
     }
     if (!message || String(message).trim().length === 0) {
       throw new AppError('message content is required', 400, 'EMPTY_MESSAGE');
@@ -1076,6 +1213,8 @@ const messageController = {
     const params = {
       sessionIds,
       targets,
+      sourceType,
+      sourceId: sourceType === 'list' ? Number(sourceId) : null,
       message: String(message).trim(),
       messageType,
       delaySeconds: parseInt(delaySeconds, 10) || 3,
@@ -1091,6 +1230,8 @@ const messageController = {
         userId,
       });
 
+      const queuedTargetCount = Array.isArray(params.targets) ? params.targets.length : null;
+
       await reportService.logActivity(
         userId,
         'message_single_user_mass_dm_start',
@@ -1099,7 +1240,9 @@ const messageController = {
         {
           queueJobId: queueJob.id,
           sessionCount: sessionIds.length,
-          targetCount: params.targets.length,
+          targetCount: queuedTargetCount,
+          sourceType: params.sourceType,
+          sourceId: params.sourceId,
           delaySeconds: params.delaySeconds,
         }
       );
@@ -1107,7 +1250,9 @@ const messageController = {
       logger.info(`Single-user mass DM queued by user ${userId}`, {
         queueJobId: queueJob.id,
         sessionCount: sessionIds.length,
-        targetCount: params.targets.length,
+        targetCount: queuedTargetCount,
+        sourceType: params.sourceType,
+        sourceId: params.sourceId,
       });
 
       return res.status(202).json({
@@ -1115,7 +1260,7 @@ const messageController = {
         data: {
           queueJobId: queueJob.id,
           status: 'queued',
-          totalTargets: params.targets.length,
+          totalTargets: queuedTargetCount,
           sessionCount: sessionIds.length,
           delaySeconds: params.delaySeconds,
         },
@@ -1163,6 +1308,7 @@ const messageController = {
    *   itemDelayMsMin?, itemDelayMsMax?
    */
   previewBulk: asyncHandler(async (req, res) => {
+    const userId = req.user.id;
     const {
       sessionIds: rawSessionIds,
       targetList,
@@ -1175,7 +1321,7 @@ const messageController = {
       itemDelayMsMax,
     } = req.body || {};
 
-    const sessionIds = await resolveSessionIdsFromRequest(req, rawSessionIds || []);
+    let sessionIds = await resolveSessionIdsFromRequest(req, rawSessionIds || []);
     if (!Array.isArray(sessionIds) || sessionIds.length === 0) {
       throw new AppError(
         'sessionIds array (or a non-empty sessionListId) is required',
@@ -1183,6 +1329,7 @@ const messageController = {
         'NO_SESSIONS'
       );
     }
+    sessionIds = await filterBulkDmSessionIds(sessionIds, userId);
 
     let totalItems;
     if (Array.isArray(targetList)) {

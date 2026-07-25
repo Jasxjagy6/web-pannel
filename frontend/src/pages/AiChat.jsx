@@ -204,7 +204,7 @@ export default function AiChat() {
       if (enabled) {
         const parts = [`AI enabled on ${d.changed} session${d.changed === 1 ? '' : 's'}`];
         if (providerLabel) parts.push(`via ${providerLabel}`);
-        if (d.skipped) parts.push(`· ${d.skipped} skipped (not logged in)`);
+        if (d.skipped) parts.push(`· ${d.skipped} skipped (frozen or not logged in)`);
         if (d.failed) parts.push(`· ${d.failed} failed`);
         toast.success(parts.join(' '));
       } else {
@@ -225,6 +225,15 @@ export default function AiChat() {
   };
 
   const toggleSession = async (sessionId) => {
+    const session = sessions.find((item) => Number(item.id) === Number(sessionId));
+    if (String(session?.spamStatus || '').toLowerCase() === 'frozen') {
+      setSettingsMap((prev) => ({
+        ...prev,
+        [sessionId]: { ...(prev[sessionId] || {}), enabled: false, frozen: true },
+      }));
+      toast.error('AI Chat stays OFF while this Telegram session is frozen.');
+      return;
+    }
     const current = settingsMap[sessionId] || { enabled: false, config: {} };
     const provider = current.config?.provider || 'cupidbot';
     const keyStatus = keyStatusByProvider[provider];
@@ -793,7 +802,9 @@ export default function AiChat() {
         ) : (
           <div className="space-y-3">
             {filteredSessions.map((s) => {
-              const settings = settingsMap[s.id] || { enabled: false, config: {} };
+              const frozen = String(s.spamStatus || '').toLowerCase() === 'frozen';
+              const storedSettings = settingsMap[s.id] || { enabled: false, config: {} };
+              const settings = frozen ? { ...storedSettings, enabled: false, frozen: true } : storedSettings;
               const expanded = expandedId === s.id;
               return (
                 <div
@@ -818,6 +829,11 @@ export default function AiChat() {
                         <span className={s.isLoggedIn ? 'text-emerald-400' : 'text-amber-400'}>
                           {s.isLoggedIn ? 'logged in' : 'not logged in'}
                         </span>
+                        {frozen && (
+                          <span className="rounded-full border border-red-500/30 bg-red-500/10 px-2 py-0.5 font-semibold text-red-300">
+                            Frozen · AI locked OFF
+                          </span>
+                        )}
                       </div>
                     </div>
 
@@ -825,7 +841,8 @@ export default function AiChat() {
                       <button
                         type="button"
                         onClick={() => toggleSession(s.id)}
-                        disabled={togglingId === s.id || !s.isLoggedIn}
+                        disabled={togglingId === s.id || !s.isLoggedIn || frozen}
+                        title={frozen ? 'AI Chat is locked OFF while this session is frozen' : undefined}
                         className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors focus:outline-none focus:ring-2 focus:ring-sky-500 focus:ring-offset-2 focus:ring-offset-dark-900 disabled:opacity-50 ${
                           settings.enabled ? 'bg-sky-500' : 'bg-gray-600'
                         }`}
@@ -837,10 +854,11 @@ export default function AiChat() {
                         />
                       </button>
                       <span className="text-sm font-medium">
-                        {settings.enabled ? 'AI ON' : 'AI OFF'}
+                        {frozen ? 'AI OFF (Frozen)' : settings.enabled ? 'AI ON' : 'AI OFF'}
                       </span>
                       <select
                         value={settings.config?.provider || 'cupidbot'}
+                        disabled={frozen}
                         onChange={async (e) => {
                           const newProvider = e.target.value;
                           const newConfig = { ...settings.config, provider: newProvider };

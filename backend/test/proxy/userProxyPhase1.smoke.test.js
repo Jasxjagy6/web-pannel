@@ -14,7 +14,6 @@
  *   P1.5  A single user can NOT own (host, port, protocol) twice.
  *   P1.6  Trigger blocks a cross-user binding in session_proxy_assignments.
  *   P1.7  proxyService.listMyProxies() excludes admin-pool rows.
- *   P1.8  proxyService.listAdminProxies() returns only user_id IS NULL rows.
  *
  * Each assertion runs inside a BEGIN/ROLLBACK so the live DB stays clean.
  *
@@ -318,30 +317,6 @@ async function applyMigrationIfMissing() {
     assert.strictEqual(mine.rowCount, 1);
     assert.strictEqual(mine.rows[0].host, 'p1-7-mine.invalid');
     assert.strictEqual(all.rowCount, 2); // both visible globally
-  });
-
-  // ----- P1.8 listAdminProxies returns only user_id IS NULL rows -----
-  await run('P1.8 listAdminProxies returns only NULL user_id rows', async (c) => {
-    const u = await c.query(`
-      INSERT INTO users (email, password_hash, role, status, is_approved)
-      VALUES ('p1.8@test.invalid', 'x', 'user', 'approved', TRUE) RETURNING id
-    `);
-    const userId = u.rows[0].id;
-    await c.query(`
-      INSERT INTO proxies (user_id, host, port, protocol, source, is_working)
-      VALUES ($1, 'p1-8-mine.invalid', 9500, 'socks5', 'user', TRUE)
-    `, [userId]);
-    await c.query(`
-      INSERT INTO proxies (host, port, protocol, source, is_working)
-      VALUES ('p1-8-admin.invalid', 9501, 'socks5', 'manual', TRUE)
-    `);
-    const adminOnly = await c.query(`
-      SELECT host FROM proxies
-       WHERE user_id IS NULL
-         AND host IN ('p1-8-mine.invalid', 'p1-8-admin.invalid')
-    `);
-    assert.strictEqual(adminOnly.rowCount, 1);
-    assert.strictEqual(adminOnly.rows[0].host, 'p1-8-admin.invalid');
   });
 
   console.log('');
