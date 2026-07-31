@@ -7,6 +7,9 @@ const compression = require('compression');
 const jwt = require('jsonwebtoken');
 require('dotenv').config();
 
+const { assertEnvironmentIsolation } = require('./config/environmentGuard');
+assertEnvironmentIsolation();
+
 const { initDB } = require('./config/database');
 const { connectRedis } = require('./config/redis');
 const { initializeQueues, closeQueues } = require('./queues');
@@ -26,7 +29,6 @@ const dashboardRoutes = require('./routes/dashboard');
 const accountSettingsRoutes = require('./routes/accountSettings');
 const twoFAJobsRoutes = require('./routes/twoFAJobs');
 const otpRoutes = require('./routes/otp');
-const proxyRoutes = require('./routes/proxies');
 const userProxyRoutes = require('./routes/userProxies');
 const antiDetectRoutes = require('./routes/antiDetect');
 const privacyRoutes = require('./routes/privacy');
@@ -169,9 +171,7 @@ const PLATFORM_ROUTERS = [
   ['/account-settings', accountSettingsRoutes],
   ['/2fa-jobs',         twoFAJobsRoutes],
   ['/otp',              otpRoutes],
-  ['/proxies',          proxyRoutes],
   ['/me/proxies',       userProxyRoutes],
-  ['/me/proxy-providers', require('./routes/proxyProviders')],
   ['/anti-detect',      antiDetectRoutes],
   ['/privacy', privacyRoutes],
   ['/login-email', loginEmailRoutes],
@@ -536,12 +536,13 @@ async function start() {
       logger.warn(`otpRelayService.start failed: ${err.message}`);
     }
 
-    // 3. Boot the proxy pool background scheduler (10-minute revalidation).
+    // 3. Continuously validate user-owned dedicated proxies. The legacy free
+    //    scraper/shared pool is intentionally retired.
     try {
-      const proxyService = require('./services/proxyService');
-      proxyService.startBackground();
+      const dedicatedProxyService = require('./services/dedicatedProxyService');
+      dedicatedProxyService.startHealthMonitor();
     } catch (err) {
-      logger.warn(`proxyService.startBackground failed: ${err.message}`);
+      logger.warn(`dedicatedProxyService.startHealthMonitor failed: ${err.message}`);
     }
 
     // 4. Start the Anti-Detect behavior simulator. It performs a small
@@ -578,6 +579,22 @@ async function start() {
       storyJobWorker.startStoryJobWorker();
     } catch (err) {
       logger.warn(`storyJobWorker.start failed: ${err.message}`);
+    }
+
+    // 5c. Apply unused Premium boost slots to selected channels/groups.
+    try {
+      require('./services/boostJobWorker').start();
+    } catch (err) {
+      logger.warn(`boostJobWorker.start failed: ${err.message}`);
+    }
+
+    // 5d. Persisted username-validation worker. Sequentially resolves public
+    // handles through live Telegram sessions and resumes interrupted jobs.
+    try {
+      require('./services/usernameValidationService').startWorker();
+      require('./services/linkUsernameFilterService').startWorker();
+    } catch (err) {
+      logger.warn(`usernameValidation worker start failed: ${err.message}`);
     }
 
     // 6. Boot the Instagram session warm-up scheduler. Every minute it
@@ -813,6 +830,7 @@ async function gracefulShutdown(signal) {
     server.close();
     try { io.close(); } catch (_) {}
     // Drain queues so in-flight jobs commit cleanly.
+    try { require('./services/usernameValidationService').stopWorker(); } catch (_) {}
     await closeQueues();
     // Close DB pool last so anything that tried to log a final query
     // still sees an open connection.

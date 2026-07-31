@@ -2,13 +2,13 @@
  * Smoke test for the Single-User Mass DM feature.
  *
  * Locks in:
- *   1. The Joi schema enforces 1..3 targets, the 1..120-second
- *      delay band, and message presence.
+ *   1. The Joi schema enforces 1..50 manual targets, saved-list source
+ *      requirements, the 1..120-second delay band, and message presence.
  *   2. The schema accepts either `sessionIds` or `sessionListId`
  *      (the same shape every other bulk-message endpoint uses).
- *   3. The service-level cleanup pass dedupes targets case-
- *      insensitively while preserving order, and rejects payloads
- *      that exceed the 3-target hard cap.
+ *   3. The service loads saved lists server-side, normalizes and dedupes
+ *      them in order, persists their source, and rejects more than 50
+ *      addressable targets without truncating.
  *
  * The send loop itself talks to Telegram and Postgres, so this
  * test focuses on the surface that doesn't require a live stack.
@@ -53,11 +53,18 @@ expectValid('singleTarget+sessionIds', {
   message: 'hi',
 });
 
-expectValid('threeTargets+sessionListId', {
+expectValid('fiftyTargets+sessionListId', {
   sessionListId: 12,
-  targets: ['@alice', '12345678', 'bob'],
+  targets: Array.from({ length: 50 }, (_, i) => `user${i + 1}`),
   message: 'hi',
   delaySeconds: 5,
+});
+
+expectValid('savedTargetList', {
+  sessionIds: [1],
+  sourceType: 'list',
+  sourceId: 42,
+  message: 'hi',
 });
 
 expectValid('messageType+async', {
@@ -83,9 +90,15 @@ expectInvalid('noTargets', {
 
 expectInvalid('tooManyTargets', {
   sessionIds: [1],
-  targets: ['a', 'b', 'c', 'd'],
+  targets: Array.from({ length: 51 }, (_, i) => `user${i + 1}`),
   message: 'hi',
 }, 'targets');
+
+expectInvalid('savedListMissingSourceId', {
+  sessionIds: [1],
+  sourceType: 'list',
+  message: 'hi',
+}, 'sourceid');
 
 expectInvalid('noSessions', {
   targets: ['@alice'],
@@ -131,13 +144,17 @@ async function withStubbedSessions(stub, fn) {
 }
 
 (async () => {
-  // 3a. Service rejects 4 targets even if the validator is bypassed.
+  // 3a. Service rejects 51 targets even if the validator is bypassed.
   await withStubbedSessions(
     async () => [{ id: 1, user_id: 1, status: 'active' }],
     async () => {
       try {
         await messageService.sendSingleUserMassDm(
-          { sessionIds: [1], targets: ['a', 'b', 'c', 'd'], message: 'hi' },
+          {
+            sessionIds: [1],
+            targets: Array.from({ length: 51 }, (_, i) => `user${i + 1}`),
+            message: 'hi',
+          },
           1
         );
         throw new Error('expected TOO_MANY_TARGETS');
@@ -149,7 +166,108 @@ async function withStubbedSessions(stub, fn) {
 
   console.log('service.cap: OK');
 
-  // 3b. Service rejects when no valid sessions are returned.
+  // 3b. Saved lists are loaded authoritatively, normalized/deduped in
+  // list order, and retain their source metadata in job options.
+  await (async () => {
+    const pool = require('../../src/config/database').pool;
+    const origPoolQuery = pool.query.bind(pool);
+    const origProcess = messageService._processSingleUserMassDm.bind(messageService);
+    let insertParams = null;
+
+    pool.query = async (sql, params) => {
+      const text = String(sql).replace(/\s+/g, ' ').trim();
+      if (text.startsWith('SELECT l.id AS list_id')) {
+        assert.deepStrictEqual(params, [42, 1]);
+        return {
+          rows: [
+            { list_id: 42, telegram_id: null, username: 'Alice', phone: null },
+            { list_id: 42, telegram_id: null, username: 'alice', phone: null },
+            { list_id: 42, telegram_id: '12345678', username: 'ignored', phone: null },
+            { list_id: 42, telegram_id: null, username: null, phone: '15551234567' },
+            { list_id: 42, telegram_id: null, username: null, phone: null },
+          ],
+        };
+      }
+      if (text.startsWith('INSERT INTO messaging_jobs')) {
+        insertParams = params;
+        return { rows: [{ id: 7001 }] };
+      }
+      throw new Error(`Unexpected SQL in saved-list test: ${text}`);
+    };
+    messageService._processSingleUserMassDm = async () => {};
+
+    try {
+      await withStubbedSessions(
+        async () => [{ id: 1, user_id: 1, status: 'active' }],
+        async () => {
+          const result = await messageService.sendSingleUserMassDm(
+            {
+              sessionIds: [1],
+              sourceType: 'list',
+              sourceId: 42,
+              message: 'hi',
+            },
+            1
+          );
+          assert.strictEqual(result.targetCount, 3);
+        }
+      );
+
+      assert.ok(insertParams, 'expected messaging job insert');
+      assert.deepStrictEqual(JSON.parse(insertParams[2]), ['@Alice', '12345678', '+15551234567']);
+      const options = JSON.parse(insertParams[6]);
+      assert.strictEqual(options.sourceType, 'list');
+      assert.strictEqual(options.sourceId, 42);
+      assert.strictEqual(options.targetCount, 3);
+    } finally {
+      pool.query = origPoolQuery;
+      messageService._processSingleUserMassDm = origProcess;
+    }
+  })();
+
+  console.log('service.savedList: OK');
+
+  // 3c. The service rejects the authoritative saved list when it has
+  // 51 addressable targets. It must not silently use the first 50.
+  await (async () => {
+    const pool = require('../../src/config/database').pool;
+    const origPoolQuery = pool.query.bind(pool);
+    pool.query = async (sql) => {
+      const text = String(sql).replace(/\s+/g, ' ').trim();
+      if (text.startsWith('SELECT l.id AS list_id')) {
+        return {
+          rows: Array.from({ length: 51 }, (_, i) => ({
+            list_id: 43,
+            telegram_id: String(10000000 + i),
+            username: null,
+            phone: null,
+          })),
+        };
+      }
+      throw new Error(`Unexpected SQL in saved-list cap test: ${text}`);
+    };
+
+    try {
+      await assert.rejects(
+        () => messageService.sendSingleUserMassDm(
+          {
+            sessionIds: [1],
+            sourceType: 'list',
+            sourceId: 43,
+            message: 'hi',
+          },
+          1
+        ),
+        (err) => err.errorCode === 'TOO_MANY_TARGETS'
+      );
+    } finally {
+      pool.query = origPoolQuery;
+    }
+  })();
+
+  console.log('service.savedListCap: OK');
+
+  // 3d. Service rejects when no valid sessions are returned.
   await withStubbedSessions(
     async () => [],
     async () => {

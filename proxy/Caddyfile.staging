@@ -1,0 +1,17 @@
+{
+	admin off
+	auto_https off
+}
+
+:80 {
+	@backend path /api /api/* /socket.io /socket.io/* /health /health/*
+	handle @backend {
+		reverse_proxy staging-backend:3005
+	}
+
+	handle {
+		reverse_proxy staging-frontend:83
+	}
+
+	encode gzip zstd
+}

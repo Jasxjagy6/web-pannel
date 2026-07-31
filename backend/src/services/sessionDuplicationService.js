@@ -335,6 +335,7 @@ async function cloneOne(ctx, sessionRow, sessionState, destApiId, destApiHash) {
     throw new Error(`Panel client for session ${sourceId} is not connected`);
   }
   const sourceClient = sourceEntry.client;
+  const sourceProxy = sourceEntry.proxy || null;
 
   // 2. Build a fresh new client with destination credentials. Empty
   //    StringSession → MTProto key exchange happens during connect,
@@ -352,8 +353,9 @@ async function cloneOne(ctx, sessionRow, sessionState, destApiId, destApiHash) {
     langCode: telegramConfig.langCode,
     systemLangCode: telegramConfig.langCode,
     baseLogger: telegramConfig.baseLogger,
-    useWSS: telegramConfig.useWSS,
+    useWSS: sourceProxy ? false : telegramConfig.useWSS,
     autoReconnect: false,
+    proxy: sourceProxy || undefined,
   });
   ctx.toDisconnect.push(newClient);
 

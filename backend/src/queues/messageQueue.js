@@ -59,13 +59,14 @@ class MessageQueueManager {
         // so a second bulk job for the same user waits for the first to
         // finish (or fail) before starting.
         // Single-User Mass DM also drives multi-session traffic but
-        // with a much smaller fan-out (≤3 targets) — give it its own
+        // with a bounded fan-out (up to 50 targets) — give it its own
         // serialisation lane so it doesn't queue behind a long
         // bulk-DM job that's saturating the same user's sessions.
         let heavyCategory = null;
         if (type === 'bulk') heavyCategory = 'message:bulk';
         else if (type === 'failover') heavyCategory = 'message:failover';
         else if (type === 'parallel') heavyCategory = 'message:parallel';
+        else if (type === 'split') heavyCategory = 'message:split';
         else if (type === 'single_user_mass_dm') heavyCategory = 'message:single_user_mass_dm';
 
         const run = async () => {
@@ -77,6 +78,8 @@ class MessageQueueManager {
             return await messageService.sendFailoverMessage(params, userId);
           } else if (type === 'parallel') {
             return await messageService.sendParallelMassDm(params, userId);
+          } else if (type === 'split') {
+            return await messageService.sendSplitMassDm(params, userId);
           } else if (type === 'group-message') {
             return await messageService.sendMessageToGroup(sessionId, groupId, message, userId);
           } else if (type === 'forward') {

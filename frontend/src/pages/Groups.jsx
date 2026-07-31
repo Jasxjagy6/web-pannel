@@ -35,6 +35,9 @@ import {
   LogIn,
   LogOut,
   Edit3,
+  Crown,
+  RefreshCw,
+  Zap,
 } from 'lucide-react';
 import {
   UserGroupIcon,
@@ -269,6 +272,343 @@ or -1001234567890
         )}
       </button>
     </form>
+  );
+}
+
+// ============================================================
+// Premium Boosts Tab
+// ============================================================
+
+function BoostsTab({ onJobsChanged }) {
+  const { showSuccess, showError } = useToast();
+  const [accounts, setAccounts] = useState([]);
+  const [selectedIds, setSelectedIds] = useState([]);
+  const [targets, setTargets] = useState('');
+  const [loading, setLoading] = useState(true);
+  const [refreshing, setRefreshing] = useState(false);
+  const [submitting, setSubmitting] = useState(false);
+  const [slotState, setSlotState] = useState({});
+  const [checkingId, setCheckingId] = useState(null);
+  const [jobs, setJobs] = useState([]);
+  const [jobsLoading, setJobsLoading] = useState(true);
+  const [jobDetail, setJobDetail] = useState(null);
+
+  const loadAccounts = useCallback(async (refresh = false) => {
+    refresh ? setRefreshing(true) : setLoading(true);
+    try {
+      const response = await groupsAPI.listBoostAccounts(refresh);
+      const next = response.data.data?.accounts || [];
+      setAccounts(next);
+      setSelectedIds((current) => current.filter((id) => next.some((account) => account.id === id)));
+      if (refresh) showSuccess(`Found ${next.length} connected Premium account${next.length === 1 ? '' : 's'}.`, 'Accounts Refreshed');
+    } catch (error) {
+      showError(parseApiError(error), 'Could Not Load Premium Accounts');
+    } finally {
+      setLoading(false);
+      setRefreshing(false);
+    }
+  }, [showError, showSuccess]);
+
+  useEffect(() => { loadAccounts(false); }, [loadAccounts]);
+
+  const loadJobs = useCallback(async () => {
+    try {
+      const response = await groupsAPI.listBoostJobs({ limit: 25 });
+      setJobs(response.data.data?.jobs || []);
+    } catch (error) {
+      console.warn('Failed to load boost jobs:', parseApiError(error));
+    } finally {
+      setJobsLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    loadJobs();
+    const timer = setInterval(loadJobs, 4000);
+    return () => clearInterval(timer);
+  }, [loadJobs]);
+
+  const inspectSlots = async (sessionId) => {
+    setCheckingId(sessionId);
+    try {
+      const response = await groupsAPI.inspectBoostAccount(sessionId);
+      setSlotState((current) => ({ ...current, [sessionId]: response.data.data }));
+    } catch (error) {
+      showError(parseApiError(error), 'Slot Check Failed');
+    } finally {
+      setCheckingId(null);
+    }
+  };
+
+  const submit = async (event) => {
+    event.preventDefault();
+    const targetIds = targets.split(/\r?\n|,/).map((value) => value.trim()).filter(Boolean);
+    if (!selectedIds.length) return showError('Select at least one Premium account.', 'No Accounts Selected');
+    if (!targetIds.length) return showError('Enter at least one group or channel username/link.', 'No Targets');
+    setSubmitting(true);
+    try {
+      const response = await groupsAPI.createBoostJob({ sessionIds: selectedIds, targets: targetIds });
+      const data = response.data.data;
+      showSuccess(
+        `Boost job #${data.jobId} queued with ${data.eligibleAccounts} eligible account${data.eligibleAccounts === 1 ? '' : 's'}.`,
+        'Boost Job Queued'
+      );
+      setTargets('');
+      loadJobs();
+      onJobsChanged?.();
+    } catch (error) {
+      showError(parseApiError(error), 'Could Not Start Boost Job');
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  const allSelected = accounts.length > 0 && selectedIds.length === accounts.length;
+
+  const cancelJob = async (jobId) => {
+    try {
+      await groupsAPI.cancelBoostJob(jobId);
+      showSuccess(`Boost job #${jobId} will stop after its current account.`, 'Cancellation Requested');
+      loadJobs();
+    } catch (error) {
+      showError(parseApiError(error), 'Cancel Failed');
+    }
+  };
+
+  const viewJob = async (jobId) => {
+    try {
+      const response = await groupsAPI.getBoostJob(jobId);
+      setJobDetail(response.data.data);
+    } catch (error) {
+      showError(parseApiError(error), 'Could Not Load Job');
+    }
+  };
+
+  return (
+    <>
+    <form onSubmit={submit} className="space-y-6">
+      <div className="rounded-xl border border-amber-500/20 bg-gradient-to-br from-amber-500/10 via-dark-900 to-dark-900 p-5">
+        <div className="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
+          <div className="flex gap-3">
+            <div className="flex h-11 w-11 shrink-0 items-center justify-center rounded-xl bg-amber-400/15 text-amber-300">
+              <Crown className="h-6 w-6" />
+            </div>
+            <div>
+              <h3 className="font-semibold text-white">Premium boost fleet</h3>
+              <p className="mt-1 max-w-2xl text-sm text-gray-400">
+                Only unused boost slots are applied. Existing boosts are never moved, and slots under Telegram cooldown are skipped.
+              </p>
+            </div>
+          </div>
+          <button
+            type="button"
+            onClick={() => loadAccounts(true)}
+            disabled={refreshing}
+            className="inline-flex items-center justify-center gap-2 rounded-lg border border-white/10 bg-white/5 px-3 py-2 text-sm text-gray-200 hover:bg-white/10 disabled:opacity-50"
+          >
+            <RefreshCw className={`h-4 w-4 ${refreshing ? 'animate-spin' : ''}`} />
+            Verify Premium
+          </button>
+        </div>
+      </div>
+
+      <div>
+        <div className="mb-3 flex items-center justify-between">
+          <div>
+            <label className="text-sm font-medium text-white">Premium accounts</label>
+            <p className="text-xs text-gray-500">{selectedIds.length} of {accounts.length} selected</p>
+          </div>
+          {accounts.length > 0 && (
+            <button
+              type="button"
+              onClick={() => setSelectedIds(allSelected ? [] : accounts.map((account) => account.id))}
+              className="text-xs font-medium text-primary-400 hover:text-primary-300"
+            >
+              {allSelected ? 'Clear all' : 'Select all'}
+            </button>
+          )}
+        </div>
+
+        {loading ? (
+          <div className="flex items-center justify-center rounded-xl border border-white/5 bg-dark-900/60 py-10 text-gray-400">
+            <Loader2 className="mr-2 h-5 w-5 animate-spin" /> Loading Premium accounts...
+          </div>
+        ) : accounts.length === 0 ? (
+          <div className="rounded-xl border border-dashed border-white/10 bg-dark-900/40 p-8 text-center">
+            <Crown className="mx-auto mb-3 h-9 w-9 text-gray-600" />
+            <p className="font-medium text-gray-300">No connected Premium accounts found</p>
+            <p className="mt-1 text-sm text-gray-500">Login Premium Telegram sessions, then click Verify Premium.</p>
+          </div>
+        ) : (
+          <div className="grid max-h-80 gap-2 overflow-y-auto pr-1 sm:grid-cols-2 xl:grid-cols-3">
+            {accounts.map((account) => {
+              const selected = selectedIds.includes(account.id);
+              const slots = slotState[account.id];
+              return (
+                <div
+                  key={account.id}
+                  className={`rounded-xl border p-3 transition ${selected ? 'border-amber-400/40 bg-amber-400/10' : 'border-white/5 bg-dark-900/50 hover:border-white/10'}`}
+                >
+                  <label className="flex cursor-pointer items-start gap-3">
+                    <input
+                      type="checkbox"
+                      checked={selected}
+                      onChange={() => setSelectedIds((current) => selected ? current.filter((id) => id !== account.id) : [...current, account.id])}
+                      className="mt-1 h-4 w-4 rounded border-gray-600 bg-dark-800 text-amber-500 focus:ring-amber-500"
+                    />
+                    <div className="min-w-0 flex-1">
+                      <p className="truncate text-sm font-medium text-white">{account.label}</p>
+                      <p className="truncate text-xs text-gray-500">{account.phone || `Session #${account.id}`}</p>
+                    </div>
+                    <Crown className="h-4 w-4 shrink-0 text-amber-400" />
+                  </label>
+                  <div className="mt-3 flex items-center justify-between border-t border-white/5 pt-2">
+                    {slots ? (
+                      <span className={`text-xs font-medium ${slots.available > 0 ? 'text-green-400' : 'text-gray-500'}`}>
+                        {slots.available} free / {slots.total} slots
+                      </span>
+                    ) : <span className="text-xs text-gray-600">Slots not checked</span>}
+                    <button
+                      type="button"
+                      onClick={() => inspectSlots(account.id)}
+                      disabled={checkingId === account.id}
+                      className="text-xs text-primary-400 hover:text-primary-300 disabled:opacity-50"
+                    >
+                      {checkingId === account.id ? 'Checking...' : 'Check slots'}
+                    </button>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        )}
+      </div>
+
+      <div>
+        <label htmlFor="boost-targets" className="text-sm font-medium text-white">Groups or channels</label>
+        <p className="mb-2 mt-1 text-xs text-gray-500">One public @username, t.me link, or private invite link per line.</p>
+        <textarea
+          id="boost-targets"
+          value={targets}
+          onChange={(event) => setTargets(event.target.value)}
+          rows={5}
+          placeholder={'@my_channel\nhttps://t.me/my_group\nhttps://t.me/+privateInviteHash'}
+          className="w-full resize-y rounded-xl border border-white/10 bg-dark-900 px-4 py-3 font-mono text-sm text-white outline-none transition placeholder:text-gray-600 focus:border-amber-400/50 focus:ring-2 focus:ring-amber-400/10"
+        />
+      </div>
+
+      <div className="flex flex-col gap-3 border-t border-white/5 pt-5 sm:flex-row sm:items-center sm:justify-between">
+        <p className="flex items-center gap-2 text-xs text-gray-500">
+          <Info className="h-4 w-4" /> Free slots are distributed evenly across all entered targets.
+        </p>
+        <button
+          type="submit"
+          disabled={submitting || !selectedIds.length || !targets.trim()}
+          className="inline-flex items-center justify-center gap-2 rounded-lg bg-amber-400 px-5 py-2.5 text-sm font-semibold text-gray-950 transition hover:bg-amber-300 disabled:cursor-not-allowed disabled:opacity-40"
+        >
+          {submitting ? <Loader2 className="h-4 w-4 animate-spin" /> : <Zap className="h-4 w-4" />}
+          Apply available boosts
+        </button>
+      </div>
+    </form>
+
+    <div className="mt-6 overflow-hidden rounded-xl border border-white/5 bg-dark-900/50">
+      <div className="flex items-center justify-between border-b border-white/5 px-4 py-3">
+        <div>
+          <h3 className="flex items-center gap-2 text-sm font-semibold text-white">
+            <Zap className="h-4 w-4 text-amber-400" /> Boost history
+          </h3>
+          <p className="mt-0.5 text-xs text-gray-500">Live per-account results for every boost run</p>
+        </div>
+        <button type="button" onClick={loadJobs} className="rounded-lg p-2 text-gray-400 hover:bg-white/5 hover:text-white" title="Refresh">
+          <RefreshCw className="h-4 w-4" />
+        </button>
+      </div>
+      {jobsLoading ? (
+        <div className="flex items-center justify-center py-10 text-sm text-gray-500"><Loader2 className="mr-2 h-4 w-4 animate-spin" /> Loading jobs...</div>
+      ) : jobs.length === 0 ? (
+        <div className="py-10 text-center text-sm text-gray-500">No boost jobs yet.</div>
+      ) : (
+        <div className="overflow-x-auto">
+          <table className="w-full min-w-[760px] text-sm">
+            <thead className="border-b border-white/5 text-left text-xs text-gray-500">
+              <tr>
+                <th className="px-4 py-3 font-medium">Job</th>
+                <th className="px-4 py-3 font-medium">Targets</th>
+                <th className="px-4 py-3 font-medium">Status</th>
+                <th className="px-4 py-3 font-medium">Boosts applied</th>
+                <th className="px-4 py-3 font-medium">Accounts</th>
+                <th className="px-4 py-3 font-medium">Created</th>
+                <th className="px-4 py-3 text-right font-medium">Actions</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-white/5">
+              {jobs.map((job) => (
+                <tr key={job.id} className="hover:bg-white/[0.03]">
+                  <td className="px-4 py-3 font-medium text-white">#{job.id}</td>
+                  <td className="max-w-64 px-4 py-3">
+                    <p className="truncate text-gray-300" title={(job.targets || []).join(', ')}>{(job.targets || []).join(', ')}</p>
+                    <p className="text-xs text-gray-600">{(job.targets || []).length} target{(job.targets || []).length === 1 ? '' : 's'}</p>
+                  </td>
+                  <td className="px-4 py-3"><StatusBadge status={job.status} size="sm" /></td>
+                  <td className="px-4 py-3 font-semibold text-amber-300">{job.applied_count || 0}</td>
+                  <td className="px-4 py-3 text-gray-400">
+                    <span className="text-green-400">{job.processed_count || 0}</span> / {job.total_sessions || 0}
+                    {(job.failed_count > 0 || job.skipped_count > 0) && <p className="text-xs text-gray-600">{job.failed_count || 0} failed, {job.skipped_count || 0} skipped</p>}
+                  </td>
+                  <td className="px-4 py-3 text-xs text-gray-500">{formatRelativeTime(job.created_at)}</td>
+                  <td className="px-4 py-3">
+                    <div className="flex justify-end gap-1">
+                      <button type="button" onClick={() => viewJob(job.id)} className="rounded-lg p-2 text-gray-400 hover:bg-white/5 hover:text-white" title="View account results"><Eye className="h-4 w-4" /></button>
+                      {['pending', 'running'].includes(job.status) && (
+                        <button type="button" onClick={() => cancelJob(job.id)} className="rounded-lg p-2 text-red-400 hover:bg-red-500/10" title="Cancel"><StopCircle className="h-4 w-4" /></button>
+                      )}
+                    </div>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </div>
+
+    {jobDetail && (
+      <Modal isOpen onClose={() => setJobDetail(null)} title={`Boost job #${jobDetail.id}`} size="xl">
+        <div className="mb-4 grid grid-cols-2 gap-3 sm:grid-cols-4">
+          <div className="rounded-lg bg-white/5 p-3"><p className="text-xs text-gray-500">Applied</p><p className="mt-1 text-xl font-semibold text-amber-300">{jobDetail.applied_count || 0}</p></div>
+          <div className="rounded-lg bg-white/5 p-3"><p className="text-xs text-gray-500">Processed</p><p className="mt-1 text-xl font-semibold text-white">{jobDetail.processed_count || 0}</p></div>
+          <div className="rounded-lg bg-white/5 p-3"><p className="text-xs text-gray-500">Failed</p><p className="mt-1 text-xl font-semibold text-red-400">{jobDetail.failed_count || 0}</p></div>
+          <div className="rounded-lg bg-white/5 p-3"><p className="text-xs text-gray-500">Skipped</p><p className="mt-1 text-xl font-semibold text-gray-400">{jobDetail.skipped_count || 0}</p></div>
+        </div>
+        <div className="max-h-[55vh] space-y-2 overflow-y-auto pr-1">
+          {(jobDetail.items || []).map((item) => (
+            <div key={item.id} className="rounded-xl border border-white/5 bg-dark-900/60 p-3">
+              <div className="flex items-center justify-between gap-3">
+                <div className="min-w-0"><p className="truncate font-medium text-white">{item.session_label}</p><p className="text-xs text-gray-600">Session #{item.session_id || 'removed'}</p></div>
+                <StatusBadge status={item.status} size="sm" />
+              </div>
+              <div className="mt-2 flex flex-wrap gap-x-4 gap-y-1 text-xs text-gray-400">
+                <span><strong className="text-amber-300">{item.applied_count || 0}</strong> boosts applied</span>
+                <span>{item.available_slots || 0} free slots found</span>
+                {item.skip_reason && <span className="text-amber-400">{String(item.skip_reason).replace(/_/g, ' ')}</span>}
+              </div>
+              {item.error_message && <p className="mt-2 break-words rounded-lg bg-red-500/10 px-2 py-1.5 text-xs text-red-300">{item.error_message}</p>}
+              {item.result?.targets?.length > 0 && (
+                <div className="mt-2 space-y-1 border-t border-white/5 pt-2">
+                  {item.result.targets.map((result, index) => (
+                    <p key={`${result.target}-${index}`} className={`text-xs ${result.success ? 'text-green-400' : 'text-red-400'}`}>
+                      {result.success ? 'Boosted' : 'Failed'} {result.title || result.target}: {(result.slots || []).length} slot{(result.slots || []).length === 1 ? '' : 's'}{result.error ? ` - ${result.error}` : ''}
+                    </p>
+                  ))}
+                </div>
+              )}
+            </div>
+          ))}
+        </div>
+      </Modal>
+    )}
+    </>
   );
 }
 
@@ -949,7 +1289,7 @@ export default function Groups() {
   const { showSuccess, showError } = useToast();
   const { connect, on, off, connected } = useWebSocket();
 
-  const [activeTab, setActiveTab] = useState('add-members'); // 'add-members' or 'join-leave'
+  const [activeTab, setActiveTab] = useState('add-members');
   const [submitting, setSubmitting] = useState(false);
   const [sessions, setSessions] = useState([]);
   const [targetLists, setTargetLists] = useState([]);
@@ -1445,6 +1785,17 @@ export default function Groups() {
             <LogIn className="w-4 h-4" />
             Join/Leave
           </button>
+          <button
+            onClick={() => setActiveTab('boosts')}
+            className={`flex-1 px-3 sm:px-5 py-3 text-sm font-medium transition flex items-center justify-center gap-2 ${
+              activeTab === 'boosts'
+                ? 'border-b-2 border-amber-400 text-amber-300 bg-amber-400/5'
+                : 'text-gray-400 hover:text-white hover:bg-white/5'
+            }`}
+          >
+            <Zap className="w-4 h-4" />
+            Boosts
+          </button>
         </div>
 
         {/* Tab Content */}
@@ -1456,23 +1807,25 @@ export default function Groups() {
               onSubmit={handleStartAdding}
               submitting={submitting}
             />
-          ) : (
+          ) : activeTab === 'join-leave' ? (
             <JoinLeaveForm
               sessions={sessions}
               onSubmit={handleJoinLeave}
               submitting={submitting}
             />
+          ) : (
+            <BoostsTab />
           )}
         </div>
       </div>
 
       {/* Active Operations Panel */}
-      <div className="rounded-xl border border-white/5 bg-dark-800 p-5">
+      <div className={`rounded-xl border border-white/5 bg-dark-800 p-5 ${activeTab === 'boosts' ? 'hidden' : ''}`}>
         <ActiveOperationsPanel operations={activeOperations} onCancel={handleCancelOperation} />
       </div>
 
       {/* Operations History */}
-      <div className="rounded-xl border border-white/5 bg-dark-800 overflow-hidden">
+      <div className={`rounded-xl border border-white/5 bg-dark-800 overflow-hidden ${activeTab === 'boosts' ? 'hidden' : ''}`}>
         <div className="px-5 py-4 border-b border-white/5">
           <h3 className="text-sm font-semibold text-white flex items-center gap-2">
             <Clock className="w-4 h-4 text-gray-400" />

@@ -13,6 +13,8 @@ import {
   Download,
   FileJson,
   FileArchive,
+  ShieldAlert,
+  Snowflake,
 } from 'lucide-react';
 import { Modal } from './Modal';
 import { useToast } from './Toast';
@@ -230,6 +232,8 @@ export default function SessionListsTab() {
   const [downloadTarget, setDownloadTarget] = useState(null);
   const [downloadFormat, setDownloadFormat] = useState('json');
   const [downloading, setDownloading] = useState(false);
+  const [organiseMenuOpen, setOrganiseMenuOpen] = useState(false);
+  const [organisingStatus, setOrganisingStatus] = useState('');
 
   const fetchLists = useCallback(async () => {
     setLoading(true);
@@ -269,8 +273,27 @@ export default function SessionListsTab() {
   }, [lists, search]);
 
   const onOrganise = () => {
+    setOrganiseMenuOpen(false);
     setEditing(null);
     setModalOpen(true);
+  };
+
+  const onOrganiseSpamStatus = async (status) => {
+    setOrganisingStatus(status);
+    try {
+      const response = await sessionListsAPI.organizeSpamStatus(status);
+      const list = response.data?.data || {};
+      showSuccess(
+        `"${list.name}" refreshed with ${list.matched_count || 0} ${status} session(s).`,
+        'Managed session list ready'
+      );
+      setOrganiseMenuOpen(false);
+      await fetchLists();
+    } catch (err) {
+      showError(parseApiError(err), `Could not organize ${status} sessions`);
+    } finally {
+      setOrganisingStatus('');
+    }
   };
 
   const onEdit = async (list) => {
@@ -358,13 +381,62 @@ export default function SessionListsTab() {
             scraping, privacy, groups, 2FA and OTP.
           </p>
         </div>
-        <button
-          onClick={onOrganise}
-          className="inline-flex items-center gap-2 rounded-lg bg-primary-600 px-4 py-2 text-sm font-medium text-white hover:bg-primary-700"
-        >
-          <Plus className="w-4 h-4" />
-          Organise sessions
-        </button>
+        <div className="relative">
+          <button
+            onClick={() => setOrganiseMenuOpen((value) => !value)}
+            className="inline-flex items-center gap-2 rounded-lg bg-primary-600 px-4 py-2 text-sm font-medium text-white hover:bg-primary-700"
+          >
+            <Plus className="w-4 h-4" />
+            Organise sessions
+          </button>
+          {organiseMenuOpen && (
+            <div className="absolute right-0 top-full z-30 mt-2 w-72 overflow-hidden rounded-xl border border-white/10 bg-dark-800 p-1.5 shadow-2xl">
+              <button
+                type="button"
+                onClick={onOrganise}
+                className="flex w-full items-start gap-3 rounded-lg px-3 py-2.5 text-left hover:bg-white/5"
+              >
+                <Plus className="mt-0.5 h-4 w-4 text-primary-400" />
+                <span>
+                  <span className="block text-sm font-medium text-white">Custom session list</span>
+                  <span className="block text-xs text-gray-500">Choose the sessions manually.</span>
+                </span>
+              </button>
+              <button
+                type="button"
+                onClick={() => onOrganiseSpamStatus('limited')}
+                disabled={Boolean(organisingStatus)}
+                className="flex w-full items-start gap-3 rounded-lg px-3 py-2.5 text-left hover:bg-amber-500/10 disabled:opacity-50"
+              >
+                {organisingStatus === 'limited' ? (
+                  <Loader2 className="mt-0.5 h-4 w-4 animate-spin text-amber-400" />
+                ) : (
+                  <ShieldAlert className="mt-0.5 h-4 w-4 text-amber-400" />
+                )}
+                <span>
+                  <span className="block text-sm font-medium text-white">Organise all Limited</span>
+                  <span className="block text-xs text-gray-500">Create or refresh the database-authoritative Limited list.</span>
+                </span>
+              </button>
+              <button
+                type="button"
+                onClick={() => onOrganiseSpamStatus('frozen')}
+                disabled={Boolean(organisingStatus)}
+                className="flex w-full items-start gap-3 rounded-lg px-3 py-2.5 text-left hover:bg-cyan-500/10 disabled:opacity-50"
+              >
+                {organisingStatus === 'frozen' ? (
+                  <Loader2 className="mt-0.5 h-4 w-4 animate-spin text-cyan-400" />
+                ) : (
+                  <Snowflake className="mt-0.5 h-4 w-4 text-cyan-400" />
+                )}
+                <span>
+                  <span className="block text-sm font-medium text-white">Organise all Frozen</span>
+                  <span className="block text-xs text-gray-500">Create or refresh the database-authoritative Frozen list.</span>
+                </span>
+              </button>
+            </div>
+          )}
+        </div>
       </div>
 
       <div className="rounded-xl border border-white/5 bg-dark-800">

@@ -52,6 +52,7 @@ export default function SessionListSwitcher({
   onSelectedSessionListIdsChange,
   className = '',
   disabled = false,
+  listOnly = false,
 }) {
   // Normalized array of currently-selected list ids, whether the parent
   // drives us in single or multiple mode.
@@ -164,6 +165,7 @@ export default function SessionListSwitcher({
   return (
     <div className={`space-y-3 ${className}`}>
       {/* Mode switch (Pick sessions / Use session list) */}
+      {!listOnly && (
       <div className="grid grid-cols-2 gap-2 rounded-xl border border-white/10 bg-dark-900 p-1">
         <button
           type="button"
@@ -194,8 +196,9 @@ export default function SessionListSwitcher({
           {multiple ? 'Use session lists' : 'Use session list'}
         </button>
       </div>
+      )}
 
-      {mode === 'list' && (
+      {(listOnly || mode === 'list') && (
         <div className="rounded-xl border border-white/10 bg-dark-900 overflow-hidden">
           {/* Toolbar */}
           <div className="flex items-center gap-2 px-3 py-2 border-b border-white/5">

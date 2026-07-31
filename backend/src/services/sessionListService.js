@@ -20,7 +20,7 @@ const logger = require('../utils/logger');
 const VALID_PLATFORMS = new Set(['telegram', 'instagram']);
 const MAX_LIST_NAME_LENGTH = 255;
 const MAX_LIST_DESCRIPTION_LENGTH = 1000;
-const MAX_SESSIONS_PER_LIST = 500;
+const MAX_SESSIONS_PER_LIST = 10000;
 
 function _normPlatform(platform) {
   const p = String(platform || 'telegram').toLowerCase();
@@ -166,7 +166,7 @@ async function listLists({ userId, platform = null, search = null }) {
     where += ` AND lower(sl.name) LIKE $${params.length}`;
   }
   const r = await pool.query(
-    `SELECT sl.id, sl.user_id, sl.platform, sl.name, sl.description,
+    `SELECT sl.id, sl.user_id, sl.platform, sl.name, sl.description, sl.system_key,
             sl.created_at, sl.updated_at,
             COALESCE(m.cnt, 0)::int AS session_count
        FROM session_lists sl
@@ -184,7 +184,7 @@ async function listLists({ userId, platform = null, search = null }) {
 
 async function getList({ userId, listId }) {
   const r = await pool.query(
-    `SELECT sl.id, sl.user_id, sl.platform, sl.name, sl.description,
+    `SELECT sl.id, sl.user_id, sl.platform, sl.name, sl.description, sl.system_key,
             sl.created_at, sl.updated_at,
             COALESCE(m.cnt, 0)::int AS session_count
        FROM session_lists sl
@@ -205,7 +205,7 @@ async function getList({ userId, listId }) {
 /**
  * Return all session rows that belong to the list (joined onto sessions).
  */
-async function getListSessions({ userId, listId, includeAll = false }) {
+async function getListSessions({ userId, listId, includeAll = false, includeFrozen = true }) {
   await getList({ userId, listId }); // owner check
   // includeAll=false (default) hides logged-out / dead sessions so the
   // resolver returns a clean list to the bulk-action controllers.
@@ -217,10 +217,16 @@ async function getListSessions({ userId, listId, includeAll = false }) {
       AND COALESCE(s.warmup_state->>'state', 'active') NOT IN ('dead')
     `;
   }
+  if (!includeFrozen) {
+    extra += `
+      AND COALESCE(s.spam_status, 'unknown') <> 'frozen'
+    `;
+  }
   const r = await pool.query(
     `SELECT s.id, s.user_id, s.platform, s.username, s.phone,
-            s.status, s.is_logged_in, s.is_2fa_enabled,
-            s.account_info, s.warmup_state, m.added_at
+             s.status, s.is_logged_in, s.is_2fa_enabled,
+             s.account_info, s.warmup_state, s.spam_status,
+             s.spam_limit_until, m.added_at
        FROM session_list_members m
        JOIN sessions s ON s.id = m.session_id
        WHERE m.list_id = $1
@@ -282,6 +288,112 @@ async function deleteList({ userId, listId }) {
   }
   logger.info(`SessionList deleted id=${listId} user=${userId}`);
   return { id: listId };
+}
+
+/**
+ * Create or refresh a managed Telegram session list from the persisted
+ * @SpamBot status. This intentionally includes logged-out rows: the list is an
+ * organizational mirror of the Sessions database, not an operation-specific
+ * runnable-session filter.
+ */
+async function organizeBySpamStatus({ userId, status }) {
+  const normalized = String(status || '').toLowerCase();
+  if (!['limited', 'frozen'].includes(normalized)) {
+    throw new AppError('Status must be limited or frozen', 400, 'INVALID_SPAM_STATUS');
+  }
+
+  const systemKey = `spam_status:${normalized}`;
+  const baseName = normalized === 'limited'
+    ? 'All Limited Sessions'
+    : 'All Frozen Sessions';
+  const description = normalized === 'limited'
+    ? 'Managed list of every Telegram session currently marked Limited by @SpamBot.'
+    : 'Managed list of every Telegram session currently marked Frozen by @SpamBot.';
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const sessionsResult = await client.query(
+      `SELECT id FROM sessions
+        WHERE user_id = $1
+          AND platform = 'telegram'
+          AND COALESCE(spam_status, 'unknown') = $2
+        ORDER BY id ASC`,
+      [userId, normalized]
+    );
+    const sessionIds = sessionsResult.rows.map((row) => Number(row.id));
+    if (sessionIds.length > MAX_SESSIONS_PER_LIST) {
+      throw new AppError(
+        `Cannot organize ${sessionIds.length} sessions because a session list supports at most ${MAX_SESSIONS_PER_LIST}`,
+        400,
+        'TOO_MANY_SESSIONS'
+      );
+    }
+
+    const existing = await client.query(
+      `SELECT id FROM session_lists
+        WHERE user_id = $1
+          AND platform = 'telegram'
+          AND system_key = $2
+        ORDER BY id ASC
+        LIMIT 1
+        FOR UPDATE`,
+      [userId, systemKey]
+    );
+
+    let listId;
+    if (existing.rows[0]) {
+      listId = Number(existing.rows[0].id);
+      await client.query(
+        `UPDATE session_lists
+            SET description = $2, updated_at = NOW()
+          WHERE id = $1`,
+        [listId, description]
+      );
+    } else {
+      const nameRows = await client.query(
+        `SELECT lower(name) AS name FROM session_lists
+          WHERE user_id = $1 AND platform = 'telegram'`,
+        [userId]
+      );
+      const usedNames = new Set(nameRows.rows.map((row) => row.name));
+      let name = baseName;
+      let suffix = 1;
+      while (usedNames.has(name.toLowerCase())) {
+        name = `${baseName} (Managed${suffix === 1 ? '' : ` ${suffix}`})`;
+        suffix++;
+      }
+      const inserted = await client.query(
+        `INSERT INTO session_lists (
+           user_id, platform, name, description, system_key, created_at, updated_at
+         ) VALUES ($1, 'telegram', $2, $3, $4, NOW(), NOW())
+         RETURNING id`,
+        [userId, name, description, systemKey]
+      );
+      listId = Number(inserted.rows[0].id);
+    }
+
+    await client.query('DELETE FROM session_list_members WHERE list_id = $1', [listId]);
+    if (sessionIds.length > 0) {
+      await client.query(
+        `INSERT INTO session_list_members (list_id, session_id)
+         SELECT $1, id FROM UNNEST($2::int[]) AS input(id)
+         ON CONFLICT DO NOTHING`,
+        [listId, sessionIds]
+      );
+    }
+    await client.query('COMMIT');
+    return {
+      ...(await getList({ userId, listId })),
+      matched_count: sessionIds.length,
+      managed_status: normalized,
+    };
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => {});
+    throw error;
+  } finally {
+    client.release();
+  }
 }
 
 async function addSessions({ userId, listId, sessionIds }) {
@@ -403,7 +515,7 @@ async function setSessions({ userId, listId, sessionIds }) {
  * @returns {Promise<number[]>}
  * @private
  */
-async function _resolveOneList({ userId, platform, listId, includeAll }) {
+async function _resolveOneList({ userId, platform, listId, includeAll, includeFrozen }) {
   const id = Number(listId);
   if (!Number.isFinite(id) || id <= 0) {
     throw new AppError('Invalid sessionListId', 400, 'INVALID_LIST_ID');
@@ -416,7 +528,7 @@ async function _resolveOneList({ userId, platform, listId, includeAll }) {
       'PLATFORM_MISMATCH'
     );
   }
-  const rows = await getListSessions({ userId, listId: id, includeAll });
+  const rows = await getListSessions({ userId, listId: id, includeAll, includeFrozen });
   const ids = rows.map((r) => Number(r.id));
   return { name: list.name, ids };
 }
@@ -440,6 +552,7 @@ async function resolveSessionIds({
   sessionListId,
   sessionListIds,
   includeAll = false,
+  includeFrozen = false,
 }) {
   // Gather every requested list id (singular + plural), de-duplicated,
   // preserving the order the operator picked them in.
@@ -462,7 +575,9 @@ async function resolveSessionIds({
     const emptyNames = [];
     for (const id of listIds) {
       // eslint-disable-next-line no-await-in-loop
-      const { name, ids } = await _resolveOneList({ userId, platform, listId: id, includeAll });
+      const { name, ids } = await _resolveOneList({
+        userId, platform, listId: id, includeAll, includeFrozen,
+      });
       if (ids.length === 0) {
         emptyNames.push(name || `#${id}`);
         continue;
@@ -485,10 +600,21 @@ async function resolveSessionIds({
     return union;
   }
 
-  // No list → trust caller's sessionIds. (Ownership is enforced by the
-  // downstream service when it loads the rows.)
+  // Explicit IDs follow the same frozen-session rule as list-backed IDs.
+  // Ownership is also checked here because the filter already needs the DB.
   if (!Array.isArray(sessionIds) || sessionIds.length === 0) return [];
-  return sessionIds.map((x) => Number(x)).filter((n) => Number.isFinite(n) && n > 0);
+  const ids = sessionIds.map((x) => Number(x)).filter((n) => Number.isFinite(n) && n > 0);
+  if (includeFrozen || _normPlatform(platform) !== 'telegram') return ids;
+  const { rows } = await pool.query(
+    `SELECT id FROM sessions
+      WHERE id = ANY($1::int[])
+        AND user_id = $2
+        AND platform = 'telegram'
+        AND COALESCE(spam_status, 'unknown') <> 'frozen'`,
+    [ids, userId]
+  );
+  const usable = new Set(rows.map((row) => Number(row.id)));
+  return ids.filter((id) => usable.has(id));
 }
 
 module.exports = {
@@ -501,6 +627,7 @@ module.exports = {
   addSessions,
   removeSessions,
   setSessions,
+  organizeBySpamStatus,
   resolveSessionIds,
   MAX_SESSIONS_PER_LIST,
 };

@@ -1,0 +1,132 @@
+name: web-pannel-staging
+
+services:
+  staging-postgres:
+    image: postgres:15
+    environment:
+      POSTGRES_DB: ${STAGING_POSTGRES_DB:-telegram_panel_staging}
+      POSTGRES_USER: ${STAGING_POSTGRES_USER:-staging_panel}
+      POSTGRES_PASSWORD: ${STAGING_POSTGRES_PASSWORD:?Set STAGING_POSTGRES_PASSWORD in the staging Compose env file}
+    volumes:
+      - staging_postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+    networks:
+      - staging-data
+
+  staging-redis:
+    image: redis:7-alpine
+    environment:
+      REDIS_PASSWORD: ${STAGING_REDIS_PASSWORD:?Set STAGING_REDIS_PASSWORD in the staging Compose env file}
+    command: ["sh", "-c", "exec redis-server --appendonly yes --requirepass \"$$REDIS_PASSWORD\""]
+    volumes:
+      - staging_redis_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "REDISCLI_AUTH=\"$${REDIS_PASSWORD}\" redis-cli ping | grep -q PONG"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+    networks:
+      - staging-data
+
+  staging-backend:
+    build:
+      context: ./backend
+      args:
+        GIT_SHA: ${STAGING_GIT_SHA:-dev}
+        GIT_REF: ${STAGING_GIT_REF:-unknown}
+        BUILD_TIME: ${STAGING_BUILD_TIME:-unknown}
+        IMAGE_TAG: ${STAGING_IMAGE_TAG:-dev}
+    env_file:
+      - ${STAGING_BACKEND_ENV_FILE:-./backend/.env.staging}
+    environment:
+      DEPLOY_ENV: staging
+      DEPLOY_COLOR: staging
+      ALLOW_TEST_EXTERNAL_ACCOUNTS: "true"
+      DB_HOST: staging-postgres
+      DB_PORT: "5432"
+      DB_NAME: ${STAGING_POSTGRES_DB:-telegram_panel_staging}
+      DB_USER: ${STAGING_POSTGRES_USER:-staging_panel}
+      DB_PASSWORD: ${STAGING_POSTGRES_PASSWORD:?Set STAGING_POSTGRES_PASSWORD in the staging Compose env file}
+      REDIS_HOST: staging-redis
+      REDIS_PORT: "6379"
+      REDIS_PASSWORD: ${STAGING_REDIS_PASSWORD:?Set STAGING_REDIS_PASSWORD in the staging Compose env file}
+      FRONTEND_URL: ${STAGING_FRONTEND_URL:-http://127.0.0.1:8080}
+      UPLOAD_DIR: /app/uploads
+      UPLOAD_DIR_ABS: /app/uploads
+      LOG_FILE: /app/logs/app.log
+      GIT_SHA: ${STAGING_GIT_SHA:-dev}
+      GIT_REF: ${STAGING_GIT_REF:-unknown}
+      BUILD_TIME: ${STAGING_BUILD_TIME:-unknown}
+      IMAGE_TAG: ${STAGING_IMAGE_TAG:-dev}
+    depends_on:
+      staging-postgres:
+        condition: service_healthy
+      staging-redis:
+        condition: service_healthy
+    volumes:
+      - staging_uploads_data:/app/uploads
+      - staging_logs_data:/app/logs
+      - staging_sessions_data:/app/sessions
+    healthcheck:
+      test: ["CMD", "node", "-e", "require('http').get('http://127.0.0.1:3005/health',r=>process.exit(r.statusCode===200?0:1)).on('error',()=>process.exit(1))"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+    networks:
+      - staging-app
+      - staging-data
+
+  staging-frontend:
+    build:
+      context: ./frontend
+      args:
+        GIT_SHA: ${STAGING_GIT_SHA:-dev}
+        BUILD_TIME: ${STAGING_BUILD_TIME:-unknown}
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider --tries=1 --timeout=2 http://127.0.0.1:83/ || exit 1"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+    networks:
+      - staging-app
+
+  staging-gateway:
+    image: caddy:2.7-alpine
+    ports:
+      - "${STAGING_GATEWAY_BIND:-127.0.0.1}:${STAGING_GATEWAY_PORT:-8080}:80"
+    volumes:
+      - ./proxy/Caddyfile.staging:/etc/caddy/Caddyfile:ro
+      - staging_caddy_data:/data
+      - staging_caddy_config:/config
+    depends_on:
+      staging-backend:
+        condition: service_healthy
+      staging-frontend:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - staging-app
+
+volumes:
+  staging_postgres_data:
+  staging_redis_data:
+  staging_uploads_data:
+  staging_logs_data:
+  staging_sessions_data:
+  staging_caddy_data:
+  staging_caddy_config:
+
+networks:
+  staging-app:
+  staging-data:
+    internal: true

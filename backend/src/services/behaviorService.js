@@ -387,9 +387,10 @@ class BehaviorService {
       `SELECT id, user_id, phone, is_logged_in, created_at, last_warmup_at,
               device_identity, bound_proxy_id
          FROM sessions
-        WHERE is_logged_in = TRUE
-          AND COALESCE(keep_alive, TRUE) = TRUE
-          AND platform = 'telegram'
+         WHERE is_logged_in = TRUE
+           AND COALESCE(keep_alive, TRUE) = TRUE
+           AND platform = 'telegram'
+           AND COALESCE(spam_status, 'unknown') <> 'frozen'
           AND (last_warmup_at IS NULL OR last_warmup_at < NOW() - ($1::int * INTERVAL '1 millisecond'))
         ORDER BY COALESCE(last_warmup_at, TIMESTAMP 'epoch') ASC, id ASC
         LIMIT $2`,
@@ -410,7 +411,8 @@ class BehaviorService {
     const r = await pool.query(
       `SELECT id, user_id, phone, is_logged_in, created_at, last_warmup_at,
               device_identity, bound_proxy_id
-         FROM sessions WHERE id = ANY($1::int[])`,
+         FROM sessions WHERE id = ANY($1::int[])
+           AND COALESCE(spam_status, 'unknown') <> 'frozen'`,
       [ids.map((x) => Number(x)).filter(Boolean)]
     );
     return r.rows;
@@ -420,7 +422,8 @@ class BehaviorService {
     const r = await pool.query(
       `SELECT id, user_id, phone, is_logged_in, created_at, last_warmup_at,
               device_identity, bound_proxy_id
-         FROM sessions WHERE id = $1`,
+         FROM sessions WHERE id = $1
+           AND COALESCE(spam_status, 'unknown') <> 'frozen'`,
       [sessionId]
     );
     return r.rows[0] || null;

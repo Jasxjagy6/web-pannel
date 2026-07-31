@@ -12,12 +12,20 @@ const express = require('express');
 const router = express.Router();
 const ctrl = require('../controllers/userProxyController');
 const { authenticate, requireApproved } = require('../middleware/auth');
+const multer = require('multer');
+
+const proxyUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 25 * 1024 * 1024, files: 1 },
+});
 
 router.use(authenticate);
 router.use(requireApproved('byo_proxy'));
 
 router.get('/', ctrl.list);
 router.post('/', ctrl.add);
+router.post('/import', proxyUpload.single('file'), ctrl.import);
+router.post('/recheck', ctrl.recheckAll);
 router.patch('/:id', ctrl.update);
 router.post('/:id/test', ctrl.test);
 router.post('/:id/bind/:sessionId', ctrl.bind);

@@ -294,6 +294,7 @@ const aiChatController = {
     let isValid = false;
     let modelId = null;
     let presetId = null;
+    let responseLanguage = 'English';
 
     try {
       const result = await capitalbotService.getAccessToken(userId);
@@ -301,6 +302,7 @@ const aiChatController = {
       isValid = result.isValid;
       modelId = result.modelId;
       presetId = result.presetId;
+      responseLanguage = result.responseLanguage || 'English';
     } catch {
       hasKey = false;
       isValid = false;
@@ -308,7 +310,7 @@ const aiChatController = {
 
     res.json({
       success: true,
-      data: { hasKey, isValid, isAdmin, modelId, presetId, configuredInEnv: !!process.env.CAPITALBOT_ACCESS_TOKEN },
+      data: { hasKey, isValid, isAdmin, modelId, presetId, responseLanguage, configuredInEnv: !!process.env.CAPITALBOT_ACCESS_TOKEN },
     });
   }),
 
@@ -317,11 +319,11 @@ const aiChatController = {
    */
   setCapitalbotKey: asyncHandler(async (req, res) => {
     const userId = req.user.id;
-    const { apiKey, modelId, presetId } = req.body || {};
+    const { apiKey, modelId, presetId, responseLanguage } = req.body || {};
     if (typeof apiKey !== 'string' || !apiKey.trim()) {
       throw new AppError('apiKey is required', 400, 'MISSING_API_KEY');
     }
-    const result = await capitalbotService.setUserApiKey(userId, apiKey.trim(), modelId, presetId);
+    const result = await capitalbotService.setUserApiKey(userId, apiKey.trim(), modelId, presetId, responseLanguage);
     if (!result.isValid) {
       throw new AppError('Invalid CapitalBot license key', 400, 'INVALID_CAPITALBOT_KEY');
     }
@@ -335,12 +337,16 @@ const aiChatController = {
    */
   updateCapitalbotModelPreset: asyncHandler(async (req, res) => {
     const userId = req.user.id;
-    const { modelId, presetId } = req.body || {};
+    const { modelId, presetId, responseLanguage } = req.body || {};
     if (modelId == null || presetId == null) {
       throw new AppError('modelId and presetId are required', 400, 'MISSING_MODEL_PRESET');
     }
-    const result = await capitalbotService.updateModelPreset(userId, modelId, presetId);
-    logger.info(`CapitalBot model/preset updated`, { userId, modelId, presetId });
+    const result = await capitalbotService.updateModelPreset(userId, modelId, presetId, responseLanguage);
+    // If language changed, update all active sessions for this user
+    if (responseLanguage) {
+      await aiChatService.updateLanguageForUserSessions(userId, responseLanguage);
+    }
+    logger.info(`CapitalBot model/preset updated`, { userId, modelId, presetId, responseLanguage });
     res.json({ success: true, data: result });
   }),
 

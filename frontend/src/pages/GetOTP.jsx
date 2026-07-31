@@ -262,6 +262,7 @@ export default function GetOTP() {
               )}
               {filtered.map((s) => {
                 const sel = selectedIds.includes(s.id);
+                const frozen = String(s.spamStatus || s.spam_status || '').toLowerCase() === 'frozen';
                 return (
                   <button
                     key={s.id}
@@ -276,7 +277,14 @@ export default function GetOTP() {
                       {sel && <CheckCircle2 className="w-4 h-4 text-white" />}
                     </span>
                     <div className="flex-1 min-w-0">
-                      <div className="text-sm font-medium text-white truncate">{s.phone}</div>
+                      <div className="flex items-center gap-2 text-sm font-medium text-white">
+                        <span className="truncate">{s.phone}</span>
+                        {frozen && (
+                          <span className="shrink-0 rounded-full border border-red-500/30 bg-red-500/15 px-2 py-0.5 text-[10px] font-semibold text-red-300">
+                            Frozen · OTP allowed
+                          </span>
+                        )}
+                      </div>
                       <div className="text-xs text-gray-500 truncate">
                         {(s.account_info?.firstName || '') + ' ' + (s.account_info?.lastName || '')}
                         {s.account_info?.username && <span className="ml-2">@{s.account_info.username}</span>}

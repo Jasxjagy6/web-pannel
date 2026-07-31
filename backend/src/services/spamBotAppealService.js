@@ -32,6 +32,7 @@ const crypto = require('crypto');
 const { pool } = require('../config/database');
 const logger = require('../utils/logger');
 const tgService = require('./telegramService');
+const spamStatusService = require('./sessionSpamStatusService');
 
 const jobs = new Map();
 
@@ -59,6 +60,24 @@ const CLEAN_PATTERNS = [
   /no restrictions/i,
 ];
 
+// The operator supplied @SpamBot's exact permanent-block reply. Telegram's
+// UI calls these accounts frozen, so this full response is authoritative.
+const FROZEN_PATTERNS = [
+  /^\s*Your account was blocked for violations of the Telegram Terms of Service based on user reports confirmed by our moderators\.\s*$/i,
+  /\b(?:your|this|the) account (?:is|was|has been) frozen\b/i,
+  /\baccount freeze(?:n|d)?\b/i,
+];
+
+// Temporary or indefinite cold-DM limits. These accounts remain enabled for
+// every feature except bulk/mass DM operations.
+const LIMITED_PATTERNS = [
+  /account is now limited until/i,
+  /account is limited/i,
+  /while the account is limited/i,
+  /anti-spam systems/i,
+  /not be able to send messages to people/i,
+];
+
 // Phrases that mean the appeal was accepted / already pending.
 const DONE_PATTERNS = [
   /your (complaint|request) (has|will)/i,
@@ -80,6 +99,40 @@ function _sleep(ms) {
 function _matchAny(text, patterns) {
   if (!text) return false;
   return patterns.some((re) => re.test(text));
+}
+
+function classifySpamBotReply(text) {
+  if (_matchAny(text, CLEAN_PATTERNS)) return 'clean';
+  if (_matchAny(text, FROZEN_PATTERNS)) return 'frozen';
+  if (_matchAny(text, LIMITED_PATTERNS)) return 'limited';
+  return 'unknown';
+}
+
+function parseSpamLimitUntil(text) {
+  const match = String(text || '').match(
+    /(?:limited until|automatically released on)\s+(\d{1,2})\s+([A-Za-z]{3})\s+(\d{4}),\s+(\d{1,2}):(\d{2})\s+UTC/i
+  );
+  if (!match) return null;
+
+  const months = {
+    jan: 0, feb: 1, mar: 2, apr: 3, may: 4, jun: 5,
+    jul: 6, aug: 7, sep: 8, oct: 9, nov: 10, dec: 11,
+  };
+  const month = months[match[2].toLowerCase()];
+  if (month == null) return null;
+
+  const value = new Date(Date.UTC(
+    Number(match[3]), month, Number(match[1]), Number(match[4]), Number(match[5]), 0
+  ));
+  if (Number.isNaN(value.getTime())) return null;
+  if (
+    value.getUTCFullYear() !== Number(match[3]) ||
+    value.getUTCMonth() !== month ||
+    value.getUTCDate() !== Number(match[1]) ||
+    value.getUTCHours() !== Number(match[4]) ||
+    value.getUTCMinutes() !== Number(match[5])
+  ) return null;
+  return value;
 }
 
 /**
@@ -147,7 +200,8 @@ async function _appealOne(job, sess) {
 
   try {
     sess.status = 'checking';
-    await tgService._ensureConnected(sid);
+    sess.classification = await spamStatusService.getStatus(sid);
+    await tgService._ensureConnected(sid, { allowFrozen: true });
     const client = tgService.clients.get(sid)?.client;
     if (!client) throw new Error('client not available');
 
@@ -162,7 +216,7 @@ async function _appealOne(job, sess) {
     } catch { /* ignore */ }
 
     // Step 1 — /start
-    await tgService.sendMessage(sid, SPAMBOT, '/start');
+    await tgService.sendMessage(sid, SPAMBOT, '/start', { allowFrozen: true });
     pushTranscript('me', '/start');
 
     let reply = await _readBotReply(sid, entity, lastSeen);
@@ -174,13 +228,33 @@ async function _appealOne(job, sess) {
     lastSeen = reply.msgId || lastSeen;
     pushTranscript('spambot', reply.text);
 
+    const classification = classifySpamBotReply(reply.text);
+    sess.classification = classification;
+
     // Clean account → nothing to appeal.
-    if (_matchAny(reply.text, CLEAN_PATTERNS)) {
+    if (classification === 'clean') {
+      await spamStatusService.recordStatus(sid, classification, reply.text);
       sess.status = 'no_restriction';
       return;
     }
 
-    // Restricted → walk the reply-keyboard appeal flow.
+    // Persist the exact classification. Unknown wording remains unknown and
+    // never blocks work; the raw reply remains visible for review.
+    const limitUntil = classification === 'limited' ? parseSpamLimitUntil(reply.text) : null;
+    await spamStatusService.recordStatus(sid, classification, reply.text, { limitUntil });
+    sess.limitUntil = limitUntil ? limitUntil.toISOString() : null;
+    if (job.mode === 'check') {
+      sess.status = classification === 'clean' ? 'no_restriction' : classification;
+      return;
+    }
+
+    if (classification === 'unknown') {
+      sess.status = 'inconclusive';
+      sess.error = 'Unrecognized @SpamBot response; status was not treated as frozen';
+      return;
+    }
+
+    // Appeal mode: walk the reply-keyboard appeal flow.
     sess.status = 'appealing';
     let steps = 0;
     while (steps < MAX_APPEAL_STEPS) {
@@ -207,7 +281,7 @@ async function _appealOne(job, sess) {
       }
 
       await _sleep(STEP_DELAY_MS);
-      await tgService.sendMessage(sid, SPAMBOT, toSend);
+      await tgService.sendMessage(sid, SPAMBOT, toSend, { allowFrozen: true });
       pushTranscript('me', toSend);
 
       reply = await _readBotReply(sid, entity, lastSeen);
@@ -228,6 +302,9 @@ async function _appealOne(job, sess) {
         return;
       }
       if (_matchAny(reply.text, CLEAN_PATTERNS)) {
+        await spamStatusService.recordStatus(sid, 'clean', reply.text);
+        sess.classification = 'clean';
+        sess.limitUntil = null;
         sess.status = 'no_restriction';
         return;
       }
@@ -239,6 +316,28 @@ async function _appealOne(job, sess) {
     sess.status = 'failed';
     sess.error = (err && err.message) ? err.message.slice(0, 200) : 'appeal failed';
     logger.warn(`spamAppeal: session ${sess.sessionId} failed: ${sess.error}`);
+  } finally {
+    // Detach prohibited background listeners before dropping the client.
+    // Get OTP is the one allowed passive exception and is reattached below.
+    try {
+      await require('./aiSessionManager').detach(sid);
+    } catch { /* best-effort */ }
+    try {
+      await require('./otpRelayService').onSessionDisconnected(sid);
+    } catch { /* best-effort */ }
+    await tgService.disconnectSession(sid).catch(() => {});
+    try {
+      await require('./otpService').refreshSessionListeners(sid);
+    } catch { /* best-effort */ }
+    if (sess.classification !== 'frozen') {
+      try {
+        await require('./otpRelayService').onSessionConnected(sid);
+      } catch { /* best-effort */ }
+      try {
+        const aiSettings = await require('./aiChatService').getSessionSettings(sid);
+        if (aiSettings.enabled) await require('./aiSessionManager').attach(sid);
+      } catch { /* best-effort */ }
+    }
   }
 }
 
@@ -262,6 +361,7 @@ function publicJobView(job) {
   return {
     jobId: job.id,
     userId: job.userId,
+    mode: job.mode,
     status: job.status,
     startedAt: job.startedAt,
     finishedAt: job.finishedAt,
@@ -271,6 +371,9 @@ function publicJobView(job) {
       total: job.sessions.length,
       appealed: job.sessions.filter((s) => s.status === 'appealed').length,
       clean: job.sessions.filter((s) => s.status === 'no_restriction').length,
+      limited: job.sessions.filter((s) => s.status === 'limited').length,
+      frozen: job.sessions.filter((s) => s.status === 'frozen').length,
+      inconclusive: job.sessions.filter((s) => s.status === 'unknown' || s.status === 'inconclusive').length,
       failed: job.sessions.filter((s) => s.status === 'failed').length,
       cancelled: job.sessions.filter((s) => s.status === 'cancelled').length,
       pending: job.sessions.filter((s) =>
@@ -283,6 +386,7 @@ function publicJobView(job) {
       label: s.label,
       status: s.status,
       error: s.error || null,
+      limitUntil: s.limitUntil || null,
       transcript: s.transcript.slice(-8),
     })),
   };
@@ -293,6 +397,14 @@ function publicJobView(job) {
  * @param {{ userId:number, sessionIds:number[], interSessionDelayMs?:number }} params
  */
 async function startAppealJob(params) {
+  return startJob(params, 'appeal');
+}
+
+async function startStatusCheckJob(params) {
+  return startJob(params, 'check');
+}
+
+async function startJob(params, mode) {
   const { userId, sessionIds, interSessionDelayMs } = params || {};
   if (!userId) throw new Error('userId required');
   if (!Array.isArray(sessionIds) || sessionIds.length === 0) {
@@ -320,6 +432,7 @@ async function startAppealJob(params) {
   const job = {
     id: jobId,
     userId,
+    mode,
     status: 'running',
     startedAt: new Date().toISOString(),
     finishedAt: null,
@@ -356,7 +469,7 @@ async function startAppealJob(params) {
     );
   });
 
-  return { jobId, total: job.sessions.length };
+  return { jobId, total: job.sessions.length, mode };
 }
 
 function getJobStatus(jobId, userId) {
@@ -375,6 +488,9 @@ function cancelJob(jobId, userId) {
 
 module.exports = {
   startAppealJob,
+  startStatusCheckJob,
+  classifySpamBotReply,
+  parseSpamLimitUntil,
   getJobStatus,
   cancelJob,
   _jobs: jobs,

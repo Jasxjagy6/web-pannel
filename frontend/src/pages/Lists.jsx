@@ -22,12 +22,15 @@ import {
   Layers,
   Send,
   Wand2,
+  ShieldCheck,
 } from 'lucide-react';
 import { Modal } from '../components/common/Modal';
 import { useToast } from '../components/common/Toast';
 import { listsAPI } from '@/api';
 import { parseApiError, formatNumber, formatDate, formatRelativeTime, exportToFile } from '@/utils/formatters';
 import SessionListsTab from '../components/common/SessionListsTab';
+import UsernameValidationTab from '../components/common/UsernameValidationTab';
+import { usePlatform } from '../context/PlatformContext';
 
 function TypeBadge({ type }) {
   const config = {
@@ -80,6 +83,7 @@ function ConfirmDialog({ isOpen, onClose, onConfirm, title, message, confirmLabe
 
 export default function Lists() {
   const navigate = useNavigate();
+  const { platform } = usePlatform();
   const { error: showError, success: showSuccess } = useToast();
 
   const [lists, setLists] = useState([]);
@@ -350,7 +354,32 @@ export default function Lists() {
     );
   };
 
-  const [tab, setTab] = useState('user'); // 'user' or 'session'
+  const [tab, setTab] = useState('user'); // 'user', 'session', or 'validate'
+
+  useEffect(() => {
+    if (platform !== 'telegram' && tab === 'validate') setTab('user');
+  }, [platform, tab]);
+
+  if (platform === 'telegram' && tab === 'validate') {
+    return (
+      <div className="space-y-6">
+        <div>
+          <h1 className="text-2xl font-bold tracking-tight text-white">Lists</h1>
+          <p className="mt-1 text-sm text-gray-400">
+            Validate imported usernames against Telegram without sending messages.
+          </p>
+        </div>
+        <div className="border-b border-white/10 flex gap-1 overflow-x-auto">
+          <button onClick={() => setTab('user')} className="whitespace-nowrap px-4 py-2 text-sm font-medium text-gray-400 hover:text-white border-b-2 border-transparent">User lists</button>
+          <button onClick={() => setTab('session')} className="whitespace-nowrap px-4 py-2 text-sm font-medium text-gray-400 hover:text-white border-b-2 border-transparent">Session lists</button>
+          <button onClick={() => setTab('validate')} className="inline-flex whitespace-nowrap items-center gap-2 px-4 py-2 text-sm font-medium text-white border-b-2 border-cyan-500">
+            <ShieldCheck className="h-4 w-4" /> Validate usernames
+          </button>
+        </div>
+        <UsernameValidationTab onListsChanged={fetchLists} />
+      </div>
+    );
+  }
 
   if (tab === 'session') {
     return (
@@ -361,7 +390,7 @@ export default function Lists() {
             Switch between your contact lists (imported users / groups / channels) and session lists (named groupings of your Telegram sessions).
           </p>
         </div>
-        <div className="border-b border-white/10 flex gap-1">
+        <div className="border-b border-white/10 flex gap-1 overflow-x-auto">
           <button
             onClick={() => setTab('user')}
             className="px-4 py-2 text-sm font-medium text-gray-400 hover:text-white border-b-2 border-transparent"
@@ -374,6 +403,14 @@ export default function Lists() {
           >
             Session lists
           </button>
+          {platform === 'telegram' && (
+            <button
+              onClick={() => setTab('validate')}
+              className="inline-flex whitespace-nowrap items-center gap-2 px-4 py-2 text-sm font-medium text-gray-400 hover:text-white border-b-2 border-transparent"
+            >
+              <ShieldCheck className="h-4 w-4" /> Validate usernames
+            </button>
+          )}
         </div>
         <SessionListsTab />
       </div>
@@ -423,7 +460,7 @@ export default function Lists() {
       </div>
 
       {/* Tabs: User Lists vs Session Lists */}
-      <div className="border-b border-white/10 flex gap-1">
+      <div className="border-b border-white/10 flex gap-1 overflow-x-auto">
         <button
           onClick={() => setTab('user')}
           className="px-4 py-2 text-sm font-medium text-white border-b-2 border-primary-500"
@@ -436,6 +473,14 @@ export default function Lists() {
         >
           Session lists
         </button>
+        {platform === 'telegram' && (
+          <button
+            onClick={() => setTab('validate')}
+            className="inline-flex whitespace-nowrap items-center gap-2 px-4 py-2 text-sm font-medium text-gray-400 hover:text-white border-b-2 border-transparent"
+          >
+            <ShieldCheck className="h-4 w-4" /> Validate usernames
+          </button>
+        )}
       </div>
 
       {/* Lists Table */}

@@ -19,6 +19,7 @@ const telegramConfig = require('../config/telegram');
 const { encrypt, decrypt } = require('../utils/crypto');
 const fingerprint = require('../utils/deviceFingerprint');
 const sessionLock = require('./sessionOwnershipLock');
+const sessionSpamStatus = require('./sessionSpamStatusService');
 
 // 1000+ session scale-out: optional Redis-backed mutex over the
 // MTProto auth_key. With STRICT_SESSION_LOCK=true, two processes
@@ -479,6 +480,9 @@ class TelegramService {
    */
   async createSession(sessionId, sessionFile, apiId, apiHash, opts = {}) {
     try {
+      await sessionSpamStatus.assertUsable(sessionId, {
+        allowFrozen: !!opts.allowFrozen,
+      });
       // Decrypt the session string
       const sessionString = decrypt(sessionFile);
 
@@ -489,7 +493,11 @@ class TelegramService {
         throw new Error('API ID and API Hash are required');
       }
 
-      const proxy = opts.proxy || null;
+      let proxy = opts.proxy || null;
+      if (!proxy && /^\d+$/.test(String(sessionId))) {
+        const resolution = await require('./dedicatedProxyService').resolveSessionProxy(sessionId);
+        proxy = resolution.proxyConfig;
+      }
       const idOpts = fingerprint.toClientOptions(opts.identity);
 
       // Create a new TelegramClient with the string session
@@ -1231,7 +1239,7 @@ class TelegramService {
    * @returns {Promise<{ messageId: number, date: string, targetId: string }>}
    */
   async sendMessage(sessionId, targetId, message, options = {}) {
-    await this._ensureConnected(sessionId);
+    await this._ensureConnected(sessionId, { allowFrozen: !!options.allowFrozen });
 
     const {
       silent = false,
@@ -1243,7 +1251,10 @@ class TelegramService {
     } = options;
 
     try {
-      const entity = await this._resolveEntity(sessionId, targetId, { accessHash });
+      const entity = await this._resolveEntity(sessionId, targetId, {
+        accessHash,
+        allowFrozen: !!options.allowFrozen,
+      });
       if (!entity) {
         throw new Error(`Could not resolve target: ${targetId}`);
       }
@@ -2536,6 +2547,95 @@ class TelegramService {
   }
 
   /**
+   * Return this Premium account's boost slots without moving any of them.
+   * A slot is available only when it is unassigned and outside Telegram's
+   * reassignment cooldown.
+   */
+  async getMyBoostSlots(sessionId) {
+    await this._ensureConnected(sessionId);
+    const client = this.clients.get(String(sessionId)).client;
+    try {
+      const result = await this._withFloodRetry(sessionId, () =>
+        client.invoke(new Api.premium.GetMyBoosts())
+      );
+      const chats = new Map((result.chats || []).map((chat) => [String(chat.id), chat]));
+      const now = Math.floor(Date.now() / 1000);
+      const slots = (result.myBoosts || []).map((boost) => {
+        const peer = boost.peer || null;
+        const peerId = peer
+          ? String(peer.channelId || peer.chatId || peer.userId || '')
+          : null;
+        const chat = peerId ? chats.get(peerId) : null;
+        const cooldownUntil = boost.cooldownUntilDate || null;
+        return {
+          slot: Number(boost.slot),
+          assigned: !!peer,
+          available: !peer && (!cooldownUntil || Number(cooldownUntil) <= now),
+          peerId,
+          peerTitle: chat?.title || chat?.username || null,
+          peerUsername: chat?.username || null,
+          expiresAt: boost.expires ? new Date(Number(boost.expires) * 1000).toISOString() : null,
+          cooldownUntil: cooldownUntil
+            ? new Date(Number(cooldownUntil) * 1000).toISOString()
+            : null,
+        };
+      });
+      return {
+        total: slots.length,
+        available: slots.filter((slot) => slot.available).length,
+        assigned: slots.filter((slot) => slot.assigned).length,
+        cooldown: slots.filter((slot) => !slot.assigned && !slot.available).length,
+        slots,
+      };
+    } catch (error) {
+      throw this._handleTelegramError(error);
+    }
+  }
+
+  /**
+   * Apply specific unused boost slots to a channel or supergroup. Existing
+   * assignments are never touched; callers obtain free slots through
+   * getMyBoostSlots first.
+   */
+  async applyBoostSlots(sessionId, rawTarget, slots) {
+    const slotIds = Array.from(new Set(
+      (slots || []).map(Number).filter((slot) => Number.isInteger(slot) && slot >= 0)
+    ));
+    if (slotIds.length === 0) throw new Error('At least one boost slot is required');
+
+    await this._ensureConnected(sessionId);
+    const client = this.clients.get(String(sessionId)).client;
+    try {
+      const entity = await this._resolveEntity(sessionId, rawTarget);
+      if (!entity || entity.className !== 'Channel') {
+        throw new Error('BOOST_PEER_INVALID: only channels and supergroups can receive boosts');
+      }
+      const peer = await client.getInputEntity(entity);
+      await this._withFloodRetry(sessionId, () =>
+        client.invoke(new Api.premium.ApplyBoost({ slots: slotIds, peer }))
+      );
+      const status = await this._withFloodRetry(sessionId, () =>
+        client.invoke(new Api.premium.GetBoostsStatus({ peer }))
+      ).catch(() => null);
+      return {
+        target: String(rawTarget),
+        targetId: entity.id ? String(entity.id) : null,
+        title: entity.title || entity.username || String(rawTarget),
+        username: entity.username || null,
+        slots: slotIds,
+        level: status ? Number(status.level || 0) : null,
+        boosts: status ? Number(status.boosts || 0) : null,
+        nextLevelBoosts: status?.nextLevelBoosts != null
+          ? Number(status.nextLevelBoosts)
+          : null,
+        boostUrl: status?.boostUrl || null,
+      };
+    } catch (error) {
+      throw this._handleTelegramError(error);
+    }
+  }
+
+  /**
    * Post a Telegram Story (photo or video) from this session's own account.
    *
    * @param {string|number} sessionId
@@ -2855,8 +2955,11 @@ class TelegramService {
    * Load a session from database and create a TelegramClient.
    * Used for auto-loading sessions that were previously logged in.
    */
-  async _loadSessionFromDB(sessionId) {
+  async _loadSessionFromDB(sessionId, opts = {}) {
     try {
+      await sessionSpamStatus.assertUsable(sessionId, {
+        allowFrozen: !!opts.allowFrozen,
+      });
       const { pool } = require('../config/database');
       const fs = require('fs').promises;
       const path = require('path');
@@ -2864,8 +2967,8 @@ class TelegramService {
       
       const result = await pool.query(
         `SELECT id, session_file_path, api_id, api_hash, is_logged_in, status,
-                device_identity, bound_proxy_id, user_api_credential_id,
-                dc_id, dc_ip, dc_port
+                 device_identity, bound_proxy_id, proxy_required, user_api_credential_id,
+                 dc_id, dc_ip, dc_port
          FROM sessions WHERE id = $1`,
         [sessionId]
       );
@@ -2943,10 +3046,12 @@ class TelegramService {
       }
       const idOpts = fingerprint.toClientOptions(identity);
 
-      // Proxies are intentionally disabled: every session connects via
-      // the panel's direct egress IP.  Proxies were a frequent cause of
-      // disconnect storms and AUTH_KEY_DUPLICATED events.
-      const proxyConf = null;
+      // New rollout sessions fail closed and always rebuild their client
+      // from the dedicated proxy stored in session_proxy_assignments.
+      // Grandfathered rows keep the historical direct-egress behavior.
+      const dedicatedProxyService = require('./dedicatedProxyService');
+      const proxyResolution = await dedicatedProxyService.resolveSessionProxy(sessionId);
+      const proxyConf = proxyResolution.proxyConfig;
 
       const stringSession = new StringSession(sessionString);
       // Anti-revoke Phase 1 (B1): if STRICT_FINGERPRINT is on and we
@@ -3029,6 +3134,12 @@ class TelegramService {
   async _ensureConnected(sessionId, opts = {}) {
     const sessionIdStr = String(sessionId);
 
+    // Confirmed @SpamBot-frozen accounts cannot perform useful work. The
+    // status-check/appeal flow opts out explicitly so it can detect recovery.
+    await sessionSpamStatus.assertUsable(sessionId, {
+      allowFrozen: !!opts.allowFrozen,
+    });
+
     // 1000+ session scale-out hook: before we open or reuse an MTProto
     // connection, take the cluster-wide ownership lock for this
     // session. This prevents two processes from connecting the same
@@ -3053,7 +3164,7 @@ class TelegramService {
     if (!entry) {
       // Session not in memory - try to load it from the database
       logger.info(`Session ${sessionId} not in memory, loading from database...`);
-      await this._loadSessionFromDB(sessionId);
+      await this._loadSessionFromDB(sessionId, opts);
       entry = this.clients.get(sessionIdStr);
 
       if (!entry) {
@@ -3062,18 +3173,22 @@ class TelegramService {
       }
     }
 
+    const dedicatedResolution = await require('./dedicatedProxyService').resolveSessionProxy(sessionId);
+    if (dedicatedResolution.required && !entry.proxy) {
+      // A strict session must never continue through a client created before
+      // its dedicated binding was established. Evict it and let the loader
+      // rebuild the client through the verified proxy.
+      await this.disconnectSession(sessionIdStr).catch(() => {});
+      await this._loadSessionFromDB(sessionId, opts);
+      entry = this.clients.get(sessionIdStr);
+      if (!entry) throw new Error(`Session ${sessionId} could not be rebuilt through its dedicated proxy`);
+    }
     const { client, apiId, apiHash } = entry;
-    const proxyConf = entry.proxy || null;
+    const proxyConf = dedicatedResolution.proxyConfig || entry.proxy || null;
     const idOpts = fingerprint.toClientOptions(entry.identity);
     const timeoutMs = Number.isFinite(opts.timeoutMs) && opts.timeoutMs > 0
       ? opts.timeoutMs
       : TG_CONNECT_TIMEOUT_MS;
-    // When the caller asks for proxy fallback we'll retry once without
-    // the configured proxy if the proxied connect times out. Default
-    // off so legacy callers retain today's "stick to the bound proxy"
-    // behaviour; the clear-chats job opts in.
-    const allowProxyFallback = !!opts.allowProxyFallback;
-
     // Check if the client is still connected
     let isConnected = false;
     try {
@@ -3175,7 +3290,9 @@ class TelegramService {
    * @private
    */
   async _resolveEntity(sessionId, identifier, options = {}) {
-    await this._ensureConnected(sessionId);
+    await this._ensureConnected(sessionId, {
+      allowFrozen: !!(options && typeof options === 'object' && options.allowFrozen),
+    });
     const client = this.clients.get(String(sessionId)).client;
 
     // Accept either `(sessionId, identifier, accessHash)` for ergonomic
@@ -3452,6 +3569,76 @@ class TelegramService {
       // path still works because they catch the error from this throw.
       throw error;
     }
+  }
+
+  /**
+   * Resolve one public username with Telegram's authoritative
+   * contacts.ResolveUsername RPC. This method performs no messaging and does
+   * not use the generic resolver's fallbacks/caches, so a successful result is
+   * proof that Telegram resolved this username for the live auth session.
+   */
+  async resolveUsernameLive(sessionId, rawUsername) {
+    const username = String(rawUsername || '').replace(/^@+/, '').trim();
+    // Keep local validation deliberately broad. Telegram is authoritative
+    // for legacy/collectible handles and will answer USERNAME_INVALID or
+    // USERNAME_NOT_OCCUPIED when a syntactically plausible value is not real.
+    if (!/^[A-Za-z0-9_]{1,64}$/.test(username)) {
+      const err = new Error(`Invalid Telegram username format: ${rawUsername}`);
+      err.code = 'USERNAME_INVALID';
+      err.errorMessage = 'USERNAME_INVALID';
+      throw err;
+    }
+
+    await this._ensureConnected(sessionId);
+    const client = this.clients.get(String(sessionId))?.client;
+    if (!client) {
+      const err = new Error(`Telegram client unavailable for session ${sessionId}`);
+      err.code = 'CLIENT_UNAVAILABLE';
+      throw err;
+    }
+
+    const timeoutMs = Math.max(
+      5000,
+      parseInt(process.env.USERNAME_VALIDATION_RPC_TIMEOUT_MS || '30000', 10)
+    );
+    let timeout;
+    const timeoutPromise = new Promise((_, reject) => {
+      timeout = setTimeout(() => {
+        const err = new Error(`Username resolution timed out after ${timeoutMs}ms`);
+        err.code = 'USERNAME_RESOLVE_TIMEOUT';
+        reject(err);
+      }, timeoutMs);
+      timeout.unref?.();
+    });
+    let result;
+    try {
+      result = await Promise.race([
+        client.invoke(new Api.contacts.ResolveUsername({ username })),
+        timeoutPromise,
+      ]);
+    } finally {
+      clearTimeout(timeout);
+    }
+    const user = (result?.users || []).find(
+      (entry) => entry && entry.className === 'User' && !entry.deleted
+    );
+    if (!user) {
+      const err = new Error(`Username @${username} did not resolve to a Telegram user`);
+      err.code = 'USERNAME_NOT_OCCUPIED';
+      err.errorMessage = 'USERNAME_NOT_OCCUPIED';
+      throw err;
+    }
+
+    return {
+      telegramId: user.id != null ? String(user.id) : null,
+      accessHash: user.accessHash != null ? String(user.accessHash) : null,
+      username: user.username || username,
+      firstName: user.firstName || null,
+      lastName: user.lastName || null,
+      phone: user.phone || null,
+      isBot: !!user.bot,
+      isPremium: !!user.premium,
+    };
   }
 
   /**

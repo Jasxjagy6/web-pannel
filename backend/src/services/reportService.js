@@ -61,6 +61,8 @@ const VALID_ACTIONS = [
   'list_export',
   'list_merge',
   'list_delete',
+  'list_username_validation_start',
+  'list_username_link_filter',
   'report_generate',
   'report_export',
   'report_delete',

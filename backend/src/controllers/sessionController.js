@@ -991,6 +991,52 @@ const sessionController = {
     igFetch.invalidateProxy(owns.rows[0].proxy_url || null);
     res.json({ success: true, data: owns.rows[0] });
   }),
+
+  /**
+   * Remove the dedicated proxy from a Telegram session and re-login from
+   * the panel's own IP.  Only meaningful for Telegram sessions that have
+   * a bound dedicated proxy.
+   */
+  removeProxyAndRelogin: asyncHandler(async (req, res) => {
+    const userId = req.user.id;
+    const sessionId = req.params.id;
+
+    if (!sessionId) {
+      throw new AppError('Session ID is required', 400, 'MISSING_SESSION_ID');
+    }
+
+    if (_isInstagram(req)) {
+      throw new AppError(
+        'Proxy removal & re-login is available for Telegram sessions only',
+        400,
+        'PROXY_REMOVAL_NOT_SUPPORTED'
+      );
+    }
+
+    const result = await sessionService.removeProxyAndRelogin(sessionId, userId);
+
+    await reportService.logActivity(
+      userId,
+      'session_remove_proxy_relogin',
+      'session',
+      sessionId,
+      { platform: 'telegram' }
+    );
+
+    logger.info(`Session proxy removed and re-logged in by user ${userId}`, {
+      sessionId,
+      status: result.status,
+    });
+
+    return res.status(200).json({
+      success: true,
+      data: {
+        sessionId: result.sessionId,
+        accountInfo: result.accountInfo,
+        status: result.status,
+      },
+    });
+  }),
 };
 
 module.exports = sessionController;

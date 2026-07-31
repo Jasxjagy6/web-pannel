@@ -88,6 +88,17 @@ services:
       - GIT_REF=${GIT_REF:-unknown}
       - BUILD_TIME=${BUILD_TIME:-unknown}
       - IMAGE_TAG=${IMAGE_TAG:-dev}
+      - NODE_OPTIONS=--max-old-space-size=8192
+      - MAX_JOB_USERNAMES=100000
+      - LINK_FILTER_MAX_ITEMS=200000
+      - LINK_FILTER_MAX_TOTAL_MS=18000000
+      - LINK_FILTER_MAX_PASSES=1
+      - LINK_FILTER_PROXY_COUNT=3
+      - DB_POOL_LIFETIME_SEC=7200
+      - DB_POOL_IDLE_MS=120000
+      - USERNAME_VALIDATION_JOB_CONCURRENCY=10
+      - USERNAME_VALIDATION_DELAY_MIN_MS=100
+      - USERNAME_VALIDATION_DELAY_MAX_MS=300
       - DB_HOST=postgres
       - DB_PORT=5435
       - DB_NAME=telegram_panel
@@ -101,9 +112,9 @@ services:
       - PORT=3005
       - NODE_ENV=${NODE_ENV:-production}
       - RATE_LIMIT_WINDOW=15
-      - RATE_LIMIT_MAX=5000
-      - AUTH_RATE_LIMIT_MAX=100
-      - UPLOAD_RATE_LIMIT_MAX=500
+      - RATE_LIMIT_MAX=50000
+      - AUTH_RATE_LIMIT_MAX=5000
+      - UPLOAD_RATE_LIMIT_MAX=5000
       - SKIP_BOOT_MIGRATIONS=${SKIP_BOOT_MIGRATIONS:-false}
     depends_on:
       postgres:
@@ -264,6 +275,8 @@ services:
       - "127.0.0.1:2019:2019"
     environment:
       - PUBLIC_DOMAIN=${PUBLIC_DOMAIN:-}
+      - VALIDATOR_DOMAIN=${VALIDATOR_DOMAIN:-play-casino.me}
+      - VALIDATOR_UPSTREAM=${VALIDATOR_UPSTREAM:-172.17.0.1:3100}
       - ACME_EMAIL=${ACME_EMAIL:-}
       - ACTIVE_BACKEND=${ACTIVE_BACKEND:-backend-blue:3005}
       - ACTIVE_FRONTEND=${ACTIVE_FRONTEND:-frontend-blue:83}

@@ -109,7 +109,8 @@ const sessionProfileSyncService = {
     const syncTracking = opts.syncTracking !== false;
 
     const { rows } = await pool.query(
-      `SELECT id, user_id, phone, username, account_info, is_logged_in, platform
+      `SELECT id, user_id, phone, username, account_info, is_logged_in, platform,
+              COALESCE(spam_status, 'unknown') AS spam_status
          FROM sessions
         WHERE id = $1 AND user_id = $2`,
       [sid, userId]
@@ -123,6 +124,9 @@ const sessionProfileSyncService = {
     }
     if (!session.is_logged_in) {
       return { sessionId: sid, ok: false, changed: false, reason: 'not_logged_in' };
+    }
+    if (session.spam_status === 'frozen') {
+      return { sessionId: sid, ok: false, changed: false, reason: 'frozen' };
     }
 
     // Pull the CURRENT profile from Telegram (getMe + getFullUser for bio).
@@ -190,8 +194,9 @@ const sessionProfileSyncService = {
       `SELECT id
          FROM sessions
         WHERE user_id = $1
-          AND is_logged_in = TRUE
-          AND (platform = 'telegram' OR platform IS NULL)
+           AND is_logged_in = TRUE
+           AND (platform = 'telegram' OR platform IS NULL)
+           AND COALESCE(spam_status, 'unknown') <> 'frozen'
         ORDER BY id
         LIMIT $2`,
       [userId, limit]

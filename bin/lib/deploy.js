@@ -509,6 +509,8 @@ async function flipCaddy({ color, frontendColor, log }) {
     backendUpstream,
     frontendUpstream,
     publicDomain: process.env.PUBLIC_DOMAIN || '',
+    validatorDomain: process.env.VALIDATOR_DOMAIN || '',
+    validatorUpstream: process.env.VALIDATOR_UPSTREAM || '172.17.0.1:3100',
     acmeEmail: process.env.ACME_EMAIL || '',
   });
   log(`pushing Caddy config → backend=${backendUpstream}, frontend=${frontendUpstream}`);

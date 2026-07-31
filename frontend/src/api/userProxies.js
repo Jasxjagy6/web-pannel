@@ -10,6 +10,10 @@ import api from './client';
 
 export const listMyProxies = () => api.get('/me/proxies');
 export const addMyProxy = (payload) => api.post('/me/proxies', payload);
+export const importMyProxies = (formData) => api.post('/me/proxies/import', formData, {
+  headers: { 'Content-Type': 'multipart/form-data' },
+});
+export const recheckMyProxies = () => api.post('/me/proxies/recheck');
 export const updateMyProxy = (id, patch) => api.patch(`/me/proxies/${id}`, patch);
 export const testMyProxy = (id) => api.post(`/me/proxies/${id}/test`);
 export const deleteMyProxy = (id) => api.delete(`/me/proxies/${id}`);

@@ -43,10 +43,10 @@ export const deleteCupidbotKey = () => api.delete(`${BASE}/cupidbot-key`);
 
 // CapitalBot API key management (per-user)
 export const getCapitalbotKey = () => api.get(`${BASE}/capitalbot-key`);
-export const setCapitalbotKey = (apiKey, modelId, presetId) =>
-  api.post(`${BASE}/capitalbot-key`, { apiKey, modelId, presetId });
-export const updateCapitalbotModelPreset = (modelId, presetId) =>
-  api.patch(`${BASE}/capitalbot-model-preset`, { modelId, presetId });
+export const setCapitalbotKey = (apiKey, modelId, presetId, responseLanguage) =>
+  api.post(`${BASE}/capitalbot-key`, { apiKey, modelId, presetId, responseLanguage });
+export const updateCapitalbotModelPreset = (modelId, presetId, responseLanguage) =>
+  api.patch(`${BASE}/capitalbot-model-preset`, { modelId, presetId, responseLanguage });
 export const fetchCapitalbotModels = (apiKey) =>
   api.post(`${BASE}/capitalbot-models`, { apiKey });
 export const getMyCapitalbotModels = () =>

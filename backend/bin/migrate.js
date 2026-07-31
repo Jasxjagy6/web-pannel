@@ -17,6 +17,8 @@
  * image whose dependencies haven't been wired together yet.
  */
 require('dotenv').config();
+const { assertEnvironmentIsolation } = require('../src/config/environmentGuard');
+assertEnvironmentIsolation();
 const { Pool } = require('pg');
 
 const migrations = require('../src/config/migrations');

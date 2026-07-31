@@ -16,9 +16,9 @@ coverage
 .idea
 
 # Local environment / secrets
-.env
-.env.local
-.env.*.local
+.env*
+!.env.example
+!.env.staging.example
 
 # Local logs / uploads / sessions — these get bind-mounted at runtime
 logs/*

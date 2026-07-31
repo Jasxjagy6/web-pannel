@@ -24,4 +24,9 @@ export const listsAPI = {
   }),
   addItems: (id, data) => api.post(`/lists/${id}/items`, data),
   removeItems: (id, data) => api.post(`/lists/${id}/items/remove`, data),
+  startUsernameValidation: (data) => api.post('/lists/username-validation/jobs', data),
+  listUsernameValidationJobs: (params) => api.get('/lists/username-validation/jobs', { params }),
+  getUsernameValidationJob: (jobId) => api.get(`/lists/username-validation/jobs/${jobId}`),
+  cancelUsernameValidationJob: (jobId) => api.post(`/lists/username-validation/jobs/${jobId}/cancel`),
+  linkFilterUsernames: (data) => api.post('/lists/username-validation/link-filter', data),
 };

@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useMemo } from 'react';
+import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import {
   Network,
   Plus,
@@ -13,6 +13,10 @@ import {
   Wifi,
   Edit3,
   PlayCircle,
+  FileArchive,
+  RefreshCw,
+  ToggleLeft,
+  ToggleRight,
 } from 'lucide-react';
 import { useToast } from '../components/common/Toast';
 import {
@@ -21,15 +25,14 @@ import {
   updateMyProxy,
   testMyProxy,
   deleteMyProxy,
+  importMyProxies,
+  recheckMyProxies,
 } from '../api/userProxies';
 import { parseApiError, formatRelativeTime } from '../utils/formatters';
 
 const PROTOCOLS = [
   { value: 'socks5', label: 'SOCKS5' },
-  { value: 'socks4', label: 'SOCKS4' },
   { value: 'mtproto', label: 'MTProto' },
-  { value: 'http', label: 'HTTP' },
-  { value: 'https', label: 'HTTPS' },
 ];
 
 // Tiny country flag — emoji from ISO-3166 alpha-2 (e.g. 'us' → 🇺🇸).
@@ -43,7 +46,7 @@ function countryFlag(code) {
 export default function Proxies() {
   const { showSuccess, showError, showInfo } = useToast();
   const [proxies, setProxies] = useState([]);
-  const [constants, setConstants] = useState({ MAX_SESSIONS_PER_PROXY: 4 });
+  const [constants, setConstants] = useState({ MAX_SESSIONS_PER_PROXY: 1 });
   const [loading, setLoading] = useState(false);
   const [search, setSearch] = useState('');
   const [filter, setFilter] = useState('all'); // all | working | dead | tg | ig
@@ -61,13 +64,16 @@ export default function Proxies() {
     secret: '',
   });
   const [adding, setAdding] = useState(false);
+  const [importing, setImporting] = useState(false);
+  const [rechecking, setRechecking] = useState(false);
+  const importRef = useRef(null);
 
   const load = useCallback(async () => {
     setLoading(true);
     try {
       const res = await listMyProxies();
       setProxies(res.data?.data?.proxies || []);
-      setConstants(res.data?.data?.constants || { MAX_SESSIONS_PER_PROXY: 4 });
+       setConstants({ ...(res.data?.data?.constants || {}), MAX_SESSIONS_PER_PROXY: 1 });
     } catch (err) {
       // 402 from the entitlement gate is handled here so the empty
       // state can show the upgrade copy. Anything else surfaces as a
@@ -75,7 +81,7 @@ export default function Proxies() {
       const code = err?.response?.data?.error?.code || err?.response?.data?.code;
       if (code === 'TRIAL_FEATURE_NOT_ALLOWED') {
         setProxies([]);
-        setConstants({ trialUpsell: true, MAX_SESSIONS_PER_PROXY: 4 });
+        setConstants({ trialUpsell: true, MAX_SESSIONS_PER_PROXY: 1 });
       } else {
         showError(parseApiError(err), 'My proxies');
       }
@@ -114,6 +120,51 @@ export default function Proxies() {
       showError(parseApiError(err), 'Add proxy failed');
     } finally {
       setAdding(false);
+    }
+  };
+
+  const handleImport = async (event) => {
+    const file = event.target.files?.[0];
+    if (!file) return;
+    const body = new FormData();
+    body.append('file', file);
+    body.append('protocol', 'socks5');
+    setImporting(true);
+    try {
+      const res = await importMyProxies(body);
+      const result = res.data?.data || {};
+      showSuccess(
+        `${result.added || 0} added, ${result.working || 0} working, ${result.duplicates || 0} duplicate, ${result.failed || 0} failed.`,
+        'Proxy import complete'
+      );
+      await load();
+    } catch (err) {
+      showError(parseApiError(err), 'Proxy import failed');
+    } finally {
+      setImporting(false);
+      if (importRef.current) importRef.current.value = '';
+    }
+  };
+
+  const handleRecheckAll = async () => {
+    setRechecking(true);
+    try {
+      const res = await recheckMyProxies();
+      showSuccess(`${res.data?.data?.checked || 0} proxies checked.`, 'Health refresh complete');
+      await load();
+    } catch (err) {
+      showError(parseApiError(err), 'Health refresh failed');
+    } finally {
+      setRechecking(false);
+    }
+  };
+
+  const handleToggle = async (proxy) => {
+    try {
+      await updateMyProxy(proxy.id, { enabled: proxy.enabled === false });
+      await load();
+    } catch (err) {
+      showError(parseApiError(err), 'Proxy update failed');
     }
   };
 
@@ -196,7 +247,7 @@ export default function Proxies() {
           <p className="text-sm text-gray-400 mt-2 max-w-prose mx-auto">
             Each Telegram & Instagram account on this panel must egress through a
             proxy you own. The free trial doesn&apos;t include this feature — pick a
-            paid plan to add and pin your own SOCKS5 / HTTP / MTProto proxies.
+            paid plan to add and pin your own SOCKS5 or MTProto proxies.
           </p>
         </div>
         <a
@@ -215,28 +266,53 @@ export default function Proxies() {
         <div>
           <h2 className="text-xl font-semibold text-white flex items-center gap-2">
             <Network className="w-5 h-5 text-primary-500" />
-            My Proxies
+            Dedicated Proxy Fleet
           </h2>
           <p className="text-sm text-gray-400">
-            Each session you create is pinned to one of your proxies for life.
-            Add SOCKS5 / HTTP / MTProto proxies you own — they will never be
-            shared with other accounts on this panel.
+            One working proxy per new Telegram session. The panel tests every
+            route continuously and strict sessions never fall back to the VPS IP.
           </p>
         </div>
       </div>
 
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
-        <StatCard icon={Wifi} label="Total"  value={stats.total} subtitle="Owned by you" color="text-gray-300" />
+        <StatCard icon={Wifi} label="Inventory" value={stats.total} subtitle="Private to your account" color="text-gray-300" />
         <StatCard icon={Shield} label="Working" value={stats.working} subtitle="Healthy now" color="text-green-400" />
         <StatCard icon={Activity} label="Telegram-validated" value={stats.tg} subtitle="DC4 reachable" color="text-primary-400" />
-        <StatCard icon={Globe} label="Instagram-validated" value={stats.ig} subtitle="i.instagram.com reachable" color="text-yellow-400" />
+        <StatCard icon={Globe} label="Available" value={proxies.filter((p) => p.is_working && p.validated_for_telegram && !(p.assigned_sessions?.length)).length} subtitle="Ready for new sessions" color="text-yellow-400" />
+      </div>
+
+      <div className="grid gap-4 lg:grid-cols-[1.2fr_.8fr]">
+        <div className="rounded-xl border border-cyan-500/20 bg-gradient-to-br from-cyan-500/10 to-dark-800 p-5">
+          <div className="flex items-start gap-3">
+            <div className="rounded-lg bg-cyan-500/15 p-2 text-cyan-300"><Shield className="h-5 w-5" /></div>
+            <div>
+              <h3 className="font-semibold text-white">Strict routing policy</h3>
+              <p className="mt-1 text-sm text-gray-300">Sessions uploaded after this rollout require a healthy dedicated proxy. Login, messaging, scraping, groups, OTP listeners, background jobs, and AI Chat all share that same proxied Telegram client.</p>
+              <p className="mt-2 text-xs text-cyan-200/70">Existing panel sessions are grandfathered and are not automatically rebound.</p>
+            </div>
+          </div>
+        </div>
+        <div className="rounded-xl border border-white/5 bg-dark-800 p-5">
+          <div className="flex items-center gap-2"><FileArchive className="h-4 w-4 text-primary-400" /><h3 className="text-sm font-semibold text-white">Bulk import</h3></div>
+          <p className="mt-2 text-xs text-gray-400">Upload TXT, CSV, JSON, or ZIP. Supported lines: <code>host:port:user:pass</code>, <code>user:pass@host:port</code>, or <code>socks5://user:pass@host:port</code>.</p>
+          <div className="mt-4 flex gap-2">
+            <input ref={importRef} type="file" accept=".txt,.csv,.json,.zip" onChange={handleImport} className="hidden" />
+            <button onClick={() => importRef.current?.click()} disabled={importing} className="inline-flex flex-1 items-center justify-center gap-2 rounded-lg bg-primary-600 px-3 py-2 text-xs font-semibold text-white hover:bg-primary-500 disabled:opacity-50">
+              {importing ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <FileArchive className="h-3.5 w-3.5" />} Import file
+            </button>
+            <button onClick={handleRecheckAll} disabled={rechecking} className="inline-flex items-center justify-center gap-2 rounded-lg border border-white/10 bg-dark-700 px-3 py-2 text-xs text-gray-200 hover:bg-white/10 disabled:opacity-50">
+              <RefreshCw className={`h-3.5 w-3.5 ${rechecking ? 'animate-spin' : ''}`} /> Check all
+            </button>
+          </div>
+        </div>
       </div>
 
       {/* Add form */}
       <form onSubmit={handleAdd} className="rounded-xl border border-white/5 bg-dark-800 p-5 space-y-4">
         <div className="flex items-center gap-2">
           <Plus className="w-4 h-4 text-primary-500" />
-          <h3 className="text-sm font-semibold text-white">Add proxy</h3>
+          <h3 className="text-sm font-semibold text-white">Add one dedicated proxy</h3>
         </div>
         <div className="grid grid-cols-1 md:grid-cols-6 gap-3">
           <FieldInput label="Label"   value={form.label}        onChange={(v) => setForm({ ...form, label: v })} placeholder="e.g. London residential" />
@@ -301,7 +377,7 @@ export default function Proxies() {
             </p>
             {proxies.length === 0 && (
               <p className="text-xs text-gray-500">
-                Add a SOCKS5, HTTP or MTProto proxy above. Each Telegram or
+                Add a SOCKS5 or MTProto proxy above. Each Telegram
                 Instagram account you create from now on must use one of your
                 proxies for egress.
               </p>
@@ -352,7 +428,7 @@ export default function Proxies() {
                       </div>
                     </td>
                     <td className="px-4 py-3 text-xs text-gray-300">
-                      {p.active_assignments || 0}/{constants.MAX_SESSIONS_PER_PROXY}
+                       {p.assigned_sessions?.length ? (p.assigned_sessions[0].phone || `Session #${p.assigned_sessions[0].sessionId}`) : 'Available'}
                     </td>
                     <td className="px-4 py-3 text-xs text-gray-400">
                       {p.last_health_check ? formatRelativeTime(p.last_health_check) : '—'}
@@ -364,6 +440,13 @@ export default function Proxies() {
                     </td>
                     <td className="px-4 py-3">
                       <div className="flex items-center justify-end gap-2">
+                        <button
+                          onClick={() => handleToggle(p)}
+                          className={`rounded-md border px-2 py-1 text-xs ${p.enabled === false ? 'border-gray-500/30 bg-gray-500/10 text-gray-400' : 'border-emerald-500/30 bg-emerald-500/10 text-emerald-300'}`}
+                          title={p.enabled === false ? 'Enable proxy' : 'Disable proxy'}
+                        >
+                          {p.enabled === false ? <ToggleLeft className="w-3 h-3" /> : <ToggleRight className="w-3 h-3" />}
+                        </button>
                         <button
                           onClick={() => handleTest(p.id)}
                           disabled={testingId === p.id}
@@ -425,7 +508,7 @@ export default function Proxies() {
                     <div>
                       <div className="text-[10px] uppercase tracking-wide text-gray-500">Sessions</div>
                       <div className="mt-0.5 text-gray-300">
-                        {p.active_assignments || 0}/{constants.MAX_SESSIONS_PER_PROXY}
+                        {p.assigned_sessions?.length ? (p.assigned_sessions[0].phone || `Session #${p.assigned_sessions[0].sessionId}`) : 'Available'}
                       </div>
                     </div>
                     <div className="col-span-2">

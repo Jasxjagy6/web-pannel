@@ -68,7 +68,14 @@ async function getConfig() {
  * `publicDomain` — used to build the host matcher for TLS. Empty string ⇒
  * HTTP only on :80.
  */
-function buildConfig({ backendUpstream, frontendUpstream, publicDomain, acmeEmail }) {
+function buildConfig({
+  backendUpstream,
+  frontendUpstream,
+  publicDomain,
+  validatorDomain,
+  validatorUpstream = '172.17.0.1:3100',
+  acmeEmail,
+}) {
   const apiRoute = {
     match: [{ path: ['/api/*', '/socket.io/*', '/health', '/health/*'] }],
     handle: [
@@ -146,18 +153,38 @@ function buildConfig({ backendUpstream, frontendUpstream, publicDomain, acmeEmai
   const servers = { http: httpServer };
   if (tlsServer) servers.https = tlsServer;
 
+  if (validatorDomain) {
+    const validatorRoute = {
+      match: [{ host: [validatorDomain] }],
+      handle: [
+        {
+          handler: 'reverse_proxy',
+          upstreams: [{ dial: validatorUpstream }],
+          headers: {
+            request: { set: { 'X-Real-IP': ['{http.request.remote.host}'] } },
+          },
+        },
+      ],
+      terminal: true,
+    };
+    httpServer.routes.unshift(validatorRoute);
+    if (!servers.https) servers.https = { listen: [':443'], routes: [] };
+    servers.https.routes.unshift(validatorRoute);
+  }
+
   const cfg = {
     admin: { listen: '0.0.0.0:2019' },
     apps: {
       http: { servers },
     },
   };
-  if (publicDomain && acmeEmail) {
+  const tlsSubjects = [publicDomain, validatorDomain].filter(Boolean);
+  if (tlsSubjects.length && acmeEmail) {
     cfg.apps.tls = {
       automation: {
         policies: [
           {
-            subjects: [publicDomain],
+            subjects: tlsSubjects,
             issuers: [{ module: 'acme', email: acmeEmail }],
           },
         ],

@@ -150,24 +150,34 @@ const schemas = {
     perSessionBurst: Joi.number().integer().min(1).max(100).optional(),
     burstCooldownSecMin: Joi.number().integer().min(0).max(600).optional(),
     burstCooldownSecMax: Joi.number().integer().min(0).max(600).optional(),
+    // Split-mode per-session quota ("how many DMs one session should do").
+    // Ignored by the failover/parallel runners; used by POST /messages/split.
+    dmsPerSession: Joi.number().integer().min(1).max(10000).optional(),
   }).or('sessionIds', 'sessionListId', 'sessionListIds'),
 
   // Single-User Mass DM
   // ---------------------------------------------------------------
-  // Operator picks 1..3 target users (username / @username / numeric
-  // Telegram id), a message, a per-send delay, and one or more
-  // sessions. Every selected session DMs every target, with the
-  // delay (in seconds) inserted BETWEEN consecutive sends. The
-  // 3-target hard cap is intentional: pushing the same DM to many
-  // strangers from one session is the fastest way to trigger
-  // PEER_FLOOD / SPAM_BLOCK on the account.
+  // Operator picks 1..50 target users manually or selects a saved target
+  // list. Every selected session DMs every target, with the delay (in
+  // seconds) inserted BETWEEN consecutive sends.
   singleUserMassDm: Joi.object({
     sessionIds: Joi.array().items(Joi.number().integer().positive()).min(1).optional(),
     sessionListId: Joi.alternatives().try(Joi.number().integer().positive(), Joi.string()).optional(),
     // Plural: target multiple session lists at once (unioned server-side).
     sessionListIds: Joi.array().items(Joi.alternatives().try(Joi.number().integer().positive(), Joi.string())).min(1).optional(),
-    // Targets: 1..3 strings (username, @username or numeric id).
-    targets: Joi.array().items(Joi.string().trim().min(1).max(64)).min(1).max(3).required(),
+    sourceType: Joi.string().valid('manual', 'list').default('manual'),
+    sourceId: Joi.number().integer().positive().when('sourceType', {
+      is: 'list',
+      then: Joi.required(),
+      otherwise: Joi.optional(),
+    }),
+    // Manual targets: 1..50 strings (username, @username or numeric id).
+    // Saved-list jobs omit this field; the service loads every row itself.
+    targets: Joi.array().items(Joi.string().trim().min(1).max(64)).min(1).max(50).when('sourceType', {
+      is: 'list',
+      then: Joi.optional(),
+      otherwise: Joi.required(),
+    }),
     message: Joi.string().min(1).max(4096).required(),
     messageType: Joi.string().valid('text', 'html', 'markdown').default('text'),
     // Per-send delay in seconds. 1..120 keeps the slowest legitimate

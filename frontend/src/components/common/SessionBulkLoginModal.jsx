@@ -1,11 +1,12 @@
 import React, { useEffect, useRef, useState } from 'react';
-import { Loader2, LogIn, ShieldCheck, X } from 'lucide-react';
+import { AlertTriangle, CheckCircle2, Loader2, LogIn, Network, ShieldCheck, X } from 'lucide-react';
 
 import { Modal } from './Modal';
 import { useToast } from './Toast';
 import {
   cancelBulkLogin,
   getBulkLoginStatus,
+  previewBulkLogin,
   startBulkLogin,
 } from '../../api/sessions';
 import { parseApiError } from '../../utils/formatters';
@@ -60,8 +61,18 @@ function StatusPill({ status }) {
   );
 }
 
-export function SessionBulkLoginModal({ isOpen, onClose, selectedSessions, onCompleted }) {
+export function SessionBulkLoginModal({
+  isOpen,
+  onClose,
+  selectedSessions,
+  onCompleted,
+  allInactive = false,
+  autoStart = false,
+}) {
   const [job, setJob] = useState(null);
+  const [plan, setPlan] = useState(null);
+  const [previewing, setPreviewing] = useState(false);
+  const [skipUnassigned, setSkipUnassigned] = useState(true);
   const [starting, setStarting] = useState(false);
   const pollRef = useRef(null);
   const completedNotifiedRef = useRef(false);
@@ -76,13 +87,35 @@ export function SessionBulkLoginModal({ isOpen, onClose, selectedSessions, onCom
   useEffect(() => {
     if (isOpen) {
       setJob(null);
+      setPlan(null);
       setStarting(false);
+      setSkipUnassigned(true);
       completedNotifiedRef.current = false;
     } else if (pollRef.current) {
       clearInterval(pollRef.current);
       pollRef.current = null;
     }
   }, [isOpen]);
+
+  useEffect(() => {
+    if (!isOpen) return;
+    let cancelled = false;
+    const loadPreview = async () => {
+      setPreviewing(true);
+      try {
+        const res = await previewBulkLogin(allInactive
+          ? { allInactive: true }
+          : { sessionIds: selectedSessions.map((session) => session.id) });
+        if (!cancelled) setPlan(res.data?.data || res.data || null);
+      } catch (err) {
+        if (!cancelled) showError(parseApiError(err), 'Proxy assignment preview failed');
+      } finally {
+        if (!cancelled) setPreviewing(false);
+      }
+    };
+    loadPreview();
+    return () => { cancelled = true; };
+  }, [isOpen, allInactive, selectedSessions, showError]);
 
   const startPolling = (jobId) => {
     if (pollRef.current) clearInterval(pollRef.current);
@@ -128,16 +161,23 @@ export function SessionBulkLoginModal({ isOpen, onClose, selectedSessions, onCom
   };
 
   const start = async () => {
+    if (!plan?.planId) return;
     setStarting(true);
     try {
       const res = await startBulkLogin({
-        sessionIds: selectedSessions.map((s) => s.id),
+        proxyPlanId: plan.planId,
+        skipUnassigned: plan.summary?.missingProxy > 0 ? skipUnassigned : false,
       });
       const data = res.data || res;
       if (!data || !data.jobId) {
         throw new Error('Server did not return a jobId');
       }
-      showInfo(`Logging in ${selectedSessions.length} session(s)…`, 'Bulk Login started');
+      showInfo(
+        allInactive
+          ? `Logging in ${data.total || 0} inactive session(s)…`
+          : `Logging in ${selectedSessions.length} session(s)…`,
+        'Bulk Login started'
+      );
       startPolling(data.jobId);
     } catch (err) {
       showError(parseApiError(err), 'Failed to start bulk login');
@@ -172,7 +212,7 @@ export function SessionBulkLoginModal({ isOpen, onClose, selectedSessions, onCom
     <Modal
       isOpen={isOpen}
       onClose={isRunning ? () => {} : onClose}
-      title="Login selected sessions"
+      title={allInactive ? 'Login all inactive sessions' : 'Login selected sessions'}
       size="lg"
       footer={
         <div className="flex w-full items-center justify-between">
@@ -191,7 +231,8 @@ export function SessionBulkLoginModal({ isOpen, onClose, selectedSessions, onCom
                 </button>
                 <button
                   type="button"
-                  disabled={starting || headerCount === 0}
+                   disabled={starting || previewing || !plan?.planId ||
+                     (plan?.summary?.missingProxy > 0 && !skipUnassigned)}
                   onClick={start}
                   className="flex items-center gap-2 rounded-lg bg-primary-600 px-4 py-2 text-sm font-semibold text-white hover:bg-primary-500 disabled:opacity-50"
                 >
@@ -200,7 +241,7 @@ export function SessionBulkLoginModal({ isOpen, onClose, selectedSessions, onCom
                   ) : (
                     <LogIn className="h-4 w-4" />
                   )}
-                  Start logging in {headerCount} session{headerCount === 1 ? '' : 's'}
+                    Confirm assignments and login
                 </button>
               </>
             )}
@@ -228,30 +269,60 @@ export function SessionBulkLoginModal({ isOpen, onClose, selectedSessions, onCom
     >
       {!job && (
         <div className="space-y-4">
-          <div className="rounded-lg border border-primary-500/20 bg-primary-500/5 p-3 text-xs text-primary-200">
-            <p className="font-semibold">How this works</p>
-            <p className="mt-1 text-primary-100/90">
-              The panel attempts to log in each selected session sequentially,
-              with a brief delay between rows so we don&apos;t hit Telegram
-              rate limits. Sessions that are already logged in are reported
-              as <span className="font-semibold">Already in</span> and do
-              not count as failures.
+          <div className="rounded-lg border border-cyan-500/20 bg-cyan-500/5 p-3 text-xs text-cyan-100">
+            <p className="flex items-center gap-2 font-semibold"><Network className="h-3.5 w-3.5" /> Dedicated egress review</p>
+            <p className="mt-1 text-cyan-100/80">
+              New sessions receive one healthy Telegram-tested proxy each. Existing sessions are grandfathered and keep their current networking behavior. Nothing logs in until you confirm this map.
             </p>
           </div>
-
-          <div>
-            <p className="mb-2 text-sm font-semibold text-white">
-              Sessions to log in ({headerCount})
-            </p>
-            <div className="max-h-48 overflow-auto rounded border border-white/10 bg-dark-900 p-2 text-xs text-gray-300">
-              {selectedSessions.map((s) => (
-                <div key={s.id} className="flex items-center gap-2 py-0.5">
-                  <ShieldCheck className="h-3 w-3 text-primary-400 shrink-0" />
-                  <span className="truncate">{s.phone || `session-${s.id}`}</span>
-                </div>
-              ))}
+          {previewing ? (
+            <div className="flex items-center justify-center gap-2 rounded-lg border border-white/10 bg-dark-900 py-10 text-sm text-gray-400">
+              <Loader2 className="h-4 w-4 animate-spin" /> Testing inventory and building assignments...
             </div>
-          </div>
+          ) : plan ? (
+            <>
+              <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
+                <PlanStat label="Sessions" value={plan.summary?.total || 0} tone="text-white" />
+                <PlanStat label="New binds" value={plan.summary?.readyToAssign || 0} tone="text-cyan-300" />
+                <PlanStat label="Already bound" value={plan.summary?.alreadyBound || 0} tone="text-emerald-300" />
+                <PlanStat label="Missing" value={plan.summary?.missingProxy || 0} tone={(plan.summary?.missingProxy || 0) ? 'text-red-300' : 'text-emerald-300'} />
+              </div>
+              {(plan.summary?.missingProxy || 0) > 0 && (
+                <div className="rounded-lg border border-red-500/30 bg-red-500/10 p-3 text-xs text-red-100">
+                  <p className="flex items-center gap-2 font-semibold"><AlertTriangle className="h-4 w-4" /> Proxy shortage</p>
+                  <p className="mt-1 text-red-100/80">{plan.summary.missingProxy} new session(s) have no healthy dedicated proxy. Strict sessions can never fall back to the VPS IP.</p>
+                  <label className="mt-3 flex cursor-pointer items-center gap-2">
+                    <input type="checkbox" checked={skipUnassigned} onChange={(event) => setSkipUnassigned(event.target.checked)} />
+                    Skip unassigned sessions and login the safe rows only
+                  </label>
+                </div>
+              )}
+              <div className="max-h-72 overflow-auto divide-y divide-white/5 rounded-lg border border-white/10 bg-dark-900">
+                {plan.sessions?.map((session) => (
+                  <div key={session.sessionId} className="flex items-center justify-between gap-3 p-3">
+                    <div className="min-w-0">
+                      <p className="truncate text-sm font-medium text-gray-100">{session.phone || `session-${session.sessionId}`}</p>
+                      <p className="text-[10px] text-gray-500">Session #{session.sessionId}</p>
+                    </div>
+                    <div className="min-w-0 text-right">
+                      {session.proxy ? (
+                        <>
+                          <p className="flex items-center justify-end gap-1 text-xs text-emerald-300"><CheckCircle2 className="h-3 w-3" /> {session.proxy.label || `${session.proxy.host}:${session.proxy.port}`}</p>
+                          <p className="truncate font-mono text-[10px] text-gray-500">{session.proxy.protocol?.toUpperCase()} {session.proxy.egressIp || session.proxy.host}</p>
+                        </>
+                      ) : session.status === 'legacy_direct' ? (
+                        <p className="text-xs text-gray-400">Legacy, unchanged</p>
+                      ) : (
+                        <p className="text-xs font-semibold text-red-300">No proxy available</p>
+                      )}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </>
+          ) : (
+            <div className="rounded-lg border border-red-500/20 bg-red-500/10 p-4 text-sm text-red-200">No proxy plan is available. Close and retry.</div>
+          )}
         </div>
       )}
 
@@ -324,6 +395,15 @@ export function SessionBulkLoginModal({ isOpen, onClose, selectedSessions, onCom
         </div>
       )}
     </Modal>
+  );
+}
+
+function PlanStat({ label, value, tone }) {
+  return (
+    <div className="rounded-lg border border-white/10 bg-dark-900 p-3">
+      <p className="text-[10px] uppercase tracking-wider text-gray-500">{label}</p>
+      <p className={`mt-1 text-xl font-semibold ${tone}`}>{value}</p>
+    </div>
   );
 }
 

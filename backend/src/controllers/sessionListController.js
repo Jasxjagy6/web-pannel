@@ -216,6 +216,25 @@ module.exports = {
     return res.status(201).json({ success: true, data: list });
   }),
 
+  /** POST /api/telegram/session-lists/organize-spam-status */
+  organizeSpamStatus: asyncHandler(async (req, res) => {
+    const platform = _platform(req);
+    if (platform !== 'telegram') {
+      throw new AppError('Spam-status lists are available for Telegram only', 400, 'TELEGRAM_ONLY');
+    }
+    const list = await sessionListService.organizeBySpamStatus({
+      userId: req.user.id,
+      status: req.body?.status,
+    });
+    reportService
+      .logActivity(req.user.id, 'session_list_organize_spam_status', 'session_list', list.id, {
+        status: list.managed_status,
+        sessions: list.matched_count,
+      })
+      .catch(() => {});
+    return res.status(201).json({ success: true, data: list });
+  }),
+
   /** GET /api/{platform}/session-lists/:id */
   get: asyncHandler(async (req, res) => {
     const id = _listId(req);

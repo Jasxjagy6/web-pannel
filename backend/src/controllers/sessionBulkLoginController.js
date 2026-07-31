@@ -14,8 +14,23 @@
 
 const { AppError, asyncHandler } = require('../utils/errorHandler');
 const service = require('../services/sessionBulkLoginService');
+const dedicatedProxyService = require('../services/dedicatedProxyService');
 
 module.exports = {
+  preview: asyncHandler(async (req, res) => {
+    const userId = req.user && req.user.id;
+    if (!userId) throw new AppError('Authentication required', 401, 'NO_AUTH');
+    const { sessionIds, allInactive } = req.body || {};
+    if (allInactive !== true && (!Array.isArray(sessionIds) || sessionIds.length === 0)) {
+      throw new AppError('sessionIds must be a non-empty array', 400, 'BAD_SESSION_IDS');
+    }
+    const plan = await dedicatedProxyService.createLoginPlan(userId, {
+      sessionIds,
+      allInactive: allInactive === true,
+    });
+    res.json({ success: true, data: plan });
+  }),
+
   /**
    * POST /start — body: { sessionIds: [..], interRowDelayMs? }
    */
@@ -24,24 +39,23 @@ module.exports = {
     if (!userId) {
       throw new AppError('Authentication required', 401, 'NO_AUTH');
     }
-    const { sessionIds, interRowDelayMs } = req.body || {};
-    if (!Array.isArray(sessionIds) || sessionIds.length === 0) {
+    const { sessionIds, allInactive, interRowDelayMs, proxyPlanId, skipUnassigned } = req.body || {};
+    if (!proxyPlanId && allInactive !== true && (!Array.isArray(sessionIds) || sessionIds.length === 0)) {
       throw new AppError(
         'sessionIds must be a non-empty array of panel session IDs',
         400,
         'BAD_SESSION_IDS'
       );
     }
-    try {
-      const { jobId } = await service.startBulkLoginJob({
-        userId,
-        sessionIds,
-        interRowDelayMs,
-      });
-      res.status(202).json({ jobId });
-    } catch (err) {
-      throw new AppError(err.message, 400, 'BULK_LOGIN_START_FAILED');
-    }
+    const result = await service.startBulkLoginJob({
+      userId,
+      sessionIds,
+      allInactive: allInactive === true,
+      interRowDelayMs,
+      proxyPlanId,
+      skipUnassigned: skipUnassigned === true,
+    });
+    res.status(202).json(result);
   }),
 
   /**

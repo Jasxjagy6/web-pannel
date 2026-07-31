@@ -132,8 +132,10 @@ class OtpService {
     const unsubs = new Map();
     for (const sid of sessionIds) {
       try {
-        const off = await telegramService.addNewMessageHandler(String(sid), (event) =>
-          this._onMessage(jobId, userId, sid, event.message || event)
+        const off = await telegramService.addNewMessageHandler(
+          String(sid),
+          (event) => this._onMessage(jobId, userId, sid, event.message || event),
+          { allowFrozen: true }
         );
         unsubs.set(sid, off);
       } catch (err) {
@@ -162,6 +164,32 @@ class OtpService {
 
     this._activeScans.set(jobId, { unsubs, timer, userId });
     emit(userId, 'otp:job:started', { jobId, total: sessionIds.length });
+  }
+
+  /**
+   * Reattach passive OTP listeners after an administrative @SpamBot check
+   * reconnects/disconnects a session. Only sessions still marked scanning in
+   * an active job are touched.
+   */
+  async refreshSessionListeners(sessionId) {
+    const sid = String(sessionId);
+    for (const [jobId, ctx] of this._activeScans.entries()) {
+      const key = Array.from(ctx.unsubs.keys()).find((value) => String(value) === sid);
+      if (key == null) continue;
+      const oldOff = ctx.unsubs.get(key);
+      try { oldOff?.(); } catch { /* ignore stale client cleanup */ }
+      try {
+        const off = await telegramService.addNewMessageHandler(
+          sid,
+          (event) => this._onMessage(jobId, ctx.userId, key, event.message || event),
+          { allowFrozen: true }
+        );
+        ctx.unsubs.set(key, off);
+      } catch (err) {
+        logger.warn(`OTP scan: failed to reattach session ${sid}: ${err.message}`);
+        ctx.unsubs.delete(key);
+      }
+    }
   }
 
   /**

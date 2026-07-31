@@ -4,9 +4,20 @@ const listController = require('../controllers/listController');
 const { authenticate, requireApproved } = require('../middleware/auth');
 const { uploadSingle } = require('../middleware/upload');
 const { validate, schemas } = require('../middleware/validator');
+const usernameValidationController = require('../controllers/usernameValidationController');
 
 router.use(authenticate);
 router.use(requireApproved);
+
+// Persisted live Telegram username-validation jobs. These routes must be
+// mounted before `/:id` so the literal path is not consumed as a list id.
+router.post('/username-validation/jobs', usernameValidationController.start);
+router.get('/username-validation/jobs', usernameValidationController.list);
+router.get('/username-validation/jobs/:jobId', usernameValidationController.get);
+router.post('/username-validation/jobs/:jobId/cancel', usernameValidationController.cancel);
+
+// Persisted sessionless link-based username filter (checks t.me web previews).
+router.post('/username-validation/link-filter', usernameValidationController.linkFilter);
 
 // POST /api/lists/import
 router.post('/import', uploadSingle('file'), validate(schemas.listImport), listController.importList);

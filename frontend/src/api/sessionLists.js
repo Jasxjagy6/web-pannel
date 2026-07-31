@@ -9,6 +9,8 @@ import api from './client';
 export const sessionListsAPI = {
   list: (params) => api.get('/session-lists', { params }),
   create: (data) => api.post('/session-lists', data),
+  organizeSpamStatus: (status) =>
+    api.post('/session-lists/organize-spam-status', { status }),
   get: (id) => api.get(`/session-lists/${id}`),
   getSessions: (id, params) => api.get(`/session-lists/${id}/sessions`, { params }),
   update: (id, data) => api.put(`/session-lists/${id}`, data),

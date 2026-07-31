@@ -74,6 +74,9 @@ const MIGRATION_ORDER = [
   'migration_v37_reddit_cookie_scraper.sql',
   'migration_v38_session_login_email.sql',
   'migration_v39_google_auth_login_email.sql',
+  'migration_v49_telegram_spam_status.sql',
+  'migration_v50_ai_response_language.sql',
+  'migration_v56_telegram_boost_jobs.sql',
 ];
 
 function listMigrationFiles() {

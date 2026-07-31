@@ -81,6 +81,19 @@ async function processGenerateReply(job) {
   const aiService = provider === 'capitalbot' ? capitalbotService : cupidbotService;
 
   try {
+    const sessionState = await pool.query(
+      `SELECT COALESCE(spam_status, 'unknown') AS spam_status
+         FROM sessions WHERE id = $1 AND platform = 'telegram'`,
+      [sid]
+    );
+    if (sessionState.rows[0]?.spam_status === 'frozen') {
+      await require('../services/aiChatService')._forceFrozenOff(sid);
+      logRow.status = 'failed';
+      logRow.error_message = 'FROZEN_SESSION_AI_DISABLED';
+      await _insertLog(logRow);
+      return { sent: false, reason: 'session_frozen' };
+    }
+
     // Use conversation state from aiChatService
     const lastExchange = conversationState?.lastExchange || { lastIncoming: null, lastOutgoing: null };
 
@@ -160,6 +173,19 @@ async function processGenerateReply(job) {
       logRow.status = 'no_reply';
       await _insertLog(logRow);
       return { sent: false, reason: 'empty_reply' };
+    }
+
+    const sendState = await pool.query(
+      `SELECT COALESCE(spam_status, 'unknown') AS spam_status
+         FROM sessions WHERE id = $1 AND platform = 'telegram'`,
+      [sid]
+    );
+    if (sendState.rows[0]?.spam_status === 'frozen') {
+      await require('../services/aiChatService')._forceFrozenOff(sid);
+      logRow.status = 'failed';
+      logRow.error_message = 'FROZEN_SESSION_AI_DISABLED';
+      await _insertLog(logRow);
+      return { sent: false, reason: 'session_frozen' };
     }
 
     // Send the message via Telegram.
