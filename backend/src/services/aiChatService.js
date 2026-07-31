@@ -47,12 +47,8 @@ const DEFAULT_CONFIG = {
     presetId: 88,
     platform: 'Telegram',
     conversationSource: 'Telegram',
-    // No hardcoded response language. CapitalBot speaks Italian (and any
-    // other language) natively, so we let it AUTO-DETECT the user's
-    // language and reply in kind (Italian to Italian users). We do NOT
-    // force `language` — forcing a fixed language / translation layer is
-    // unnecessary and was the English hardcode we removed.
-    detectLanguage: true,
+    detectLanguage: false,
+    language: 'English',
     audio: true,
     video: true,
     image: true,
@@ -492,6 +488,19 @@ class AiChatService {
     const sid = Number(sessionId);
     const session = await this._authorizeSession(sid, userId);
 
+    // Stamp the user's language preference into the config when enabling
+    // with CapitalBot so the AI replies in the chosen language.
+    if (enabled && (config.provider || 'cupidbot') === 'capitalbot') {
+      const capitalbotService = require('./capitalbotService');
+      try {
+        const cap = await capitalbotService.getAccessToken(userId);
+        const lang = cap.responseLanguage || 'English';
+        config.capitalbot = { ...(config.capitalbot || {}), language: lang, detectLanguage: false };
+      } catch {
+        // If key is missing (admin using env key), use defaults
+      }
+    }
+
     const cfg = _mergeConfig(config);
 
     if (session.spam_status === 'frozen') {
@@ -623,6 +632,7 @@ class AiChatService {
    */
   async bulkSetSessionsEnabled(userId, enabled) {
     let provider = null;
+    let userLanguage = 'English';
     if (enabled) {
       provider = await this.resolveActiveProvider(userId);
       if (!provider) {
@@ -631,6 +641,15 @@ class AiChatService {
           400,
           'NO_VALID_AI_KEY'
         );
+      }
+      if (provider === 'capitalbot') {
+        const capitalbotService = require('./capitalbotService');
+        try {
+          const cap = await capitalbotService.getAccessToken(userId);
+          userLanguage = cap.responseLanguage || 'English';
+        } catch {
+          userLanguage = 'English';
+        }
       }
     }
 
@@ -668,11 +687,21 @@ class AiChatService {
       }
 
       try {
-        // Preserve existing per-session config; only (re)stamp provider
-        // on enable so the worker routes to the correct API.
+        // Preserve existing per-session config; (re)stamp provider and
+        // language on enable so the worker routes to the correct API
+        // and uses the user's chosen language.
         const existing = await this.getSessionSettings(sid);
         const cfg = { ...(existing.config || {}) };
-        if (enabled) cfg.provider = provider;
+        if (enabled) {
+          cfg.provider = provider;
+          if (provider === 'capitalbot') {
+            cfg.capitalbot = {
+              ...(cfg.capitalbot || {}),
+              language: userLanguage,
+              detectLanguage: false,
+            };
+          }
+        }
 
         // eslint-disable-next-line no-await-in-loop
         await this.setSessionEnabled(sid, userId, enabled, cfg);
@@ -1128,6 +1157,42 @@ class AiChatService {
       [sessionId]
     );
     return rows[0]?.user_id;
+  }
+
+  /**
+   * Update the AI response language across all Telegram sessions for a user.
+   * Called when the user changes their language preference in the UI.
+   */
+  async updateLanguageForUserSessions(userId, language) {
+    const { rows } = await pool.query(
+      `SELECT s.id FROM sessions s
+        WHERE s.user_id = $1 AND s.platform = 'telegram'`,
+      [userId]
+    );
+    let updated = 0;
+    for (const row of rows) {
+      const sid = Number(row.id);
+      try {
+        const existing = await this.getSessionSettings(sid);
+        if (!existing.enabled) continue;
+        const cfg = { ...(existing.config || {}) };
+        if (cfg.provider === 'capitalbot') {
+          cfg.capitalbot = { ...(cfg.capitalbot || {}), language, detectLanguage: false };
+          await pool.query(
+            `INSERT INTO ai_session_settings (session_id, enabled, config, updated_at)
+             VALUES ($1, $2, $3, NOW())
+             ON CONFLICT (session_id) DO UPDATE
+             SET config = EXCLUDED.config, updated_at = NOW()`,
+            [sid, !!existing.enabled, JSON.stringify(cfg)]
+          );
+          updated++;
+        }
+      } catch (err) {
+        logger.warn(`updateLanguageForUserSessions: session ${sid} failed: ${err.message}`);
+      }
+    }
+    logger.info(`Updated language to "${language}" for ${updated} session(s) of user ${userId}`);
+    return { updated };
   }
 
   /**

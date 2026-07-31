@@ -60,6 +60,21 @@ const AI_PROVIDERS = [
   { id: 'capitalbot', label: 'CapitalBot', desc: 'Multi-platform AI chat automation.' },
 ];
 
+const AI_LANGUAGES = [
+  { value: 'Italian', label: 'Italiano (Italian)' },
+  { value: 'English', label: 'English' },
+  { value: 'Spanish', label: 'Español (Spanish)' },
+  { value: 'French', label: 'Français (French)' },
+  { value: 'German', label: 'Deutsch (German)' },
+  { value: 'Portuguese', label: 'Português (Portuguese)' },
+  { value: 'Dutch', label: 'Nederlands (Dutch)' },
+  { value: 'Russian', label: 'Русский (Russian)' },
+  { value: 'Turkish', label: 'Türkçe (Turkish)' },
+  { value: 'Arabic', label: 'العربية (Arabic)' },
+  { value: 'Chinese', label: '中文 (Chinese)' },
+  { value: 'Japanese', label: '日本語 (Japanese)' },
+];
+
 function _statusPill(status) {
   if (status === 'sent')
     return { label: 'Sent', tone: 'emerald', Icon: CheckCircle2 };
@@ -118,6 +133,7 @@ export default function AiChat() {
   const [activeKeyProvider, setActiveKeyProvider] = useState('cupidbot');
   const [modelIdDraft, setModelIdDraft] = useState('');
   const [presetIdDraft, setPresetIdDraft] = useState('');
+  const [languageDraft, setLanguageDraft] = useState('English');
   const [availableModels, setAvailableModels] = useState([]);
   const [availablePresets, setAvailablePresets] = useState([]);
   const [showModelPresetForm, setShowModelPresetForm] = useState(false);
@@ -161,6 +177,9 @@ export default function AiChat() {
         cupidbot: cupidbotStatus,
         capitalbot: capitalbotStatus,
       });
+      if (capitalbotStatus?.responseLanguage) {
+        setLanguageDraft(capitalbotStatus.responseLanguage);
+      }
       if (capitalbotStatus?.isValid && (!capitalbotStatus.modelId || !capitalbotStatus.presetId)) {
         getMyCapitalbotModels().then((res) => {
           const body = res?.data;
@@ -283,7 +302,7 @@ export default function AiChat() {
         setKeyDraft('');
         toast.success(`CupidBot API key validated and saved.`);
       } else {
-        const saveRes = await setCapitalbotKey(keyDraft.trim());
+        const saveRes = await setCapitalbotKey(keyDraft.trim(), null, null, languageDraft);
         const saveData = saveRes?.data?.data || {};
         setKeyStatusByProvider((prev) => ({
           ...prev,
@@ -293,8 +312,10 @@ export default function AiChat() {
             isAdmin: prev.capitalbot?.isAdmin || false,
             modelId: saveData.modelId,
             presetId: saveData.presetId,
+            responseLanguage: saveData.responseLanguage || languageDraft,
           },
         }));
+        setLanguageDraft(saveData.responseLanguage || languageDraft);
         setKeyDraft('');
         toast.success(`CapitalBot license key validated and saved.`);
         const fetchedModels = saveData.models || [];
@@ -332,13 +353,13 @@ export default function AiChat() {
     }
     setModelPresetSaving(true);
     try {
-      await updateCapitalbotModelPreset(mid, pid);
+      await updateCapitalbotModelPreset(mid, pid, languageDraft);
       setKeyStatusByProvider((prev) => ({
         ...prev,
-        capitalbot: { ...prev.capitalbot, modelId: mid, presetId: pid },
+        capitalbot: { ...prev.capitalbot, modelId: mid, presetId: pid, responseLanguage: languageDraft },
       }));
       setShowModelPresetForm(false);
-      toast.success(`CapitalBot model (${mid}) and preset (${pid}) saved.`);
+      toast.success(`CapitalBot model (${mid}) and preset (${pid}) saved. Language: ${AI_LANGUAGES.find((l) => l.value === languageDraft)?.label || languageDraft}`);
     } catch (err) {
       toast.error(err?.response?.data?.error?.message || 'Failed to save model/preset');
     } finally {
@@ -374,6 +395,7 @@ export default function AiChat() {
       }));
       setShowModelPresetForm(false);
       setModelCustomMode(false);
+      setLanguageDraft('English');
       toast.success('CapitalBot license key removed.');
     } catch (err) {
       toast.error(err?.response?.data?.error?.message || 'Failed to remove license key');
@@ -561,7 +583,18 @@ export default function AiChat() {
             <button
               key={p.id}
               type="button"
-              onClick={() => { setActiveKeyProvider(p.id); setKeyDraft(''); setKeyError(null); setShowModelPresetForm(false); setModelCustomMode(false); }}
+              onClick={() => {
+                setActiveKeyProvider(p.id);
+                setKeyDraft('');
+                setKeyError(null);
+                setShowModelPresetForm(false);
+                setModelCustomMode(false);
+                if (p.id === 'capitalbot' && keyStatusByProvider.capitalbot?.responseLanguage) {
+                  setLanguageDraft(keyStatusByProvider.capitalbot.responseLanguage);
+                } else if (p.id !== 'capitalbot') {
+                  setLanguageDraft('English');
+                }
+              }}
               className={`flex-1 rounded-lg border px-4 py-2 text-left transition-colors ${
                 activeKeyProvider === p.id
                   ? 'border-sky-500/50 bg-sky-500/10 text-sky-200'
@@ -599,33 +632,34 @@ export default function AiChat() {
                   </p>
                   {ks.isValid && activeKeyProvider === 'capitalbot' && ks.modelId != null && ks.presetId != null && (
                     <p className="mt-1 text-xs text-emerald-300/70">
-                      Model: {ks.modelId} &middot; Preset: {ks.presetId}
+                      Model: {ks.modelId} &middot; Preset: {ks.presetId} &middot; Language: {ks.responseLanguage || languageDraft || 'English'}
                     </p>
                   )}
                 </div>
-                {ks.isValid && activeKeyProvider === 'capitalbot' && ks.modelId != null && ks.presetId != null && (
-                  <button
-                    type="button"
-                    onClick={async () => {
-                      setModelIdDraft(String(ks.modelId));
-                      setPresetIdDraft(String(ks.presetId));
-                      try {
-                        const modelsRes = await getMyCapitalbotModels();
-                        const body = modelsRes?.data;
-                        if (body?.success && body?.data?.data) {
-                          const d = body.data.data;
-                          if (Array.isArray(d.models)) setAvailableModels(d.models);
-                          if (Array.isArray(d.presets)) setAvailablePresets(d.presets);
-                          setModelCustomMode(!d.models?.length);
-                        }
-                      } catch (_) {}
-                      setShowModelPresetForm(true);
-                    }}
-                    className="rounded-md border border-white/10 px-3 py-1.5 text-xs hover:bg-white/5"
-                  >
-                    Change Config
-                  </button>
-                )}
+                  {ks.isValid && activeKeyProvider === 'capitalbot' && ks.modelId != null && ks.presetId != null && (
+                    <button
+                      type="button"
+                      onClick={async () => {
+                        setModelIdDraft(String(ks.modelId));
+                        setPresetIdDraft(String(ks.presetId));
+                        if (ks.responseLanguage) setLanguageDraft(ks.responseLanguage);
+                        try {
+                          const modelsRes = await getMyCapitalbotModels();
+                          const body = modelsRes?.data;
+                          if (body?.success && body?.data?.data) {
+                            const d = body.data.data;
+                            if (Array.isArray(d.models)) setAvailableModels(d.models);
+                            if (Array.isArray(d.presets)) setAvailablePresets(d.presets);
+                            setModelCustomMode(!d.models?.length);
+                          }
+                        } catch (_) {}
+                        setShowModelPresetForm(true);
+                      }}
+                      className="rounded-md border border-white/10 px-3 py-1.5 text-xs hover:bg-white/5"
+                    >
+                      Change Config
+                    </button>
+                  )}
               </div>
 
               <div className="mt-3 flex flex-col gap-2 sm:flex-row">
@@ -729,15 +763,63 @@ export default function AiChat() {
                       {modelPresetSaving ? 'Saving…' : 'Save Config'}
                     </button>
                   </div>
-                  {modelCustomMode && (
-                    <button
-                      type="button"
-                      onClick={() => { setModelCustomMode(false); setModelIdDraft(availableModels.length > 0 ? String(availableModels[0].modelId) : ''); }}
-                      className="mt-2 text-xs text-sky-400 hover:text-sky-300"
-                    >
-                      Back to dropdown
-                    </button>
-                  )}
+
+                  {/* Language selection */}
+                  <div className="mt-4 border-t border-white/10 pt-4">
+                    <p className="mb-2 text-sm font-semibold text-gray-200">
+                      AI Response Language
+                    </p>
+                    <p className="mb-3 text-xs text-gray-400">
+                      The AI will always reply in the selected language, regardless of the user&apos;s language.
+                    </p>
+                    <div className="flex flex-col gap-3 sm:flex-row sm:items-center">
+                      <select
+                        value={languageDraft}
+                        onChange={(e) => setLanguageDraft(e.target.value)}
+                        className="flex-1 rounded-md border border-white/10 bg-dark-900 px-3 py-2 text-sm text-gray-200 focus:border-sky-500 focus:outline-none"
+                        disabled={modelPresetSaving}
+                      >
+                        {AI_LANGUAGES.map((l) => (
+                          <option key={l.value} value={l.value}>
+                            {l.label}
+                          </option>
+                        ))}
+                      </select>
+                      <button
+                        type="button"
+                        onClick={async () => {
+                          if (!modelIdDraft || !presetIdDraft) {
+                            toast.error('Save model and preset first.');
+                            return;
+                          }
+                          setModelPresetSaving(true);
+                          try {
+                            await updateCapitalbotModelPreset(
+                              parseInt(modelIdDraft, 10),
+                              parseInt(presetIdDraft, 10),
+                              languageDraft
+                            );
+                            setKeyStatusByProvider((prev) => ({
+                              ...prev,
+                              capitalbot: {
+                                ...prev.capitalbot,
+                                responseLanguage: languageDraft,
+                              },
+                            }));
+                            toast.success(`AI language set to ${AI_LANGUAGES.find((l) => l.value === languageDraft)?.label || languageDraft}`);
+                          } catch (err) {
+                            toast.error(err?.response?.data?.error?.message || 'Failed to save language');
+                          } finally {
+                            setModelPresetSaving(false);
+                          }
+                        }}
+                        disabled={modelPresetSaving}
+                        className="rounded-md bg-sky-600 px-4 py-2 text-sm font-medium text-white hover:bg-sky-500 disabled:opacity-50"
+                      >
+                        {modelPresetSaving ? 'Saving…' : 'Save Language'}
+                      </button>
+                    </div>
+                  </div>
                 </div>
               )}
             </div>

@@ -96,7 +96,7 @@ class CapitalBotService {
     }
 
     const { rows } = await pool.query(
-      `SELECT api_key, is_valid, model_id, preset_id FROM user_capitalbot_keys WHERE user_id = $1`,
+      `SELECT api_key, is_valid, model_id, preset_id, response_language FROM user_capitalbot_keys WHERE user_id = $1`,
       [uid]
     );
     if (rows.length && rows[0].api_key) {
@@ -106,13 +106,14 @@ class CapitalBotService {
         isValid: rows[0].is_valid,
         modelId: rows[0].model_id ? Number(rows[0].model_id) : null,
         presetId: rows[0].preset_id ? Number(rows[0].preset_id) : null,
+        responseLanguage: rows[0].response_language || 'English',
       };
     }
 
     throw new Error('CapitalBot API key is not configured. Please add your license key in the AI menu.');
   }
 
-  async setUserApiKey(userId, apiKey, modelId = null, presetId = null) {
+  async setUserApiKey(userId, apiKey, modelId = null, presetId = null, responseLanguage = 'English') {
     const uid = Number(userId);
     if (!uid) throw new Error('User ID is required');
     if (!apiKey || typeof apiKey !== 'string' || !apiKey.trim()) {
@@ -124,38 +125,47 @@ class CapitalBotService {
 
     const mId = modelId ? Number(modelId) : null;
     const pId = presetId ? Number(presetId) : null;
+    const lang = responseLanguage || 'English';
 
     const firstModelId = models?.length ? models[0].modelId : null;
     const firstPresetId = presets?.length ? presets[0].id : null;
 
     await pool.query(
-      `INSERT INTO user_capitalbot_keys (user_id, api_key, is_valid, model_id, preset_id, updated_at)
-       VALUES ($1, $2, $3, $4, $5, NOW())
+      `INSERT INTO user_capitalbot_keys (user_id, api_key, is_valid, model_id, preset_id, response_language, updated_at)
+       VALUES ($1, $2, $3, $4, $5, $6, NOW())
        ON CONFLICT (user_id) DO UPDATE
        SET api_key = EXCLUDED.api_key,
            is_valid = EXCLUDED.is_valid,
            model_id = COALESCE(EXCLUDED.model_id, user_capitalbot_keys.model_id),
            preset_id = COALESCE(EXCLUDED.preset_id, user_capitalbot_keys.preset_id),
+           response_language = COALESCE(EXCLUDED.response_language, user_capitalbot_keys.response_language),
            updated_at = NOW()`,
-      [uid, key, isValid, mId || firstModelId, pId || firstPresetId]
+      [uid, key, isValid, mId || firstModelId, pId || firstPresetId, lang]
     );
 
-    return { userId: uid, isValid, modelId: mId || firstModelId, presetId: pId || firstPresetId, models, presets };
+    return { userId: uid, isValid, modelId: mId || firstModelId, presetId: pId || firstPresetId, responseLanguage: lang, models, presets };
   }
 
-  async updateModelPreset(userId, modelId, presetId) {
+  async updateModelPreset(userId, modelId, presetId, responseLanguage = null) {
     const uid = Number(userId);
     if (!uid) throw new Error('User ID is required');
 
     const mId = modelId ? Number(modelId) : null;
     const pId = presetId ? Number(presetId) : null;
 
-    await pool.query(
-      `UPDATE user_capitalbot_keys SET model_id = $1, preset_id = $2, updated_at = NOW() WHERE user_id = $3`,
-      [mId, pId, uid]
-    );
+    if (responseLanguage) {
+      await pool.query(
+        `UPDATE user_capitalbot_keys SET model_id = $1, preset_id = $2, response_language = $3, updated_at = NOW() WHERE user_id = $4`,
+        [mId, pId, responseLanguage, uid]
+      );
+    } else {
+      await pool.query(
+        `UPDATE user_capitalbot_keys SET model_id = $1, preset_id = $2, updated_at = NOW() WHERE user_id = $3`,
+        [mId, pId, uid]
+      );
+    }
 
-    return { userId: uid, modelId: mId, presetId: pId };
+    return { userId: uid, modelId: mId, presetId: pId, responseLanguage };
   }
 
   async validateApiKey(apiKey) {

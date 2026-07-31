@@ -15,4 +15,10 @@ export const groupsAPI = {
   cancelOperation: (id) => api.post(`/groups/operations/${id}/cancel`),
   getInfo: (id, sessionId) => api.get(`/groups/${id}/info`, { params: { sessionId } }),
   removeMember: (id, data) => api.delete(`/groups/${id}/remove-member`, { data }),
+  listBoostAccounts: (refresh = false) => api.get('/groups/boosts/accounts', { params: { refresh } }),
+  inspectBoostAccount: (sessionId) => api.get(`/groups/boosts/accounts/${sessionId}`),
+  createBoostJob: (data) => api.post('/groups/boosts/jobs', data),
+  listBoostJobs: (params) => api.get('/groups/boosts/jobs', { params }),
+  getBoostJob: (id) => api.get(`/groups/boosts/jobs/${id}`),
+  cancelBoostJob: (id) => api.post(`/groups/boosts/jobs/${id}/cancel`),
 };

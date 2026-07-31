@@ -1,6 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const groupController = require('../controllers/groupController');
+const boostController = require('../controllers/boostController');
 const { authenticate, requireApproved } = require('../middleware/auth');
 const { validate, schemas } = require('../middleware/validator');
 
@@ -38,6 +39,14 @@ router.get('/operations/:id', groupController.getOperation);
 
 // POST /api/groups/operations/:id/cancel
 router.post('/operations/:id/cancel', groupController.cancelOperation);
+
+// Premium account boosts for channels and supergroups.
+router.get('/boosts/accounts', boostController.listAccounts);
+router.get('/boosts/accounts/:sessionId', boostController.inspectAccount);
+router.post('/boosts/jobs', boostController.createJob);
+router.get('/boosts/jobs', boostController.listJobs);
+router.get('/boosts/jobs/:id', boostController.getJob);
+router.post('/boosts/jobs/:id/cancel', boostController.cancelJob);
 
 // GET /api/groups/:id/info
 router.get('/:id/info', groupController.getGroupInfo);

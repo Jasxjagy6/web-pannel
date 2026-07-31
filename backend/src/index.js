@@ -581,7 +581,14 @@ async function start() {
       logger.warn(`storyJobWorker.start failed: ${err.message}`);
     }
 
-    // 5c. Persisted username-validation worker. Sequentially resolves public
+    // 5c. Apply unused Premium boost slots to selected channels/groups.
+    try {
+      require('./services/boostJobWorker').start();
+    } catch (err) {
+      logger.warn(`boostJobWorker.start failed: ${err.message}`);
+    }
+
+    // 5d. Persisted username-validation worker. Sequentially resolves public
     // handles through live Telegram sessions and resumes interrupted jobs.
     try {
       require('./services/usernameValidationService').startWorker();

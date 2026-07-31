@@ -2547,6 +2547,95 @@ class TelegramService {
   }
 
   /**
+   * Return this Premium account's boost slots without moving any of them.
+   * A slot is available only when it is unassigned and outside Telegram's
+   * reassignment cooldown.
+   */
+  async getMyBoostSlots(sessionId) {
+    await this._ensureConnected(sessionId);
+    const client = this.clients.get(String(sessionId)).client;
+    try {
+      const result = await this._withFloodRetry(sessionId, () =>
+        client.invoke(new Api.premium.GetMyBoosts())
+      );
+      const chats = new Map((result.chats || []).map((chat) => [String(chat.id), chat]));
+      const now = Math.floor(Date.now() / 1000);
+      const slots = (result.myBoosts || []).map((boost) => {
+        const peer = boost.peer || null;
+        const peerId = peer
+          ? String(peer.channelId || peer.chatId || peer.userId || '')
+          : null;
+        const chat = peerId ? chats.get(peerId) : null;
+        const cooldownUntil = boost.cooldownUntilDate || null;
+        return {
+          slot: Number(boost.slot),
+          assigned: !!peer,
+          available: !peer && (!cooldownUntil || Number(cooldownUntil) <= now),
+          peerId,
+          peerTitle: chat?.title || chat?.username || null,
+          peerUsername: chat?.username || null,
+          expiresAt: boost.expires ? new Date(Number(boost.expires) * 1000).toISOString() : null,
+          cooldownUntil: cooldownUntil
+            ? new Date(Number(cooldownUntil) * 1000).toISOString()
+            : null,
+        };
+      });
+      return {
+        total: slots.length,
+        available: slots.filter((slot) => slot.available).length,
+        assigned: slots.filter((slot) => slot.assigned).length,
+        cooldown: slots.filter((slot) => !slot.assigned && !slot.available).length,
+        slots,
+      };
+    } catch (error) {
+      throw this._handleTelegramError(error);
+    }
+  }
+
+  /**
+   * Apply specific unused boost slots to a channel or supergroup. Existing
+   * assignments are never touched; callers obtain free slots through
+   * getMyBoostSlots first.
+   */
+  async applyBoostSlots(sessionId, rawTarget, slots) {
+    const slotIds = Array.from(new Set(
+      (slots || []).map(Number).filter((slot) => Number.isInteger(slot) && slot >= 0)
+    ));
+    if (slotIds.length === 0) throw new Error('At least one boost slot is required');
+
+    await this._ensureConnected(sessionId);
+    const client = this.clients.get(String(sessionId)).client;
+    try {
+      const entity = await this._resolveEntity(sessionId, rawTarget);
+      if (!entity || entity.className !== 'Channel') {
+        throw new Error('BOOST_PEER_INVALID: only channels and supergroups can receive boosts');
+      }
+      const peer = await client.getInputEntity(entity);
+      await this._withFloodRetry(sessionId, () =>
+        client.invoke(new Api.premium.ApplyBoost({ slots: slotIds, peer }))
+      );
+      const status = await this._withFloodRetry(sessionId, () =>
+        client.invoke(new Api.premium.GetBoostsStatus({ peer }))
+      ).catch(() => null);
+      return {
+        target: String(rawTarget),
+        targetId: entity.id ? String(entity.id) : null,
+        title: entity.title || entity.username || String(rawTarget),
+        username: entity.username || null,
+        slots: slotIds,
+        level: status ? Number(status.level || 0) : null,
+        boosts: status ? Number(status.boosts || 0) : null,
+        nextLevelBoosts: status?.nextLevelBoosts != null
+          ? Number(status.nextLevelBoosts)
+          : null,
+        boostUrl: status?.boostUrl || null,
+      };
+    } catch (error) {
+      throw this._handleTelegramError(error);
+    }
+  }
+
+  /**
    * Post a Telegram Story (photo or video) from this session's own account.
    *
    * @param {string|number} sessionId
