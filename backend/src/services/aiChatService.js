@@ -192,13 +192,14 @@ class AiChatService {
     }
 
     // Store incoming message in memory
+    const mediaKind = this._detectMediaKind(msg);
     const memoryItem = {
       id: `tg-${msg.id}`,
       telegramMessageId: tcService._toIdNum(msg.id),
       timestamp: Date.now(),
       msg: msg.message || '',
       isIncoming: true,
-      medias: [],
+      medias: mediaKind ? [{ kind: mediaKind, hasMedia: true }] : [],
     };
 
     await aiMemoryService.append(sid, peerType, peerId, memoryItem, cfg.memoryMessageLimit);
@@ -345,6 +346,29 @@ class AiChatService {
       isReengage: true,
     });
     return { handled: true };
+  }
+
+  /**
+   * Detect the media kind of a raw GramJS message so the memory record can
+   * carry it (CapitalBot then receives a marker like *IMAGE* in chatHistory
+   * instead of thinking a photo was plain text).
+   */
+  _detectMediaKind(msg) {
+    const media = msg?.media;
+    if (!media) return null;
+    const cn = media.className || '';
+    if (cn.includes('Photo')) return 'photo';
+    if (cn.includes('Document')) {
+      const attrs = media.document?.attributes || [];
+      if (attrs.some((a) => a.className === 'DocumentAttributeSticker')) return 'sticker';
+      if (attrs.some((a) => a.className === 'DocumentAttributeVideo')) return 'video';
+      if (attrs.some((a) => a.className === 'DocumentAttributeAudio')) return 'audio';
+      return 'document';
+    }
+    if (cn.includes('Geo') || cn.includes('Location')) return 'geo';
+    if (cn.includes('Contact')) return 'contact';
+    if (cn.includes('WebPage')) return 'webpage';
+    return 'other';
   }
 
   /**
