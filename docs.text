@@ -1,0 +1,1767 @@
+# AI Chatter API Documentation
+
+Simple guide to using the AI Chatter API.
+
+**Base URL:** `https://api.capitalbot.ai`
+
+## ðŸŽ¯ Key Features
+
+- **ðŸ’¬ Smart Conversation AI** - Context-aware responses with personality
+- **ðŸŽ¨ Media Generation** - Images, videos, and voice notes 
+- **ðŸ“Š Automatic Statistics** - Track conversations, conversions, and costs
+- **ðŸŽ­ Auto Openers & Follow-ups** - Hands-free conversation management
+- **ðŸ“ Media Upload Support** - Analyze user-sent images, videos, and audio
+
+---
+
+## POST /generateResponse
+
+Generate AI chat responses.
+
+### Endpoint
+```
+POST https://api.capitalbot.ai/generateResponse
+```
+
+### Request Body
+
+**Required Fields:**
+```json
+{
+  "licensekey": "your-license-key",
+  "modelId": 43,
+  "presetId": 88,
+  "accountId": "your-account-id",
+  "userInfos": {
+    "useridentifier": "551237460629"
+  },
+  "chatHistory": [
+    {
+      "role": "user",
+      "content": "hey",
+      "timestamp": 1730755200
+    }
+  ]
+}
+```
+
+**Required Field Descriptions:**
+- `licensekey` (string) - Your API license key
+- `modelId` (number) - AI model/character ID
+- `presetId` (number) - Conversation preset/template ID  
+- `accountId` (string) - Unique identifier for the account chatting (e.g., Snapchat username, Instagram handle)
+- `userInfos.useridentifier` (string) - **Required.** Unique identifier for the user being chatted with (e.g., their user ID, phone number hash, etc.)
+- `chatHistory` (array) - Array of previous messages in the conversation
+  - **IMPORTANT:** Every message MUST include a `timestamp` field (Unix epoch in seconds)
+  - Requests will be rejected (400 error) if any message is missing a timestamp
+
+**Optional Fields (override preset defaults):**
+```json
+{
+  "conversationCreatedAt": 1747400000000,
+  "timezone": "America/New_York",
+  "conversationSource": "Instagram",
+  "platform": "Snapchat",
+  "city": "New York",
+  "outfit": "Outfit Day 1",
+  "photoRate": 30,
+  "interestLevel": "Medium",
+  "modelName": "Lily",
+  "modelAge": "22",
+  "chattingStyle": 50,
+  "appearance": "Blonde hair, blue eyes, fit body",
+  "hobbies": "Gym, travel, photography",
+  "ctaInfo": "My OnlyFans is $3 and I post daily",
+  "dayTimeActivity": "At the gym",
+  "nightTimeActivity": "Can't sleep",
+  "detectLanguage": false,
+  "language": "English",
+  "phaseGoal": "Build rapport",
+  "livePhotoSource": "Primary",
+  "mp3tomp4": false,
+  "matchLocation": true,
+  "affiliate": "YourAffiliateCode",
+  "audio": true,
+  "video": true,
+  "image": true,
+  "userInfos": {
+    "name": "Jake",
+    "username": "jake_cool",  
+    "age": 25,
+    "location": "New York"
+  }
+}
+```
+
+**Field Descriptions:**
+- `conversationCreatedAt` (number, ms since epoch) - **Optional.** When the underlying chat (e.g. Snapchat conversation) was originally created. Used ONLY by the "Avoid Chats Older Than" ignore condition: if the preset has `avoidOldChatsEnabled: true` and `conversationCreatedAt < avoidOldChatsBeforeTimestamp`, the request short-circuits with `ignored: true` (no AI call, no credits). Omit the field to disable server-side enforcement (the SnapShot extension already enforces this client-side).
+- `timezone` (string) - User's timezone (e.g., "America/New_York")
+- `conversationSource` (string) - Where conversation started (e.g., "Instagram", "Tinder")
+- `language` (string) - **Optional override.** Reply language for this request (name like "Italian" or ISO code like "it"). Only honored when it matches the preset's primary language or one of its configured secondary languages â€” any other value is treated as a caller bug, logged, and replaced with the preset's primary language. Omit this field to simply use the preset's language settings.
+- `platform` (string) - Current chat platform (e.g., "Snapchat", "Instagram")
+- `city` (string) - AI model's home city/location (where the character lives). Overrides preset setting.
+- `outfit` (string) - Current outfit day (e.g., "Outfit Day 1")
+- `photoRate` (number 0-100) - Probability of sending photos
+- `interestLevel` (string) - User interest level ("Low", "Medium", "High")
+- `modelName` (string) - AI model character name
+- `modelAge` (string/number) - AI model age
+- `chattingStyle` (number 0-100) - Chatting style intensity
+- `appearance` (string) - Physical appearance description
+- `hobbies` (string) - Interests and hobbies
+- `ctaInfo` (string) - Call-to-action message (e.g., OnlyFans info)
+- `dayTimeActivity` (string) - What AI does during day
+- `nightTimeActivity` (string) - What AI does at night
+- `detectLanguage` (boolean) - Auto-detect user's language
+- `language` (string) - Response language if detectLanguage is false
+- `phaseGoal` (string) - Current conversation phase goal
+- `livePhotoSource` (string) - Photo source type ("Primary", "Sexy", etc.)
+- `mp3tomp4` (boolean) - Convert MP3 voice messages to MP4 video format (required for Snapchat API voice messages)
+- `matchLocation` (boolean) - Match AI's location to user's location
+- `affiliate` (string) - **Optional.** Affiliate tracking code. If provided, the affiliate will earn 10% commission on this conversation based on weighted average pricing. Example: `"affiliate": "CapitalAI"`
+- `audio` (boolean) - **Optional.** Enable/disable audio/voice messages (default: `true`). When `false`, no voice notes will be generated and `need_voice` objections will be ignored.
+- `video` (boolean) - **Optional.** Enable/disable video files (default: `true`). When `false`, only images will be selected for media responses.
+- `image` (boolean) - **Optional.** Enable/disable image files (default: `true`). When `false`, only videos will be selected for media responses.
+- `userInfos.name` (string) - **Optional.** User's display name (e.g., "Jake", "Sarah")
+- `userInfos.username` (string) - **Optional.** User's username/handle (e.g., "jake_cool", "@sarah.xo")
+- `userInfos.age` (number/string) - **Optional.** User's age
+- `userInfos.location` (string) - **Optional.** User's location/city. When provided, skips the location-asking phase entirely and uses this as the user's known location.
+
+### Affiliate System
+
+CapitalAI supports an affiliate program where partners can earn commissions on conversations generated through their referrals.
+
+**How it works:**
+1. Include the `affiliate` parameter in your `/generateResponse` requests
+2. On the first AI-generated response (not on automatic opener messages), the system:
+   - Calculates the customer's **weighted average price** (total spent / total credits purchased)
+   - Awards the affiliate with revenue share of that price
+ 
+ 
+### Media Type Control
+
+Control which types of media the AI can send using the `audio`, `video`, and `image` flags. This is useful for:
+- Platform compatibility (some platforms don't support certain media types)
+- Cost optimization (disable expensive media generation)
+- Testing text-only flows
+
+**Behavior:**
+- **`audio: false`** - Disables voice notes. The `need_voice` objection will be ignored.
+- **`video: false`** - Only images will be selected. Videos are excluded from photo rate and objection handling.
+- **`image: false`** - Only videos will be selected. Images are excluded from photo rate and objection handling.
+- **All media disabled** (`audio: false, video: false, image: false`) - No media will be sent at all.
+
+**Examples:**
+
+**Text + Images Only (No Audio, No Video):**
+```json
+{
+  "licensekey": "your-key",
+  "modelId": 43,
+  "presetId": 88,
+  "accountId": "testaccount",
+  "audio": false,
+  "video": false,
+  "image": true,
+  "chatHistory": [...]
+}
+```
+
+**Text + Videos Only (No Audio, No Images):**
+```json
+{
+  "licensekey": "your-key",
+  "modelId": 43,
+  "presetId": 88,
+  "accountId": "testaccount",
+  "audio": false,
+  "video": true,
+  "image": false,
+  "chatHistory": [...]
+}
+```
+
+**Text Only (No Media):**
+```json
+{
+  "licensekey": "your-key",
+  "modelId": 43,
+  "presetId": 88,
+  "accountId": "testaccount",
+  "audio": false,
+  "video": false,
+  "image": false,
+  "chatHistory": [...]
+}
+```
+ 
+### Example Request
+
+```javascript
+const response = await fetch('https://api.capitalbot.ai/generateResponse', {
+  method: 'POST',
+  headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify({
+    licensekey: "your-license-key",
+    modelId: 43,
+    presetId: 88,
+    accountId: "testaccount",
+    userInfos: {
+      useridentifier: "551237460629",
+      name: "Jake"
+    },
+    chatHistory: [
+      { role: "user", content: "hey what's up", timestamp: 1730755200 }
+    ]
+  })
+});
+
+const result = await response.json();
+```
+
+### Response
+
+The response contains a `content` array â€” an ordered list of typed content pieces (text, images, videos, audio) that should be sent to the user in sequence.
+
+**Success (200) - Normal response:**
+```json
+{
+  "content": [
+    { "type": "text", "content": "hey!" },
+    { "type": "text", "content": "how are you" },
+    { "type": "image", "content": "https://image-vault.fra1.digitaloceanspaces.com/photo.jpg", "mediaPool": "Primary" }
+  ],
+  "converted": false,
+  "underage": false,
+  "conversationId": 4821337,
+  "statistics": {
+    "location": "New York",
+    "conversationStarted": "2025-11-05T01:30:00.000Z",
+    "username": "blake_123",
+    "aiGenerations": 12,
+    "currentMood": "Warm",
+    "lastObjection": "need_media",
+    "totalExchanges": 12,
+    "exchangeInPhase": 5,
+    "currentPhase": "Building Rapport",
+    "currentCycle": 1,
+    "ctaShared": false
+  }
+}
+```
+
+*`conversationId` is the engine's internal id for this conversation. It is the value appended as `ecid` to OFAPI tracking links (see "Tracking links" below) and is omitted on the very first exchange before the conversation row exists.*
+
+### Tracking links (OFAPI attribution)
+
+If a preset's CTA URL is an [OnlyFansAPI](https://onlyfansapi.com) smart link (`trk.of-traffic.com/go/...`), the engine automatically appends attribution params at send time (known tracking hosts are auto-detected â€” there is no manual toggle):
+
+```
+trk.of-traffic.com/go/XXXXX?ecid=<conversationId>&affS1=<fan username, when known>
+```
+
+OFAPI uses `ecid` to call back into `GET /api/conversation/:id` (shared `x-api-key` auth, see the endpoint's section below) and retrieve the conversation metadata + transcript, attributing the subscription to the exact chat.
+
+**Web-only link disguise:** when the request `platform` is `"Web"` and the URL card in Settings has a "Show link as (Web only)" text configured, the response additionally carries `"linkDisplay": "onlyfans.com/yourname"`. The Web chat page then renders the tracking link with that label while clicking still opens the real tracking URL. The field is omitted for all other platforms and when no disguise text is set.
+
+**Success (200) - Voice message (mp3tomp4: true):**
+```json
+{
+  "content": [
+    { "type": "text", "content": "here's a voice message for you babe" },
+    { "type": "audio", "content": "https://image-vault.fra1.digitaloceanspaces.com/voice.mp4", "mediaPool": "Audio" }
+  ],
+  "converted": false,
+  "underage": false,
+  "statistics": { "..." : "..." }
+}
+```
+*Note: When `mp3tomp4: true`, voice messages are converted from MP3 to MP4 video format with a static image background for platforms that don't support audio files.*
+
+**Success (200) - Media-only response (no text):**
+```json
+{
+  "content": [
+    { "type": "video", "content": "https://image-vault.fra1.digitaloceanspaces.com/clip.mp4", "mediaPool": "Sexy" }
+  ],
+  "converted": false,
+  "underage": false
+}
+```
+
+**Success (200) - User already engaged by another account:**
+```json
+{
+  "content": [],
+  "converted": false,
+  "underage": false,
+  "messagedAlready": true,
+  "engagedUser": {
+    "engagedBy": "otherAccount456",
+    "daysRemaining": 3
+  }
+}
+```
+
+**Success (200) - AI credits depleted:**
+```json
+{
+  "content": [],
+  "converted": false,
+  "underage": false,
+  "aiCreditOver": true
+}
+```
+
+**Success (200) - Internal account detected (self-engagement blocked):**
+```json
+{
+  "content": [],
+  "converted": false,
+  "underage": false,
+  "internalAccount": true
+}
+```
+*Note: This response is returned when the user's username matches an existing CapitalAI account ID. This prevents the AI from accidentally engaging with other CapitalAI users.*
+
+**Success (200) - Request matched an enabled ignore condition:**
+```json
+{
+  "content": [],
+  "converted": false,
+  "underage": false,
+  "ignored": true
+}
+```
+*Note: This response is returned whenever an enabled **Ignore condition** matches the request. Two condition kinds are evaluated:*
+1. *Username / UUID list match â€” request's `username` OR `useridentifier` is on a list enabled for the current preset.*
+2. *Avoid Chats Older Than â€” preset has `avoidOldChatsEnabled: true`, a cutoff in `avoidOldChatsBeforeTimestamp` (ms epoch), AND the request body supplies `conversationCreatedAt` (ms epoch) that's older than the cutoff. If `conversationCreatedAt` is not supplied this condition is skipped server-side (the SnapShot extension enforces it client-side using the same preset keys).*
+
+*No AI call is made, no credits are charged. Manage conditions in the dashboard under **Settings â†’ Ignore condition**; see the [Ignore List endpoints](#ignore-list-endpoints) below for managing username/UUID lists.*
+
+**Content Array:**
+
+The `content` array contains ordered entries. Each entry has:
+- `type` (string) - `"text"`, `"image"`, `"video"`, or `"audio"`
+- `content` (string) - The text message or media URL
+- `mediaPool` (string|null) - Media vault category. Only present on media entries. Values: `"Primary"`, `"Sexy"`, `"Happy"`, `"Sad"`, `"Hidden"`, `"Audio"`, `"Specific"`, or `null`
+
+**Response Fields:**
+- `content` (array) - Ordered list of content pieces to send (see above)
+- `converted` (boolean) - User agreed to CTA/conversion
+- `underage` (boolean) - Underage content detected
+- `timewaste` (boolean) - Conversation reached AI messages limit and was ended
+- `tierFiltered` (boolean) - User was filtered out by T2/T3 country tier filter (no AI response, no credit charged)
+- `genderFiltered` (boolean) - User was filtered out by female gender filter (no AI response, no credit charged)
+- `aiCreditOver` (boolean) - AI credits depleted (no more conversations allowed)
+- `messagedAlready` (boolean) - User already engaged by another account (cooldown active)
+- `internalAccount` (boolean) - Username matches a CapitalAI account (self-engagement blocked)
+- `ignored` (boolean) - Request matched an enabled ignore condition: either a username/UUID on an enabled list, or the conversation is older than the preset's "Avoid Chats Older Than" cutoff (when `conversationCreatedAt` is supplied in the request body). Silently dropped â€” no AI call, no credits charged. See [Ignore List endpoints](#ignore-list-endpoints).
+- `engagedUser` (object|null) - Details if `messagedAlready: true` (contains `engagedBy` and `daysRemaining`)
+- `statistics` (object) - Conversation statistics and tracking info
+
+**Statistics Object:**
+- `location` (string|null) - User's location/city
+- `conversationStarted` (string|null) - ISO timestamp when conversation began
+- `username` (string|null) - User's username
+- `aiGenerations` (number) - Total AI messages sent
+- `currentMood` (string|null) - Latest mood (Neutral, Warm, Hot, Cold)
+- `lastObjection` (string|null) - Last triggered objection (need_media, need_voice, objection_none, or custom)
+- `totalExchanges` (number) - Total exchanges (same as aiGenerations)
+- `exchangeInPhase` (number) - Exchanges in current phase
+- `currentPhase` (string|null) - Current phase title (e.g., "Building Rapport", "Sexting")
+- `currentCycle` (number) - Current cycle number (1, 2, 3...)
+- `ctaShared` (boolean) - Whether CTA has been shared
+
+**UserInfos Object:**
+- `useridentifier` (string, **required**) - Unique user identifier for the person you're chatting with
+- `name` (string, optional) - User's display name
+- `username` (string, optional) - User's username/handle
+- `age` (number/string, optional) - User's age
+- `location` (string, optional) - User's city/location
+
+### Sending User Media
+
+When a user sends you media (photo/video/audio), you can send it directly with `/generateResponse` using FormData.
+
+**Content-Type:** `multipart/form-data`
+
+**CRITICAL REQUIREMENT:**
+When uploading media, you MUST include BOTH:
+1. âœ… **The media marker in chatHistory** (`*IMAGE*`, `*VIDEO*`, or `*AUDIO*`) with timestamp
+2. âœ… **The file in the FormData** (as the `file` field)
+
+**âŒ WRONG - Only sending file:**
+```javascript
+formData.append('file', imageFile);  // Missing *IMAGE* marker in chatHistory
+```
+
+**âœ… CORRECT - Marker + File:**
+```javascript
+formData.append('chatHistory', JSON.stringify([
+  { role: 'user', content: '*IMAGE*', timestamp: 1730755200 }  // â† Marker with timestamp
+]));
+formData.append('file', imageFile);  // â† Actual file
+```
+
+**How it works:**
+1. Convert your JSON fields to FormData
+2. Add the media marker to chatHistory with timestamp
+3. Add the media file as `file` field
+4. Send to `/generateResponse`
+5. The media is analyzed and AI responds in ONE request
+
+**Example with Media:**
+
+```javascript
+const formData = new FormData();
+
+// Required fields
+formData.append('licensekey', 'your-license-key');
+formData.append('modelId', '43');
+formData.append('presetId', '88');
+formData.append('accountId', 'your-account-id');
+formData.append('platform', 'Snapchat');
+
+// Chat history with *IMAGE* marker (REQUIRED when uploading file)
+formData.append('chatHistory', JSON.stringify([
+  { role: 'user', content: 'check this out', timestamp: 1730755200 },
+  { role: 'user', content: '*IMAGE*', timestamp: 1730755201 }  // â† Media marker with timestamp
+]));
+
+// User info as JSON string
+formData.append('userInfos', JSON.stringify({
+  useridentifier: '1234567890',
+  name: 'Jake'
+}));
+
+// The media file
+formData.append('file', imageFile); // File object from <input type="file">
+
+const response = await fetch('https://api.capitalbot.ai/generateResponse', {
+  method: 'POST',
+  body: formData // No Content-Type header needed (browser sets it automatically)
+});
+
+const result = await response.json();
+// Iterate over result.content to send each piece in order
+result.content.forEach(item => {
+  if (item.type === 'text') sendText(item.content);
+  else sendMedia(item.content, item.type, item.mediaPool);
+});
+```
+
+**cURL Example:**
+
+```bash
+curl -X POST 'https://api.capitalbot.ai/generateResponse' \
+  -F 'licensekey=your-license-key' \
+  -F 'modelId=43' \
+  -F 'presetId=88' \
+  -F 'accountId=your-account-id' \
+  -F 'platform=Snapchat' \
+  -F 'chatHistory=[{"role":"user","content":"check this","timestamp":1730755200},{"role":"user","content":"*IMAGE*","timestamp":1730755201}]' \
+  -F 'userInfos={"useridentifier":"1234567890","name":"Jake"}' \
+  -F 'file=@/path/to/image.jpg'
+```
+
+**Important Notes:**
+- **ALL messages MUST have timestamps** - Requests without timestamps will be rejected with 400 error
+- **Media uploads REQUIRE markers** - When uploading a file, include `*IMAGE*`, `*VIDEO*`, or `*AUDIO*` in chatHistory with timestamp
+- When using FormData, `chatHistory` and `userInfos` must be **JSON strings**
+- `modelId` and `presetId` can be sent as strings (will be converted automatically)
+- Supported files: Images (JPG, PNG, GIF, WebP), Audio (MP3, WAV, OGG, M4A), Video (MP4, WebM, MOV)
+- Max file size: 50MB
+- Media is analyzed internally and the analysis is added to the conversation context automatically
+- Files are analyzed and immediately deleted (not stored)
+- **Rate Limits:** 5 media requests per minute per user, 30 per day per user
+
+**When NOT to use FormData:**
+- If the user sends only text (no media), use regular JSON request (faster)
+
+### Alternative: File URL (instead of multipart upload)
+
+Instead of uploading the file via multipart/form-data, you can pass a **URL string** (or an **array of URLs**) in the `file` field of a regular JSON request. The server will download and analyze the file(s) automatically.
+
+This is useful when you already have a publicly accessible URL for the media (e.g., from a CDN, Instagram, or Snapchat).
+
+**Single file URL:**
+
+```json
+{
+  "licensekey": "your-license-key",
+  "modelId": 43,
+  "presetId": 88,
+  "accountId": "your-account-id",
+  "chatHistory": [
+    { "role": "user", "content": "check this out", "timestamp": 1730755200 },
+    { "role": "user", "content": "*IMAGE*", "timestamp": 1730755201 }
+  ],
+  "userInfos": { "useridentifier": "1234567890", "name": "Jake" },
+  "file": "https://example.com/photo.jpg"
+}
+```
+
+**Multiple file URLs (array):**
+
+When the user sends multiple media files at once, pass them as an array. All files are downloaded in parallel and analyzed together.
+
+```json
+{
+  "licensekey": "your-license-key",
+  "modelId": 43,
+  "presetId": 88,
+  "accountId": "your-account-id",
+  "chatHistory": [
+    { "role": "user", "content": "look at these", "timestamp": 1730755200 },
+    { "role": "user", "content": "*IMAGE*", "timestamp": 1730755201 },
+    { "role": "user", "content": "*IMAGE*", "timestamp": 1730755202 },
+    { "role": "user", "content": "*VIDEO*", "timestamp": 1730755203 }
+  ],
+  "userInfos": { "useridentifier": "1234567890", "name": "Jake" },
+  "file": [
+    "https://example.com/photo1.jpg",
+    "https://example.com/photo2.jpg",
+    "https://example.com/video.mp4"
+  ]
+}
+```
+
+**Important Notes:**
+- URLs must be publicly accessible (no auth headers are sent)
+- The `*IMAGE*` / `*VIDEO*` / `*AUDIO*` marker in chatHistory is still required
+- Supported formats are the same as multipart uploads (JPG, PNG, GIF, WebP, MP3, WAV, OGG, M4A, MP4, WebM, MOV)
+- Max download size: 50MB per file, 30 second timeout per download
+- If a URL fails to download (expired, 404, etc.), it is skipped silently â€” the request still processes normally with any remaining files
+- Content-Type for URL requests is `application/json` (not multipart/form-data)
+
+---
+
+## Automatic Conversation Features
+
+### 1. Opener Generation (Automatic)
+
+The AI **automatically** generates opener messages when starting NEW conversations.
+
+**Trigger:** Empty `chatHistory` array AND no file upload
+
+```javascript
+{
+  "licensekey": "your-license-key",
+  "modelId": 88,
+  "presetId": 143,
+  "chatHistory": [],  // Empty = opener automatically triggered
+  "userInfos": {
+    "useridentifier": "user123"
+  }
+}
+```
+
+**Response:**
+```json
+{
+  "content": [
+    { "type": "text", "content": "hey!" },
+    { "type": "text", "content": "ðŸ‘‹ðŸ»" },
+    { "type": "image", "content": "https://image-vault.fra1.digitaloceanspaces.com/selfie.jpg", "mediaPool": "Primary" }
+  ],
+  "converted": false,
+  "underage": false
+}
+```
+
+### 2. Follow-up Generation (Automatic)
+
+The AI **automatically** generates follow-up/re-engagement messages when appropriate.
+
+**Trigger:** Last message in `chatHistory` has `role` = `"bot"` or `"assistant"` AND no file upload
+
+**Important:** If a file is uploaded along with the request, the followup will NOT trigger - the system will analyze the media instead.
+
+```javascript
+{
+  "licensekey": "your-license-key",
+  "modelId": 88,
+  "presetId": 143,
+  "chatHistory": [
+    { "role": "bot", "content": "hey! how's your day going?", "timestamp": 1733270400 }
+    // â†‘ Last message from bot = follow-up automatically triggered (if no file uploaded)
+  ],
+  "userInfos": {
+    "useridentifier": "user123"
+  }
+}
+```
+
+**Response:**
+```json
+{
+  "content": [
+    { "type": "text", "content": "still there? ðŸ‘€" }
+  ],
+  "converted": false,
+  "underage": false
+}
+```
+
+### 3. Media Types in Chat
+
+Include media in chat history using these markers:
+
+```javascript
+{
+  "chatHistory": [
+    { role: "user", content: "check this out", timestamp: 1730755200 },
+    { role: "user", content: "*IMAGE*", timestamp: 1730755201 }
+  ]
+}
+```
+
+**Supported markers:**
+- `*IMAGE*` - Photo
+- `*VIDEO*` - Video
+- `*AUDIO*` - Voice note
+- `*GIF*` - Animated GIF
+- `*STICKER*` - Sticker
+- `*LOCATION*` - Location pin
+- `*SCREENSHOT*` - Screenshot
+- `*MISSED-CALL*` - Missed call
+- `*STORY-REPLY*` - Story reply
+- `*INVISIBLE-SNAP*` - Invisible snap
+- `*SAVED-SNAP*` - Saved snap
+- `*MAP-PIN*` - Map location
+- `*SPAM*` - Spam content
+
+**Example with media:**
+```json
+{
+  "chatHistory": [
+    { role: "user", content: "look at this", timestamp: 1730755200 },
+    { role: "user", content: "*IMAGE*", timestamp: 1730755201 },
+    { role: "bot", content: "omg cute!", timestamp: 1730755210 },
+    { role: "user", content: "*VIDEO*", timestamp: 1730755220 }
+  ]
+}
+```
+
+---
+
+## Complete Example - Unified Approach
+
+Send text and/or media in a single request to `/generateResponse`.
+
+### Text-Only Message
+
+```javascript
+async function sendTextMessage(text, chatHistory = []) {
+  // Add user message to history
+  chatHistory.push({
+    role: 'user',
+    content: text,
+    timestamp: Math.floor(Date.now() / 1000)
+  });
+  
+  // Send JSON request
+  const response = await fetch('https://api.capitalbot.ai/generateResponse', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      licensekey: 'your-license-key',
+      modelId: 43,
+      presetId: 88,
+      accountId: 'your-account-id',
+      platform: 'Snapchat',
+      userInfos: {
+        useridentifier: '1234567890',
+        name: 'Jake'
+      },
+      chatHistory: chatHistory
+    })
+  });
+  
+  return await response.json();
+}
+
+// Usage
+const result = await sendTextMessage('hey whats up');
+console.log(result.content); // [{ type: "text", content: "hey babe!" }, { type: "text", content: "how are you" }]
+```
+
+### Message with Media (Unified)
+
+```javascript
+async function sendMessageWithMedia(text, mediaFile, mediaType, chatHistory = []) {
+  // Add text message to history (if provided)
+  if (text) {
+    chatHistory.push({
+      role: 'user',
+      content: text,
+      timestamp: Math.floor(Date.now() / 1000)
+    });
+  }
+  
+  // REQUIRED: Add media marker to chatHistory
+  // Determine marker based on file type
+  const marker = mediaType === 'image' ? '*IMAGE*' : 
+                 mediaType === 'video' ? '*VIDEO*' : '*AUDIO*';
+  
+  chatHistory.push({
+    role: 'user',
+    content: marker,
+    timestamp: Math.floor(Date.now() / 1000)
+  });
+  
+  // Create FormData (required for file uploads)
+  const formData = new FormData();
+  
+  // Add all parameters
+  formData.append('licensekey', 'your-license-key');
+  formData.append('modelId', '43');
+  formData.append('presetId', '88');
+  formData.append('accountId', 'your-account-id');
+  formData.append('platform', 'Snapchat');
+  
+  // Add JSON fields as strings
+  formData.append('chatHistory', JSON.stringify(chatHistory));
+  formData.append('userInfos', JSON.stringify({
+    useridentifier: '1234567890',
+    name: 'Jake'
+  }));
+  
+  // Add the media file
+  formData.append('file', mediaFile);
+  
+  // Send unified request
+  const response = await fetch('https://api.capitalbot.ai/generateResponse', {
+    method: 'POST',
+    body: formData
+  });
+  
+  return await response.json();
+}
+
+// Usage
+const result = await sendMessageWithMedia('check this pic', myImageFile, 'image');
+console.log(result.content); // [{ type: "text", content: "wow nice!" }, { type: "text", content: "you look great" }]
+```
+
+### Universal Function (Handles Both)
+
+```javascript
+async function sendMessage(text, mediaFile = null, mediaType = null, chatHistory = []) {
+  // Add text to history if provided
+  if (text) {
+    chatHistory.push({
+      role: 'user',
+      content: text,
+      timestamp: Math.floor(Date.now() / 1000)
+    });
+  }
+  
+  // If media is attached, use FormData
+  if (mediaFile) {
+    // REQUIRED: Add media marker
+    const marker = mediaType === 'image' ? '*IMAGE*' : 
+                   mediaType === 'video' ? '*VIDEO*' : '*AUDIO*';
+    
+    chatHistory.push({
+      role: 'user',
+      content: marker,
+      timestamp: Math.floor(Date.now() / 1000)
+    });
+    
+    const formData = new FormData();
+    formData.append('licensekey', 'your-license-key');
+    formData.append('modelId', '43');
+    formData.append('presetId', '88');
+    formData.append('accountId', 'your-account-id');
+    formData.append('platform', 'Snapchat');
+    formData.append('chatHistory', JSON.stringify(chatHistory));
+    formData.append('userInfos', JSON.stringify({
+      useridentifier: '1234567890',
+      name: 'Jake'
+    }));
+    formData.append('file', mediaFile);
+    
+    const response = await fetch('https://api.capitalbot.ai/generateResponse', {
+      method: 'POST',
+      body: formData
+    });
+    
+    return await response.json();
+  }
+  
+  // Otherwise, use JSON
+  const response = await fetch('https://api.capitalbot.ai/generateResponse', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      licensekey: 'your-license-key',
+      modelId: 43,
+      presetId: 88,
+      accountId: 'your-account-id',
+      platform: 'Snapchat',
+      userInfos: {
+        useridentifier: '1234567890',
+        name: 'Jake'
+      },
+      chatHistory: chatHistory
+    })
+  });
+  
+  return await response.json();
+}
+
+// Usage examples
+const textOnly = await sendMessage('hey');
+const withMedia = await sendMessage('check this', myPhotoFile, 'image');
+const mediaOnly = await sendMessage('', myPhotoFile, 'image');
+```
+
+---
+
+## Response Flags
+
+### `converted: true`
+User agreed to CTA (e.g., OnlyFans link, phone number, etc.)
+
+**âš ï¸ IMPORTANT: Conversions Can Be Reversed**
+
+When `converted: true` is returned, the conversation is marked as converted and the API stops sending messages. **However, this is not permanent.** CapitalAI users can "un-convert" users from the dashboard if they determine the conversion was a false positive.
+
+**Best Practice for Clients:**
+- âœ… **DO:** Continue checking the conversation periodically (e.g., every 60 minutes)
+- âŒ **DON'T:** Permanently disable the conversation client-side after receiving `converted: true`
+
+**Why?** If a CapitalAI user un-converts the user, the next API call will return:
+```json
+{
+  "content": [
+    { "type": "text", "content": "i cannot find you on my OF :(" }
+  ],
+  "converted": false
+}
+```
+
+After this message, the conversation automatically resumes normal flow.
+
+**Example: Un-Convert Flow**
+
+1. **Initial Conversion:**
+```json
+// User: "I subscribed!"
+{
+  "content": [],
+  "converted": true  // âš ï¸ Conversation paused
+}
+```
+
+2. **CapitalAI User Un-Converts** (from dashboard, 30 minutes later)
+   - CapitalAI user clicks "â†© Un-Convert" button
+   - Status changed to "un-converted" in database
+
+3. **Client Checks Again** (periodic check at 60-minute mark):
+```json
+// Client sends: "hey"
+{
+  "content": [
+    { "type": "text", "content": "i cannot find you on my OF :(" }
+  ],
+  "converted": false  // âœ… Conversation resumed!
+}
+```
+
+4. **Normal Flow Resumes:**
+```json
+// User: "oh really?"
+{
+  "content": [
+    { "type": "text", "content": "yeah i cant find ur username" },
+    { "type": "text", "content": "did u use a different name" }
+  ],
+  "converted": false
+}
+```
+
+### `underage: true`
+Underage content detected (conversation should be terminated permanently)
+
+### `aiCreditOver: true`
+AI credits depleted. No more conversations can be started until credits are refilled.
+
+```json
+{
+  "content": [],
+  "converted": false,
+  "underage": false,
+  "aiCreditOver": true
+}
+```
+
+### `tierFiltered: true`
+User was filtered out by the T2/T3 country tier filter. The AI classified the user's name, username, and bio as belonging to a T2 or T3 country, and the preset's tier filter setting matched. No AI response is generated and no credit is charged.
+
+```json
+{
+  "content": [],
+  "converted": false,
+  "tierFiltered": true,
+  "genderFiltered": false
+}
+```
+
+**How it works:**
+1. Configure the tier filter level in your preset's Main Settings: `"off"`, `"T3"` (filter T3 only), or `"T2T3"` (filter T2 and T3).
+2. On the first request of a conversation, the AI classifies the user based on their name, username, and optional bio (tier + gender together in one classification call).
+3. The classification is cached per conversation â€” it only runs once.
+4. If the user's tier matches the filter, `tierFiltered: true` is returned immediately with no AI engagement.
+5. T1 users (developed countries) always pass through.
+
+### `genderFiltered: true`
+User was filtered out by the female filter. The AI classified the user as female (based on name, username, and bio), and the preset's `Filter Females` setting was enabled. No AI response is generated and no credit is charged.
+
+```json
+{
+  "content": [],
+  "converted": false,
+  "tierFiltered": false,
+  "genderFiltered": true
+}
+```
+
+### `messagedAlready: true`
+User already engaged by another account. Do not send messages during cooldown period.
+
+```json
+{
+  "content": [],
+  "messagedAlready": true,
+  "engagedUser": {
+    "engagedBy": "otherAccount456",
+    "daysRemaining": 3
+  }
+}
+```
+
+### `ppvExhausted: true`
+Selling Mode has sold/delivered **every** PPV item to this fan â€” there is nothing left to sell. No AI response is generated; the conversation stops. The client should **stop chatting this fan** and the CapitalAI user should **add more PPV content** in the Media Vault. If more PPV is added later, selling resumes automatically on the next request.
+
+`totalSpent` reports how much this fan has paid for PPV in this conversation (in USD), so you can see what the fan was worth.
+
+```json
+{
+  "content": [],
+  "messages": [],
+  "converted": false,
+  "underage": false,
+  "sellingMode": true,
+  "ppvExhausted": true,
+  "totalSpent": 25
+}
+```
+
+### `chatCooldown: true`
+Selling Mode sells one **outfit day** at a time (PPV items are grouped by their `Outfit Day N`). When the current day's PPV is sold out **and a later outfit day still has content**, the model sends a short in-character "going to shower / change outfit, brb" message and the chat is put on a **hard cooldown** (15 minutes by default).
+
+During that window every request **early-exits with no AI response** and returns the cooldown flags below. When the cooldown elapses, selling automatically resumes on the **next outfit day's** content.
+
+- `chatCooldown: true` â€” the chat is paused on a day-transition cooldown.
+- `chatCooldownUntil` â€” absolute **unix timestamp (seconds)** when the cooldown ends. Compute remaining time as `chatCooldownUntil - now`.
+
+The turn that *starts* the cooldown carries the in-character shower message in `content`/`messages` **plus** these flags. Every subsequent request during the window returns the flags with an **empty** `content`/`messages`.
+
+```json
+{
+  "content": [],
+  "messages": [],
+  "converted": false,
+  "underage": false,
+  "sellingMode": true,
+  "chatCooldown": true,
+  "chatCooldownUntil": 1782187200
+}
+```
+
+### Media-Only Response
+AI sends only media (no text messages). The `content` array contains only a media entry.
+
+```json
+{
+  "content": [
+    { "type": "audio", "content": "https://image-vault.fra1.digitaloceanspaces.com/voice.mp3", "mediaPool": "Audio" }
+  ],
+  "converted": false,
+  "underage": false
+}
+```
+
+---
+
+## Ignore List Endpoints
+
+> **Note:** In the dashboard UI, this feature is grouped under **Settings â†’ Ignore condition**. The "Ignore condition" panel hosts TWO kinds of conditions: (1) the username / UUID lists managed by the endpoints below, and (2) a per-preset "Avoid Chats Older Than" datetime cutoff (stored in `preset.settings.avoidOldChatsEnabled` + `preset.settings.avoidOldChatsBeforeTimestamp`, which save and load with the rest of the preset â€” no separate endpoint). The endpoint paths below remain `/api/ignore-lists` for backward compatibility.
+
+Ignore lists let you silently drop `/generateResponse` requests for specific usernames or user identifiers. When a request's `userInfos.username` OR `userInfos.useridentifier` matches an entry in any list that's **enabled for the preset being used**, the response is returned immediately with `ignored: true` â€” no AI call, no credits charged, no conversation row written.
+
+**Key design:**
+- Lists are **shared across all presets** under a license (the same lists appear in every preset's settings tab).
+- Enable/disable is **per-preset** (each preset opts in to whichever lists it wants).
+- Matching is **case-insensitive**. Both username and identifier are checked against the same flat entry pool.
+- Imports accept `.txt` (one value per line) and `.csv` (one value per cell; comma-separated). Blank lines and lines starting with `#` are skipped. Duplicates within the file and against existing entries are silently dropped.
+
+### Other ignore conditions (saved on the preset JSON, no dedicated endpoints)
+
+Three additional ignore conditions live directly on `preset.settings` and are saved/loaded as part of the normal preset save flow â€” there are no dedicated endpoints. Key names are intentionally identical to the SnapShot extension and `config/defaults.js` so values round-trip without translation.
+
+#### a) "Avoid Chats Older Than" â€” datetime cutoff
+
+| Key | Type | Meaning |
+|---|---|---|
+| `avoidOldChatsEnabled` | bool | Master toggle |
+| `avoidOldChatsBeforeTimestamp` | number | Cutoff datetime, **ms since epoch** (`0` = unset) |
+
+**Server-side enforcement** is opt-in: `/generateResponse` only applies the cutoff if the client includes a top-level `conversationCreatedAt` field in the request body (ms epoch). When supplied AND the cutoff is enabled AND `conversationCreatedAt < avoidOldChatsBeforeTimestamp`, the request short-circuits with `ignored: true`. When `conversationCreatedAt` is absent the check is silently skipped on the server â€” the SnapShot extension enforces it client-side from the actual chat creation date.
+
+#### b) "CTA link mentioned recently" â€” chatHistory regex scan
+
+| Key | Type | Meaning |
+|---|---|---|
+| `ctaRecentlyMentionedEnabled` | bool | Master toggle |
+
+When enabled, the pipeline first checks whether the conversation row is marked `existing_convo = 1`. Only then does it regex-scan the **last 20 assistant messages** of the incoming `chatHistory` for a URL / common bio-link domain / 10+ digit number. If any match, the request short-circuits with `ignored: true`. **Does NOT consult the database `cta_sent` flag** â€” that only tracks our own sends. This check is designed for users migrated from a competitor product, to avoid re-engaging imported chats that have most likely already been converted by the competitor. Normal CapitalAI-owned chats with `existing_convo = 0` are skipped, even if our own CTA was mentioned earlier. No LLM call.
+
+#### c) Behavioral conditions â€” LLM-evaluated natural-language rules
+
+| Key | Type | Meaning |
+|---|---|---|
+| `behavioralIgnoreConditions` | array | `[{ id: string, label: string, enabled: bool }]` |
+
+Each condition is a plain-English sentence describing a user behaviour (e.g. `"User speaks French"`, `"User is older than 30"`, `"User mentions he doesn't want to subscribe"`). The pipeline reads the latest user message from `chatHistory`, asks the utility-tier classifier whether it matches any enabled condition, and short-circuits with `ignored: true` on a match.
+
+**Underage** is **not** in this array â€” it's hard-wired into the existing objection classifier and shown in the dashboard as a locked default-on row for transparency only.
+
+**Cost note:** Per-preset opt-in is the cost boundary. A preset with zero enabled behavioral conditions makes zero classifier calls. Each preset that does enable one or more conditions adds exactly one utility-tier LLM round-trip per `/generateResponse` (only when the request actually contains a user message in `chatHistory`).
+
+All endpoints require the standard `license-key` header (or `licensekey` in the body/query string). Member keys need the `settings_read` permission for GET and `settings_write` for any mutation.
+
+### GET /api/ignore-lists
+
+List every ignore list owned by the calling license. Pass `?presetId=N` to also include the `enabled` flag for each list (does that list match against requests on this specific preset?).
+
+**Request:**
+```
+GET /api/ignore-lists?presetId=42
+license-key: sk_live_xxx
+```
+
+**Response:**
+```json
+{
+  "success": true,
+  "lists": [
+    { "id": 1, "name": "Spam UUIDs",     "entryCount": 12500, "enabled": true,  "createdAt": "...", "updatedAt": "..." },
+    { "id": 2, "name": "Blocked usernames", "entryCount": 80, "enabled": false, "createdAt": "...", "updatedAt": "..." }
+  ]
+}
+```
+
+### POST /api/ignore-lists
+
+Create a new (empty) ignore list. If `name` is omitted or blank, the server auto-names the list `Ignorelist N` (smallest free integer for the license).
+
+**Body:** `{ "name": "Spam UUIDs" }` *(name optional)*
+
+**Response (201):**
+```json
+{ "success": true, "list": { "id": 7, "name": "Ignorelist 3", "entryCount": 0 } }
+```
+
+Returns `409 Conflict` if the chosen name already exists on the license.
+
+### PATCH /api/ignore-lists/:id
+
+Rename a list.
+
+**Body:** `{ "name": "New name" }`
+
+Returns `404` if the list doesn't belong to the license, `400` on empty name, `409` on duplicate name.
+
+### DELETE /api/ignore-lists/:id
+
+Hard-delete a list. Cascades through its entries and removes it from every preset that had it enabled.
+
+### POST /api/ignore-lists/:id/import
+
+Append entries to a list. Two input modes:
+
+**A. Multipart upload (recommended for files):**
+```
+POST /api/ignore-lists/7/import
+Content-Type: multipart/form-data
+license-key: sk_live_xxx
+
+(form-field "file" containing the .txt or .csv)
+```
+
+**B. JSON bulk:**
+```json
+{ "values": ["alice", "bob123", "550e8400-e29b-41d4-a716-446655440000"] }
+```
+
+**Response:**
+```json
+{ "success": true, "added": 9823, "total": 12500 }
+```
+
+`added` counts only the rows actually inserted (duplicates within the file and against existing entries are skipped silently). `total` is the list's total entry count after the import.
+
+**Limits:**
+- File size: 5 MB
+- Max values per import: 200,000 (split the file and import in batches if you need more)
+- Each value: 190 chars max â€” longer values are silently dropped
+
+### DELETE /api/ignore-lists/:id/entries
+
+Wipe every entry from a list (keeps the list itself, so you can re-import).
+
+### PUT /api/presets/:presetId/ignore-lists
+
+Set the EXACT set of ignore lists enabled on a preset (idempotent â€” overwrites whatever was there before). Send an empty array to disable every list for the preset.
+
+**Body:** `{ "enabledListIds": [1, 7] }`
+
+**Response:**
+```json
+{ "success": true, "enabledListIds": [1, 7] }
+```
+
+Any IDs in the request that don't belong to your license are silently dropped â€” so you can't accidentally enable another tenant's list against your preset.
+
+### `ignored: true` Response
+
+When a `/generateResponse` request matches an enabled ignore list, the response is:
+
+```json
+{
+  "content": [],
+  "messages": [],
+  "media": "",
+  "converted": false,
+  "underage": false,
+  "ignored": true
+}
+```
+
+No `statistics` block (the request never reached the stats pipeline), no AI call, no credit charge, no conversation written. Treat this exactly like `internalAccount: true` â€” the caller should not retry, should not show the user any indication that the bot exists, and should not store the message anywhere.
+
+---
+
+## POST /setConversationCtaUrl
+
+Pin a custom CTA URL on a specific conversation. Once pinned, the engine uses **exactly this URL** whenever it sends the CTA link in that conversation â€” instead of the random pick from the preset's CTA URL list. The pin survives preset edits: even if the preset's CTA list changes (or never contained this URL at all), the pinned URL keeps being used.
+
+### Endpoint
+```
+POST https://api.capitalbot.ai/setConversationCtaUrl
+```
+
+### Request Body
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `licensekey` | string | âœ… | Your license key (or `license-key` header). Member keys work too. |
+| `accountId` | string | âœ… | The model account the conversation belongs to (same value you send to `/generateResponse`). |
+| `useridentifier` | string | one of the two | The platform user id of the fan (preferred lookup â€” exact match). |
+| `username` | string | one of the two | The fan's username. Used only when `useridentifier` is not provided. If the same username has several conversations under the account, **all** of them are updated. |
+| `url` | string \| null | âœ… | The link to pin (max 500 chars, single line) â€” or `null` to **un-pin** and revert the conversation to normal random selection from the preset's CTA list. Does **not** need to be a full `http(s)` URL: bare domains (`fansly.com/xyz`), spaced links (`snapadd .xyz`), and handles are stored and sent exactly as provided. |
+
+### Example
+
+```json
+{
+  "licensekey": "your-license-key",
+  "accountId": "myModelAccount",
+  "useridentifier": "883604263",
+  "url": "https://onlyfans.com/mymodel/c99"
+}
+```
+
+### Response
+
+```json
+{
+  "success": true,
+  "action": "pinned",
+  "url": "https://onlyfans.com/mymodel/c99",
+  "updated": 1,
+  "identifiers": ["883604263"]
+}
+```
+
+`action` is `"pinned"` or `"cleared"`. `updated` is the number of conversation rows changed. `identifiers` lists the resolved user identifiers (useful when looking up by `username`).
+
+### Errors
+
+- `400` â€” missing/invalid `accountId`, no `useridentifier`/`username`, or invalid `url`.
+- `404` â€” no conversation matches. Conversations are created on the **first `/generateResponse` call**, so the fan must have at least one exchange before you can pin a URL. Retry after the conversation exists.
+
+### Notes
+
+- The lookup is always scoped to your license â€” you can only modify your own conversations.
+- Pinning does not resend anything; it only changes which link the engine uses the next time the CTA (or a link resend) fires in that conversation.
+- Timing: the CTA link is typically sent well into the conversation, so pinning any time after the first message is early enough.
+
+---
+
+## POST /getModelsAndPresets
+
+Get available models and presets for your license.
+
+### Endpoint
+```
+POST https://api.capitalbot.ai/getModelsAndPresets
+```
+
+### Request Body
+
+```json
+{
+  "licensekey": "your-license-key",
+  "includeArchived": false
+}
+```
+
+- `includeArchived` (optional, default `false`): archived presets are excluded
+  from the `presets` list unless this is `true`. The dashboard passes `true`
+  (it shows archived presets under an "Archive" group); the extension does not,
+  so archived presets never appear there.
+
+### Response
+
+**Success (200):**
+```json
+{
+  "success": true,
+  "data": {
+    "models": [
+      {
+        "modelId": 43,
+        "name": "Lily"
+      },
+      {
+        "modelId": 44,
+        "name": "Emma"
+      }
+    ],
+    "presets": [
+      {
+        "id": 88,
+        "name": "Instagram Flirty",
+        "archived": 0
+      },
+      {
+        "id": 89,
+        "name": "Tinder Casual",
+        "archived": 0
+      }
+    ],
+    "licenseId": 5
+  }
+}
+```
+
+---
+
+## PATCH /presets/:id/archive
+
+Archive or unarchive a preset (Preset Archive feature). Archived presets keep
+all their settings, are hidden from the extension's preset list, and show under
+the "Archive" group in the dashboard preset dropdown. Requires the
+`License-Key` header (settings_write permission).
+
+### Endpoint
+```
+PATCH https://api.capitalbot.ai/presets/:id/archive
+```
+
+### Request Body
+
+```json
+{
+  "archived": true
+}
+```
+
+### Response
+
+**Success (200):**
+```json
+{
+  "result": "ok",
+  "message": "Preset archived"
+}
+```
+
+**Error (400):**
+```json
+{
+  "error": "License key is required"
+}
+```
+
+**Error (404):**
+```json
+{
+  "error": "License key not found"
+}
+```
+
+---
+
+## POST /statistics
+
+Get comprehensive conversation statistics for your license.
+
+### Endpoint
+```
+POST https://api.capitalbot.ai/statistics
+```
+
+### Request Body
+
+```json
+{
+  "licensekey": "your-license-key",
+  "modelId": 43,
+  "presetId": 88,
+  "period": "7days",
+  "account": "all"
+}
+```
+
+**Required Fields:**
+- `licensekey` - Your license key
+- `modelId` - Specific model ID or `"all"`
+- `presetId` - Specific preset ID or `"all"`
+- `period` - Time period: `"today"`, `"3days"`, `"7days"`, `"30days"`, `"all"`
+- `account` - Account ID to filter by, or `"all"` for all accounts
+
+**Note:** No `accountId` required in the request. Use the `account` filter to scope results to specific accounts.
+
+### Response
+
+**Success (200):**
+```json
+{
+  "filters": {
+    "modelId": 43,
+    "presetId": 88,
+    "period": "7days",
+    "account": "all",
+    "dateRange": {
+      "from": "2025-11-27",
+      "to": "2025-12-04"
+    }
+  },
+  "statistics": {
+    "messages": 1250,
+    "conversations": 156,
+    "newConversations": 89,
+    "ctaPhaseStarted": 45,
+    "ctaLinksShared": 32,
+    "conversionsFromCTAPercent": "71.9%",
+    "conversionsTotal": 23,
+    "conversionsPercent": "14.7%",
+    "lastBotMessageAt": 1764878400
+  }
+}
+```
+
+**Response Field Notes:**
+- `lastBotMessageAt` (number | null) - UNIX timestamp (in **seconds**) of the most recent bot message generated for the filtered `account`, across any of that account's conversations. Only populated when a **specific** account ID is passed in the `account` filter (not when `"all"`). Returns `null` if the account has never had any conversations, or the account filter is `"all"`.
+
+---
+
+## POST /statistics/accounts-bulk
+
+Per-account statistics for **all accounts of your license in one call** â€” one row per account. Built for integrations that previously called `/statistics` once per account: if you have thousands of accounts, use this endpoint instead of fanning out per-account requests.
+
+### Endpoint
+```
+POST https://api.capitalbot.ai/statistics/accounts-bulk
+```
+
+### Request Body
+
+```json
+{
+  "licensekey": "your-license-key",
+  "presetId": 88,
+  "period": "30days"
+}
+```
+
+**Required Fields:**
+- `licensekey` - Your license key
+
+**Optional Fields:**
+- `presetId` - Narrow to one preset, or `"all"` (default: all presets of the license)
+- `modelId` - Narrow to one model, or `"all"` (default: all)
+- `period` - `"today"`, `"yesterday"`, `"last24h"`, `"3days"`, `"7days"`, `"30days"`, `"all"`, `"custom"` (default: `"7days"` â€” note this differs from `/statistics`, which defaults to `"all"`)
+- `dateFrom` / `dateTo` - `"YYYY-MM-DD"`, only used with `period: "custom"` (inclusive of both days)
+- `timezone` - Offset in minutes from UTC (JavaScript `getTimezoneOffset()` convention) for day-boundary alignment
+- `platform` - Platform name filter (e.g. `"Snapchat"`), or `"all"` (default)
+
+There is **no** `account` parameter â€” the whole point is every account at once. For a single account, use `/statistics`.
+
+### Response
+
+**Success (200):**
+```json
+{
+  "filters": {
+    "modelId": "all",
+    "presetId": 88,
+    "period": "30days",
+    "dateRange": { "from": "2026-07-15 00:00:00", "to": "2026-08-15 00:00:00" }
+  },
+  "accountCount": 2,
+  "accounts": [
+    {
+      "account": "acc_8f3k2",
+      "conversations": 156,
+      "totalConversations": 210,
+      "newConversations": 89,
+      "conversionsTotal": 23,
+      "messages": 1250,
+      "ctaLinksShared": 32
+    },
+    {
+      "account": "acc_9x1m4",
+      "conversations": 98,
+      "totalConversations": 120,
+      "newConversations": 61,
+      "conversionsTotal": 11,
+      "messages": 780,
+      "ctaLinksShared": 19
+    }
+  ]
+}
+```
+
+Metric definitions are identical to `/statistics`, so per-account numbers line up 1:1 with what `/statistics` returns for the same account and period. Accounts with no activity in the period are omitted.
+
+**Performance note:** this is a heavier aggregation than `/statistics` (measured ~5-10s for a license with ~40k accounts over 30 days). Call it a few times per day and cache the result â€” do not poll it.
+
+---
+
+## POST /api/dashboard/search
+
+Search and page through your conversations (same endpoint the dashboard's Conversations page uses). Returns up to 100 conversations per call, newest first.
+
+### Endpoint
+```
+POST https://api.capitalbot.ai/api/dashboard/search
+```
+
+### Request Body
+
+```json
+{
+  "licensekey": "your-license-key",
+  "timeframe": "7d",
+  "convertedOnly": true,
+  "offset": 0
+}
+```
+
+**Required Fields:**
+- `licensekey` - Your license key
+
+**Optional Fields:**
+- `username` - Text search on username/name, or an exact identifier
+- `timeframe` - `"1h"`, `"24h"`, `"3d"`, `"7d"`, `"30d"`, `"all"` (default: `"all"`)
+- `startDate` / `endDate` - Explicit date bounds on `updated_at`, `"YYYY-MM-DD"` or full ISO datetime. When either is set, `timeframe` is ignored. A date-only `endDate` means *through the end of that day*. Use these to reach an exact historical window directly instead of paging from newest.
+- `modelId` / `presetId` - Narrow to one model/preset
+- `convertedOnly` - Only conversations marked converted
+- `chargedOnly` - Only conversations that were charged
+- `ctaReceived` - Only conversations that received a CTA (default `true`)
+- `offset` - Pagination offset (100 rows per page)
+
+### Response
+
+**Success (200):** `{ "success": true, "conversations": [ ... ], "count": 100, "totalCount": 1234, "hasMore": true }` â€” each row includes `conversation_id`, `identifier`, `accountId`, `username`, `name`, `status`, `updated_at`, `conversation_started_at`. Page by increasing `offset` in steps of 100 while `hasMore` is `true`.
+
+**Errors:** `400` on unparseable `startDate`/`endDate`.
+
+---
+
+## Conversation Continuation
+
+The next three endpoints exist for one workflow: **continuing a conversation on the paid platform (e.g. OnlyFans) after the fan subscribed**. Pull the original conversation's transcript, get an AI briefing of what was talked about, and get ready-to-send openers that reference the original chat â€” so the fan feels the model actually remembers him, even though the conversation started on Snapchat, Telegram or another platform.
+
+All three endpoints share the **same request format**: `POST` with a JSON payload, identifying the conversation with **one** of two methods:
+
+| Method | Payload | Notes |
+|--------|---------|-------|
+| **Conversation ID** (preferred) | `{ "conversationId": 4832101 }` | The engine's internal id â€” the value appended as `ecid` to tracking links and returned by `/generateResponse` as `statistics.conversationId`. Exact match. |
+| **Identifier + account ID** | `{ "identifier": "u382915728", "accountId": "acc_123" }` | The fan's platform identifier. `accountId` pins the exact conversation â€” the same fan identifier can exist once per account. Without `accountId`, the most recently active conversation for that identifier is used. |
+
+---
+
+## POST /api/conversation
+
+Pulls a conversation's metadata and full transcript â€” e.g. to hand the chat over to a human or to attribute a subscription (the conversation id is the `ecid` value the engine appended to tracking links, see "Tracking links (OFAPI attribution)" above).
+
+### Endpoint
+```
+POST https://api.capitalbot.ai/api/conversation
+```
+
+> **Legacy:** `GET /api/conversation/:id` (id in the path, `accountId`/`limit` as query params, partner `x-api-key` auth) is still supported for existing partner integrations, but new integrations should use the POST form.
+
+### Authentication
+
+Standard license-key auth (`licensekey` in the body or `License-Key` header) â€” same as every other endpoint. The conversation must belong to your license.
+
+### Request Body
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `licensekey` | string | Yes | Your license key (or send it as `License-Key` header). |
+| `conversationId` | number | One of the two | The engine's internal conversation id (preferred â€” exact match). |
+| `identifier` | string | One of the two | The fan's platform identifier. |
+| `accountId` | string | No | Only used with identifier lookup. Narrows the match to the conversation on this specific account. |
+| `limit` | number | No | Return only the **last N** transcript messages instead of the full history. |
+
+### Example Requests
+
+```bash
+# By conversation id (the ecid from the tracking link)
+curl -X POST "https://api.capitalbot.ai/api/conversation" \
+  -H "Content-Type: application/json" \
+  -d '{ "licensekey": "YOUR-LICENSE-KEY", "conversationId": 4832101 }'
+
+# By identifier + account id, last 20 messages only
+curl -X POST "https://api.capitalbot.ai/api/conversation" \
+  -H "Content-Type: application/json" \
+  -d '{ "licensekey": "YOUR-LICENSE-KEY", "identifier": "u382915728", "accountId": "acc_123", "limit": 20 }'
+```
+
+### Response
+
+**Success (200):**
+```json
+{
+  "conversation": {
+    "id": 4832101,
+    "identifier": "u382915728",
+    "accountId": "acc_123",
+    "username": "johndoe99",
+    "name": "John",
+    "platform": "snapchat",
+    "location": "Dallas, Texas",
+    "status": "converted",
+    "converted": true,
+    "convertedSource": "auto",
+    "assistantResponseCount": 42,
+    "ctaSent": true,
+    "startedAt": "2026-08-01T18:22:10.000Z",
+    "updatedAt": "2026-08-03T09:14:55.000Z"
+  },
+  "transcript": [
+    { "role": "assistant", "content": "heyy stranger", "timestamp": "2026-08-01T18:22:10.000Z" },
+    { "role": "user", "content": "hey who is this", "timestamp": "2026-08-01T18:25:41.000Z" }
+  ]
+}
+```
+
+- `status` is a human-readable label: `active`, `converted`, `not_interested`, `underage`, `assistance`, `ended` or `reported`.
+- `timestamp` can be `null` for older messages that were stored without one.
+
+**Not found (404):**
+```json
+{ "error": "Conversation not found" }
+```
+
+---
+
+## POST /api/dashboard/generate-summary
+
+Generates a short AI summary of a conversation from the original platform (what the fan talked about, his mood, where the chat stands) â€” e.g. to brief an OnlyFans chatter taking over after the fan subscribed. Same endpoint the dashboard's Conversations page uses.
+
+### Endpoint
+```
+POST https://api.capitalbot.ai/api/dashboard/generate-summary
+```
+
+### Authentication
+
+Standard license-key auth (`licensekey` in the body or `License-Key` header). The conversation must belong to your license.
+
+### Request Body
+
+Identify the conversation with **one** of the two methods (same contract as `/api/conversation`):
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `conversationId` | number | One of the two | The engine's internal conversation id (preferred â€” exact match). |
+| `identifier` | string | One of the two | The fan's platform identifier. Matches the most recently active conversation with that identifier under your license. |
+| `accountId` | string | No | Only used with identifier lookup. Pins the exact conversation on this specific account. |
+| `licensekey` | string | Yes | Your license key (or send it as `License-Key` header). |
+
+### Example Request
+
+```bash
+curl -X POST "https://api.capitalbot.ai/api/dashboard/generate-summary" \
+  -H "Content-Type: application/json" \
+  -d '{ "licensekey": "YOUR-LICENSE-KEY", "identifier": "u382915728", "accountId": "acc_123" }'
+```
+
+### Response
+
+**Success (200):**
+```json
+{
+  "success": true,
+  "summary": "John is a 34-year-old from Dallas, very engaged and flirty. He asked about custom content twice and is close to subscribing â€” the last CTA was sent but he hasn't clicked yet.",
+  "isReported": false
+}
+```
+
+Special cases (still `200` with `success: true`):
+- `"No conversation history found."` â€” no stored messages for this conversation.
+- `"No reply yet â€” only the opener was sent."` â€” the fan never responded, so there is nothing to summarize.
+- `"Not enough conversation yet to summarise (2/5 replies needed)."` â€” at least 5 fan replies are required before a summary is generated.
+- For **reported** conversations the summary analyzes the report reason instead, and `isReported` is `true`.
+
+---
+
+## POST /api/dashboard/generate-openers
+
+Generates up to 3 opener messages for continuing the conversation on the **paid platform** (e.g. OnlyFans) after the fan subscribed. The openers are based on the full chat history from the original platform (Snapchat, Telegram, â€¦) and reference what was talked about there â€” the fan feels the model actually remembers him and the conversation continues seamlessly.
+
+> **Not** related to the AI chat's own automatic opener generation on the original platform â€” this endpoint is only for the paid-platform handoff.
+
+### Endpoint
+```
+POST https://api.capitalbot.ai/api/dashboard/generate-openers
+```
+
+### Authentication
+
+Standard license-key auth, same as `generate-summary`. The conversation must belong to your license.
+
+### Request Body
+
+Same contract as `generate-summary` and `/api/conversation`:
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `conversationId` | number | One of the two | The engine's internal conversation id (preferred â€” exact match). |
+| `identifier` | string | One of the two | The fan's platform identifier. Matches the most recently active conversation with that identifier under your license. |
+| `accountId` | string | No | Only used with identifier lookup. Pins the exact conversation on this specific account. |
+| `licensekey` | string | Yes | Your license key (or send it as `License-Key` header). |
+
+### Example Request
+
+```bash
+curl -X POST "https://api.capitalbot.ai/api/dashboard/generate-openers" \
+  -H "Content-Type: application/json" \
+  -d '{ "licensekey": "YOUR-LICENSE-KEY", "identifier": "u382915728", "accountId": "acc_123" }'
+```
+
+### Response
+
+**Success (200):**
+```json
+{
+  "success": true,
+  "openers": [
+    "still thinking about what u said about vegas lol",
+    "u went quiet on meâ€¦ everything ok?",
+    "guess who just got out of the shower"
+  ]
+}
+```
+
+- If the conversation has no stored history yet, a set of generic fallback openers is returned instead.
+- Openers are disabled for reported conversations: `{ "success": true, "openers": [], "disabled": true, "reason": "..." }`.
+
+---
+
+## Rate Limits
+
+### Generate Response
+- **60 requests per minute per `useridentifier`**
+ 
+
+### Media Analysis
+- **5 requests per minute per user identifier**
+- **30 requests per day per user identifier**
+- **50MB file size limit**
+- Resets daily (24-hour rolling window)
+
+### Summary & Opener Generation
+- **30 requests per minute per license key** (shared across `/api/dashboard/generate-summary` and `/api/dashboard/generate-openers`)
+
+---
+
+## Error Responses
+
+### 400 Bad Request
+```json
+{
+  "error": "Validation failed",
+  "details": [
+    {
+      "field": "modelId",
+      "message": "\"modelId\" is required"
+    }
+  ]
+}
+```
+
+### 401 Unauthorized
+```json
+{
+  "error": "Unauthorized",
+  "message": "Invalid or missing license key"
+}
+```
+
+### 403 Forbidden
+```json
+{
+  "error": "Forbidden",
+  "message": "You do not have access to this model"
+}
+```
+*Returned when trying to use a model or preset that doesn't belong to your license.*
+
+### 429 Too Many Requests
+```json
+{
+  "error": "Too many requests",
+  "message": "Rate limit exceeded"
+}
+```
+
+### 500 Internal Server Error
+```json
+{
+  "error": "Internal server error",
+  "message": "An unexpected error occurred"
+}
+```
+
+**Common Error Types:**
+- **Validation Errors (400)** - Invalid or missing required fields
+- **Authentication Errors (401)** - Invalid license key
+- **Authorization Errors (403)** - Accessing resources from another license
+- **Rate Limit Errors (429)** - Too many requests
+- **AI Credit Depleted (200)** - Returns success with `aiCreditOver: true` flag
+- **Server Errors (500)** - Internal processing errors
+
+---
+
+**Updated:** December 14, 2025

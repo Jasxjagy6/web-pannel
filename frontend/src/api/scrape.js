@@ -4,6 +4,16 @@ export const scrapeGroup = (data) => api.post('/scrape/group', data);
 
 export const scrapeChannel = (data) => api.post('/scrape/channel', data);
 
+// Dump ALL personal (DM) chats from the selected sessions / session
+// lists as a downloadable file. Telegram-only (lives under the in-panel
+// Telegram client surface). Returns a blob attachment. Bio lookups can
+// take a while on large dialog lists, so allow up to 5 minutes.
+export const scrapePersonalChats = (data) =>
+  api.post('/telegram/client/sessions/scrape/chats', data, {
+    responseType: 'blob',
+    timeout: 300000,
+  });
+
 export const listScrapeJobs = (params) => api.get('/scrape/jobs', { params });
 
 export const getScrapeJob = (id) => api.get(`/scrape/jobs/${id}`);

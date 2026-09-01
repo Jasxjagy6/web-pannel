@@ -604,6 +604,124 @@ class TelegramClientService {
   }
 
   /**
+   * Scrape ALL personal (DM) chats for one session — human users only.
+   *
+   * Unlike `getDialogs`, this collects the fields operators need for a
+   * contact-style export (username / id / first / last / phone / bio)
+   * from the raw dialog entities rather than the UI-shaped summary.
+   *
+   * Bots, the user's own chat, and saved channels/groups are excluded,
+   * matching the panel-wide "personal chats only" rule used everywhere
+   * else. Bio is fetched best-effort per user via `users.GetFullUser`
+   * with flood-wait retry; if a flood is hit the remaining bio lookups
+   * are skipped (bio left empty) so one rate-limit can't abort the whole
+   * export. Total bio lookups are capped by `maxBio` to protect the
+   * account from a burst of profile fetches.
+   *
+   * @param {string|number} sessionId
+   * @param {string|number} userId
+   * @param {object} [opts]
+   * @param {number} [opts.limit=200] Max dialogs to inspect per session.
+   * @param {boolean} [opts.withBio=true] Whether to attempt bio lookup.
+   * @param {number} [opts.maxBio=200] Cap on per-session bio fetches.
+   * @returns {Promise<{ total: number, chats: object[] }>}
+   */
+  async scrapePersonalChats(sessionId, userId, opts = {}) {
+    await _loadAndAuthSession(sessionId, userId);
+    await tgService._ensureConnected(sessionId);
+
+    const limit = Math.min(
+      Math.max(1, parseInt(opts.limit, 10) || MAX_DIALOGS_LIMIT),
+      MAX_DIALOGS_LIMIT
+    );
+    const withBio = opts.withBio !== false;
+    const maxBio = Math.max(0, parseInt(opts.maxBio, 10) || 200);
+
+    const entry = tgService.clients.get(String(sessionId));
+    if (!entry) throw new AppError('Session client not loaded', 500, 'CLIENT_NOT_LOADED');
+
+    const me = await tgService.getMe(sessionId).catch(() => null);
+    const ownId = me ? _toIdNum(me.id) : null;
+
+    let dialogs;
+    try {
+      dialogs = await entry.client.getDialogs({ limit });
+    } catch (err) {
+      logger.error(`scrapePersonalChats getDialogs failed for session ${sessionId}: ${err.message}`);
+      throw new AppError(`Failed to fetch dialogs: ${err.message}`, 502, 'DIALOGS_FETCH_FAILED');
+    }
+
+    const chats = [];
+
+    // First pass: extract every personal (non-bot, non-self) user record.
+    for (const d of dialogs || []) {
+      const entity = d.entity;
+      if (!entity || entity.className !== 'User') continue;
+
+      const id = _toIdNum(entity.id);
+      if (id == null) continue;
+      // personal chats only: no bots, no self-chat
+      if (entity.bot) continue;
+      if (ownId != null && id === ownId) continue;
+
+      chats.push({
+        id,
+        entity,
+        record: {
+          id,
+          username: entity.username || null,
+          firstName: entity.firstName || '',
+          lastName: entity.lastName || '',
+          phone: entity.phone || null,
+          bio: '',
+        },
+      });
+    }
+
+    // Second pass: best-effort bio lookups, run with a small concurrency
+    // pool (serial GetFullUser for ~100 DMs is very slow) and a shared
+    // flood guard — the first flood aborts every remaining lookup rather
+    // than blocking the whole dump for minutes. A per-user failure only
+    // leaves that row's bio empty.
+    if (withBio) {
+      const records = chats.slice(0, maxBio);
+      let flooded = false;
+      let cursor = 0;
+      const workers = [];
+      const worker = async () => {
+        while (!flooded) {
+          const idx = cursor++;
+          if (idx >= records.length) return;
+          const { record } = records[idx];
+          try {
+            const full = await _withFloodRetry(
+              () => entry.client.invoke(new Api.users.GetFullUser({ id: record.entity })),
+              { maxRetries: 1, maxFloodSeconds: 30 }
+            );
+            record.bio = full?.fullUser?.about || '';
+          } catch (err) {
+            const wait = _floodWaitSeconds(err);
+            if (wait != null) {
+              flooded = true;
+            } else {
+              logger.debug(`getFullUser bio failed for user ${record.id}: ${err.message}`);
+            }
+          }
+        }
+      };
+      // Keep concurrency low: bursts of users.GetFullUser trip Telegram's
+      // rate limit on real accounts. 2 parallel lookups stays fast enough
+      // for hundreds of DMs without hammering the limit.
+      const concurrency = Math.min(2, records.length);
+      for (let i = 0; i < concurrency; i += 1) workers.push(worker());
+      await Promise.all(workers);
+    }
+
+    const result = chats.map((c) => c.record);
+    return { total: result.length, chats: result };
+  }
+
+  /**
    * Fetch message history for a (peerType, peerId) pair.
    *
    * @param {string|number} sessionId

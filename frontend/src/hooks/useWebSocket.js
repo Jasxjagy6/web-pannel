@@ -7,6 +7,11 @@ const SOCKET_URL = import.meta.env.VITE_SOCKET_URL || (typeof window !== 'undefi
 const SUBSCRIBE_EVENT = 'platform:subscribe';
 const UNSUBSCRIBE_EVENT = 'platform:unsubscribe';
 
+// Socket.IO endpoint path — the SPA is served behind a reverse proxy at
+// /panel, so the socket handshake must be addressed under that prefix
+// (the upstream Caddy strips /panel before forwarding to the backend).
+const SOCKET_PATH = `${(import.meta.env.VITE_BASE_PATH || '/panel').replace(/\/$/, '')}/socket.io`;
+
 /**
  * useWebSocket — thin wrapper around the Socket.IO client.
  *
@@ -50,6 +55,7 @@ export function useWebSocket() {
 
     socketRef.current = io(SOCKET_URL, {
       auth: { token },
+      path: SOCKET_PATH,
       // Stamp the platform on the handshake so the server can join the
       // right room before the first event flows.
       query: { platform: _activePlatform() },

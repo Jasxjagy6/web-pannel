@@ -4,6 +4,7 @@ import { listSessions } from '../api/sessions';
 import {
   scrapeGroup,
   scrapeChannel,
+  scrapePersonalChats,
   listScrapeJobs,
   getScrapeProgress,
   cancelScrapeJob,
@@ -86,6 +87,11 @@ export default function Scrape() {
   const [targets, setTargets] = useState('');
   const [scrapeType, setScrapeType] = useState('group');
   const [limit, setLimit] = useState(1000);
+  // v-c: "Scrape Personal Chats" mode — dumps every DM (human user)
+  // from the selected sessions instead of a group/channel target scrape.
+  const [scrapeChats, setScrapeChats] = useState(false);
+  const [chatFormat, setChatFormat] = useState('csv');
+  const [chatWithBio, setChatWithBio] = useState(true);
   const [showBotFilters, setShowBotFilters] = useState(false);
   const [botFilterOptions, setBotFilterOptions] = useState({
     enabled: true,
@@ -413,7 +419,61 @@ export default function Scrape() {
     }
   };
 
-  // Launch period-bounded monitor jobs for the prompted admin-only targets.
+  // Personal-chats dump: scrape every DM (human user) from the selected
+  // sessions / session list and hand the returned file to the browser to
+  // download. Synchronous backend call — the blob IS the result.
+  const handleScrapeChats = async (e) => {
+    e.preventDefault();
+
+    const usingList = sessionPickMode === 'list' && selectedSessionListId;
+    if (!usingList && selectedSessions.length === 0) {
+      showError('Please select at least one session (or a session list)', 'Validation Error');
+      return;
+    }
+    if (sessionPickMode === 'list' && !selectedSessionListId) {
+      showError('Please pick a session list', 'Validation Error');
+      return;
+    }
+
+    setSubmitting(true);
+    try {
+      const payload = {
+        format: chatFormat,
+        withBio: chatWithBio,
+      };
+      if (sessionPickMode === 'list' && selectedSessionListId) {
+        payload.sessionListId = Number(selectedSessionListId);
+      } else {
+        payload.sessionIds = selectedSessions;
+      }
+
+      const res = await scrapePersonalChats(payload);
+      const blob = res.data;
+      const cd = res.headers['content-disposition'] || '';
+      const m = cd.match(/filename="?([^";]+)"?/i);
+      const filename = m ? m[1] : `personal_chats_${Date.now()}.${chatFormat}`;
+
+      if (typeof window !== 'undefined') {
+        const url = window.URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = filename;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        window.URL.revokeObjectURL(url);
+      }
+
+      showSuccess(
+        `Personal chats exported (${usingList ? 'session list' : `${selectedSessions.length} sessions`}). Downloaded ${filename}.`,
+        'Export Complete'
+      );
+    } catch (err) {
+      showError(parseApiError(err), 'Scrape Error');
+    } finally {
+      setSubmitting(false);
+    }
+  };
   //
   // v28: when `multiChatMonitor` is ON we send ALL admin targets as one
   // V2 job (`chats: [...]`).  V2's cohort scheduler then distributes
@@ -705,7 +765,45 @@ export default function Scrape() {
 
       {/* SCRAPE TAB */}
       {activeTab === 'scrape' && (
-        <form onSubmit={handleScrape} className="space-y-6">
+        <form onSubmit={scrapeChats ? handleScrapeChats : handleScrape} className="space-y-6">
+          {/* Scrape mode toggle: group/channel target scrape vs personal-chats dump */}
+          <div className={cardClass}>
+            <label className={labelClass}>
+              <Radio className="w-4 h-4 inline mr-2" />
+              Scrape Mode
+            </label>
+            <div className="flex gap-2">
+              <button
+                type="button"
+                onClick={() => setScrapeChats(false)}
+                className={`flex-1 py-2 px-3 rounded-lg text-sm transition ${
+                  !scrapeChats
+                    ? 'bg-primary-600 text-white'
+                    : 'bg-dark-800 text-gray-400 hover:bg-dark-700'
+                }`}
+              >
+                Groups / Channels
+                <span className="block text-xs font-normal opacity-80 mt-0.5">
+                  Scrape members from group / channel targets
+                </span>
+              </button>
+              <button
+                type="button"
+                onClick={() => setScrapeChats(true)}
+                className={`flex-1 py-2 px-3 rounded-lg text-sm transition ${
+                  scrapeChats
+                    ? 'bg-primary-600 text-white'
+                    : 'bg-dark-800 text-gray-400 hover:bg-dark-700'
+                }`}
+              >
+                Personal Chats (DMs)
+                <span className="block text-xs font-normal opacity-80 mt-0.5">
+                  Dump all direct chats from your sessions
+                </span>
+              </button>
+            </div>
+          </div>
+
           {/* Session Selection */}
           <div className={cardClass}>
             <SessionListSwitcher
@@ -768,6 +866,7 @@ export default function Scrape() {
           </div>
 
           {/* Target Input */}
+          {!scrapeChats && (
           <div className={cardClass}>
             <label className={labelClass}>
               <Link className="w-4 h-4 inline mr-2" />
@@ -783,7 +882,57 @@ export default function Scrape() {
               Enter one target per line. Supports: usernames, links, or numeric IDs
             </p>
           </div>
+          )}
 
+          {/* Personal-chats options (DM dump) */}
+          {scrapeChats && (
+            <div className={cardClass}>
+              <div className="flex items-center justify-between mb-3">
+                <label className={labelClass}>
+                  <Download className="w-4 h-4 inline mr-2" />
+                  Export Format
+                </label>
+              </div>
+              <div className="flex gap-2 mb-4">
+                {['csv', 'json', 'txt'].map(f => (
+                  <button
+                    key={f}
+                    type="button"
+                    onClick={() => setChatFormat(f)}
+                    className={`flex-1 py-2 px-3 rounded-lg text-sm uppercase transition ${
+                      chatFormat === f
+                        ? 'bg-primary-600 text-white'
+                        : 'bg-dark-800 text-gray-400 hover:bg-dark-700'
+                    }`}
+                  >
+                    {f}
+                  </button>
+                ))}
+              </div>
+              <label className="flex items-center gap-2 text-sm text-gray-300">
+                <input
+                  type="checkbox"
+                  checked={chatWithBio}
+                  onChange={e => setChatWithBio(e.target.checked)}
+                  className="rounded border-white/20 bg-dark-900 text-primary-600"
+                />
+                Include bio (best-effort)
+                <span className="text-xs text-gray-500">
+                  (fetches each user's About — may slow large dumps)
+                </span>
+              </label>
+              <p className="text-xs text-gray-500 mt-3">
+                All personal chats (human users only — no bots, groups or channels) from the
+                selected sessions are collected and de-duplicated into a downloadable file.
+                Fields: username, id, firstname, lastname, phone, bio.
+              </p>
+            </div>
+          )}
+
+          {/* Group/Channel-only sections: hidden-members toggle, settings,
+              bot filter — hidden in Personal Chats mode. */}
+          {!scrapeChats && (
+          <>
           {/* v8: explicit hidden-members toggle. When ON we route the
               entire submit straight to monitor mode and surface the
               "this is allowed via period monitoring" copy below. */}
@@ -984,21 +1133,32 @@ export default function Scrape() {
               </div>
             )}
           </div>
+          </>
+          )}
 
           {/* Submit Button */}
           <button
             type="submit"
             disabled={
               submitting ||
-              !targets.trim() ||
-              (sessionPickMode === 'list' ? !selectedSessionListId : selectedSessions.length === 0)
+              (sessionPickMode === 'list' ? !selectedSessionListId : selectedSessions.length === 0) ||
+              (!scrapeChats && !targets.trim())
             }
             className={`${btnPrimary} w-full py-3 text-base`}
           >
             {submitting ? (
               <>
                 <Loader2 className="w-4 h-4 animate-spin" />
-                Starting Scrape...
+                {scrapeChats ? 'Scraping personal chats...' : 'Starting Scrape...'}
+              </>
+            ) : scrapeChats ? (
+              <>
+                <Download className="w-4 h-4" />
+                Export Personal Chats (
+                {sessionPickMode === 'list'
+                  ? 'session list'
+                  : `${selectedSessions.length} sessions`}
+                )
               </>
             ) : (
               <>

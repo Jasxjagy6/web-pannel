@@ -1,5 +1,6 @@
 import { apiError } from '../../utils/apiError';
 import { useEffect, useState } from 'react';
+const __BASE = (import.meta.env.VITE_BASE_PATH || '/panel').replace(/\/$/, '');
 import { Network, Plus, Trash2, RefreshCw, Globe, PlayCircle } from 'lucide-react';
 // BYO Proxy (Phase 3): IG panel uses the shared /api/me/proxies surface
 // so users only see their own proxies (never the admin pool).
@@ -114,7 +115,7 @@ export default function InstagramProxies() {
           <p className="mt-2 text-sm text-pink-700 dark:text-pink-200">
             Bring-your-own proxy is a paid feature.
           </p>
-          <a href="/billing" className="mt-3 inline-block rounded-lg bg-pink-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-pink-500">
+          <a href={`${__BASE}/billing`} className="mt-3 inline-block rounded-lg bg-pink-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-pink-500">
             Upgrade plan
           </a>
         </div>
