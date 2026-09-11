@@ -12,6 +12,7 @@ const controller = require('../controllers/telegramClientController');
 const { authenticate, requireApproved } = require('../middleware/auth');
 const { generalLimiter } = require('../middleware/rateLimiter');
 const { uploadFile, uploadVoice, uploadPhoto } = require('../middleware/tgClientUpload');
+const personalChatsController = require('../controllers/personalChatsController');
 
 router.use(authenticate);
 router.use(requireApproved);
@@ -31,6 +32,12 @@ function maybeMultipart(mw) {
 
 // --- Sessions -------------------------------------------------------------
 router.get('/sessions', controller.listSessions);
+
+// POST /sessions/scrape/chats — Dump all personal (DM) chats from the
+// selected sessions/lists as a downloadable CSV/JSON/TXT. Declared before
+// /sessions/:id/* so the static path wins over the param route.
+router.post('/sessions/scrape/chats', personalChatsController.scrapeChats);
+
 // Bulk "Clear chat history across N sessions" — declared before
 // /sessions/:id/* so the static path wins over the param route.
 // Job-based: POST kicks off the work asynchronously and returns the

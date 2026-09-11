@@ -11,6 +11,14 @@ ARG BUILD_TIME=unknown
 ENV VITE_GIT_SHA=${GIT_SHA}
 ENV VITE_BUILD_TIME=${BUILD_TIME}
 
+# The SPA is served behind a reverse proxy at /panel (the host only exposes
+# port 80 publicly, which is shared with another app). Bake the base path +
+# API URL into the bundle so all assets, router, API calls and the socket
+# path are rooted under /panel/. The upstream Caddy strips /panel before
+# forwarding to this container.
+ENV VITE_BASE_PATH=/panel
+ENV VITE_API_URL=/panel/api
+
 WORKDIR /app
 
 COPY package*.json ./

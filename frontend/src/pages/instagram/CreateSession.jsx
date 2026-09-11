@@ -1,5 +1,6 @@
 import { useState, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
+const __BASE = (import.meta.env.VITE_BASE_PATH || '/panel').replace(/\/$/, '');
 import {
   Instagram,
   ShieldCheck,
@@ -293,13 +294,13 @@ export default function InstagramCreateSession() {
             >
               {proxyState === 'trial_blocked' ? (
                 <div className="rounded-lg border border-yellow-300 bg-yellow-50 p-3 text-xs text-yellow-700">
-                  Bring-your-own proxy is a paid feature. <a href="/billing" className="underline">Upgrade</a> to add a proxy.
+                  Bring-your-own proxy is a paid feature. <a href={`${__BASE}/billing`} className="underline">Upgrade</a> to add a proxy.
                 </div>
               ) : proxyState === 'loading' ? (
                 <div className="text-xs text-gray-500">Loading your proxies…</div>
               ) : proxies.length === 0 ? (
                 <div className="rounded-lg border border-yellow-300 bg-yellow-50 p-3 text-xs text-yellow-700">
-                  You haven&apos;t added any proxies. <a href="/instagram/proxies" target="_blank" rel="noopener noreferrer" className="underline">Add one</a> first.
+                  You haven&apos;t added any proxies. <a href={`${__BASE}/instagram/proxies`} target="_blank" rel="noopener noreferrer" className="underline">Add one</a> first.
                 </div>
               ) : (
                 <select

@@ -18,6 +18,9 @@ const SOCKET_URL =
     ? `${window.location.protocol}//${window.location.host}`
     : '');
 
+// Socket.IO endpoint path mirroring the SPA's /panel reverse-proxy mount.
+const SOCKET_PATH = `${(import.meta.env.VITE_BASE_PATH || '/panel').replace(/\/$/, '')}/socket.io`;
+
 export function useTelegramClientSocket(sessionId, store) {
   const socketRef = useRef(null);
 
@@ -34,6 +37,7 @@ export function useTelegramClientSocket(sessionId, store) {
     store.getState().setSocketStatus('connecting');
     const socket = io(SOCKET_URL, {
       auth: { token },
+      path: SOCKET_PATH,
       query: { platform: 'telegram' },
       transports: ['websocket', 'polling'],
     });

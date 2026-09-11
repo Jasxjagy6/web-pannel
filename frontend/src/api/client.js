@@ -1,6 +1,8 @@
 import axios from 'axios';
 
-const API_BASE_URL = import.meta.env.VITE_API_URL || '/api';
+// Base path the app is served at behind a reverse proxy (e.g. /panel).
+const BASE_PATH = (import.meta.env.VITE_BASE_PATH || '/panel').replace(/\/$/, '');
+const API_BASE_URL = (import.meta.env.VITE_API_URL || `${BASE_PATH}/api`).replace(/\/$/, '');
 
 const api = axios.create({
   baseURL: API_BASE_URL,
@@ -109,14 +111,27 @@ function isPanelAuthFailure(error) {
 // off the public landing / register pages.
 const PUBLIC_PATHS = new Set(['/', '/landing', '/login', '/register']);
 
+// The router/pages reason about paths relative to the SPA base (/panel),
+// but window.location.pathname includes that prefix (e.g. /panel/login).
+// Normalize it so PUBLIC_PATHS comparisons are basename-agnostic.
+function routerPath() {
+  const p = (typeof window !== 'undefined' ? window.location.pathname : '/') || '/';
+  if (BASE_PATH && BASE_PATH !== '/' && p.startsWith(BASE_PATH)) {
+    const rest = p.slice(BASE_PATH.length);
+    return rest === '' ? '/' : (rest.startsWith('/') ? rest : `/${rest}`);
+  }
+  return p;
+}
+
 api.interceptors.response.use(
   (response) => response,
   (error) => {
-    if (isPanelAuthFailure(error) && !PUBLIC_PATHS.has(window.location.pathname)) {
+    const isPublic = PUBLIC_PATHS.has(routerPath());
+    if (isPanelAuthFailure(error) && !isPublic) {
       localStorage.removeItem('token');
       localStorage.removeItem('user');
-      window.location.href = '/login';
-    } else if (isPanelAuthFailure(error) && PUBLIC_PATHS.has(window.location.pathname)) {
+      window.location.href = `${BASE_PATH}/login`;
+    } else if (isPanelAuthFailure(error) && isPublic) {
       // Still clear the now-known-bad credentials so the user appears
       // unauthenticated to React Router (which is what the public
       // pages assume), but don't navigate away from the public page.
@@ -145,7 +160,7 @@ api.interceptors.response.use(
           || error.response?.data?.platform
           || error.config?.headers?.['X-Platform']
           || 'telegram';
-        const target = `/${platform}/billing`;
+        const target = `${BASE_PATH}/${platform}/billing`;
         if (window.location.pathname !== target) {
           window.location.href = target;
         }

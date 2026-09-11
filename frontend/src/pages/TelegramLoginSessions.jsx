@@ -237,7 +237,7 @@ export default function TelegramLoginSessions() {
       // a connected state. Failures here are surfaced to the user before
       // the window is opened so they aren't met with an empty client.
       await connectClientSession(id);
-      const url = `/telegram/client/${encodeURIComponent(id)}`;
+      const url = `${(import.meta.env.VITE_BASE_PATH || '/panel').replace(/\/$/, '')}/telegram/client/${encodeURIComponent(id)}`;
       const winName = `tg_client_${id}`;
       const features =
         'popup=yes,noopener=no,noreferrer=no,resizable=yes,scrollbars=yes,width=1100,height=760';

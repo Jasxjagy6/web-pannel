@@ -22,6 +22,7 @@ import {
 } from 'lucide-react';
 import { useNavigate } from 'react-router-dom';
 import { useToast } from '../components/common/Toast';
+const BASE_PATH = (import.meta.env.VITE_BASE_PATH || '/panel').replace(/\/$/, '');
 import {
   createSessionStart,
   createSessionVerify,
@@ -239,11 +240,11 @@ function PhoneStep({
         </label>
         {trialBlocked ? (
           <div className="rounded-lg border border-yellow-500/30 bg-yellow-500/10 px-3 py-2 text-xs text-yellow-200">
-            Bring-your-own proxy is a paid feature. <a href="/billing" className="underline">Upgrade</a> to add a proxy and create accounts.
+            Bring-your-own proxy is a paid feature. <a href={`${BASE_PATH}/billing`} className="underline">Upgrade</a> to add a proxy and create accounts.
           </div>
         ) : noProxies ? (
           <div className="rounded-lg border border-yellow-500/30 bg-yellow-500/10 px-3 py-2 text-xs text-yellow-200">
-            You haven&apos;t added any proxies yet. <a href="/proxies" target="_blank" rel="noopener noreferrer" className="underline">Add one in My Proxies</a> first — every Telegram account on this panel is pinned to a proxy you own.
+            You haven&apos;t added any proxies yet. <a href={`${BASE_PATH}/proxies`} target="_blank" rel="noopener noreferrer" className="underline">Add one in My Proxies</a> first — every Telegram account on this panel is pinned to a proxy you own.
           </div>
         ) : proxyState === 'loading' ? (
           <div className="rounded-lg border border-white/10 bg-dark-900 px-3 py-2.5 text-xs text-gray-400">
@@ -270,7 +271,7 @@ function PhoneStep({
               })}
             </select>
             <p className="text-[11px] text-gray-500">
-              The session is pinned to this proxy for life. <a href="/proxies" target="_blank" rel="noopener noreferrer" className="text-primary-400 hover:underline">+ Add new proxy…</a>
+              The session is pinned to this proxy for life. <a href={`${BASE_PATH}/proxies`} target="_blank" rel="noopener noreferrer" className="text-primary-400 hover:underline">+ Add new proxy…</a>
             </p>
           </div>
         )}

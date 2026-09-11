@@ -4,6 +4,8 @@ import { useToast } from '../components/common/Toast';
 import { parseApiError, formatRelativeTime } from '../utils/formatters';
 import { listSessions } from '../api/sessions';
 
+const API_BASE = (import.meta.env.VITE_API_URL || `${(import.meta.env.VITE_BASE_PATH || '/panel').replace(/\/$/, '')}/api`).replace(/\/$/, '');
+
 function StatusBadge({ status }) {
   const meta = {
     pending:    { icon: Clock,         color: 'text-gray-400 bg-gray-500/10 border-gray-500/30' },
@@ -166,7 +168,7 @@ export default function LoginEmailTab() {
 
   const fetchGmailAccounts = useCallback(async () => {
     try {
-      const res = await fetch('/api/login-email/gmail-accounts', {
+      const res = await fetch(`${API_BASE}/login-email/gmail-accounts`, {
         headers: { Authorization: `Bearer ${token}` }
       });
       const data = await res.json();
@@ -178,7 +180,7 @@ export default function LoginEmailTab() {
 
   const fetchJobs = useCallback(async () => {
     try {
-      const res = await fetch('/api/login-email/jobs', {
+      const res = await fetch(`${API_BASE}/login-email/jobs`, {
         headers: { Authorization: `Bearer ${token}` }
       });
       const data = await res.json();
@@ -209,7 +211,7 @@ export default function LoginEmailTab() {
     const code = params.get('code');
     if (code) {
       const redirectUri = window.location.origin + window.location.pathname;
-      fetch('/api/login-email/google-callback', {
+      fetch(`${API_BASE}/login-email/google-callback`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -274,7 +276,7 @@ export default function LoginEmailTab() {
 
     setSubmitting(true);
     try {
-      const res = await fetch('/api/login-email/jobs', {
+      const res = await fetch(`${API_BASE}/login-email/jobs`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',

@@ -27,6 +27,27 @@ const MAX_CHAT_HISTORY = Math.max(
 const ENV_KEY_CACHE_TTL_MS = 5 * 60 * 1000;
 const _envKeyCache = { value: null, expiresAt: 0 };
 
+// Map our stored media kind to the marker string CapitalBot understands in
+// chatHistory (see docs.text — the AI uses *IMAGE*, *VIDEO*, *AUDIO* etc.
+// to know what media the user sent or the bot already sent).
+const MEDIA_KIND_MARKERS = {
+  photo: '*IMAGE*',
+  image: '*IMAGE*',
+  video: '*VIDEO*',
+  audio: '*AUDIO*',
+  voice: '*AUDIO*',
+  gif: '*GIF*',
+  sticker: '*STICKER*',
+  geo: '*LOCATION*',
+  location: '*LOCATION*',
+  contact: '*CONTACT*',
+};
+
+function _mediaMarker(kind) {
+  const k = String(kind || '').toLowerCase();
+  return MEDIA_KIND_MARKERS[k] || null;
+}
+
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -219,11 +240,23 @@ class CapitalBotService {
         ? messages.slice(-MAX_CHAT_HISTORY)
         : messages;
 
-    return bounded.map((m) => ({
-      role: m.isIncoming ? 'user' : 'assistant',
-      content: m.msg || '',
-      timestamp: Math.floor((m.timestamp || Date.now()) / 1000),
-    }));
+    return bounded.map((m) => {
+      // Attach media markers (e.g. "*IMAGE*") for any media the user sent or
+      // the bot sent. CapitalBot reads these markers to keep its media-aware
+      // conversation state in sync — without them it may think a photo the
+      // user just sent was a plain text message.
+      const markers = (Array.isArray(m.medias) ? m.medias : [])
+        .map((md) => _mediaMarker(md.kind || md.fileType || md.type))
+        .filter(Boolean);
+      const parts = [];
+      if (m.msg && String(m.msg).trim()) parts.push(String(m.msg).trim());
+      parts.push(...markers);
+      return {
+        role: m.isIncoming ? 'user' : 'assistant',
+        content: parts.join('\n'),
+        timestamp: Math.floor((m.timestamp || Date.now()) / 1000),
+      };
+    });
   }
 
   async generateReply({
@@ -334,6 +367,16 @@ class CapitalBotService {
             ? { url: mediaEntry.content, type: mediaEntry.type, mediaPool: mediaEntry.mediaPool || null }
             : null;
 
+          // Ordered list of typed content pieces (text | image | video |
+          // audio) exactly as CapitalBot returned them. The worker sends
+          // them in sequence so the user receives photos/videos/voice notes
+          // interleaved with the AI's text, not just the first media item.
+          const content = contentArray.map((item) => ({
+            type: item.type || 'text',
+            content: item.content || '',
+            mediaPool: item.mediaPool || null,
+          }));
+
           let category = null;
           if (res.data.underage) category = 'underage';
           else if (res.data.aiCreditOver) category = 'ai_credit_over';
@@ -350,6 +393,7 @@ class CapitalBotService {
             statusCode: res.statusCode,
             text: responseText,
             media,
+            content,
             didConvert: !!res.data.converted,
             category,
             rateLimit: null,

@@ -4,6 +4,11 @@ import { fileURLToPath, URL } from 'node:url';
 
 export default defineConfig({
   plugins: [react()],
+  // The SPA is served behind a reverse proxy at the /panel path (the only
+  // publicly reachable port on the host is 80, shared with another app), so
+  // all emitted asset URLs are rooted at /panel/. The upstream Caddy strips
+  // /panel before forwarding to the frontend container.
+  base: process.env.VITE_BASE_PATH || '/panel/',
   resolve: {
     alias: {
       '@': fileURLToPath(new URL('./src', import.meta.url)),

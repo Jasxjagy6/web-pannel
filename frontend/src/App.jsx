@@ -337,7 +337,7 @@ function PlatformRoutes() {
 
 export default function App() {
   return (
-    <BrowserRouter>
+    <BrowserRouter basename={import.meta.env.VITE_BASE_PATH || '/panel'}>
       <AuthProvider>
         <PlatformProvider>
           <ThemeProvider>

@@ -17,6 +17,11 @@
  */
 
 const { Worker } = require('bullmq');
+const https = require('https');
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
+const { Api } = require('telegram');
 const cupidbotService = require('../services/cupidbotService');
 const capitalbotService = require('../services/capitalbotService');
 const aiMemoryService = require('../services/aiMemoryService');
@@ -146,7 +151,23 @@ async function processGenerateReply(job) {
       logger.warn(`AI Worker: ${provider} rate limit for session ${sid}: ${JSON.stringify(aiResponse.rateLimit)}`);
     }
 
-    if (!aiResponse.text) {
+    // Build the ordered list of content pieces to send. CapitalBot returns
+    // an ordered `content` array (text | image | video | audio items) that
+    // the user should receive in sequence. Other providers only produce a
+    // single text reply, which we wrap into one item so the whole send
+    // pipeline (including per-item media handling) stays shared.
+    const contentItems =
+      provider === 'capitalbot' && Array.isArray(aiResponse.content) && aiResponse.content.length > 0
+        ? aiResponse.content
+        : [];
+    if (contentItems.length === 0 && aiResponse.text) {
+      contentItems.push({ type: 'text', content: aiResponse.text });
+    }
+    const sendableItems = contentItems.filter(
+      (item) => item.content && String(item.content).trim()
+    );
+
+    if (sendableItems.length === 0) {
       // CapitalBot returns empty content with converted=true when the user
       // has AGREED to the CTA/conversion — the API intentionally stops
       // sending messages. That is a SUCCESS, not a failed/empty reply, so
@@ -162,115 +183,74 @@ async function processGenerateReply(job) {
       return { sent: false, reason: 'empty_reply' };
     }
 
-    // Send the message via Telegram.
-    const doSend = () => tgService.sendMessage(
-      sessionId,
-      pid,
-      aiResponse.text,
-      { silent: false, accessHash: recipient?.accessHash || null }
-    );
-    let sent;
-    try {
-      sent = await doSend();
-    } catch (sendErr) {
-      // "Could not find the input entity" means this peer isn't in the
-      // session's GramJS entity cache (common for a brand-new incoming DM
-      // right after a restart, before any catch-up sweep warmed the
-      // cache). getDialogs() repopulates the entity cache; then the retry
-      // resolves. Only do this for the entity error — other send failures
-      // (privacy, flood, etc.) aren't fixed by a dialog scan.
-      // PEER_ID_INVALID is the same underlying problem as "input entity":
-      // the peer isn't resolvable from the session's cache. A getDialogs()
-      // warm fixes both, so retry once for either.
-      const isEntityErr = /input entity|Could not find the input|PEER_ID_INVALID|PEER_ID/i.test(sendErr.message || '');
-      let recovered = false;
-      if (isEntityErr) {
-        const entry = tgService.clients.get(String(sid));
-        const client = entry && entry.client ? entry.client : null;
-        if (client) {
-          // Strategy 1: warm the entity cache with getDialogs, then retry
-          // via the normal send path.
-          try {
-            await client.getDialogs({ limit: 200 });
-            sent = await doSend();
-            recovered = true;
-            logger.info(`AI Worker: recovered send for session ${sid} peer ${pid} after entity-cache warm`);
-          } catch (_) { /* fall through */ }
+    // Send each content piece in order. Text failures are fatal (matches
+    // the previous single-message behavior — an unreachable peer, privacy
+    // block, flood, etc.). Media failures are best-effort: a URL that 404s
+    // or times out is skipped so the rest of the reply still goes through.
+    const confirmedIds = [];
+    let lastOutgoingMessageId = null;
+    let anySent = false;
+    let sendFailure = null;
 
-          // Strategy 2: build the InputPeerUser directly from the peer id +
-          // the access_hash the catch-up captured from the dialog. This
-          // resolves peers that getDialogs didn't surface (older than the
-          // top-200 window) but for which we already hold a valid hash.
-          if (!recovered && recipient?.accessHash) {
-            try {
-              const { Api } = require('telegram');
-              const inputPeer = new Api.InputPeerUser({
-                userId: BigInt(pid),
-                accessHash: BigInt(String(recipient.accessHash)),
-              });
-              sent = await client.sendMessage(inputPeer, { message: aiResponse.text });
-              recovered = true;
-              logger.info(`AI Worker: recovered send for session ${sid} peer ${pid} via direct InputPeerUser`);
-            } catch (directErr) {
-              logger.warn(`AI Worker: direct-peer retry failed for session ${sid} peer ${pid}: ${directErr.message}`);
-            }
-          }
+    for (const item of sendableItems) {
+      if (item.type === 'text') {
+        try {
+          const sent = await _sendTextToPeer(sessionId, pid, String(item.content), recipient);
+          const mid = tcService._toIdNum(sent?.messageId ?? sent?.id);
+          lastOutgoingMessageId = mid;
+          confirmedIds.push(String(mid));
+          await _appendOutgoingMemory(sid, peerType, pid, item, mid, config);
+          anySent = true;
+        } catch (sendErr) {
+          sendFailure = sendErr;
+          logger.warn(
+            `AI chat sendMessage failed for session ${sid} peer ${pid}: ${sendErr.message}. ` +
+            `${provider} response: ${JSON.stringify(aiResponse)}`
+          );
+          break;
         }
-      }
-      if (!recovered) {
-        logger.warn(
-          `AI chat sendMessage failed for session ${sid} peer ${pid}: ${sendErr.message}. ` +
-          `${provider} response: ${JSON.stringify(aiResponse)}`
-        );
-        // Distinguish an UNREACHABLE peer (stale access_hash — Telegram
-        // won't let us message this stranger, nothing we can do) from a
-        // genuine send failure. The AI itself worked; the peer is just not
-        // messageable. Logged as `send_failed` still records the reason but
-        // the error text carries PEER_ID_INVALID so dashboards can exclude
-        // it from the real failure rate. We keep the status as send_failed
-        // (unchanged schema) but the catch-up now skips these peers so they
-        // are not retried into the metric every sweep.
-        logRow.status = 'send_failed';
-        logRow.error_message = sendErr.message;
-        await _insertLog(logRow);
-        return { sent: false, reason: 'send_failed' };
+      } else {
+        const sent = await _sendMediaToPeer(sessionId, pid, item, recipient);
+        if (sent) {
+          const mid = tcService._toIdNum(sent?.id);
+          lastOutgoingMessageId = mid;
+          confirmedIds.push(String(mid));
+          await _appendOutgoingMemory(sid, peerType, pid, item, mid, config);
+          anySent = true;
+        } else {
+          logger.warn(`AI Worker: skipped ${item.type} item for session ${sid} peer ${pid}`);
+        }
       }
     }
 
-    // Track the outgoing message ID for confirmation on next API call
-    const outgoingMessageId = tcService._toIdNum(sent?.messageId ?? sent?.id);
-    const outgoingItem = {
-      id: `tg-ai-${outgoingMessageId ?? Date.now()}`,
-      telegramMessageId: outgoingMessageId,
-      timestamp: Date.now(),
-      msg: aiResponse.text,
-      isIncoming: false,
-      medias: [],
-      confirmed: false, // Will be marked confirmed on next successful API call
-    };
+    if (!anySent) {
+      // Distinguish an UNREACHABLE peer (stale access_hash — Telegram
+      // won't let us message this stranger, nothing we can do) from a
+      // genuine send failure. The AI itself worked; the peer is just not
+      // messageable. Logged as `send_failed` still records the reason but
+      // the error text carries PEER_ID_INVALID so dashboards can exclude
+      // it from the real failure rate.
+      logRow.status = 'send_failed';
+      logRow.error_message = sendFailure ? sendFailure.message : 'All content items failed to send';
+      await _insertLog(logRow);
+      return { sent: false, reason: 'send_failed' };
+    }
 
-    await aiMemoryService.append(
-      sid,
-      peerType,
-      pid,
-      outgoingItem,
-      config.memoryMessageLimit || DEFAULT_MEMORY_LIMIT
-    );
+    if (sendFailure) {
+      // A later text item failed after earlier items already went out —
+      // the reply was delivered, so log the warning but keep status=sent.
+      logger.warn(`AI Worker: partial send failure for session ${sid} peer ${pid}: ${sendFailure.message}`);
+    }
 
-    // Mark this outgoing message as pending confirmation
-    // We'll confirm it on the next successful API call
-    const confirmedIds = [String(outgoingMessageId)].filter(Boolean);
-
-    // Log success with confirmed message IDs
     logRow.status = 'sent';
     logRow.confirmed_ai_message_ids = confirmedIds;
     await _insertLog(logRow);
 
     // Update conversation state with last AI message sent
-    await _updateConversationState(sid, peerType, pid, 'active', aiResponse.category, outgoingMessageId);
+    await _updateConversationState(sid, peerType, pid, 'active', aiResponse.category, lastOutgoingMessageId);
 
-    logger.info(`AI Worker: successfully sent reply for session ${sid} peer ${pid}, msgId=${outgoingMessageId}`);
-    return { sent: true, messageId: outgoingMessageId, category: aiResponse.category, didConvert: aiResponse.didConvert };
+    logger.info(`AI Worker: successfully sent reply for session ${sid} peer ${pid}, msgId=${lastOutgoingMessageId}`);
+    return { sent: true, messageId: lastOutgoingMessageId, category: aiResponse.category, didConvert: aiResponse.didConvert };
   } catch (err) {
     logRow.status = 'failed';
     logRow.error_message = err.message;
@@ -285,6 +265,274 @@ async function processGenerateReply(job) {
     logger.warn(`AI chat job failed for session ${sid}: ${err.message}`);
     throw err;
   }
+}
+
+/**
+ * Send a text message with entity-cache recovery.
+ *
+ * "Could not find the input entity" means this peer isn't in the session's
+ * GramJS entity cache (common for a brand-new incoming DM right after a
+ * restart, before any catch-up sweep warmed the cache). getDialogs()
+ * repopulates the entity cache; then the retry resolves. Only do this for
+ * the entity error — other send failures (privacy, flood, etc.) aren't
+ * fixed by a dialog scan. PEER_ID_INVALID is the same underlying problem,
+ * so it's retried once too.
+ */
+async function _sendTextToPeer(sessionId, pid, text, recipient) {
+  const sid = Number(sessionId);
+  const doSend = () => tgService.sendMessage(
+    sessionId,
+    pid,
+    text,
+    { silent: false, accessHash: recipient?.accessHash || null }
+  );
+  try {
+    return await doSend();
+  } catch (sendErr) {
+    const isEntityErr = /input entity|Could not find the input|PEER_ID_INVALID|PEER_ID/i.test(sendErr.message || '');
+    if (!isEntityErr) throw sendErr;
+
+    const entry = tgService.clients.get(String(sid));
+    const client = entry && entry.client ? entry.client : null;
+    if (!client) throw sendErr;
+
+    // Strategy 1: warm the entity cache with getDialogs, then retry via
+    // the normal send path.
+    let sent;
+    let recovered = false;
+    try {
+      await client.getDialogs({ limit: 200 });
+      sent = await doSend();
+      recovered = true;
+      logger.info(`AI Worker: recovered send for session ${sid} peer ${pid} after entity-cache warm`);
+    } catch (_) { /* fall through */ }
+
+    // Strategy 2: build the InputPeerUser directly from the peer id + the
+    // access_hash the catch-up captured from the dialog. This resolves
+    // peers that getDialogs didn't surface (older than the top-200 window)
+    // but for which we already hold a valid hash.
+    if (!recovered && recipient?.accessHash) {
+      try {
+        const inputPeer = new Api.InputPeerUser({
+          userId: BigInt(pid),
+          accessHash: BigInt(String(recipient.accessHash)),
+        });
+        sent = await client.sendMessage(inputPeer, { message: text });
+        recovered = true;
+        logger.info(`AI Worker: recovered send for session ${sid} peer ${pid} via direct InputPeerUser`);
+      } catch (directErr) {
+        logger.warn(`AI Worker: direct-peer retry failed for session ${sid} peer ${pid}: ${directErr.message}`);
+      }
+    }
+
+    if (!recovered) throw sendErr;
+    return sent;
+  }
+}
+
+/**
+ * Resolve the peer entity for a media send, with the same entity-cache
+ * recovery used for text sends. Returns `{ client, entity }`.
+ */
+async function _resolvePeerForSend(sessionId, pid, recipient) {
+  const sid = Number(sessionId);
+  const entry = tgService.clients.get(String(sid));
+  const client = entry && entry.client ? entry.client : null;
+  const doResolve = () => tgService._resolveEntity(sessionId, pid, {
+    accessHash: recipient?.accessHash || null,
+  });
+
+  try {
+    return { client, entity: await doResolve() };
+  } catch (resolveErr) {
+    const isEntityErr = /input entity|Could not find the input|PEER_ID_INVALID|PEER_ID/i.test(resolveErr.message || '');
+    if (!isEntityErr) throw resolveErr;
+  }
+
+  if (client) {
+    try { await client.getDialogs({ limit: 200 }); } catch (_) { /* ignore */ }
+    try {
+      return { client, entity: await doResolve() };
+    } catch (err) {
+      const isEntityErr = /input entity|Could not find the input|PEER_ID_INVALID|PEER_ID/i.test(err.message || '');
+      if (!isEntityErr) throw err;
+    }
+  }
+
+  if (recipient?.accessHash) {
+    return {
+      client,
+      entity: new Api.InputPeerUser({
+        userId: BigInt(pid),
+        accessHash: BigInt(String(recipient.accessHash)),
+      }),
+    };
+  }
+
+  throw new Error(`Could not resolve peer ${pid} for media send`);
+}
+
+/**
+ * Send a media content item (image | video | audio) from CapitalBot.
+ * Downloads the media URL to a temp file, then uploads it via the session
+ * client's sendFile. Returns the sent message, or null on any failure so
+ * the caller can skip it (best-effort).
+ */
+async function _sendMediaToPeer(sessionId, pid, item, recipient) {
+  const sid = Number(sessionId);
+  const url = String(item.content || '').trim();
+  if (!/^https?:\/\//i.test(url)) {
+    logger.warn(`AI Worker: invalid ${item.type} URL for session ${sid} peer ${pid}: ${url.slice(0, 80)}`);
+    return null;
+  }
+
+  let tmpPath;
+  try {
+    tmpPath = await _downloadToTemp(url);
+  } catch (err) {
+    logger.warn(`AI Worker: media download failed for session ${sid} peer ${pid}: ${err.message}`);
+    return null;
+  }
+
+  try {
+    const { client, entity } = await _resolvePeerForSend(sessionId, pid, recipient);
+    if (!client) throw new Error('Session client not loaded');
+    const sendOpts = _buildMediaSendOptions(item.type, tmpPath, url);
+    const result = await tgService._withFloodRetry(sessionId, async () => {
+      return await client.sendFile(entity, sendOpts);
+    });
+    return result;
+  } catch (err) {
+    logger.warn(`AI Worker: media send failed for session ${sid} peer ${pid}: ${err.message}`);
+    return null;
+  } finally {
+    try { fs.unlinkSync(tmpPath); } catch (_) { /* ignore */ }
+  }
+}
+
+function _buildMediaSendOptions(type, tmpPath, url) {
+  const fileName = _fileNameFromUrl(url) || _defaultFileName(type);
+  if (type === 'image') {
+    // No attributes → GramJS auto-detects the photo from the file's mime
+    // type. A .gif is sent as an animation instead of a static photo.
+    if (/\.gif$/i.test(fileName)) {
+      return {
+        file: tmpPath,
+        forceDocument: true,
+        attributes: [new Api.DocumentAttributeAnimated(), new Api.DocumentAttributeFilename({ fileName })],
+      };
+    }
+    return { file: tmpPath };
+  }
+  if (type === 'video') {
+    return {
+      file: tmpPath,
+      attributes: [
+        new Api.DocumentAttributeVideo({ duration: 0, w: 0, h: 0, supportsStreaming: true }),
+        new Api.DocumentAttributeFilename({ fileName }),
+      ],
+      fileName,
+    };
+  }
+  // audio → voice note
+  return {
+    file: tmpPath,
+    attributes: [
+      new Api.DocumentAttributeAudio({ duration: 0, voice: true }),
+      new Api.DocumentAttributeFilename({ fileName }),
+    ],
+    voiceNote: true,
+    fileName,
+  };
+}
+
+function _defaultFileName(type) {
+  if (type === 'video') return 'video.mp4';
+  if (type === 'audio') return 'voice.ogg';
+  return 'image.jpg';
+}
+
+function _extFromUrl(url) {
+  try {
+    const m = /\.[a-z0-9]{2,5}$/i.exec(new URL(url).pathname);
+    return m ? m[0].toLowerCase() : '';
+  } catch {
+    return '';
+  }
+}
+
+function _fileNameFromUrl(url) {
+  try {
+    const base = String(new URL(url).pathname).split('/').pop();
+    return base && /\.[a-z0-9]{2,5}$/i.test(base) ? decodeURIComponent(base) : null;
+  } catch {
+    return null;
+  }
+}
+
+function _downloadToTemp(url) {
+  return new Promise((resolve, reject) => {
+    const parsed = new URL(url);
+    const reqOpts = {
+      hostname: parsed.hostname,
+      port: parsed.port || 443,
+      path: parsed.pathname + parsed.search,
+      method: 'GET',
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (TelegramPanelAI/1.0)',
+        Accept: '*/*',
+      },
+      timeout: 60000,
+    };
+    const req = https.request(reqOpts, (res) => {
+      if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+        res.resume();
+        return resolve(_downloadToTemp(new URL(res.headers.location, url).toString()));
+      }
+      if (res.statusCode !== 200) {
+        res.resume();
+        return reject(new Error(`HTTP ${res.statusCode}`));
+      }
+      const tmpPath = path.join(
+        os.tmpdir(),
+        `ai-media-${Date.now()}-${Math.round(Math.random() * 1e9)}${_extFromUrl(url)}`
+      );
+      const ws = fs.createWriteStream(tmpPath);
+      res.pipe(ws);
+      ws.on('finish', () => resolve(tmpPath));
+      ws.on('error', reject);
+    });
+    req.on('error', reject);
+    req.on('timeout', () => {
+      req.destroy();
+      reject(new Error('Media download timed out'));
+    });
+    req.end();
+  });
+}
+
+/**
+ * Append one memory item for a sent content piece so the AI's chat history
+ * stays in sync (text pieces as text, media pieces as a marker + medias).
+ */
+async function _appendOutgoingMemory(sid, peerType, pid, item, mid, config) {
+  const isMedia = item.type !== 'text';
+  const outgoingItem = {
+    id: `tg-ai-${mid ?? Date.now()}`,
+    telegramMessageId: mid,
+    timestamp: Date.now(),
+    msg: isMedia ? '' : String(item.content),
+    isIncoming: false,
+    medias: isMedia ? [{ kind: item.type, hasMedia: true }] : [],
+    confirmed: false, // Will be marked confirmed on next successful API call
+  };
+  await aiMemoryService.append(
+    sid,
+    peerType,
+    pid,
+    outgoingItem,
+    config.memoryMessageLimit || DEFAULT_MEMORY_LIMIT
+  );
 }
 
 /**

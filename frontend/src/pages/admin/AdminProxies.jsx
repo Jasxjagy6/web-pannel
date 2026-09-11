@@ -2,6 +2,7 @@ import { useState, useEffect, useCallback, useMemo } from 'react';
 import {
   Network, Plus, Trash2, RefreshCcw, Loader2, Wifi, Activity, Users,
 } from 'lucide-react';
+const BASE_PATH = (import.meta.env.VITE_BASE_PATH || '/panel').replace(/\/$/, '');
 import { useToast } from '../../components/common/Toast';
 import {
   adminListProxies,
@@ -123,7 +124,7 @@ export default function AdminProxies() {
           </h2>
           <p className="text-sm text-gray-400">
             The shared free + manual pool (rows where <code>user_id IS NULL</code>).
-            Regular users go through <a href="/proxies" className="text-primary-400 hover:underline">My Proxies</a>;
+            Regular users go through <a href={`${BASE_PATH}/proxies`} className="text-primary-400 hover:underline">My Proxies</a>;
             this surface is admin-only.
           </p>
         </div>
